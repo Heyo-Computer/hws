@@ -505,6 +505,9 @@ impl BackgroundService for Supervisor {
                         continue;
                     };
                     let pid = stream.peer_cred().ok().and_then(|c| c.pid());
+                    // This process's own requests (tunnel ingress) never
+                    // outlive their link: release their state when it breaks.
+                    let pid = pid.filter(|&pid| pid != std::process::id() as i32);
                     let exited = exits.subscribe(pid);
                     let (control, metrics, access, security) = (
                         control.clone(),
@@ -580,6 +583,12 @@ pub(crate) async fn current_manager() -> Option<u64> {
 /// state that request holds. If that manager is gone, this is a restart: the
 /// state went with it, and the worker carries on.
 pub fn control_interrupted(manager: Option<u64>, error: &str) {
+    // The manager's own requests (tunnel ingress): the manager releases their
+    // state itself, and exiting would stop everything it manages.
+    if REQUESTS.get().is_none() {
+        tracing::warn!(%error, "a request in the manager lost its control link");
+        return;
+    }
     let Some(id) = manager else {
         control_lost(error)
     };

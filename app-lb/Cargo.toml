@@ -97,6 +97,10 @@ url = "2"
 # Wire types for pg-vm-pool's JSON admin API, shared with pg-fc itself, for
 # the pg-fc plugin. serde-only.
 pg-fc-api = { path = "../pg-fc/api" }
+# The tunnel plugin's own endpoint (`src/plugins/tunnel.rs`). Already in the
+# tree through heyo-sdk; direct because the plugin accepts connections, which
+# heyo-sdk's client-only wrapper does not.
+iroh = "1"
 
 async-trait = "0.1"
 futures.workspace = true

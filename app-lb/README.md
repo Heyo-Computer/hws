@@ -3319,6 +3319,57 @@ it like any other backend. Audio transcription (`/v1/audio/transcriptions`) is
 not proxied either — a multipart upload of tens of megabytes is data-plane
 work.
 
+### Heyo Cloud tunnel (`tunnel`)
+
+The `tunnel` plugin gives an app-lb that the internet cannot reach (a laptop,
+a home server, a machine behind NAT) a public
+`https://<subdomain>.heyo.computer` without opening a port.
+
+How a request gets here:
+
+1. app-lb runs its own iroh endpoint.
+2. heyvmd on the same machine registers a tunnel with Heyo Cloud on
+   app-lb's behalf, using the credential from `heyvm login`. heyvmd holds the
+   credential; app-lb never does.
+3. The cloud edge terminates TLS, dials the endpoint, and sends each request
+   over an iroh stream.
+4. app-lb serves the request through the same proxy as its own listeners, so
+   routing, sign-in gates, guard rules and the access log all apply.
+
+Requirements and behaviour:
+
+- heyvmd must be running on the same machine and logged in (`heyvm login`).
+  If it isn't, the plugin's card says so.
+- Only the cloud edge can open streams. The edge's endpoint ids come back
+  from registration, and any other endpoint is refused before a byte is
+  read.
+- The visitor's address arrives as `X-Heyo-Client-IP`. It is trusted only on
+  tunnel ingress, and removed before any request reaches an upstream.
+- The endpoint key is kept in `app-lb-tunnel.key` beside the state file
+  (mode 0600), so a hostname keeps pointing here across restarts.
+  Registrations refresh every minute.
+- ACME never orders certificates for tunnel hostnames, because the edge
+  terminates their TLS.
+- Tunnel streams are served by the app-lb manager, not the forwarding
+  worker: they arrive over the manager's endpoint. A manager restart drops
+  streams in flight and the edge redials; the worker's own listeners are
+  unaffected.
+
+To use it:
+
+- **Enable** it. With no configuration it claims one public hostname that
+  the cloud picks.
+- **Name hostnames** by listing them:
+  ```json
+  {"hostnames": [{"subdomain": "my-shop"}, {"subdomain": "my-admin", "public": false}]}
+  ```
+- **Private hostnames** (`public: false`) require a Heyo sign-in for your
+  account at the edge.
+- **Route a hostname** to a deployment by adding it as a `host` route. The
+  plugin card has a "Route to" picker that does this for you.
+- **Release a hostname** from the card, which also removes it from the
+  configuration.
+
 ## Clients
 
 | | |

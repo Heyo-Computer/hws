@@ -481,6 +481,12 @@ impl VmManager {
         })
     }
 
+    /// The daemon client itself, for routes `heyo_sdk` has no typed wrapper
+    /// for (the tunnel plugin's `/tunnels`).
+    pub fn client(&self) -> &HeyoClient {
+        &self.client
+    }
+
     /// Which daemon endpoint this manager reached — a socket path or a URL.
     pub fn transport(&self) -> &str {
         &self.transport

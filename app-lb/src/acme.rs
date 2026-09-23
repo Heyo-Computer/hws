@@ -413,6 +413,10 @@ pub struct AcmeConfig {
     /// configured — or when they are but the zone id is not, which is a
     /// misconfiguration `main` warns about at startup.
     pub dns: Option<crate::dns::Route53>,
+    /// Hostnames whose TLS something else terminates — the cloud edge, for an
+    /// app-lb tunnel's hostnames. Never ordered: HTTP-01 for them can only
+    /// fail, since the edge answers their port 80.
+    pub external_tls: crate::plugins::tunnel::ExternalTlsHosts,
 }
 
 impl AcmeConfig {
@@ -692,7 +696,12 @@ impl AcmeManager {
             for rule in &deployment.spec.routes {
                 if let Some(host) = &rule.host {
                     let host = host.trim().to_ascii_lowercase();
-                    if self.covering_wildcard(&host).is_none() {
+                    let external = self
+                        .config
+                        .external_tls
+                        .read()
+                        .is_ok_and(|set| set.contains(&host));
+                    if self.covering_wildcard(&host).is_none() && !external {
                         hosts.insert(host);
                     }
                 }
@@ -1180,6 +1189,7 @@ mod tests {
                 // Never reached: these tests exercise which hosts are selected,
                 // never an order.
                 dns: None,
+                external_tls: Default::default(),
             },
         )
     }
@@ -1308,6 +1318,30 @@ mod tests {
             manager.warned.lock().unwrap().is_empty(),
             "a covered suffix is served, not unsupported",
         );
+    }
+
+    /// A tunnel hostname is certified by the cloud edge; an HTTP-01 order for
+    /// it could only fail, every sweep, forever.
+    #[test]
+    fn desired_hosts_skips_hosts_whose_tls_is_terminated_elsewhere() {
+        let rule = |h: &str| RouteRule {
+            host: Some(h.into()),
+            host_suffix: None,
+            path_prefix: None,
+            strip_prefix: false,
+            redirect: None,
+        };
+        let manager = manager(
+            "external",
+            registry_with(vec![rule("shop.heyo.computer"), rule("own.example.com")]),
+        );
+        manager
+            .config
+            .external_tls
+            .write()
+            .unwrap()
+            .insert("shop.heyo.computer".into());
+        assert_eq!(manager.desired_hosts(), vec!["own.example.com".to_string()]);
     }
 
     #[test]

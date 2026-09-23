@@ -66,6 +66,7 @@ pub mod pgfc;
 pub mod postgres;
 pub mod remote;
 pub mod secrets;
+pub mod tunnel;
 pub mod vapi;
 
 use crate::fleet_store::{Collection, Expect, FileCollection, FileOptions};
