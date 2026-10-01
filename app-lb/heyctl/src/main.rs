@@ -15,8 +15,8 @@
 // dispatch. That is the point of the split — every command below runs through
 // the same client an SDK caller gets, so a field the client stops understanding
 // breaks the build here rather than blanking a column at somebody's terminal.
-use heyctl::cmd;
-use heyctl::cmd::GlobalOpts;
+use hws::cmd;
+use hws::cmd::GlobalOpts;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -376,7 +376,7 @@ fn run(cli: &Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use heyctl::output::OutputFormat;
+    use hws::output::OutputFormat;
     use super::*;
 
     #[test]

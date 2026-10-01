@@ -15,7 +15,7 @@
 //! Regenerate the fixtures with:
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
-use heyctl::types::{
+use hws::types::{
     AuthProviderView, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, PluginView,
     UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };

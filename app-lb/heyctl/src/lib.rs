@@ -10,8 +10,8 @@
 //! terminal.
 //!
 //! ```no_run
-//! # async fn f() -> heyctl::Result<()> {
-//! use heyctl::{Client, ExecRequest};
+//! # async fn f() -> hws::Result<()> {
+//! use hws::{Client, ExecRequest};
 //!
 //! let lb = Client::builder("127.0.0.1:9090")
 //!     .token(std::env::var("APP_LB_TOKEN").unwrap())
@@ -29,8 +29,8 @@
 //! it is the operator credential, and the one that mints tokens.
 //!
 //! ```no_run
-//! # async fn f() -> heyctl::Result<()> {
-//! use heyctl::{AdminScope, Client, NewToken};
+//! # async fn f() -> hws::Result<()> {
+//! use hws::{AdminScope, Client, NewToken};
 //!
 //! let admin = Client::builder("127.0.0.1:9090").basic("admin", "s3cret").build()?;
 //! let minted = admin.mint_token(

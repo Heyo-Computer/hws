@@ -1,13 +1,18 @@
 [package]
-name = "heyctl"
+name = "hws"
 version.workspace = true
 edition.workspace = true
 description = "Client library and kubectl-shaped CLI for the app-lb admin API"
 license = "Apache-2.0"
+repository = "https://github.com/Heyo-Computer/heyo-public"
+readme = "README.md"
 
+# Published to crates.io as `hws` (formerly `serverctl`); the binary keeps the
+# `heyctl` name.
+#
 # One crate, two products. The library is the whole crate minus `main.rs` and
 # `cmd/`; the CLI is a `[[bin]]` behind the default `cli` feature, so
-# `cargo install heyctl` still works and a library consumer writes
+# `cargo install hws` installs the `heyctl` binary and a library consumer writes
 # `default-features = false` to get none of clap, rpassword or a terminal.
 #
 # The CLI being the library's own first consumer is the point: a field the client

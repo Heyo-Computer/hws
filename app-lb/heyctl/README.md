@@ -3,8 +3,10 @@
 A client library **and** a kubectl-shaped CLI for the [app-lb](../README.md)
 admin API.
 
-One crate, two products. `cargo install heyctl` gets the CLI;
-`heyctl = { version = "0.1", default-features = false }` gets the library
+Published on crates.io as `hws` (formerly `serverctl`).
+
+One crate, two products. `cargo install hws` gets the `heyctl` CLI;
+`hws = { version = "0.1", default-features = false }` gets the library
 with none of clap, rpassword or a terminal linked in. The CLI is the library's
 own first consumer, which is the point: a field the client stops understanding
 becomes a compile error rather than a silently blank column at somebody's
@@ -32,7 +34,7 @@ reads the script from stdin and takes the flags for its own.
 Or build it:
 
 ```sh
-cargo build --release -p heyctl
+cargo build --release -p hws
 install -m 0755 target/release/heyctl ~/.local/bin/
 ```
 
@@ -115,11 +117,11 @@ served over HTTPS from a host you control.
 
 ```toml
 [dependencies]
-heyctl = { version = "0.1", default-features = false }
+hws = { version = "0.1", default-features = false }
 ```
 
 ```rust
-use heyctl::{Client, ExecRequest};
+use hws::{Client, ExecRequest};
 
 let lb = Client::builder("127.0.0.1:9090")
     .token(std::env::var("APP_LB_TOKEN")?)
@@ -129,7 +131,7 @@ let out = lb.exec("sb-7f3a9c", &ExecRequest::new("uname -a")).await?;
 println!("{}", out.stdout);
 ```
 
-Async by default. Under the `blocking` feature, `heyctl::blocking::Client` is
+Async by default. Under the `blocking` feature, `hws::blocking::Client` is
 the same surface with the `await`s taken out — it is what the CLI uses, and it
 returns a clear error rather than tokio's panic if you call it from inside a
 runtime.
@@ -162,7 +164,7 @@ lb.wait_for_job(&job.id)
     .await?;
 ```
 
-Full API documentation: `cargo doc -p heyctl --no-default-features --open`.
+Full API documentation: `cargo doc -p hws --no-default-features --open`.
 
 ## App-tokens
 

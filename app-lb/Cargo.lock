@@ -154,7 +154,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "app-lb"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1704,31 +1704,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
-name = "heyctl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "clap_complete",
- "dirs",
- "flate2",
- "futures",
- "libc",
- "reqwest 0.12.28",
- "rpassword",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "tar",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "ureq",
-]
-
-[[package]]
 name = "heyo-sdk"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1880,6 +1855,31 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "hws"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "clap_complete",
+ "dirs",
+ "flate2",
+ "futures",
+ "libc",
+ "reqwest 0.12.28",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tar",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "ureq",
+]
 
 [[package]]
 name = "hybrid-array"

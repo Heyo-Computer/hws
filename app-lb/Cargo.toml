@@ -14,7 +14,7 @@ edition.workspace = true
 members = ["heyctl"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 # Hoisted so the two crates cannot drift onto different major versions of a
