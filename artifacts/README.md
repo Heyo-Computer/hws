@@ -502,10 +502,38 @@ The integration tests write real multi-megabyte images, so they want a few
 hundred megabytes free; on a filesystem that is nearly full they can fail with a
 genuine `ENOSPC` rather than a defect.
 
+## Global store and hub
+
+Set `ART_S3_BUCKET` (with `ART_S3_ACCESS_KEY_ID` / `ART_S3_SECRET_ACCESS_KEY`)
+and `art serve` becomes a regional cache in front of the bucket. The bucket is
+the system of record for blobs, manifests, tags, labels and repositories, so
+every region sees the same tags and the bucket alone rebuilds any of them.
+Writes land in the bucket before they succeed; blobs and manifests read
+through; tags revalidate by ETag every `ART_TAG_TTL`; a background mirror keeps
+listings global; cold blobs are evicted from the disk once the bucket holds
+them. Blobs travel as *artsparse* (`src/asp.rs`) — their allocated extents only
+— so a 20 GiB rootfs costs what it occupies, not its length.
+
+```sh
+art s3 backfill               # publish an existing store into the bucket
+art s3 verify --deep          # prove the backup is whole
+art s3 gc --dry-run           # bucket GC, under a lease; never run by the daemon
+```
+
+Tags can be namespaced: `heyo/postgres:16` is tag `16` in repository
+`heyo/postgres`. Flat tags are unchanged. A repository marked public
+(`art repo public heyo/postgres`, `PUT /repos/{repo}`, or
+`heyctl artifact push --public`) pulls anonymously end to end and is listed on
+the hub at `/hub` (`ART_HUB=1`).
+
+Full reference: [docs/artifacts.md](../docs/artifacts.md#global-store).
+
 ## Status
 
-v1, plus the `art serve` daemon and a Firecracker image. Not yet built: Range
-requests, `art pull` across hosts, and advisory leases for pin reporting.
+v1, plus the `art serve` daemon, a Firecracker image, the S3 global store and
+the public hub. Not yet built: Range requests, streaming a cold blob to the
+client while it fills (a fill completes before the first byte is served), and
+advisory leases for pin reporting.
 
 Not planned: chunking, a small-blob pack tier, and compression. Inodes are 93%
 free on the target host, so a pack tier would constrain nothing while costing the

@@ -62,6 +62,7 @@ The table lists each multi-region capability, how you opt in, and its state in t
 | **Fleet view** | app-lb `APP_LB_FLEET_FILE` or `PUT /control-plane/config`, served at `GET /fleet`. Example: [`.heyo/fleet/fleet.json`](../.heyo/fleet/fleet.json). | Implemented, observation only |
 | **One-hop gateway transport** | app-lb `gateway {mode: forward, local; service; region; auth}` on a static deployment. It carries authenticated HTTPS forwarding to a peer app-lb, which serves locally only. | Implemented and tested with two local processes. Not live. |
 | **Hierarchical routing** (weighted region selection, then a local backend or one peer hop) | orchestrator `PUT .../regional-policy`, app-lb `discovery.regional`, `protocol=regional-v1` | Integrated and tested locally. **Admission and activation APIs are closed. Do not set regional policy on a live service.** |
+| **Global artifact store** | `art serve` with `ART_S3_BUCKET`: every region's store is a cache of one bucket, which holds tags, manifests and blobs and is their backup. Tags written in one region are visible in the others within `ART_TAG_TTL`; `If-Match` tag writes are compare-and-swap across regions; bucket GC runs under a lease. See [artifacts](artifacts.md#global-store). | Implemented and tested against a local S3 API with two daemons. Not live: the bucket and the `artifacts-s3` secret are not provisioned |
 | **Regional release workflow** | [`.ci/workflows/regional-release.yml`](../.ci/workflows/regional-release.yml): merge, then us3, then eu1, then poolers, then the CI controller | Sequential per-region app-lb candidate rollouts. See below. |
 
 ## Setting up a service in two regions
@@ -178,7 +179,7 @@ For any of these, move traffic away first, perform the maintenance, verify that 
 
 | Path | What it is |
 | --- | --- |
-| [`.heyo/regions/us3/`](../.heyo/regions/us3/README.md) | Inert app-lb templates (zero replicas, no routes, commit placeholder) for adding CI, the artifact store and Cloud to a new region alongside an existing one. The README lists the HeyoSecret paths to deliver as app-lb secrets and the order of checks before you publish a route. |
+| [`.heyo/regions/us3/`](../.heyo/regions/us3/README.md) | Inert app-lb templates (zero replicas, no routes, commit placeholder) for adding CI, the artifact store (a cache of the global store) and Cloud to a new region alongside an existing one. The README lists the HeyoSecret paths to deliver as app-lb secrets and the order of checks before you publish a route. |
 | [`heyosecret/app-lb.us3.json`](../heyosecret/app-lb.us3.json), [`orchestrator/app-lb.us3.json`](../orchestrator/app-lb.us3.json) | The same kind of template for HeyoSecret and the orchestrator |
 | [`.heyo/fleet/fleet.json`](../.heyo/fleet/fleet.json) | Example gateway list for app-lb's fleet view (observation only) |
 | [`.heyo/deployment-environments.json`](../.heyo/deployment-environments.json) | Host-keyed defaults (discovery allowlist, replica counts) loaded by the service deployment workflow |

@@ -35,9 +35,10 @@ The store must be **owned by the user who reads it**. With `fs.protected_hardlin
 | --- | --- |
 | Blob | Immutable bytes, named by their sha256 (64 lowercase hex characters) |
 | Manifest | Canonical JSON listing named entries (`name`, `digest`, `size`) plus string `annotations`. Addressed by the sha256 of its own JSON. Has no timestamp, so re-importing an unchanged image dedupes |
-| Tag | A mutable name pointing at a blob or manifest digest. `[A-Za-z0-9_.-]`, at most 64 characters. A 64-hex string is always a digest, never a tag |
+| Tag | A mutable name pointing at a blob or manifest digest. Either **flat** (`debian-hermes`: `[A-Za-z0-9_.-]`, at most 64 characters) or **namespaced** (`heyo/postgres:16`: a repository, `:`, and a flat tag; a bare `heyo/postgres` means `:latest`). A 64-hex string is always a digest, never a tag |
+| Repository | The part of a namespaced tag before the `:` — 1 to 4 `/`-separated lowercase segments (`[a-z0-9._-]`, each starting with a letter or digit). Has metadata: `public` and a `description`. A public repository is listed on the hub and pullable without a key |
 | Label | A human `name` (max 80 characters) and `description` (max 2000) attached to a digest. Metadata only; it does not change the digest |
-| Public flag | Marks one blob as downloadable without a credential |
+| Public flag | Marks one blob as downloadable without a credential. Repositories are the usual way to publish; this is for handing out one file |
 
 A **ref** is a tag or a digest. When you ask for a blob by a tag that names a manifest, the store steps through it: a manifest with one entry resolves to that entry; a manifest with several is an error that lists them (except `art heyvm materialize`, which picks the `rootfs.ext4` entry).
 
@@ -60,7 +61,7 @@ sudo install -m0755 artifacts/target/release/art /usr/local/bin/art
 art init                    # creates the store under $ART_ROOT or ~/.artifacts
 ```
 
-The HTTP daemon is behind the default-on `daemon` cargo feature. Build with `--no-default-features` for the library alone.
+The HTTP daemon is behind the default-on `daemon` cargo feature and the S3 client behind the default-on `s3` feature. Build with `--no-default-features` for the library alone, or `--no-default-features --features daemon` for a daemon with no TLS stack (the remote tier then works only against `ART_REMOTE_DIR`).
 
 ## Configuration
 
@@ -91,6 +92,30 @@ Every value resolves flag, then environment variable, then default.
 
 `ART_ADMIN_PASSWORD`, `ART_DASHBOARD_OPEN`, and `ART_DASHBOARD_GATE` are mutually exclusive; setting two of them is a startup error. With none set, the dashboard is not mounted at all.
 
+| Env | Flag | Default | Meaning |
+| --- | --- | --- | --- |
+| `ART_HUB` | `--hub` | `false` | Serve the public hub at `/hub` |
+| `ART_HUB_HOST` | `--hub-host` | unset | The hub's host name; `/` on that host opens the hub instead of the dashboard |
+
+### Global store (daemon and `art s3`, `art repo`)
+
+Set `ART_S3_BUCKET` and the daemon becomes a regional cache in front of the bucket. See [Global store](#global-store).
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `ART_S3_BUCKET` | unset | The bucket. Unset means a local-only store, exactly as before |
+| `ART_S3_PREFIX` | `art/` | Key prefix inside the bucket |
+| `ART_S3_REGION` | `us-east-1` | Bucket region. A wrong value is corrected from S3's redirect and logged |
+| `ART_S3_ENDPOINT` | unset | S3-compatible endpoint (R2, MinIO), addressed path-style |
+| `ART_S3_ACCESS_KEY_ID`, `ART_S3_SECRET_ACCESS_KEY` | required with a bucket | Credentials. Deliver them from one `artifacts-s3` HeyoSecret shared by every region |
+| `ART_S3_PART_SIZE` | `33554432` (32 MiB) | Multipart part size. Raised automatically past S3's 10,000-part limit |
+| `ART_S3_CONCURRENCY` | `4` | Parts uploaded at once. Memory is part size × concurrency |
+| `ART_REMOTE_DIR` | unset | A directory standing in for a bucket (tests, a shared mount). Exclusive with `ART_S3_BUCKET` |
+| `ART_TAG_TTL` | `30s` | How long a tag read is trusted before it is revalidated against the bucket |
+| `ART_SYNC_INTERVAL` | `30s` | How often the mirror, the public index and cache eviction run |
+| `ART_CACHE_MAX_BYTES` | unset | Evict cached blobs once they occupy more than this |
+| `ART_CACHE_MIN_FREE_BYTES` | 2 × `ART_MIN_FREE_BYTES` | Evict cached blobs once the filesystem has less free than this |
+
 ## CLI reference
 
 Global flags: `--root`, `--min-free-bytes`, `--json` (machine-readable output on every command).
@@ -119,6 +144,19 @@ Exit codes: `0` success, `1` failure, `2` bad usage (invalid digest or tag), `3`
 | `art untag <name>` | Remove a tag. What it named becomes collectable |
 | `art label <ref> [--name N] [--description D\|-] [--clear]` | Set or clear a label. Both fields are replaced together; `-` reads the description from stdin |
 | `art public <ref> [--off]` | Make a blob anonymously downloadable over HTTP, or private again |
+| `art repo ls` | Every repository, public or private, with its tags |
+| `art repo public <repo> [--off]` | Publish a repository on the hub (anonymous pulls), or make it private |
+| `art repo describe <repo> <text\|->` | Set a repository's description |
+
+### Global store
+
+| Command | What it does |
+| --- | --- |
+| `art s3 backfill [--dry-run] [--overwrite-tags]` | Publish this store into the bucket. Idempotent. A tag the bucket already points elsewhere is reported, not replaced, unless `--overwrite-tags` |
+| `art s3 verify [--deep]` | Check every tag in the bucket reaches content the bucket holds; `--deep` downloads and re-hashes every blob |
+| `art s3 gc [--dry-run] [--min-age 24h]` | Delete content no tag reaches from the bucket, under a lease so only one region collects at a time |
+| `art s3 pull <ref>` | Fetch a reference and every blob in its manifest into this store's cache |
+| `art s3 sync` | Mirror the bucket's tags, labels and repositories into this store once |
 
 ### Removal
 
@@ -180,8 +218,8 @@ Uploads and downloads stream, so large images never sit in memory. Small request
 | `PUT /manifests` | Store a manifest (JSON body); returns its digest |
 | `GET /manifests/{ref}` | The manifest's own JSON, by tag or digest |
 | `GET /tags` | All tags as `{"tag", "digest"}` |
-| `GET /tags/{name}` | One tag |
-| `PUT /tags/{name}` | Body is a digest (plain text). `204` |
+| `GET /tags/{name}` | One tag. With a global store, carries the tag's `ETag` |
+| `PUT /tags/{name}` | Body is a digest (plain text). `204`. With `If-Match: <etag>`, only if the tag has not moved since (`412` otherwise) — across every region |
 | `DELETE /tags/{name}` | Remove a tag |
 | `GET /labels/{ref}` | Label, or nulls if unlabelled |
 | `PUT /labels/{ref}` | JSON `{"name", "description"}`. Replaces the whole label |
@@ -189,11 +227,17 @@ Uploads and downloads stream, so large images never sit in memory. Small request
 | `GET /public/{ref}` | Whether a blob is public |
 | `PUT /public/{ref}` | Make a blob public |
 | `DELETE /public/{ref}` | Make it private again |
-| `GET /usage` | Logical size, physical size, free space |
+| `GET /repos` | Every repository with its tags; an anonymous caller sees only public ones |
+| `GET /repos/{repo}` | One repository |
+| `PUT /repos/{repo}` | JSON `{"public", "description"}`. Replaces the metadata |
+| `DELETE /repos/{repo}` | Forget the metadata; the repository becomes private, its tags stay |
+| `GET /usage` | Logical size, physical size, free space (this region's cache) |
 
 Blob responses carry `ETag` (the digest), `Cache-Control: public, max-age=31536000, immutable`, and `x-art-allocated` (bytes actually on disk).
 
-Error statuses: `400` bad digest, tag, or label; `401` bad or missing key; `403` read-only mode; `404` not found; `409` digest mismatch or ambiguous manifest; `507` out of space.
+Namespaced references work raw or percent-encoded: `/tags/heyo/postgres:16` and `/tags/heyo%2Fpostgres%3A16` are the same tag.
+
+Error statuses: `400` bad digest, tag, or label; `401` bad or missing key; `403` read-only mode; `404` not found; `409` digest mismatch, ambiguous manifest, or a manifest/tag naming content the global store does not hold; `412` a lost `If-Match`; `503` the global store is unreachable (writes only); `507` out of space.
 
 There is no `gc` and no `materialize` route. Garbage collection stays in the CLI, and a remote materialization is just `GET /blobs/{digest}`.
 
@@ -201,7 +245,14 @@ There is no `gc` and no `materialize` route. Garbage collection stays in the CLI
 
 With `ART_API_KEY` set, every route except `/healthz` requires the key as `Authorization: Bearer <key>` or `X-Api-Key: <key>`. The comparison is constant-time.
 
-One exception: a request with **no credential** may `GET` or `HEAD` `/blobs/{digest}` for a blob marked public. Listings, manifests, tags, and all writes still need the key. A request that presents a **wrong** key is rejected even for a public blob. A blob re-inserted after GC starts private.
+Anonymous requests (no credential at all) may `GET`/`HEAD` exactly what a public repository needs to be pulled:
+
+- `/tags/{tag}` and `/manifests/{tag}` for a tag in a public repository;
+- `/manifests/{digest}` and `/blobs/{digest}` for anything such a tag reaches;
+- `/blobs/{digest}` for a blob marked public on its own;
+- `/repos` (filtered to public repositories) and `/repos/{repo}` for a public one.
+
+Everything else — other listings, private repositories, every write — still needs the key. A request that presents a **wrong** key is rejected even for something public. Only key holders can make a repository public.
 
 ```sh
 art public web-bundle                    # or: curl -XPUT -H "x-api-key: $KEY" $URL/public/web-bundle
@@ -217,6 +268,71 @@ curl -XPUT -H "x-api-key: $KEY" --data "$D" "$URL/tags/web-v2"
 ```
 
 `heyctl artifact push` does this for you and stores the key in a saved registry.
+
+## Global store
+
+With `ART_S3_BUCKET` set, the bucket is the system of record and each regional `art serve` is a cache in front of it. Every region sees the same tags, and the bucket alone is enough to rebuild any of them — it is the backup.
+
+- **Writes go to the bucket first.** `PUT /blobs` answers only once the blob is in the bucket. A manifest is refused (`409`) unless the bucket holds every blob it names; a tag is refused unless the bucket holds what it points at. The bucket never holds a pointer to nothing.
+- **Blobs and manifests read through.** A miss is fetched, checked against its digest and kept. Concurrent misses on one blob share one download. A corrupt object is never cached.
+- **Tags revalidate.** A tag older than `ART_TAG_TTL` is checked with `If-None-Match`, so a tag moved in us3 is seen in eu1 within the TTL. If the bucket is unreachable, the cached tag is served and the failure logged: an image a region already holds keeps booting during an S3 outage. Writes fail with `503`.
+- **Mutable state is mirrored.** Every `ART_SYNC_INTERVAL` the daemon lists the bucket's tags, labels, public markers and repositories and updates its local copies, so listings, the dashboard and the hub show the global state. The mirror only removes local objects it copied from the bucket; a tag that exists only in one region is left alone and logged until `art s3 backfill` publishes it.
+- **The disk is a cache.** Past `ART_CACHE_MAX_BYTES`, or below `ART_CACHE_MIN_FREE_BYTES` free, blobs the bucket holds and nothing has materialized are evicted, least recently used first. A blob only on this disk is never evicted.
+- **Garbage collection is `art s3 gc`, never the daemon.** It holds a lease object (`locks/gc`) taken with a conditional write, so two regions cannot sweep at once, and keeps anything younger than `--min-age` (default 24h) so another region's half-finished push survives. `art gc` on a regional store only trims its cache.
+
+The daemon refuses to start unless the bucket honours conditional writes (`If-None-Match: *`): tag compare-and-swap and the GC lease depend on it. AWS S3, R2 and MinIO all do.
+
+Bucket requirements: **versioning on** (tag history and undelete for free) and a lifecycle rule that **aborts incomplete multipart uploads after one day**.
+
+### Bucket layout
+
+```text
+<prefix>blobs/<aa>/<64-hex>.asp   the blob, artsparse-encoded
+<prefix>manifests/<aa>/<64-hex>   canonical JSON, byte-identical to a local store's
+<prefix>labels/<aa>/<64-hex>      label JSON
+<prefix>public/<aa>/<64-hex>      empty marker: blob downloads anonymously
+<prefix>tags/<name>               "<digest>\n" (a namespaced tag keeps its '/')
+<prefix>repos/<repo>.json         {"public", "description", "updated"}
+<prefix>locks/gc                  the GC lease while a sweep runs
+```
+
+**artsparse v1** keeps a sparse rootfs small in the bucket (a 64 MiB image with 12 MiB of data is a 12 MiB object): the four bytes `ASP1`, a little-endian `u32` header length, a JSON header `{"size": <logical length>, "extents": [[offset, length], ...]}`, then each extent's bytes in order. Everything outside the extents is zeros. The blob's digest covers the full logical stream, holes included, so a reader proves what it rebuilt by re-hashing.
+
+### Moving an existing store into the bucket
+
+```sh
+art s3 backfill --dry-run     # what would be uploaded, and any tag conflicts
+art s3 backfill               # safe to re-run; tags go last
+art s3 verify                 # every tag reaches content the bucket holds
+```
+
+Turning on `ART_S3_BUCKET` before backfilling is safe: local-only tags keep resolving and are reported until published.
+
+## Public hub
+
+`ART_HUB=1` serves a catalog of public repositories at `/hub`, readable by anyone: each repository's tags, sizes, entries, and copyable pull commands. It shows nothing anonymous pulls do not already allow, and a private repository is a `404`, not a `403`.
+
+Publish (key holders only):
+
+```sh
+heyctl artifact push postgres.ext4 --tag heyo/postgres:16 --public
+# or, for an existing tag:
+art repo public heyo/postgres
+art repo describe heyo/postgres "PostgreSQL 16 on Debian, for heyvm"
+```
+
+Pull (anyone):
+
+```sh
+heyctl artifact pull hub.heyo.work/heyo/postgres:16 --dest ./postgres.ext4
+curl -fsSL https://hub.heyo.work/manifests/heyo/postgres:16
+```
+
+An app-lb deployment pulls with no `auth`:
+
+```json
+"artifact": { "store": "https://hub.heyo.work", "ref": "heyo/postgres:16" }
+```
 
 ## Dashboard
 
@@ -314,7 +430,9 @@ $ART_ROOT/
   blobs/<aa>/<64-hex>      mode 0444, immutable
   manifests/<aa>/<64-hex>  canonical JSON, addressed by its own sha256
   labels/<aa>/<64-hex>     name and description for a blob or manifest
-  tags/<name>              one digest and a newline
+  tags/<name>              one digest and a newline; a namespaced tag's '/' is '~'
+  repos/<repo>.json        repository metadata; '/' is '~'
+  remote-state.json        ETags of what the mirror copied from the global store
   tmp/                     incoming files on the fallback insert path
 ```
 
@@ -346,3 +464,7 @@ curl -s -H "x-api-key: $KEY" "$URL/usage"
 | Store VM loses every blob on restart | `ART_ROOT` is on the rootfs; move it under `/workspace` |
 | app-lb: "`art` is not on app-lb's PATH" | Local-path store with no `art` binary on the app-lb host; install it, set `APP_LB_ART_BIN`, or use a URL store |
 | `ambiguous` error when getting a tag | The tag names a manifest with several entries; name the entry's digest |
+| Startup error "accepted a second If-None-Match" | The bucket's store ignores conditional writes; use AWS S3, R2 or MinIO |
+| `409 missing_content` on a manifest or tag | The global store lacks a blob it names: upload blobs first, or run `art s3 backfill` on the region that has them |
+| `503 remote_error` on writes | The bucket is unreachable; reads keep working from the cache |
+| Log: "tags exist only in this region's cache" | Tags written with the CLI or before the bucket was configured; run `art s3 backfill` |

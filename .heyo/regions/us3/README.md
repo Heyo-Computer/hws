@@ -36,12 +36,26 @@ repository with `ci/system.yml` as its workflow path.
 
 ## Artifact store
 
-`artifacts.json` builds the public `artifacts/Dockerfile`. Provision
-`artifacts-us3/api-key` in HeyoSecret and deliver it through app-lb's
-`artifacts-us3` secret. Build at zero replicas, then start one and verify
-`/healthz` and authenticated blob/manifest access before assigning
-`artifacts.us3.heyo.work`. Anonymous API calls must be rejected. The store's
-data disk is service state; never recycle it as CI job scratch space.
+`artifacts.json` builds the public `artifacts/Dockerfile` as a **regional cache
+of the global store**: the S3 bucket named by `ART_S3_BUCKET` is the system of
+record for every region, so us3 sees the same tags as us2 and eu1 and its disk
+only needs to hold what us3 pulls (`ART_CACHE_MAX_BYTES`, 30 GiB here). See
+[the global store](../../../docs/artifacts.md#global-store).
+
+Credentials are the canonical ones, shared with every other region — one store,
+one key:
+
+- `artifacts/api-key` — the store's API key (`ART_API_KEY`), also CI's
+  `CI_ARTIFACT_TOKEN`;
+- `artifacts-s3/access-key-id` and `artifacts-s3/secret-access-key` — the
+  bucket credentials.
+
+Deliver both through app-lb secrets of the same names. Build at zero replicas,
+then start one and verify `/healthz`, the startup log line `global store: this
+daemon is a regional cache`, and authenticated blob/manifest access before
+assigning `artifacts.us3.heyo.work`. Anonymous API calls must be rejected except
+for public repositories. The cache disk is service state; never recycle it as
+CI job scratch space.
 
 Configure CI's HTTP artifacts sink with that URL and credential. app-lb pulls
 the same immutable manifests using an artifact credential reference. The CI

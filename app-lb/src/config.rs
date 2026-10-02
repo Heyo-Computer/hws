@@ -5594,6 +5594,22 @@ mod tests {
     }
 
     #[test]
+    fn the_hub_example_is_a_valid_ungated_global_store_cache() {
+        let mut spec: DeploymentSpec =
+            serde_json::from_str(include_str!("../examples/artifacts-hub.json")).unwrap();
+        spec.normalize();
+        spec.validate().unwrap();
+        // art gates itself: anonymous pulls of public repositories are the point,
+        // so an app-lb auth gate in front would break the hub.
+        assert!(spec.auth.is_none());
+        let vm = spec.vm.as_ref().unwrap();
+        for env in ["ART_API_KEY", "ART_S3_ACCESS_KEY_ID", "ART_S3_SECRET_ACCESS_KEY"] {
+            assert!(vm.env_from.iter().any(|s| s.env.as_deref() == Some(env)), "{env}");
+            assert!(!vm.env_vars.as_ref().is_some_and(|v| v.contains_key(env)), "{env} must come from a secret");
+        }
+    }
+
+    #[test]
     fn managed_nats_template_preserves_single_writer_storage_and_private_access() {
         let mut spec: DeploymentSpec = serde_json::from_str(include_str!("../examples/nats/managed.json")).unwrap();
         spec.normalize();

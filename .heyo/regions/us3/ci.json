@@ -33,7 +33,7 @@
       {"secret": "ci-us3", "key": "webhook-secret", "as": "CI_WEBHOOK_SECRET"},
       {"secret": "ci-us3", "key": "native-runner-secret", "as": "CI_NATIVE_RUNNER_SECRET"},
       {"secret": "ci-us3", "key": "nats-token", "as": "CI_NATS_TOKEN"},
-      {"secret": "artifacts-us3", "key": "api-key", "as": "CI_ARTIFACT_TOKEN"},
+      {"secret": "artifacts", "key": "api-key", "as": "CI_ARTIFACT_TOKEN"},
       {"secret": "ci-us3", "key": "heyosecret-token", "as": "CI_HEYOSECRET_TOKEN"}
     ]
   },
