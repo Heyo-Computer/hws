@@ -218,7 +218,7 @@ async fn repo_page(
                 div.sec-head { h2 { "Pull" } }
                 p.muted { "No account or key needed." }
                 h3 { "heyctl" }
-                pre { code { "heyctl artifact pull " (host) "/" (example) " -o ./" (r.name.as_str().rsplit('/').next().unwrap_or("out")) } }
+                pre { code { "heyctl artifact pull " (host) "/" (example) " --dest ./" (r.name.as_str().rsplit('/').next().unwrap_or("out")) } }
                 h3 { "app-lb deployment" }
                 pre { code { (format!("\"artifact\": {{ \"store\": \"{base}\", \"ref\": \"{example}\" }}")) } }
                 h3 { "HTTP" }

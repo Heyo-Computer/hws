@@ -196,9 +196,10 @@ pub struct PullArgs {
 
     /// Where to write it. For a single-file artifact, a file path (default:
     /// the entry's name in the current directory); for several entries, a
-    /// directory.
-    #[arg(short, long, value_name = "PATH")]
-    pub output: Option<PathBuf>,
+    /// directory. (`--dest` rather than `-o`, which is the global output
+    /// format.)
+    #[arg(long, value_name = "PATH")]
+    pub dest: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -693,14 +694,14 @@ fn pull(globals: &GlobalOpts, opts: &RegistryOpts, args: &PullArgs) -> Result<()
     }
 
     let targets: Vec<(PathBuf, &str)> = if entries.len() == 1 {
-        let dest = match &args.output {
+        let dest = match &args.dest {
             Some(p) if p.is_dir() => p.join(&entries[0].0),
             Some(p) => p.clone(),
             None => PathBuf::from(&entries[0].0),
         };
         vec![(dest, entries[0].1.as_str())]
     } else {
-        let dir = args.output.clone().unwrap_or_else(|| PathBuf::from("."));
+        let dir = args.dest.clone().unwrap_or_else(|| PathBuf::from("."));
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         entries.iter().map(|(n, d)| (dir.join(n), d.as_str())).collect()
     };
