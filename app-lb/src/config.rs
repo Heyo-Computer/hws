@@ -1855,12 +1855,45 @@ impl ArtifactSpec {
 /// Mirrors `TagName::parse` and `Digest::parse` in the `artifacts` crate rather
 /// than deferring to the store, because a reference that store would reject
 /// should be a registration error here and not a job that fails minutes later.
-/// A digest is 64 lowercase hex characters; a tag is `[A-Za-z0-9._-]`, not
-/// starting with `-` or `.` — which also means it can never contain a path
-/// separator or a `..`, and so can never travel outside the store when it is
-/// pasted into a URL path.
+///
+/// Three spellings:
+///
+/// * a digest — 64 lowercase hex characters;
+/// * a flat tag — `[A-Za-z0-9._-]`, not starting with `-` or `.`;
+/// * a namespaced tag — `repo[:tag]`, as the hub publishes them
+///   (`heyo/postgres:16`). The repo is 1–4 `/`-separated segments of
+///   `[a-z0-9._-]`, each starting with a letter or digit, so no segment can be
+///   empty, `.` or `..`; the tag after the colon is a flat tag.
+///
+/// None of them can travel outside the store when pasted into a URL path: the
+/// only separator any of them contains is a `/` between segments that cannot
+/// be dot entries, and the store routes `/tags/{*name}` as one parameter.
 fn is_valid_artifact_ref(r: &str) -> bool {
-    if r.is_empty() || r.len() > 128 {
+    if r.is_empty() || r.len() > 256 {
+        return false;
+    }
+    if !(r.contains('/') || r.contains(':')) {
+        return is_flat_tag(r);
+    }
+    let (repo, tag) = r.split_once(':').unwrap_or((r, "latest"));
+    if repo.is_empty() || repo.len() > 180 || !is_flat_tag(tag) {
+        return false;
+    }
+    let segments: Vec<&str> = repo.split('/').collect();
+    segments.len() <= 4
+        && segments.iter().all(|seg| {
+            let b = seg.as_bytes();
+            !b.is_empty()
+                && b.len() <= 64
+                && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+                && b.iter().all(|&c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-')
+                })
+        })
+}
+
+fn is_flat_tag(r: &str) -> bool {
+    if r.is_empty() || r.len() > 64 {
         return false;
     }
     let first = r.as_bytes()[0];
@@ -4464,7 +4497,8 @@ impl std::fmt::Display for SpecError {
             Self::BadArtifactRef(r) => write!(
                 f,
                 "artifact.ref {r:?} is neither a tag nor a digest: a tag is [A-Za-z0-9._-] \
-                 and may not start with `-` or `.`, and a digest is 64 lowercase hex characters"
+                 and may not start with `-` or `.`, or a repository and tag like \
+                 `heyo/postgres:16` (lowercase segments); a digest is 64 lowercase hex characters"
             ),
             Self::ZeroGrow => write!(
                 f,
@@ -5885,7 +5919,10 @@ mod tests {
         // The two sources share the `ref` field and read it by different rules.
         // A branch name with a slash is a perfectly good git ref and not a tag,
         // so which rule applies has to follow from which source is set.
-        for r in ["release/2.1", "a b", "-flag"] {
+        // `Release/2.1` is still no tag: repositories are lowercase. (A
+        // lowercase `release/2.1` now reads as the repository
+        // `release/2.1:latest`, which the store would resolve.)
+        for r in ["Release/2.1", "a b", "-flag"] {
             let mut s = spec();
             s.build = Some(BuildSpec {
                 source_ref: Some(r.into()),
@@ -6295,7 +6332,17 @@ mod tests {
     fn an_artifact_ref_is_a_tag_or_a_digest() {
         let digest = "c74abee2ce84".repeat(5) + "abcd";
         assert_eq!(digest.len(), 64);
-        for r in ["debian-hermes", "ubuntu-24.04", "web_v2", digest.as_str()] {
+        for r in [
+            "debian-hermes",
+            "ubuntu-24.04",
+            "web_v2",
+            digest.as_str(),
+            // Namespaced, as the hub publishes them.
+            "heyo/postgres:16",
+            "heyo/postgres",
+            "postgres:16",
+            "acme/team/web:v1.2",
+        ] {
             let s = DeploymentSpec {
                 ingress: None,
                 account_id: None,
@@ -6305,9 +6352,24 @@ mod tests {
             };
             assert!(s.validate().is_ok(), "{r} should be accepted");
         }
-        // A leading `-` reads as a flag to anything that shells out, and a
-        // slash or a `..` would leave the store when pasted into a URL path.
-        for r in ["", "-flag", ".hidden", "a/b", "../etc/passwd", "has space"] {
+        // A leading `-` reads as a flag to anything that shells out, and an
+        // empty or dot segment would leave the store when pasted into a URL
+        // path. Repositories are lowercase, as registries' are.
+        for r in [
+            "",
+            "-flag",
+            ".hidden",
+            "a//b",
+            "../etc/passwd",
+            "a/../b",
+            "/a",
+            "a/",
+            "Heyo/pg:16",
+            "a/b:c/d",
+            "a/b:",
+            "a/b/c/d/e",
+            "has space",
+        ] {
             let s = DeploymentSpec {
                 ingress: None,
                 account_id: None,
@@ -7837,7 +7899,7 @@ mod tests {
             );
         }
 
-        for reference in ["", "-leading-dash", ".leading-dot", "has/slash", "has space"] {
+        for reference in ["", "-leading-dash", ".leading-dot", "Has/Upper", "a//b", "has space"] {
             let mut m = a_mount("/data");
             m.artifact_ref = reference.into();
             let err = spec_with_mounts(vec![m]).validate().unwrap_err();

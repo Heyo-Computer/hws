@@ -268,7 +268,10 @@ function publishTool(clients: Clients, http: boolean): Tool {
       tag: z
         .string({ required_error: "`tag` is required — a publish nothing names is unreachable." })
         .min(1, "`tag` is required — a publish nothing names is unreachable.")
-        .describe("the tag to point at this build, e.g. 'marketing-site'"),
+        .describe(
+          "the tag to point at this build: flat, e.g. 'marketing-site', or namespaced " +
+            "repo:tag, e.g. 'acme/site:v3' (a bare 'acme/site' means ':latest')",
+        ),
       // Absent over HTTP rather than present-and-refused: advertising a parameter
       // that can only fail is the shape this server is organised against.
       ...(http
@@ -278,7 +281,7 @@ function publishTool(clients: Clients, http: boolean): Tool {
       name: z
         .string()
         .optional()
-        .describe("entry name inside the manifest; defaults to the tag"),
+        .describe("entry name inside the manifest; defaults to the tag's last segment"),
       kind: z
         .string()
         .optional()
@@ -297,7 +300,9 @@ function publishTool(clients: Clients, http: boolean): Tool {
         clients,
         tag,
         bytes,
-        (a.name as string | undefined)?.trim() || tag,
+        // A namespaced tag's `/` and `:` make a poor file name; a puller
+        // writes the entry under this name.
+        (a.name as string | undefined)?.trim() || tag.split("/").pop()!.replace(":", "-"),
         (a.kind as string | undefined)?.trim() || KIND_GENERIC,
         a.annotations as Record<string, string> | undefined,
       );

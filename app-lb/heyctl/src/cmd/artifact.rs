@@ -54,6 +54,13 @@ pub enum ArtifactCmd {
     #[command(visible_alias = "push-df")]
     PushDockerfile(PushDockerfileArgs),
 
+    /// Download a tag or digest — from the configured store, or from any store
+    /// named by host, the hub included: `hub.heyo.work/heyo/postgres:16`.
+    ///
+    /// A public repository needs no login. Every byte is checked against its
+    /// digest before the file appears.
+    Pull(PullArgs),
+
     /// List the store's tags — the images a deployment can name.
     #[command(visible_alias = "tags")]
     Ls,
@@ -173,6 +180,25 @@ pub struct PushArgs {
     /// Upload even if the store already reports holding these bytes.
     #[arg(long)]
     pub force: bool,
+
+    /// Make the tag's repository public afterwards: listed on the hub and
+    /// pullable by anyone without a key. Needs a namespaced tag
+    /// (`heyo/postgres:16`) and the store's API key.
+    #[arg(long, requires = "tag")]
+    pub public: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct PullArgs {
+    /// `[host/]repo:tag`, a flat tag, or a digest.
+    #[arg(value_name = "REF")]
+    pub reference: String,
+
+    /// Where to write it. For a single-file artifact, a file path (default:
+    /// the entry's name in the current directory); for several entries, a
+    /// directory.
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -246,6 +272,7 @@ pub fn run(globals: &GlobalOpts, opts: &RegistryOpts, cmd: &ArtifactCmd) -> Resu
         ArtifactCmd::Login(args) => login(globals, args),
         ArtifactCmd::Push(args) => push(globals, opts, args),
         ArtifactCmd::PushDockerfile(args) => push_dockerfile(globals, opts, args),
+        ArtifactCmd::Pull(args) => pull(globals, opts, args),
         ArtifactCmd::Ls => ls(globals, opts),
         ArtifactCmd::Describe(args) => describe(globals, opts, args),
         ArtifactCmd::Usage => usage(globals, opts),
@@ -512,11 +539,14 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
         if !artifact::is_valid_tag(&t) {
             bail!(
                 "{t:?} is not a usable tag: tags are [A-Za-z0-9._-] and may not start with \
-                 `-` or `.`"
+                 `-` or `.`, or a repository and tag like `heyo/postgres:16`"
             );
         }
         Some(t)
     };
+    if args.public && tag.as_deref().and_then(artifact::repo_of).is_none() {
+        bail!("--public needs a namespaced tag (`team/name:tag`): only repositories are public");
+    }
 
     let (c, registry, _) = client(globals, opts)?;
     let quiet = globals.output.is_machine();
@@ -564,10 +594,18 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
     if let Some(t) = &tag {
         c.put_tag(t, &manifest_digest)?;
     }
+    let public_repo = match tag.as_deref().and_then(artifact::repo_of) {
+        Some(repo) if args.public => {
+            c.put_repo(repo, true, None)?;
+            Some(repo.to_string())
+        }
+        _ => None,
+    };
 
     let result = json!({
         "registry": registry,
         "store": c.url(),
+        "public": public_repo,
         "path": path.display().to_string(),
         "digest": digest,
         "manifest": manifest_digest,
@@ -580,6 +618,9 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
     }
 
     output::section("Pushed");
+    if let Some(repo) = &public_repo {
+        output::field("public", format!("{repo} is on the hub; anyone can pull it"));
+    }
     output::field("store", c.url());
     output::field("digest", &digest);
     output::field("manifest", &manifest_digest);
@@ -593,6 +634,103 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
     println!("Pull it with:");
     println!("  heyctl set artifact <deployment> --store {} --ref {reference}", c.url());
     println!("  heyctl pull <deployment> --wait");
+    Ok(())
+}
+
+// -- pull ------------------------------------------------------------------
+
+fn pull(globals: &GlobalOpts, opts: &RegistryOpts, args: &PullArgs) -> Result<()> {
+    let (store, reference) = artifact::split_store_ref(&args.reference);
+    if !(artifact::is_valid_tag(&reference) || artifact::is_digest(&reference)) {
+        bail!("{reference:?} is neither a tag nor a digest");
+    }
+    let c = match &store {
+        // Named by host: no stored registry is consulted, and the request is
+        // anonymous unless a key was passed explicitly.
+        Some(url) => RegistryClient::new(
+            url,
+            opts.api_key.as_deref(),
+            globals.insecure_skip_tls_verify,
+            Duration::from_secs(globals.request_timeout),
+        )?,
+        None => client(globals, opts)?.0,
+    };
+    let quiet = globals.output.is_machine();
+
+    let Some(resolved) = c.resolve(&reference)? else {
+        bail!("{reference} is not in {}", c.url());
+    };
+    // (entry name, digest) pairs to fetch.
+    let entries: Vec<(String, String)> = match &resolved {
+        artifact::Resolved::Manifest(m) => m
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                Some((
+                    e.get("name")?.as_str()?.to_string(),
+                    e.get("digest")?.as_str()?.to_string(),
+                ))
+            })
+            .collect(),
+        artifact::Resolved::Blob(d) => {
+            let name = reference
+                .rsplit('/')
+                .next()
+                .unwrap_or(&reference)
+                .replace(':', "-");
+            vec![(name, d.clone())]
+        }
+    };
+    if entries.is_empty() {
+        bail!("{reference} names a manifest with no entries");
+    }
+    for (name, digest) in &entries {
+        if !artifact::is_safe_entry_name(name) || !artifact::is_digest(digest) {
+            bail!("the store described an entry {name:?} ({digest}) that is not safe to write");
+        }
+    }
+
+    let targets: Vec<(PathBuf, &str)> = if entries.len() == 1 {
+        let dest = match &args.output {
+            Some(p) if p.is_dir() => p.join(&entries[0].0),
+            Some(p) => p.clone(),
+            None => PathBuf::from(&entries[0].0),
+        };
+        vec![(dest, entries[0].1.as_str())]
+    } else {
+        let dir = args.output.clone().unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        entries.iter().map(|(n, d)| (dir.join(n), d.as_str())).collect()
+    };
+
+    let mut pulled = Vec::new();
+    for (dest, digest) in &targets {
+        if !quiet {
+            eprintln!("Pulling {} -> {}", &digest[..12], dest.display());
+        }
+        let size = c.get_blob(digest, dest, |done, total| {
+            if !quiet {
+                progress("pulling", done, total);
+            }
+        })?;
+        if !quiet {
+            clear_progress();
+        }
+        pulled.push(json!({"path": dest.display().to_string(), "digest": digest, "size": size}));
+    }
+
+    let result = json!({ "store": c.url(), "ref": reference, "files": pulled });
+    if quiet {
+        return output::emit(&result, globals.output, &[]);
+    }
+    output::section("Pulled");
+    output::field("store", c.url());
+    output::field("ref", &reference);
+    for f in &pulled {
+        output::field("file", f["path"].as_str().unwrap_or_default());
+    }
     Ok(())
 }
 
