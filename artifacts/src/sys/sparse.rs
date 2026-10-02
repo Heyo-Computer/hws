@@ -735,7 +735,11 @@ mod tests {
         assert_eq!(segs[0].off, 0);
         assert_eq!(segs.last().unwrap().off + segs.last().unwrap().len, size);
         // The hole itself is not in any segment.
-        assert!(!segs.iter().any(|s| s.off <= 65536 && s.off + s.len > 65536 + 4096));
+        assert!(
+            !segs
+                .iter()
+                .any(|s| s.off <= 65536 && s.off + s.len > 65536 + 4096)
+        );
     }
 
     #[test]
@@ -913,7 +917,11 @@ mod tests {
         for shape in [Shape::Dense, Shape::HoleAware, Shape::SQUASH] {
             let (seen, _) = observed(&src, &dst, data.len() as u64, shape);
             assert_eq!(seen, data, "logical stream differs for {shape:?}");
-            assert_eq!(std::fs::read(&dst).unwrap(), data, "content differs for {shape:?}");
+            assert_eq!(
+                std::fs::read(&dst).unwrap(),
+                data,
+                "content differs for {shape:?}"
+            );
         }
     }
 

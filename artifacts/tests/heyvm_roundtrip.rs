@@ -40,7 +40,12 @@ fn fake_image(dir: &Path, name: &str) -> (PathBuf, Vec<u8>) {
     }
     // A second live region past the middle, so a hole-aware copy has to handle
     // more than one extent.
-    for (i, b) in data.iter_mut().skip(20 * 1024 * 1024).take(64 * 1024).enumerate() {
+    for (i, b) in data
+        .iter_mut()
+        .skip(20 * 1024 * 1024)
+        .take(64 * 1024)
+        .enumerate()
+    {
         *b = (i % 199) as u8;
     }
     let images = dir.join("images");
@@ -128,7 +133,11 @@ async fn image_survives_sparsify_import_materialize_and_gc() {
         m.bytes_written,
         imported.blob.size
     );
-    assert_eq!(std::fs::read(&rootfs).unwrap(), data, "content must be exact");
+    assert_eq!(
+        std::fs::read(&rootfs).unwrap(),
+        data,
+        "content must be exact"
+    );
     assert_eq!(
         std::fs::metadata(&rootfs).unwrap().len(),
         imported.blob.size,

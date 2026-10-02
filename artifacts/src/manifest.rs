@@ -226,7 +226,8 @@ mod tests {
 
     #[test]
     fn rejects_a_manifest_with_an_invalid_digest() {
-        let json = br#"{"schema":1,"kind":"generic","entries":[{"name":"x","digest":"nope","size":1}]}"#;
+        let json =
+            br#"{"schema":1,"kind":"generic","entries":[{"name":"x","digest":"nope","size":1}]}"#;
         assert!(Manifest::from_json(json).is_err());
     }
 

@@ -218,7 +218,10 @@ mod tests {
     #[test]
     fn a_description_keeps_its_line_breaks_and_nothing_else() {
         let l = Label::new(None, Some("what it is\n\nwhy it is here".into())).unwrap();
-        assert_eq!(l.description.as_deref(), Some("what it is\n\nwhy it is here"));
+        assert_eq!(
+            l.description.as_deref(),
+            Some("what it is\n\nwhy it is here")
+        );
         assert!(Label::new(None, Some("colour\u{1b}[31m".into())).is_err());
         assert!(Label::new(None, Some("bell\u{7}".into())).is_err());
     }
@@ -246,7 +249,11 @@ mod tests {
         assert_eq!(l.display_name(), Some("the debian base"));
 
         let l = Label::new(Some("rootfs".into()), Some("anything".into())).unwrap();
-        assert_eq!(l.display_name(), Some("rootfs"), "a name wins over a description");
+        assert_eq!(
+            l.display_name(),
+            Some("rootfs"),
+            "a name wins over a description"
+        );
 
         assert_eq!(Label::default().display_name(), None);
     }
@@ -259,7 +266,10 @@ mod tests {
         let json = String::from_utf8(l.to_json()).unwrap();
         assert!(json.ends_with('\n'), "{json:?}");
         assert!(json.contains('\n'), "pretty, not a single line: {json:?}");
-        assert!(!json.contains("description"), "an absent field is omitted: {json}");
+        assert!(
+            !json.contains("description"),
+            "an absent field is omitted: {json}"
+        );
         assert_eq!(serde_json::from_str::<Label>(&json).unwrap(), l);
     }
 }

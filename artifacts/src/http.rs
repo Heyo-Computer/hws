@@ -20,8 +20,10 @@ use crate::config::Config;
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::manifest::Manifest;
+use crate::registry::Registry;
+use crate::repos::RepoMeta;
 use crate::store::{BlobInfo, Store, Usage};
-use crate::tags::{Ref, TagName};
+use crate::tags::{Ref, RepoName, TagName};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -38,11 +40,30 @@ const SMALL_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ServeState {
-    store: Store,
+    registry: Registry,
     api_key: Option<Arc<String>>,
     /// Reject every mutating route. For a VM that only serves content.
     read_only: bool,
 }
+
+impl ServeState {
+    pub fn new(registry: Registry, api_key: Option<String>, read_only: bool) -> ServeState {
+        ServeState {
+            registry,
+            api_key: api_key.map(Arc::new),
+            read_only,
+        }
+    }
+
+    fn store(&self) -> &Store {
+        self.registry.store()
+    }
+}
+
+/// Set on a request that presented no credential to a daemon that has one, so
+/// a listing route can show only what is public.
+#[derive(Debug, Clone, Copy)]
+struct Anonymous;
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
@@ -51,6 +72,11 @@ pub struct ServeOptions {
     pub read_only: bool,
     /// Whether the dashboard is unmounted, gated, or open.
     pub dashboard: crate::config::DashboardAccess,
+    /// Serve the public hub at `/hub`.
+    pub hub: bool,
+    /// The hub's own host name: a request for `/` on it lands on the hub
+    /// rather than the dashboard.
+    pub hub_host: Option<String>,
 }
 
 /// Serve until SIGTERM or Ctrl-C.
@@ -61,11 +87,28 @@ pub async fn serve(config: &Config, opts: ServeOptions) -> crate::Result<()> {
             "no API key set (ART_API_KEY); every route is open to anyone who can reach this listener"
         );
     }
-    let state = ServeState {
-        store: store.clone(),
-        api_key: opts.api_key.map(Arc::new),
-        read_only: opts.read_only,
-    };
+    let remote = crate::registry::remote_from_env()?;
+    if let Some(remote) = &remote {
+        // Refuse to serve against a remote that cannot be reached or that
+        // ignores conditional writes — see `Remote::probe`.
+        remote.probe().await?;
+        tracing::info!(remote = %remote.describe(), "global store: this daemon is a regional cache");
+    }
+    let registry = Registry::new(
+        store.clone(),
+        remote,
+        crate::registry::options_from_env(config)?,
+    );
+    registry.start_background().await;
+    let state = ServeState::new(registry.clone(), opts.api_key.clone(), opts.read_only);
+    let hub = opts.hub.then(|| crate::hub::HubState {
+        registry: registry.clone(),
+        host: opts.hub_host.clone(),
+        ui: Arc::new(crate::heyo_ui::CookieConfig::from_env("ART")),
+    });
+    if hub.is_some() {
+        tracing::info!(host = ?opts.hub_host, "public hub at /hub");
+    }
 
     let web = match &opts.dashboard {
         crate::config::DashboardAccess::Password(creds) => {
@@ -139,7 +182,17 @@ pub async fn serve(config: &Config, opts: ServeOptions) -> crate::Result<()> {
         "artifacts daemon listening"
     );
 
-    axum::serve(listener, router(state).merge(web_router(web)))
+    // The hub claims `/` on its own host; everywhere else `/` is the
+    // dashboard's, when there is one.
+    let app = match &hub {
+        Some(h) if h.host.is_some() || web.is_none() => crate::hub::router(hub.clone())
+            .merge(router(state))
+            .merge(web_router_without_index(web)),
+        _ => router(state)
+            .merge(web_router(web))
+            .merge(crate::hub::router(hub.clone())),
+    };
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await
         .map_err(|e| Error::Io {
@@ -158,18 +211,28 @@ pub fn router(state: ServeState) -> Router {
 
     let rest = Router::new()
         .route("/blobs/{digest}", get(get_blob).head(head_blob))
-        .route("/manifests/{reference}", get(get_manifest))
+        // Wildcards, so a namespaced reference reaches the handler whether
+        // its '/' arrives raw (`/tags/heyo/postgres:16`) or percent-encoded.
+        .route("/manifests/{*reference}", get(get_manifest))
         .route("/tags", get(list_tags))
-        .route("/tags/{name}", get(get_tag).put(put_tag).delete(delete_tag))
+        .route(
+            "/tags/{*name}",
+            get(get_tag).put(put_tag).delete(delete_tag),
+        )
         .route("/blobs", get(list_blobs))
         .route("/manifests", get(list_manifests).put(put_manifest))
         .route(
-            "/labels/{reference}",
+            "/labels/{*reference}",
             get(get_label).put(put_label).delete(delete_label),
         )
         .route(
-            "/public/{reference}",
+            "/public/{*reference}",
             get(get_public).put(put_public).delete(delete_public),
+        )
+        .route("/repos", get(list_repos))
+        .route(
+            "/repos/{*repo}",
+            get(get_repo).put(put_repo).delete(delete_repo),
         )
         .route("/usage", get(get_usage))
         .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT))
@@ -194,14 +257,27 @@ pub fn router(state: ServeState) -> Router {
 /// `WWW-Authenticate`), and different blast radii. Keeping them apart means an
 /// edit to one cannot quietly widen the other.
 pub fn web_router(web: Option<crate::web::WebState>) -> Router {
+    dashboard_router(web, true)
+}
+
+/// The dashboard without its `/` redirect, for a listener whose `/` belongs to
+/// the hub.
+pub fn web_router_without_index(web: Option<crate::web::WebState>) -> Router {
+    dashboard_router(web, false)
+}
+
+fn dashboard_router(web: Option<crate::web::WebState>, index: bool) -> Router {
     use crate::web;
     let Some(state) = web else {
         return Router::new();
     };
+    let root = if index {
+        Router::new().route("/", get(web::index))
+    } else {
+        Router::new()
+    };
 
-    Router::new()
-        .route("/", get(web::index))
-        .route("/dashboard", get(web::overview))
+    root.route("/dashboard", get(web::overview))
         .route("/dashboard/blobs", get(web::blobs_page))
         .route("/dashboard/blob/{digest}", get(web::blob_page))
         .route("/dashboard/manifests", get(web::manifests_page))
@@ -269,7 +345,7 @@ async fn require_dashboard_auth(
 /// key is still rejected even for a public blob — a client sending a stale
 /// credential has a configuration error, and masking it behind the public
 /// flag would hide the day the key rotated.
-async fn authorize(State(st): State<ServeState>, req: Request, next: Next) -> Response {
+async fn authorize(State(st): State<ServeState>, mut req: Request, next: Next) -> Response {
     let Some(expected) = &st.api_key else {
         return next.run(req).await;
     };
@@ -282,10 +358,9 @@ async fn authorize(State(st): State<ServeState>, req: Request, next: Next) -> Re
 
     if presented.is_none()
         && (req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD)
-        && let Some(digest) = req.uri().path().strip_prefix("/blobs/")
-        && let Ok(d) = Digest::parse(digest)
-        && st.store.is_public(&d).await.unwrap_or(false)
+        && anon_allowed(&st, req.uri().path()).await
     {
+        req.extensions_mut().insert(Anonymous);
         return next.run(req).await;
     }
 
@@ -308,6 +383,68 @@ async fn authorize(State(st): State<ServeState>, req: Request, next: Next) -> Re
         return ApiError(Error::Unauthorized).into_response();
     }
     next.run(req).await
+}
+
+/// Whether an anonymous `GET`/`HEAD` of `path` is allowed.
+///
+/// Exactly what a public repository needs to be pulled, and nothing more:
+///
+/// - `/tags/{tag}` and `/manifests/{tag}` for a tag in a public repository;
+/// - `/manifests/{digest}` and `/blobs/{digest}` for anything such a tag
+///   reaches — the manifest and every blob in it;
+/// - `/blobs/{digest}` for a blob marked public on its own (`PUT /public`);
+/// - `/repos/{repo}` for a public repository, and `/repos`, which an anonymous
+///   caller sees filtered to the public ones.
+///
+/// Everything is answered from the in-memory [`crate::registry::PublicIndex`]
+/// except the per-blob marker, which is one `access(2)`.
+async fn anon_allowed(st: &ServeState, path: &str) -> bool {
+    let idx = st.registry.public_index();
+    let decoded = |rest: &str| percent_decode(rest);
+    if path == "/repos" {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix("/repos/") {
+        return RepoName::parse(&decoded(rest)).is_ok_and(|r| idx.repo_is_public(&r));
+    }
+    if let Some(rest) = path.strip_prefix("/tags/") {
+        return TagName::parse(&decoded(rest)).is_ok_and(|t| idx.tag_is_public(&t));
+    }
+    if let Some(rest) = path.strip_prefix("/manifests/") {
+        return match Ref::parse(&decoded(rest)) {
+            Ok(Ref::Digest(d)) => idx.digests.contains(&d),
+            Ok(Ref::Tag(t)) => idx.tag_is_public(&t),
+            Err(_) => false,
+        };
+    }
+    if let Some(rest) = path.strip_prefix("/blobs/")
+        && let Ok(d) = Digest::parse(rest)
+    {
+        return idx.digests.contains(&d) || st.store().is_public(&d).await.unwrap_or(false);
+    }
+    false
+}
+
+/// Decode `%XX` escapes in a path segment. Anything malformed is left as it
+/// is, and the name parser after this refuses it.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Small helper so the auth path does not depend on the `Digest` newtype.
@@ -340,7 +477,7 @@ async fn head_blob(
     Path(digest): Path<String>,
 ) -> Result<Response, ApiError> {
     let d = Digest::parse(&digest).map_err(Error::from)?;
-    let info = st.store.stat(&d).await?;
+    let info = st.registry.ensure_blob(&d).await?;
     Ok(blob_headers(&info).into_response())
 }
 
@@ -349,8 +486,8 @@ async fn get_blob(
     Path(digest): Path<String>,
 ) -> Result<Response, ApiError> {
     let d = Digest::parse(&digest).map_err(Error::from)?;
-    let info = st.store.stat(&d).await?;
-    let file = st.store.open_blob(&d).await?;
+    let info = st.registry.ensure_blob(&d).await?;
+    let file = st.store().open_blob(&d).await?;
     // Reads through the holes of a sparsified blob, which is exactly right: the
     // digest covers the logical stream, and that is what a caller expects.
     let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file));
@@ -375,7 +512,10 @@ async fn put_blob(
     // Squash: an uploaded artifact is usually a disk image, and a caller who
     // knows otherwise loses nothing — a zero-run scan of incompressible data
     // finds nothing and writes everything.
-    let info = st.store.insert_async(reader, crate::Shape::SQUASH).await?;
+    let info = st
+        .store()
+        .insert_async(reader, crate::Shape::SQUASH)
+        .await?;
 
     if info.digest != expected {
         // The bytes are stored under their true name — this is a
@@ -386,6 +526,10 @@ async fn put_blob(
             actual: info.digest,
         }));
     }
+    // Durable in the global store before the client hears "stored". Until
+    // then the local copy is only a cache, and a region that fails here has
+    // not published anything.
+    st.registry.publish_blob(&info.digest).await?;
     let status = if info.deduped {
         StatusCode::OK
     } else {
@@ -424,8 +568,8 @@ async fn get_manifest(
     Path(reference): Path<String>,
 ) -> Result<Response, ApiError> {
     let r = Ref::parse(&reference).map_err(Error::from)?;
-    let d = st.store.resolve(&r).await?;
-    let m = st.store.get_manifest(&d).await?;
+    let d = st.registry.resolve(&r).await?;
+    let m = st.registry.manifest(&d).await?;
     Ok(Json(m).into_response())
 }
 
@@ -434,7 +578,7 @@ async fn put_manifest(
     Json(m): Json<Manifest>,
 ) -> Result<Response, ApiError> {
     st.writable()?;
-    let d = st.store.put_manifest(&m).await?;
+    let d = st.registry.put_manifest(&m).await?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "digest": d.as_str() })),
@@ -453,9 +597,9 @@ async fn put_manifest(
 /// two things that turn a digest into something a person recognises, and asking
 /// for them per row would be a request each.
 async fn list_blobs(State(st): State<ServeState>) -> Result<Response, ApiError> {
-    let blobs = st.store.list_blobs().await?;
-    let labels = st.store.label_map().await?;
-    let tags = st.store.tags_by_digest().await?;
+    let blobs = st.store().list_blobs().await?;
+    let labels = st.store().label_map().await?;
+    let tags = st.store().tags_by_digest().await?;
     let body: Vec<_> = blobs
         .iter()
         .map(|b| {
@@ -479,11 +623,11 @@ async fn list_blobs(State(st): State<ServeState>) -> Result<Response, ApiError> 
 /// are the label, which is *not* part of it — see [`crate::labels`] for why a
 /// manifest's description cannot live inside a manifest.
 async fn list_manifests(State(st): State<ServeState>) -> Result<Response, ApiError> {
-    let labels = st.store.label_map().await?;
-    let tags = st.store.tags_by_digest().await?;
+    let labels = st.store().label_map().await?;
+    let tags = st.store().tags_by_digest().await?;
     let mut body = Vec::new();
-    for d in st.store.list_manifests().await? {
-        let m = st.store.get_manifest(&d).await.ok();
+    for d in st.store().list_manifests().await? {
+        let m = st.store().get_manifest(&d).await.ok();
         body.push(serde_json::json!({
             "digest": d.as_str(),
             "kind": m.as_ref().map(|m| m.kind.clone()),
@@ -517,8 +661,8 @@ async fn get_label(
     Path(reference): Path<String>,
 ) -> Result<Response, ApiError> {
     let r = Ref::parse(&reference).map_err(Error::from)?;
-    let d = st.store.resolve(&r).await?;
-    let label = st.store.get_label(&d).await?.unwrap_or_default();
+    let d = st.registry.resolve(&r).await?;
+    let label = st.store().get_label(&d).await?.unwrap_or_default();
     Ok(Json(serde_json::json!({
         "digest": d.as_str(),
         "name": label.name,
@@ -536,11 +680,11 @@ async fn put_label(
 ) -> Result<Response, ApiError> {
     st.writable()?;
     let r = Ref::parse(&reference).map_err(Error::from)?;
-    let d = st.store.resolve(&r).await?;
+    let d = st.registry.resolve(&r).await?;
     // A digest the store does not hold is refused by `set_label` itself, so
     // this route and the CLI cannot disagree about it.
     let label = crate::labels::Label::new(body.name, body.description).map_err(Error::from)?;
-    st.store.set_label(&d, &label).await?;
+    st.registry.set_label(&d, &label).await?;
     Ok(Json(serde_json::json!({
         "digest": d.as_str(),
         "name": label.name,
@@ -555,8 +699,8 @@ async fn delete_label(
 ) -> Result<Response, ApiError> {
     st.writable()?;
     let r = Ref::parse(&reference).map_err(Error::from)?;
-    let d = st.store.resolve(&r).await?;
-    let removed = st.store.remove_label(&d).await?;
+    let d = st.registry.resolve(&r).await?;
+    let removed = st.registry.remove_label(&d).await?;
     Ok(Json(serde_json::json!({"digest": d.as_str(), "removed": removed})).into_response())
 }
 
@@ -567,8 +711,8 @@ async fn get_public(
     Path(reference): Path<String>,
 ) -> Result<Response, ApiError> {
     let r = Ref::parse(&reference).map_err(Error::from)?;
-    let d = st.store.resolve_blob(&r).await?;
-    let public = st.store.is_public(&d).await?;
+    let d = st.registry.resolve_blob(&r).await?;
+    let public = st.store().is_public(&d).await?;
     Ok(Json(serde_json::json!({"digest": d.as_str(), "public": public})).into_response())
 }
 
@@ -582,8 +726,8 @@ async fn put_public(
 ) -> Result<Response, ApiError> {
     st.writable()?;
     let r = Ref::parse(&reference).map_err(Error::from)?;
-    let d = st.store.resolve_blob(&r).await?;
-    st.store.set_public(&d).await?;
+    let d = st.registry.resolve_blob(&r).await?;
+    st.registry.set_public(&d).await?;
     Ok(Json(serde_json::json!({
         "digest": d.as_str(),
         "public": true,
@@ -599,8 +743,8 @@ async fn delete_public(
 ) -> Result<Response, ApiError> {
     st.writable()?;
     let r = Ref::parse(&reference).map_err(Error::from)?;
-    let d = st.store.resolve_blob(&r).await?;
-    let removed = st.store.remove_public(&d).await?;
+    let d = st.registry.resolve_blob(&r).await?;
+    let removed = st.registry.remove_public(&d).await?;
     Ok(Json(serde_json::json!({"digest": d.as_str(), "removed": removed})).into_response())
 }
 
@@ -613,7 +757,7 @@ struct LabelBody {
 }
 
 async fn list_tags(State(st): State<ServeState>) -> Result<Response, ApiError> {
-    let tags = st.store.list_tags().await?;
+    let tags = st.store().list_tags().await?;
     let body: Vec<_> = tags
         .iter()
         .map(|(t, d)| serde_json::json!({"tag": t.as_str(), "digest": d.as_str()}))
@@ -633,20 +777,41 @@ async fn get_tag(
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
     let t = TagName::parse(&name).map_err(Error::from)?;
-    let d = st.store.get_tag(&t).await?;
-    Ok(Json(serde_json::json!({"tag": t.as_str(), "digest": d.as_str()})).into_response())
+    let (d, etag) = st.registry.get_tag(&t).await?;
+    let mut resp =
+        Json(serde_json::json!({"tag": t.as_str(), "digest": d.as_str()})).into_response();
+    set_etag(&mut resp, etag.as_deref());
+    Ok(resp)
 }
 
+/// The tag's ETag in the global store — what a caller sends back as
+/// `If-Match` to move the tag only if nobody else has.
+fn set_etag(resp: &mut Response, etag: Option<&str>) {
+    if let Some(v) = etag.and_then(|e| header::HeaderValue::from_str(e).ok()) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+}
+
+/// Point a tag at a digest. With `If-Match: <etag>` (from a previous `GET`),
+/// only if the tag has not moved since — a compare-and-swap that holds across
+/// every region sharing the global store. `412` if it lost.
 async fn put_tag(
     State(st): State<ServeState>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: String,
 ) -> Result<Response, ApiError> {
     st.writable()?;
     let t = TagName::parse(&name).map_err(Error::from)?;
     let d = Digest::parse(body.trim()).map_err(Error::from)?;
-    st.store.set_tag(&t, &d).await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let if_match = headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let etag = st.registry.set_tag(&t, &d, if_match).await?;
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    set_etag(&mut resp, etag.as_deref());
+    Ok(resp)
 }
 
 async fn delete_tag(
@@ -655,14 +820,110 @@ async fn delete_tag(
 ) -> Result<Response, ApiError> {
     st.writable()?;
     let t = TagName::parse(&name).map_err(Error::from)?;
-    if !st.store.remove_tag(&t).await? {
+    if !st.registry.remove_tag(&t).await? {
         return Err(ApiError(Error::TagNotFound(name)));
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+// ---------------------------------------------------------------------------
+// Repositories
+// ---------------------------------------------------------------------------
+
+fn repo_json(r: &crate::store::Repository) -> serde_json::Value {
+    serde_json::json!({
+        "repo": r.name.as_str(),
+        "public": r.meta.public,
+        "description": r.meta.description,
+        "updated": r.meta.updated,
+        "tags": r.tags.iter().map(|(t, d)| serde_json::json!({
+            "tag": t.as_str(),
+            "name": t.short(),
+            "digest": d.as_str(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Every repository — anything with a namespaced tag or with metadata — and
+/// its tags. An anonymous caller sees only the public ones.
+async fn list_repos(
+    State(st): State<ServeState>,
+    anon: Option<axum::Extension<Anonymous>>,
+) -> Result<Response, ApiError> {
+    let repos = st.store().repositories().await?;
+    let body: Vec<_> = repos
+        .iter()
+        .filter(|r| anon.is_none() || r.meta.public)
+        .map(repo_json)
+        .collect();
+    Ok(Json(body).into_response())
+}
+
+async fn get_repo(
+    State(st): State<ServeState>,
+    Path(repo): Path<String>,
+) -> Result<Response, ApiError> {
+    let r = RepoName::parse(&repo).map_err(Error::from)?;
+    let found = st
+        .store()
+        .repositories()
+        .await?
+        .into_iter()
+        .find(|x| x.name == r)
+        .ok_or_else(|| Error::RepoNotFound(r.to_string()))?;
+    Ok(Json(repo_json(&found)).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct RepoBody {
+    #[serde(default)]
+    public: bool,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Replace a repository's metadata. Making a repository public is what puts
+/// it on the hub and lets anyone pull it, so it needs the API key like every
+/// other write — on a daemon with a key, only its holders publish.
+async fn put_repo(
+    State(st): State<ServeState>,
+    Path(repo): Path<String>,
+    Json(body): Json<RepoBody>,
+) -> Result<Response, ApiError> {
+    st.writable()?;
+    let r = RepoName::parse(&repo).map_err(Error::from)?;
+    let meta = RepoMeta {
+        public: body.public,
+        description: body
+            .description
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
+        updated: 0,
+    }
+    .touched();
+    st.registry.set_repo(&r, &meta).await?;
+    Ok(Json(serde_json::json!({
+        "repo": r.as_str(),
+        "public": meta.public,
+        "description": meta.description,
+        "updated": meta.updated,
+    }))
+    .into_response())
+}
+
+/// Forget what was said about a repository. Its tags stay; it becomes private.
+async fn delete_repo(
+    State(st): State<ServeState>,
+    Path(repo): Path<String>,
+) -> Result<Response, ApiError> {
+    st.writable()?;
+    let r = RepoName::parse(&repo).map_err(Error::from)?;
+    let removed = st.registry.remove_repo(&r).await?;
+    Ok(Json(serde_json::json!({"repo": r.as_str(), "removed": removed})).into_response())
+}
+
 async fn get_usage(State(st): State<ServeState>) -> Result<Response, ApiError> {
-    let u = st.store.usage().await?;
+    let u = st.store().usage().await?;
     Ok(Json(usage_json(&u)).into_response())
 }
 
@@ -706,10 +967,19 @@ impl IntoResponse for ApiError {
             // Forbidden, not Unauthorized: the caller's credentials are fine and
             // a better key would not help.
             Error::ReadOnly => StatusCode::FORBIDDEN,
-            Error::NotFound(_) | Error::TagNotFound(_) => StatusCode::NOT_FOUND,
-            Error::Digest(_) | Error::TagName(_) | Error::Label(_) | Error::ManifestVersion(_) => {
-                StatusCode::BAD_REQUEST
+            Error::NotFound(_) | Error::TagNotFound(_) | Error::RepoNotFound(_) => {
+                StatusCode::NOT_FOUND
             }
+            Error::Digest(_)
+            | Error::TagName(_)
+            | Error::Label(_)
+            | Error::Repo(_)
+            | Error::ManifestVersion(_) => StatusCode::BAD_REQUEST,
+            Error::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+            Error::Missing(_) => StatusCode::CONFLICT,
+            // The global store is down or refusing; this host is fine and a
+            // retry may well succeed.
+            Error::Remote(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::AmbiguousManifest { .. } => StatusCode::CONFLICT,
             Error::DigestMismatch { .. } => StatusCode::CONFLICT,
             Error::NoSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
@@ -803,11 +1073,11 @@ mod tests {
             heyvm_images_dir: d.path().join("images"),
         })
         .unwrap();
-        let state = ServeState {
-            store: store.clone(),
-            api_key: api_key.map(|k| Arc::new(k.to_string())),
+        let state = ServeState::new(
+            Registry::local(store.clone()),
+            api_key.map(str::to_string),
             read_only,
-        };
+        );
         (router(state), store)
     }
 
@@ -1452,11 +1722,11 @@ mod tests {
         // to one listener, so this composes them the same way.
         let d = tmpdir();
         let store = store_at(&d);
-        let api = router(ServeState {
-            store: store.clone(),
-            api_key: Some(Arc::new("secret".to_string())),
-            read_only: false,
-        });
+        let api = router(ServeState::new(
+            Registry::local(store.clone()),
+            Some("secret".to_string()),
+            false,
+        ));
         let merged = api.merge(web_router(Some(crate::web::WebState {
             store,
             auth: None,
@@ -1862,5 +2132,203 @@ mod tests {
             let r = app.clone().oneshot(req).await.unwrap();
             assert_eq!(r.status(), StatusCode::FORBIDDEN);
         }
+    }
+
+    async fn status_of(app: &Router, req: HttpRequest<Body>) -> (StatusCode, String) {
+        let r = app.clone().oneshot(req).await.unwrap();
+        let s = r.status();
+        (s, body_string(r).await)
+    }
+
+    fn anon_get(path: &str) -> HttpRequest<Body> {
+        HttpRequest::get(path).body(Body::empty()).unwrap()
+    }
+
+    /// The hub's contract: a public repository is pullable end to end with no
+    /// credential — tag, manifest, every blob — and nothing private opens.
+    #[tokio::test]
+    async fn a_public_repository_pulls_anonymously_and_nothing_else_does() {
+        let d = tmpdir();
+        let (_, store) = app(&d, Some("secret"), false);
+        let reg = Registry::local(store.clone());
+        let app = router(ServeState::new(reg.clone(), Some("secret".into()), false));
+
+        let blob = store
+            .insert_bytes(b"pg rootfs".to_vec())
+            .await
+            .unwrap()
+            .digest;
+        let m = Manifest::new(crate::KIND_ROOTFS).with_entry("rootfs.ext4", blob.clone(), 9);
+        let md = store.put_manifest(&m).await.unwrap();
+        let other = store
+            .insert_bytes(b"private".to_vec())
+            .await
+            .unwrap()
+            .digest;
+        reg.set_tag(&TagName::parse("heyo/postgres:16").unwrap(), &md, None)
+            .await
+            .unwrap();
+        reg.set_tag(&TagName::parse("acme/app:1").unwrap(), &other, None)
+            .await
+            .unwrap();
+
+        // Before publication: everything is closed.
+        assert_eq!(
+            status_of(&app, anon_get("/tags/heyo/postgres:16")).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let put = HttpRequest::put("/repos/heyo/postgres")
+            .header("x-api-key", "secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"public":true,"description":"PostgreSQL"}"#))
+            .unwrap();
+        assert_eq!(status_of(&app, put).await.0, StatusCode::OK);
+
+        for path in [
+            "/tags/heyo/postgres:16".to_string(),
+            "/tags/heyo%2Fpostgres%3A16".to_string(),
+            "/manifests/heyo/postgres:16".to_string(),
+            format!("/manifests/{md}"),
+            format!("/blobs/{blob}"),
+            "/repos/heyo/postgres".to_string(),
+        ] {
+            let (s, body) = status_of(&app, anon_get(&path)).await;
+            assert_eq!(s, StatusCode::OK, "{path}: {body}");
+        }
+        let (_, body) = status_of(&app, anon_get(&format!("/blobs/{blob}"))).await;
+        assert_eq!(body, "pg rootfs");
+
+        // The listing shows only the public repository to a stranger…
+        let (s, body) = status_of(&app, anon_get("/repos")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(
+            body.contains("heyo/postgres") && !body.contains("acme/app"),
+            "{body}"
+        );
+        // …and everything to the key holder.
+        let (_, body) = status_of(
+            &app,
+            HttpRequest::get("/repos")
+                .header("x-api-key", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(body.contains("acme/app"), "{body}");
+
+        // Private things, listings, and every write stay closed.
+        for path in [
+            "/tags/acme/app:1".to_string(),
+            "/repos/acme/app".to_string(),
+            format!("/blobs/{other}"),
+            "/tags".to_string(),
+            "/blobs".to_string(),
+        ] {
+            assert_eq!(
+                status_of(&app, anon_get(&path)).await.0,
+                StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+        }
+        // An absent tag in a public repository is simply absent.
+        assert_eq!(
+            status_of(&app, anon_get("/tags/heyo/postgres:17")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let write = HttpRequest::put("/tags/heyo/postgres:16")
+            .body(Body::from(other.as_str().to_string()))
+            .unwrap();
+        assert_eq!(status_of(&app, write).await.0, StatusCode::UNAUTHORIZED);
+        let unpublish = HttpRequest::delete("/repos/heyo/postgres")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(&app, unpublish).await.0, StatusCode::UNAUTHORIZED);
+        // A wrong key is still wrong, even for something public.
+        let wrong = HttpRequest::get("/tags/heyo/postgres:16")
+            .header("x-api-key", "stale")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(&app, wrong).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn namespaced_tags_round_trip_raw_or_encoded_and_flat_tags_are_unchanged() {
+        let d = tmpdir();
+        let (app, store) = app(&d, None, false);
+        let blob = store.insert_bytes(b"x".to_vec()).await.unwrap().digest;
+        for (put, get) in [
+            ("/tags/heyo%2Fweb%3Av1", "/tags/heyo/web:v1"),
+            ("/tags/heyo/web:v2", "/tags/heyo%2Fweb%3Av2"),
+            ("/tags/debian", "/tags/debian"),
+        ] {
+            let r = HttpRequest::put(put)
+                .body(Body::from(blob.as_str().to_string()))
+                .unwrap();
+            assert_eq!(status_of(&app, r).await.0, StatusCode::NO_CONTENT, "{put}");
+            let (s, body) = status_of(&app, anon_get(get)).await;
+            assert_eq!(s, StatusCode::OK, "{get}");
+            assert!(body.contains(blob.as_str()));
+        }
+        let (_, body) = status_of(&app, anon_get("/tags")).await;
+        assert!(
+            body.contains("\"heyo/web:v1\"") && body.contains("\"debian\""),
+            "{body}"
+        );
+        // Traversal through the wildcard is refused at the parser.
+        let r = HttpRequest::put("/tags/..%2F..%2Fetc")
+            .body(Body::from(blob.as_str().to_string()))
+            .unwrap();
+        assert_eq!(status_of(&app, r).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status_of(&app, anon_get("/repos/heyo/web")).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_writes_are_durable_before_success() {
+        let d = tmpdir();
+        let (_, store) = app(&d, None, false);
+        let remote = crate::remote::Remote::fs(d.path().join("bucket")).unwrap();
+        let reg = Registry::new(store, Some(remote.clone()), Default::default());
+        let app = router(ServeState::new(reg, None, false));
+
+        let data = b"durable".to_vec();
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&data))
+        };
+        let r = HttpRequest::put(format!("/blobs/{digest}"))
+            .body(Body::from(data))
+            .unwrap();
+        assert_eq!(status_of(&app, r).await.0, StatusCode::CREATED);
+        let d2 = Digest::parse(&digest).unwrap();
+        assert!(
+            remote
+                .head(&crate::remote::keys::blob(&d2))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A tag naming something the remote lacks is a conflict, not a 500.
+        let missing = "0".repeat(64);
+        let r = HttpRequest::put("/tags/x")
+            .body(Body::from(missing))
+            .unwrap();
+        assert_eq!(status_of(&app, r).await.0, StatusCode::CONFLICT);
+
+        // A compare-and-swap that loses is a 412.
+        let r = HttpRequest::put("/tags/x")
+            .body(Body::from(digest.clone()))
+            .unwrap();
+        let resp = app.clone().oneshot(r).await.unwrap();
+        assert!(resp.headers().get(header::ETAG).is_some());
+        let r = HttpRequest::put("/tags/x")
+            .header("if-match", "\"stale\"")
+            .body(Body::from(digest))
+            .unwrap();
+        assert_eq!(status_of(&app, r).await.0, StatusCode::PRECONDITION_FAILED);
     }
 }

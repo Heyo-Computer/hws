@@ -36,7 +36,9 @@ pub struct AdminCredentials {
 
 impl AdminCredentials {
     pub fn from_env() -> Option<AdminCredentials> {
-        let password = std::env::var("ART_ADMIN_PASSWORD").ok().filter(|p| !p.is_empty())?;
+        let password = std::env::var("ART_ADMIN_PASSWORD")
+            .ok()
+            .filter(|p| !p.is_empty())?;
         let user = std::env::var("ART_ADMIN_USER")
             .ok()
             .filter(|u| !u.is_empty())
@@ -111,7 +113,9 @@ impl DashboardAccess {
             _ => {}
         }
         Ok(match (password, open, gate) {
-            (Some(password), _, _) => DashboardAccess::Password(AdminCredentials { user, password }),
+            (Some(password), _, _) => {
+                DashboardAccess::Password(AdminCredentials { user, password })
+            }
             (None, true, _) => DashboardAccess::Open,
             (None, _, true) => DashboardAccess::Gate,
             (None, false, false) => DashboardAccess::Off,
@@ -141,7 +145,10 @@ impl Config {
             None => home_dir()?.join(".artifacts"),
         };
         if root.is_relative() {
-            return Err(format!("store root must be absolute, got {}", root.display()));
+            return Err(format!(
+                "store root must be absolute, got {}",
+                root.display()
+            ));
         }
 
         let min_free_bytes = match min_free_flag {
@@ -258,7 +265,8 @@ mod tests {
 
     #[test]
     fn a_password_gates_and_the_opt_in_opens() {
-        match DashboardAccess::resolve(Some("hunter2".into()), "ops".into(), false, false).unwrap() {
+        match DashboardAccess::resolve(Some("hunter2".into()), "ops".into(), false, false).unwrap()
+        {
             DashboardAccess::Password(c) => {
                 assert_eq!(c.user, "ops");
                 assert_eq!(c.password, "hunter2");
@@ -275,7 +283,8 @@ mod tests {
     fn a_password_and_the_open_opt_in_together_are_an_error() {
         // Neither precedence rule is safe to pick silently: one of the two
         // settings would be a lie, and the operator cannot tell which.
-        let e = DashboardAccess::resolve(Some("hunter2".into()), "admin".into(), true, false).unwrap_err();
+        let e = DashboardAccess::resolve(Some("hunter2".into()), "admin".into(), true, false)
+            .unwrap_err();
         assert!(e.contains("ART_ADMIN_PASSWORD"), "{e}");
         assert!(e.contains("ART_DASHBOARD_OPEN"), "{e}");
     }

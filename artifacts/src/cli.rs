@@ -201,7 +201,40 @@ pub enum Command {
             num_args = 0..=1,
         )]
         dashboard_gate: bool,
+        /// Serve the public hub at `/hub`: a catalog of the public
+        /// repositories, readable by anyone. It shows only what anonymous
+        /// pulls already allow.
+        #[arg(
+            long,
+            env = "ART_HUB",
+            value_parser = clap::builder::BoolishValueParser::new(),
+            default_value = "false",
+            default_missing_value = "true",
+            num_args = 0..=1,
+        )]
+        hub: bool,
+        /// The hub's host name (e.g. `hub.heyo.work`). `/` on that host
+        /// opens the catalog instead of the dashboard.
+        #[arg(long, env = "ART_HUB_HOST")]
+        hub_host: Option<String>,
     },
+    /// The global store: publish this store to S3, check it, collect it.
+    ///
+    /// Configured by the same variables as the daemon: `ART_S3_BUCKET`,
+    /// `ART_S3_PREFIX`, `ART_S3_REGION`, `ART_S3_ENDPOINT`,
+    /// `ART_S3_ACCESS_KEY_ID`, `ART_S3_SECRET_ACCESS_KEY` — or
+    /// `ART_REMOTE_DIR` for a directory standing in for a bucket.
+    #[cfg(feature = "daemon")]
+    #[command(subcommand)]
+    S3(S3Command),
+    /// Repositories (`heyo/postgres`): make one public on the hub, describe
+    /// it, list them.
+    ///
+    /// Writes through to the global store when one is configured, so every
+    /// region sees the change.
+    #[cfg(feature = "daemon")]
+    #[command(subcommand)]
+    Repo(RepoCommand),
     /// Dockerfiles that define a rootfs.
     #[command(subcommand)]
     Dockerfile(DockerfileCommand),
@@ -219,6 +252,63 @@ pub struct LsWhat {
     pub tags: bool,
     #[arg(long)]
     pub manifests: bool,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Subcommand)]
+pub enum S3Command {
+    /// Publish everything in this store to the global one.
+    ///
+    /// Idempotent and safe to re-run. Order is blobs, manifests, labels,
+    /// public markers, repositories, then tags, so the remote never holds a
+    /// tag naming something it lacks. A tag the remote already points
+    /// elsewhere is reported and left alone unless `--overwrite-tags`.
+    Backfill {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        overwrite_tags: bool,
+    },
+    /// Check that every tag in the global store reaches content it holds.
+    Verify {
+        /// Download and re-hash every blob a tag reaches.
+        #[arg(long)]
+        deep: bool,
+    },
+    /// Delete content no tag reaches from the global store.
+    ///
+    /// Holds a lease in the bucket while it runs, so two regions cannot
+    /// collect at once. Only this deletes from the remote; the daemon never
+    /// does.
+    Gc {
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep anything newer than this. Long by default: another region may
+        /// have uploaded blobs whose manifest it has not written yet.
+        #[arg(long, value_parser = parse_duration, default_value = "24h")]
+        min_age: Duration,
+    },
+    /// Copy a reference — and every blob its manifest names — into this
+    /// store's cache.
+    Pull { reference: String },
+    /// Mirror the global store's tags, labels and repositories here once.
+    Sync,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Subcommand)]
+pub enum RepoCommand {
+    /// Every repository, with its tags and whether it is public.
+    Ls,
+    /// Make a repository public — listed on the hub and pullable by anyone —
+    /// or private again with `--off`.
+    Public {
+        repo: String,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Set a repository's description (`-` reads stdin).
+    Describe { repo: String, description: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -307,7 +397,7 @@ pub const EXIT_NO_SPACE: i32 = 3;
 pub fn exit_code(e: &Error) -> i32 {
     match e {
         Error::NoSpace { .. } => EXIT_NO_SPACE,
-        Error::Digest(_) | Error::TagName(_) => EXIT_USAGE,
+        Error::Digest(_) | Error::TagName(_) | Error::Repo(_) => EXIT_USAGE,
         _ => EXIT_FAILURE,
     }
 }
@@ -612,6 +702,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             admin_user,
             dashboard_open,
             dashboard_gate,
+            hub,
+            hub_host,
         } => {
             let dashboard = crate::config::DashboardAccess::resolve(
                 admin_password,
@@ -632,14 +724,216 @@ pub async fn run(cli: Cli) -> Result<()> {
                     api_key,
                     read_only,
                     dashboard,
+                    hub,
+                    hub_host,
                 },
             )
             .await?;
         }
 
+        #[cfg(feature = "daemon")]
+        Command::S3(cmd) => run_s3(&store, &config, cmd, json).await?,
+
+        #[cfg(feature = "daemon")]
+        Command::Repo(cmd) => run_repo(&store, &config, cmd, json).await?,
+
         Command::Dockerfile(cmd) => run_dockerfile(&store, cmd, json).await?,
 
         Command::Heyvm(cmd) => run_heyvm(&store, &config, cmd, json).await?,
+    }
+    Ok(())
+}
+
+#[cfg(feature = "daemon")]
+fn registry_for(store: &Store, config: &Config) -> Result<crate::registry::Registry> {
+    let remote = crate::registry::remote_from_env()?;
+    Ok(crate::registry::Registry::new(
+        store.clone(),
+        remote,
+        crate::registry::options_from_env(config)?,
+    ))
+}
+
+#[cfg(feature = "daemon")]
+async fn run_s3(store: &Store, config: &Config, cmd: S3Command, json: bool) -> Result<()> {
+    use crate::s3ops;
+    let reg = registry_for(store, config)?;
+    let Some(remote) = reg.remote().cloned() else {
+        return Err(Error::Io {
+            context: "no global store configured: set ART_S3_BUCKET (and its credentials) \
+                      or ART_REMOTE_DIR"
+                .into(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad configuration"),
+        });
+    };
+    match cmd {
+        S3Command::Backfill {
+            dry_run,
+            overwrite_tags,
+        } => {
+            let r = s3ops::backfill(store, &remote, dry_run, overwrite_tags).await?;
+            if json {
+                print_json(&serde_json::to_value(&r).expect("report serializes"));
+            } else {
+                let verb = if dry_run { "would upload" } else { "uploaded" };
+                println!(
+                    "{verb} {} blobs ({}), {} manifests, {} tags to {}",
+                    r.blobs_uploaded,
+                    human(r.bytes_uploaded),
+                    r.manifests_uploaded,
+                    r.tags_uploaded,
+                    remote.describe()
+                );
+                println!(
+                    "already present: {} blobs, {} tags; {} labels, {} public markers, {} repositories",
+                    r.blobs_present, r.tags_present, r.labels, r.public_markers, r.repos
+                );
+                for c in &r.tag_conflicts {
+                    println!("conflict  {c}  (re-run with --overwrite-tags to replace)");
+                }
+                for c in r.tags_skipped.iter().chain(&r.manifests_skipped) {
+                    println!("skipped   {c}");
+                }
+            }
+        }
+        S3Command::Verify { deep } => {
+            let r = s3ops::verify(store, &remote, deep).await?;
+            if json {
+                print_json(&serde_json::to_value(&r).expect("report serializes"));
+            } else {
+                println!(
+                    "{} tags, {} manifests, {} blobs checked{}",
+                    r.tags,
+                    r.manifests,
+                    r.blobs,
+                    if deep { " (re-hashed)" } else { "" }
+                );
+                for p in &r.problems {
+                    println!("problem   {p}");
+                }
+            }
+            if !r.problems.is_empty() {
+                return Err(Error::Remote(format!(
+                    "{} problems in {}",
+                    r.problems.len(),
+                    remote.describe()
+                )));
+            }
+        }
+        S3Command::Gc { dry_run, min_age } => {
+            let r = s3ops::gc(&remote, min_age, dry_run).await?;
+            if json {
+                print_json(&serde_json::to_value(&r).expect("report serializes"));
+            } else {
+                let verb = if dry_run { "would remove" } else { "removed" };
+                println!(
+                    "{verb} {} blobs ({}), {} manifests, {} labels/markers; kept {} reachable, {} young",
+                    r.blobs_removed,
+                    human(r.bytes_freed),
+                    r.manifests_removed,
+                    r.metadata_removed,
+                    r.kept_reachable,
+                    r.kept_young
+                );
+            }
+        }
+        S3Command::Pull { reference } => {
+            let r = Ref::parse(&reference)?;
+            let d = reg.resolve(&r).await?;
+            let mut blobs = Vec::new();
+            match reg.manifest(&d).await {
+                Ok(m) => blobs.extend(m.entries.into_iter().map(|e| e.digest)),
+                Err(Error::NotFound(_)) => blobs.push(d.clone()),
+                Err(e) => return Err(e),
+            }
+            for b in &blobs {
+                reg.ensure_blob(b).await?;
+            }
+            if json {
+                print_json(&serde_json::json!({"digest": d.as_str(), "blobs": blobs.len()}));
+            } else {
+                println!("{d}  {} blob(s) cached", blobs.len());
+            }
+        }
+        S3Command::Sync => {
+            let r = reg.sync().await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "fetched": r.fetched, "removed": r.removed, "localOnly": r.local_only,
+                }));
+            } else {
+                println!(
+                    "fetched {}, removed {}, {} tags only here",
+                    r.fetched, r.removed, r.local_only
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "daemon")]
+async fn run_repo(store: &Store, config: &Config, cmd: RepoCommand, json: bool) -> Result<()> {
+    use crate::tags::RepoName;
+    let reg = registry_for(store, config)?;
+    match cmd {
+        RepoCommand::Ls => {
+            if reg.remote().is_some() {
+                reg.sync().await?;
+            }
+            let repos = store.repositories().await?;
+            if json {
+                let v: Vec<_> = repos
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "repo": r.name.as_str(),
+                            "public": r.meta.public,
+                            "description": r.meta.description,
+                            "tags": r.tags.iter().map(|(t, _)| t.short()).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                print_json(&serde_json::json!(v));
+            } else {
+                for r in &repos {
+                    let tags: Vec<_> = r.tags.iter().map(|(t, _)| t.short()).collect();
+                    println!(
+                        "{:<40} {:<8} {}",
+                        r.name.as_str(),
+                        if r.meta.public { "public" } else { "private" },
+                        tags.join(" ")
+                    );
+                }
+            }
+        }
+        RepoCommand::Public { repo, off } => {
+            let r = RepoName::parse(&repo)?;
+            let mut meta = store.get_repo(&r).await?.unwrap_or_default();
+            meta.public = !off;
+            reg.set_repo(&r, &meta.touched()).await?;
+            if json {
+                print_json(&serde_json::json!({"repo": r.as_str(), "public": !off}));
+            } else {
+                println!("{r} is now {}", if off { "private" } else { "public" });
+            }
+        }
+        RepoCommand::Describe { repo, description } => {
+            let r = RepoName::parse(&repo)?;
+            let description = if description == "-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).ctx("read stdin")?;
+                s
+            } else {
+                description
+            };
+            let mut meta = store.get_repo(&r).await?.unwrap_or_default();
+            meta.description = Some(description.trim().to_string()).filter(|d| !d.is_empty());
+            reg.set_repo(&r, &meta.touched()).await?;
+            if !json {
+                println!("described {r}");
+            }
+        }
     }
     Ok(())
 }
