@@ -394,12 +394,76 @@ impl Registry {
         }
     }
 
-    /// Store a manifest — in the remote first, refusing it unless the remote
-    /// holds every blob it names.
+    // -- promotion ---------------------------------------------------------
+    //
+    // A store that predates its remote holds content the remote has never
+    // seen. Refusing every write that names such content would make the
+    // first push after enabling S3 fail — a client that asks "do you have this
+    // blob?" hears yes from the cache, skips the upload, and then has its
+    // manifest refused. So a write that names content only this region holds
+    // publishes that content first. The invariant is unchanged: the remote
+    // still never holds a pointer to something it lacks.
+
+    /// Make sure the remote holds blob `d`, publishing the local copy if only
+    /// this region has it. `false` if neither does.
+    async fn promote_blob(&self, d: &Digest) -> Result<bool> {
+        if self.blob_in_remote(d).await? {
+            return Ok(true);
+        }
+        if !self.inner.store.has(d).await? {
+            return Ok(false);
+        }
+        tracing::info!(digest = %d, "publishing a blob only this region held");
+        self.publish_blob(d).await?;
+        Ok(true)
+    }
+
+    /// The same for a manifest, and every blob it names first.
+    async fn promote_manifest(&self, d: &Digest) -> Result<bool> {
+        let Some(remote) = &self.inner.remote else {
+            return Ok(self.inner.store.get_manifest(d).await.is_ok());
+        };
+        if remote.head(&keys::manifest(d)).await?.is_some() {
+            return Ok(true);
+        }
+        let m = match self.inner.store.get_manifest(d).await {
+            Ok(m) => m,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        for e in &m.entries {
+            if !self.promote_blob(&e.digest).await? {
+                return Err(Error::Missing(e.digest.clone()));
+            }
+        }
+        // The bytes on disk, not a re-serialization: they are what `d` names.
+        let path = self.inner.store.inner().manifest_path_of(d);
+        let bytes = tokio::fs::read(&path).await.map_err(|e| Error::Io {
+            context: format!("read {}", path.display()),
+            source: e,
+        })?;
+        tracing::info!(digest = %d, "publishing a manifest only this region held");
+        match remote.put(&keys::manifest(d), bytes, Cond::IfAbsent).await {
+            Ok(_) | Err(Error::PreconditionFailed(_)) => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whatever `d` names — manifest or blob — in the remote. `false` if
+    /// neither the remote nor this region holds it.
+    async fn promote(&self, d: &Digest) -> Result<bool> {
+        if self.manifest_in_remote(d).await? || self.blob_in_remote(d).await? {
+            return Ok(true);
+        }
+        Ok(self.promote_manifest(d).await? || self.promote_blob(d).await?)
+    }
+
+    /// Store a manifest — in the remote first, refusing it unless every blob
+    /// it names is in the remote or can be published from this region.
     pub async fn put_manifest(&self, m: &Manifest) -> Result<Digest> {
         if let Some(remote) = &self.inner.remote {
             for e in &m.entries {
-                if !self.blob_in_remote(&e.digest).await? {
+                if !self.promote_blob(&e.digest).await? {
                     return Err(Error::Missing(e.digest.clone()));
                 }
             }
@@ -517,7 +581,7 @@ impl Registry {
             self.after_write().await;
             return Ok(None);
         };
-        if !(self.manifest_in_remote(d).await? || self.blob_in_remote(d).await?) {
+        if !self.promote(d).await? {
             return Err(Error::Missing(d.clone()));
         }
         let key = keys::tag(t);
@@ -550,19 +614,12 @@ impl Registry {
 
     // -- labels and public markers ----------------------------------------
 
-    async fn exists_anywhere(&self, d: &Digest) -> Result<bool> {
-        Ok(self.inner.store.has(d).await?
-            || self.inner.store.get_manifest(d).await.is_ok()
-            || self.blob_in_remote(d).await?
-            || self.manifest_in_remote(d).await?)
-    }
-
     pub async fn set_label(&self, d: &Digest, label: &Label) -> Result<()> {
         label.validate()?;
         let Some(remote) = &self.inner.remote else {
             return self.inner.store.set_label(d, label).await;
         };
-        if !self.exists_anywhere(d).await? {
+        if !self.promote(d).await? {
             return Err(Error::NotFound(d.clone()));
         }
         let key = keys::label(d);
@@ -589,7 +646,7 @@ impl Registry {
             self.inner.store.set_public(d).await?;
             return Ok(());
         };
-        if !self.blob_in_remote(d).await? {
+        if !self.promote_blob(d).await? {
             return Err(Error::NotFound(d.clone()));
         }
         let key = keys::public(d);
@@ -1090,22 +1147,86 @@ mod tests {
     async fn the_remote_never_holds_a_pointer_to_nothing() {
         let (_b, remote) = shared();
         let us = region(&remote, opts());
-        // Only local: never published.
-        let local = us
-            .reg
-            .store()
-            .insert_bytes(b"unpublished".to_vec())
-            .await
-            .unwrap();
-        let m = Manifest::new(crate::KIND_GENERIC).with_entry("x", local.digest.clone(), 11);
+        // In neither store.
+        let nowhere = Digest::parse(&"0".repeat(64)).unwrap();
+        let m = Manifest::new(crate::KIND_GENERIC).with_entry("x", nowhere.clone(), 11);
         assert!(matches!(
             us.reg.put_manifest(&m).await,
             Err(Error::Missing(_))
         ));
         assert!(matches!(
-            us.reg.set_tag(&tag("x"), &local.digest, None).await,
+            us.reg.set_tag(&tag("x"), &nowhere, None).await,
             Err(Error::Missing(_))
         ));
+        // A manifest this region holds whose blob is gone everywhere.
+        let gone = us
+            .reg
+            .store()
+            .insert_bytes(b"gone".to_vec())
+            .await
+            .unwrap()
+            .digest;
+        let md = us
+            .reg
+            .store()
+            .put_manifest(&Manifest::new(crate::KIND_GENERIC).with_entry("g", gone.clone(), 4))
+            .await
+            .unwrap();
+        us.reg.store().evict_blob(&gone).await.unwrap();
+        assert!(matches!(
+            us.reg.set_tag(&tag("g"), &md, None).await,
+            Err(Error::Missing(_))
+        ));
+        assert!(remote.head(&keys::manifest(&md)).await.unwrap().is_none());
+    }
+
+    /// A store that predates its remote: content only it holds is published
+    /// by the first write that names it, so a client that skipped an upload
+    /// because the cache said "already here" still succeeds.
+    #[tokio::test]
+    async fn writes_naming_pre_remote_content_publish_it_first() {
+        let (_b, remote) = shared();
+        let us = region(&remote, opts());
+        let eu = region(&remote, opts());
+        // Written straight to the cache, as everything was before S3.
+        let store = us.reg.store();
+        let old = store
+            .insert_bytes(b"old image".to_vec())
+            .await
+            .unwrap()
+            .digest;
+        let old_m = Manifest::new(crate::KIND_ROOTFS).with_entry("rootfs.ext4", old.clone(), 9);
+        let old_md = store.put_manifest(&old_m).await.unwrap();
+        let older = store.insert_bytes(b"older".to_vec()).await.unwrap().digest;
+
+        // A push that deduplicated against the cache: manifest only.
+        let m = Manifest::new(crate::KIND_GENERIC).with_entry("x", older.clone(), 5);
+        us.reg.put_manifest(&m).await.unwrap();
+        assert!(remote.head(&keys::blob(&older)).await.unwrap().is_some());
+
+        // Tagging a manifest only this region had publishes it and its blobs.
+        us.reg
+            .set_tag(&tag("heyo/old:1"), &old_md, None)
+            .await
+            .unwrap();
+        assert!(
+            remote
+                .head(&keys::manifest(&old_md))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(remote.head(&keys::blob(&old)).await.unwrap().is_some());
+
+        // And another region can pull all of it.
+        let (d, _) = eu.reg.get_tag(&tag("heyo/old:1")).await.unwrap();
+        assert_eq!(eu.reg.manifest(&d).await.unwrap(), old_m);
+        eu.reg.ensure_blob(&old).await.unwrap();
+
+        // Labels and public markers promote too.
+        let lone = store.insert_bytes(b"lone".to_vec()).await.unwrap().digest;
+        us.reg.set_public(&lone).await.unwrap();
+        assert!(remote.head(&keys::blob(&lone)).await.unwrap().is_some());
     }
 
     #[tokio::test]

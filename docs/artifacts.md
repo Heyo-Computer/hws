@@ -152,6 +152,7 @@ Exit codes: `0` success, `1` failure, `2` bad usage (invalid digest or tag), `3`
 
 | Command | What it does |
 | --- | --- |
+| `art s3 probe` | Check the bucket is reachable, the credentials work and conditional writes are honoured — what `art serve` checks at startup |
 | `art s3 backfill [--dry-run] [--overwrite-tags]` | Publish this store into the bucket. Idempotent. A tag the bucket already points elsewhere is reported, not replaced, unless `--overwrite-tags` |
 | `art s3 verify [--deep]` | Check every tag in the bucket reaches content the bucket holds; `--deep` downloads and re-hashes every blob |
 | `art s3 gc [--dry-run] [--min-age 24h]` | Delete content no tag reaches from the bucket, under a lease so only one region collects at a time |
@@ -300,13 +301,15 @@ Bucket requirements: **versioning on** (tag history and undelete for free) and a
 
 ### Moving an existing store into the bucket
 
+For a store already serving traffic, follow [the migration runbook](../artifacts/docs/runbook-global-store-migration.md): its data must reach the bucket from a copy of the running VM's disk before anything replaces the VM. The core of it:
+
 ```sh
 art s3 backfill --dry-run     # what would be uploaded, and any tag conflicts
 art s3 backfill               # safe to re-run; tags go last
 art s3 verify                 # every tag reaches content the bucket holds
 ```
 
-Turning on `ART_S3_BUCKET` before backfilling is safe: local-only tags keep resolving and are reported until published.
+Turning on `ART_S3_BUCKET` before backfilling is safe: local-only tags keep resolving and are reported until published, and a write that names content only this store holds — a push whose blob the cache already had, a tag on an old manifest — publishes that content to the bucket first.
 
 ## Public hub
 

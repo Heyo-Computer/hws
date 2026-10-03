@@ -257,6 +257,9 @@ pub struct LsWhat {
 #[cfg(feature = "daemon")]
 #[derive(Debug, Subcommand)]
 pub enum S3Command {
+    /// Check the bucket is reachable, the credentials work, and conditional
+    /// writes are honoured — exactly what `art serve` checks before it starts.
+    Probe,
     /// Publish everything in this store to the global one.
     ///
     /// Idempotent and safe to re-run. Order is blobs, manifests, labels,
@@ -767,6 +770,17 @@ async fn run_s3(store: &Store, config: &Config, cmd: S3Command, json: bool) -> R
         });
     };
     match cmd {
+        S3Command::Probe => {
+            remote.probe().await?;
+            if json {
+                print_json(&serde_json::json!({"remote": remote.describe(), "ok": true}));
+            } else {
+                println!(
+                    "{}: reachable, credentials accepted, conditional writes honoured",
+                    remote.describe()
+                );
+            }
+        }
         S3Command::Backfill {
             dry_run,
             overwrite_tags,
