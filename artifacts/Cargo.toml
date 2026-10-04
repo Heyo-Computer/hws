@@ -12,7 +12,12 @@ name = "art"
 path = "src/main.rs"
 
 [features]
-default = ["daemon"]
+default = ["daemon", "s3"]
+# The S3 remote tier (`ART_S3_BUCKET`): the global store every regional daemon
+# reads through and writes through. Separate from `daemon` because it is the
+# one part of the crate that needs an HTTP client and TLS; without it the
+# remote tier still works against a directory (`ART_REMOTE_DIR`).
+s3 = ["daemon", "dep:reqwest", "dep:hmac"]
 # The HTTP server. On by default for the `art` binary; mvm-ctrl should depend
 # with `default-features = false`, because it is pinned to axum 0.7 and there is
 # no reason to compile a second axum tree into `heyvm`.
@@ -87,6 +92,14 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 maud = { version = "0.27", features = ["axum"], optional = true }
 # Constant-time API-key comparison.
 subtle = { version = "2.6", optional = true }
+
+# -- s3 feature ---------------------------------------------------------------
+# The same client stack pg-fc signs S3 requests with (src/remote/sigv4.rs is
+# its presigner): SigV4 by hand over hmac + sha2, rustls rather than OpenSSL so
+# the binary still runs in a minimal guest, and `stream` so a cache fill never
+# holds a blob in memory.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+hmac = { version = "0.12", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Raw ioctl/fallocate/statx/copy_file_range. Confined to src/sys/; no `unsafe`

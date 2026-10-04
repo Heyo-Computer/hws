@@ -736,11 +736,11 @@ fn dedup_ratio(u: &Usage) -> f64 {
     }
 }
 
-fn short(d: &Digest) -> String {
+pub(crate) fn short(d: &Digest) -> String {
     format!("{}…", &d.as_str()[..12])
 }
 
-fn human(n: u64) -> String {
+pub(crate) fn human(n: u64) -> String {
     crate::cli::human(n)
 }
 
@@ -836,7 +836,7 @@ fn login_body(failed: bool) -> Markup {
 /// good, warning, critical — rather than being tinted with the one accent,
 /// because the whole point of the capacity meter is that 94% looks different
 /// from 40% before anybody reads the number.
-const STYLE: &str = r#"
+pub(crate) const STYLE: &str = r#"
 main { max-width: 1200px; margin: 0 auto; padding: var(--gap-5) var(--gap-5) var(--gap-6); }
 section { margin-bottom: var(--gap-5); }
 body.centered { display: grid; place-items: center; min-height: 100vh; }

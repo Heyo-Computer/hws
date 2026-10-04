@@ -29,24 +29,34 @@ compile_error!(
 
 #[cfg(feature = "daemon")]
 pub mod admin;
+pub mod asp;
 // The platform UI kit — tokens, the theme cookie and forwarded identity —
 // shared with app-lb, app-obs, ci and heyosecret. Included by path rather than
 // depended on as a crate, because those apps sit on three axum versions and two
 // Rust editions; the shared module names no framework type. See `ui/README.md`.
-#[path = "../../ui/ui.rs"]
-pub mod heyo_ui;
 pub mod cli;
 pub mod config;
 pub mod digest;
 pub mod dockerfile;
 pub mod error;
 pub mod gc;
+#[path = "../../ui/ui.rs"]
+pub mod heyo_ui;
 pub mod heyvm;
 #[cfg(feature = "daemon")]
 pub mod http;
+#[cfg(feature = "daemon")]
+pub mod hub;
 pub mod labels;
 pub mod lock;
 pub mod manifest;
+#[cfg(feature = "daemon")]
+pub mod registry;
+#[cfg(feature = "daemon")]
+pub mod remote;
+pub mod repos;
+#[cfg(feature = "daemon")]
+pub mod s3ops;
 pub mod store;
 pub mod sys;
 pub mod tags;
@@ -59,6 +69,7 @@ pub use error::{Error, Result};
 pub use labels::{Label, Labelled};
 pub use manifest::{BlobRef, Entry, Manifest};
 pub use manifest::{KIND_BUNDLE, KIND_DOCKERFILE, KIND_GENERIC, KIND_ROOTFS};
-pub use store::{BlobInfo, Materialize, Materialized, Method, Store, Usage};
+pub use repos::RepoMeta;
+pub use store::{BlobInfo, Materialize, Materialized, Method, Repository, Store, Usage};
 pub use sys::sparse::Shape;
-pub use tags::{Ref, TagName};
+pub use tags::{Ref, RepoName, TagName};

@@ -23,7 +23,7 @@
 use crate::config::BLOCK_SIZE;
 use crate::digest::Digest;
 use crate::error::{Error, IoContext, Result};
-use crate::manifest::{BlobRef, Manifest, KIND_BUNDLE, KIND_ROOTFS};
+use crate::manifest::{BlobRef, KIND_BUNDLE, KIND_ROOTFS, Manifest};
 use crate::store::{BlobInfo, Materialize, Materialized, Store};
 use crate::sys::space;
 use crate::sys::sparse::{self, Shape};
@@ -580,7 +580,10 @@ mod tests {
         assert_eq!(m.kind, KIND_ROOTFS);
         assert_eq!(m.get(ANN_PRIMITIVE), Some(PRIMITIVE_EXT4_RAW));
         assert_eq!(m.get(ANN_IMAGE), Some("debian-hermes"));
-        assert_eq!(m.get(ANN_NOMINAL_SIZE), Some(data.len().to_string().as_str()));
+        assert_eq!(
+            m.get(ANN_NOMINAL_SIZE),
+            Some(data.len().to_string().as_str())
+        );
         assert_eq!(s.get_tag(&imported.name).await.unwrap(), imported.manifest);
     }
 
@@ -642,7 +645,9 @@ mod tests {
         // Writable, and a different inode from the blob.
         assert_ne!(
             space::stat_path(&dest).unwrap().ino,
-            space::stat_path(&s.blob_path(&imported.blob.digest)).unwrap().ino
+            space::stat_path(&s.blob_path(&imported.blob.digest))
+                .unwrap()
+                .ino
         );
         std::fs::write(&dest, b"guest scribbled here").unwrap();
         s.verify(&imported.blob.digest).await.unwrap();
@@ -707,7 +712,11 @@ mod tests {
         assert_eq!(st.size, 1024 * 1024 * 1024);
         // Sparse growth: the guest has not used the room yet, so neither should
         // the host.
-        assert!(st.allocated < 16 * 1024 * 1024, "allocated {}", st.allocated);
+        assert!(
+            st.allocated < 16 * 1024 * 1024,
+            "allocated {}",
+            st.allocated
+        );
     }
 
     #[tokio::test]
@@ -849,7 +858,10 @@ mod tests {
         assert_eq!(std::fs::read(out.join("rootfs.ext4")).unwrap(), rootfs);
         assert_eq!(std::fs::read(out.join("data.ext4")).unwrap(), data);
         // Export on the same filesystem costs nothing.
-        assert!(mats.iter().all(|m| m.method == crate::store::Method::Hardlink));
+        assert!(
+            mats.iter()
+                .all(|m| m.method == crate::store::Method::Hardlink)
+        );
     }
 
     #[tokio::test]

@@ -295,6 +295,127 @@ impl RegistryClient {
     pub fn delete_tag(&self, name: &str) -> Result<()> {
         self.send("DELETE", &format!("/tags/{}", escape(name))).map(|_| ())
     }
+
+    /// Set a repository's metadata: whether it is public — on the hub and
+    /// pullable without a key — and its description.
+    pub fn put_repo(&self, repo: &str, public: bool, description: Option<&str>) -> Result<Value> {
+        let req = self
+            .request("PUT", &format!("/repos/{}", escape(repo)))
+            .set("Content-Type", "application/json");
+        match req.send_json(json!({ "public": public, "description": description })) {
+            Ok(resp) => serde_json::from_str(&resp.into_string().unwrap_or_default())
+                .context("the store's answer to PUT /repos was not JSON"),
+            Err(ureq::Error::Status(code, resp)) => {
+                Err(self.api_error(code, &resp.into_string().unwrap_or_default()))
+            }
+            Err(ureq::Error::Transport(t)) => {
+                Err(anyhow!("cannot reach the artifact store at {} ({t})", self.base))
+            }
+        }
+    }
+
+    /// What a reference names: a manifest when there is one by that name,
+    /// otherwise the blob a tag points at directly. `None` if neither exists.
+    pub fn resolve(&self, reference: &str) -> Result<Option<Resolved>> {
+        let (code, body) = self.raw(self.request("GET", &format!("/manifests/{}", escape(reference))))?;
+        match code {
+            200 => {
+                let m: Value = serde_json::from_str(&body)
+                    .context("the store's manifest was not JSON")?;
+                return Ok(Some(Resolved::Manifest(m)));
+            }
+            404 => {}
+            _ => return Err(self.api_error(code, &body)),
+        }
+        // A tag may name a bare blob (`art put --tag`).
+        let (code, body) = self.raw(self.request("GET", &format!("/tags/{}", escape(reference))))?;
+        match code {
+            200 => {
+                let v: Value = serde_json::from_str(&body).context("the store's tag was not JSON")?;
+                let d = v
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("the store's tag carried no digest"))?;
+                Ok(Some(Resolved::Blob(d.to_string())))
+            }
+            404 if is_digest(reference) => Ok(Some(Resolved::Blob(reference.to_string()))),
+            404 => Ok(None),
+            _ => Err(self.api_error(code, &body)),
+        }
+    }
+
+    /// Stream `GET /blobs/{digest}` to `dest`, hashing as it lands, and refuse
+    /// — deleting the file — if the bytes are not what their name promises.
+    /// Written to a temp name beside `dest` and renamed into place, so a failed
+    /// pull never leaves a half-file that looks complete.
+    pub fn get_blob(&self, digest: &str, dest: &Path, mut progress: impl FnMut(u64, u64)) -> Result<u64> {
+        let resp = match self.request("GET", &format!("/blobs/{}", escape(digest))).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, resp)) => {
+                return Err(self.api_error(code, &resp.into_string().unwrap_or_default()));
+            }
+            Err(ureq::Error::Transport(t)) => {
+                return Err(anyhow!("cannot reach the artifact store at {} ({t})", self.base));
+            }
+        };
+        let total = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let tmp = dest.with_file_name(format!(
+            ".{}.heyctl-pull",
+            dest.file_name().and_then(|n| n.to_str()).unwrap_or("blob")
+        ));
+        let result = (|| -> Result<u64> {
+            let mut out = std::fs::File::create(&tmp)
+                .with_context(|| format!("creating {}", tmp.display()))?;
+            let mut reader = resp.into_reader();
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; HASH_CHUNK];
+            let mut n_total = 0u64;
+            loop {
+                let n = reader.read(&mut buf).context("reading the download")?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                std::io::Write::write_all(&mut out, &buf[..n])
+                    .with_context(|| format!("writing {}", tmp.display()))?;
+                n_total += n as u64;
+                progress(n_total, total);
+            }
+            out.sync_all().ok();
+            let actual = hex(&hasher.finalize());
+            if actual != digest {
+                bail!("the store sent bytes that hash to {actual}, not {digest}; nothing was written");
+            }
+            std::fs::rename(&tmp, dest)
+                .with_context(|| format!("moving the download into {}", dest.display()))?;
+            Ok(n_total)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
+}
+
+/// What a pull reference resolved to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Resolved {
+    Manifest(Value),
+    Blob(String),
+}
+
+pub fn is_digest(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A manifest entry name that is safe to use as a file name: no separator, not
+/// a dot entry, not hidden.
+pub fn is_safe_entry_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 /// The manifest `art heyvm import` writes, byte for byte.
@@ -471,8 +592,20 @@ pub fn heyvm_image_path(name: &str) -> Result<std::path::PathBuf> {
 
 /// A tag, by the store's rules. Checked here so a bad name fails before a
 /// multi-gigabyte upload rather than after it.
+///
+/// Either flat (`debian-hermes`) or namespaced (`heyo/postgres:16`, where a
+/// bare `heyo/postgres` means `:latest`). A namespaced repository is 1–4
+/// lowercase `/`-separated segments, each starting with a letter or digit.
 pub fn is_valid_tag(name: &str) -> bool {
-    if name.is_empty() || name.len() > 128 {
+    if !(name.contains('/') || name.contains(':')) {
+        return is_flat_tag(name);
+    }
+    let (repo, tag) = name.split_once(':').unwrap_or((name, "latest"));
+    is_valid_repo(repo) && is_flat_tag(tag)
+}
+
+fn is_flat_tag(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
         return false;
     }
     let first = name.as_bytes()[0];
@@ -481,6 +614,53 @@ pub fn is_valid_tag(name: &str) -> bool {
     }
     name.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+}
+
+/// A repository name, by the store's rules (`heyo/postgres`).
+pub fn is_valid_repo(repo: &str) -> bool {
+    if repo.is_empty() || repo.len() > 180 {
+        return false;
+    }
+    let segments: Vec<&str> = repo.split('/').collect();
+    segments.len() <= 4
+        && segments.iter().all(|seg| {
+            let b = seg.as_bytes();
+            !b.is_empty()
+                && b.len() <= 64
+                && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+                && b.iter().all(|&c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-')
+                })
+        })
+}
+
+/// The repository a namespaced tag belongs to; `None` for a flat tag.
+pub fn repo_of(tag: &str) -> Option<&str> {
+    if !(tag.contains('/') || tag.contains(':')) {
+        return None;
+    }
+    Some(tag.split_once(':').map(|(r, _)| r).unwrap_or(tag))
+}
+
+/// Split a pull reference into the store it names and the reference within it.
+///
+/// `hub.heyo.work/heyo/postgres:16` names a store by host, the way an image
+/// reference names a registry: the first segment is a host when there is more
+/// than one segment and it contains a `.` or a `:` or is `localhost`. Anything
+/// else (`heyo/postgres:16`, `debian`) is a reference into the configured store.
+pub fn split_store_ref(reference: &str) -> (Option<String>, String) {
+    if let Some((first, rest)) = reference.split_once('/')
+        && (first.contains('.') || first.contains(':') || first == "localhost")
+        && !rest.is_empty()
+    {
+        let scheme = if first.starts_with("localhost") || first.starts_with("127.") {
+            "http"
+        } else {
+            "https"
+        };
+        return (Some(format!("{scheme}://{first}")), rest.to_string());
+    }
+    (None, reference.to_string())
 }
 
 /// The tag a file gets when none is given: its name without `.ext4`, which is
@@ -636,8 +816,43 @@ mod tests {
         assert!(!is_valid_tag(""));
         assert!(!is_valid_tag("-leading-dash"));
         assert!(!is_valid_tag(".hidden"));
-        assert!(!is_valid_tag("a/b"));
+        assert!(!is_valid_tag("a//b"));
+        assert!(!is_valid_tag("A/b"));
+        assert!(!is_valid_tag("a/../b"));
+        assert!(!is_valid_tag("a/b:c/d"));
         assert!(!is_valid_tag("has space"));
+        // Namespaced, as the hub publishes them.
+        assert!(is_valid_tag("heyo/postgres:16"));
+        assert!(is_valid_tag("heyo/postgres"));
+        assert!(is_valid_tag("a/b"));
+        assert_eq!(repo_of("heyo/postgres:16"), Some("heyo/postgres"));
+        assert_eq!(repo_of("heyo/postgres"), Some("heyo/postgres"));
+        assert_eq!(repo_of("debian"), None);
+    }
+
+    #[test]
+    fn a_pull_reference_names_its_store_like_an_image_names_its_registry() {
+        assert_eq!(
+            split_store_ref("hub.heyo.work/heyo/postgres:16"),
+            (Some("https://hub.heyo.work".into()), "heyo/postgres:16".into())
+        );
+        assert_eq!(
+            split_store_ref("localhost:8080/heyo/pg:1"),
+            (Some("http://localhost:8080".into()), "heyo/pg:1".into())
+        );
+        // No host: a reference into the configured store.
+        assert_eq!(split_store_ref("heyo/postgres:16"), (None, "heyo/postgres:16".into()));
+        assert_eq!(split_store_ref("postgres:16"), (None, "postgres:16".into()));
+        assert_eq!(split_store_ref("debian"), (None, "debian".into()));
+    }
+
+    #[test]
+    fn only_plain_entry_names_are_written() {
+        assert!(is_safe_entry_name("rootfs.ext4"));
+        assert!(is_safe_entry_name("context.tar.gz"));
+        for bad in ["", "../x", "a/b", ".bashrc", ".."] {
+            assert!(!is_safe_entry_name(bad), "{bad}");
+        }
     }
 
     #[test]

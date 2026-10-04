@@ -1,0 +1,50 @@
+{
+  "id": "artifacts-hub",
+  "routes": [
+    { "host": "hub.heyo.work" }
+  ],
+  "vm": {
+    "driver": "firecracker",
+    "image": "artifacts",
+    "port": 8080,
+    "start_command": "setsid nohup /usr/local/bin/art serve </dev/null >/var/log/art.log 2>&1 &",
+    "size_class": "small",
+    "disk_size_gb": 40,
+    "env_vars": {
+      "ART_ROOT": "/workspace/store",
+      "ART_LISTEN": "0.0.0.0:8080",
+      "ART_MIN_FREE_BYTES": "536870912",
+      "ART_S3_BUCKET": "heyo-artifacts",
+      "ART_S3_PREFIX": "art/",
+      "ART_S3_REGION": "us-east-1",
+      "ART_CACHE_MAX_BYTES": "32212254720",
+      "ART_HUB": "1",
+      "ART_HUB_HOST": "hub.heyo.work",
+      "RUST_LOG": "art=info,artifacts=info"
+    },
+    "env_from": [
+      { "secret": "artifacts", "key": "api-key", "as": "ART_API_KEY" },
+      { "secret": "artifacts-s3", "key": "access-key-id", "as": "ART_S3_ACCESS_KEY_ID" },
+      { "secret": "artifacts-s3", "key": "secret-access-key", "as": "ART_S3_SECRET_ACCESS_KEY" }
+    ],
+    "ttl_seconds": 0
+  },
+  "build": {
+    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
+    "ref": "main",
+    "dockerfile": "artifacts/Dockerfile",
+    "context": ".",
+    "image_size_mb": 768,
+    "auth": { "secret": "github", "key": "token" }
+  },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "target_concurrency": 64,
+    "scale_to_zero_after_secs": 0,
+    "cold_start_timeout_secs": 120,
+    "drain_timeout_secs": 30
+  },
+  "health": { "path": "/healthz", "timeout_secs": 2 }
+}

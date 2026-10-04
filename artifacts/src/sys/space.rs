@@ -105,8 +105,7 @@ pub fn fstat(fd: RawFd) -> io::Result<FileStat> {
 /// `statx` on a path, without following a final symlink.
 pub fn stat_path(path: &Path) -> Result<FileStat> {
     let c = cpath(path).ctx(format!("stat {}", path.display()))?;
-    statx_at(libc::AT_FDCWD, &c, libc::AT_SYMLINK_NOFOLLOW)
-        .ctx(format!("stat {}", path.display()))
+    statx_at(libc::AT_FDCWD, &c, libc::AT_SYMLINK_NOFOLLOW).ctx(format!("stat {}", path.display()))
 }
 
 fn statx_at(dirfd: RawFd, path: &std::ffi::CStr, flags: libc::c_int) -> io::Result<FileStat> {

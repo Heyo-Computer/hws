@@ -237,8 +237,8 @@ pub fn supports_tmpfile(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys::sparse::pwrite_all;
     use crate::sys::space;
+    use crate::sys::sparse::pwrite_all;
 
     fn tmpdir() -> tempfile::TempDir {
         match std::env::var_os("ART_TEST_DIR").map(PathBuf::from) {
@@ -282,7 +282,10 @@ mod tests {
 
         // The structural guard: nothing can open a blob for writing, so a
         // caller cannot corrupt content whose name promises what it contains.
-        let e = std::fs::OpenOptions::new().write(true).open(&p).unwrap_err();
+        let e = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -295,7 +298,10 @@ mod tests {
         // A second writer of identical content must not replace the inode —
         // that is the difference between `link` and `rename`, and the reason
         // hardlinks already handed out stay valid.
-        assert_eq!(insert(d.path(), "blob", b"same"), LinkOutcome::AlreadyExists);
+        assert_eq!(
+            insert(d.path(), "blob", b"same"),
+            LinkOutcome::AlreadyExists
+        );
         let second_ino = space::stat_path(&d.path().join("blob")).unwrap().ino;
         assert_eq!(first_ino, second_ino);
         assert_eq!(std::fs::read(d.path().join("blob")).unwrap(), b"same");

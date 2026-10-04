@@ -158,7 +158,11 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(max.load(Ordering::SeqCst), 1, "lock allowed concurrent entry");
+        assert_eq!(
+            max.load(Ordering::SeqCst),
+            1,
+            "lock allowed concurrent entry"
+        );
     }
 
     #[test]

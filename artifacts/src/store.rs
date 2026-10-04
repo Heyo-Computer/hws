@@ -8,7 +8,8 @@
 //! blobs/<aa>/<64-hex>    mode 0444
 //! manifests/<aa>/<64-hex>  canonical JSON, addressed by its own sha256
 //! labels/<aa>/<64-hex>   a name and description for either of the above
-//! tags/<name>            one digest and a newline
+//! tags/<name>            one digest and a newline; a namespaced tag's '/' is '~'
+//! repos/<name>.json      what is said about a repository: public, description
 //! tmp/                   incoming files, named only on the no-O_TMPFILE path
 //! ```
 //!
@@ -35,10 +36,11 @@ use crate::error::{Error, IoContext, Result};
 use crate::labels::{Label, Labelled};
 use crate::lock::{LockMode, StoreLock};
 use crate::manifest::Manifest;
+use crate::repos::RepoMeta;
 use crate::sys::space::{self, FileStat};
 use crate::sys::sparse::{self, Shape};
 use crate::sys::tmpfile::{Incoming, LinkOutcome};
-use crate::tags::{Ref, TagName};
+use crate::tags::{Ref, RepoName, TagName};
 use sha2::{Digest as _, Sha256};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -106,6 +108,14 @@ pub struct Materialized {
     pub bytes_written: u64,
 }
 
+/// A repository as listed: its metadata and the tags in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repository {
+    pub name: RepoName,
+    pub meta: RepoMeta,
+    pub tags: Vec<(TagName, Digest)>,
+}
+
 /// Aggregate accounting for `art usage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Usage {
@@ -145,7 +155,7 @@ impl Store {
                 std::fs::create_dir_all(&d).ctx(format!("create {}", d.display()))?;
             }
         }
-        for sub in ["tags", "tmp"] {
+        for sub in ["tags", "repos", "tmp"] {
             let d = root.join(sub);
             std::fs::create_dir_all(&d).ctx(format!("create {}", d.display()))?;
         }
@@ -226,6 +236,38 @@ impl Store {
         .await
     }
 
+    /// Insert a blob from its [`crate::asp`] encoding — what the remote tier
+    /// stores — refusing it unless the rebuilt bytes hash to `expected`.
+    ///
+    /// The holes come back as holes, so a cache fill costs what the blob
+    /// occupies, not its logical length.
+    pub async fn insert_encoded<R>(&self, reader: R, expected: &Digest) -> Result<BlobInfo>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let inner = self.inner.clone();
+        let expected = expected.clone();
+        blocking(move || inner.insert_encoded(reader, &expected)).await
+    }
+
+    /// A blob as an [`crate::asp`] stream, and that stream's exact length.
+    pub async fn encode_blob(&self, d: &Digest) -> Result<crate::asp::Encoder> {
+        let inner = self.inner.clone();
+        let d = d.clone();
+        blocking(move || {
+            let p = inner.blob_path(&d);
+            let st = space::stat_path(&p).map_err(|e| match e {
+                Error::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+                    Error::NotFound(d.clone())
+                }
+                other => other,
+            })?;
+            let f = sparse::open_for_read(&p)?;
+            crate::asp::Encoder::new(f, st.size).ctx(format!("encode {}", p.display()))
+        })
+        .await
+    }
+
     pub async fn has(&self, d: &Digest) -> Result<bool> {
         Ok(self.stat(d).await.is_ok())
     }
@@ -286,6 +328,15 @@ impl Store {
     pub async fn put_manifest(&self, m: &Manifest) -> Result<Digest> {
         let inner = self.inner.clone();
         let bytes = m.to_canonical_json();
+        blocking(move || inner.put_manifest(bytes)).await
+    }
+
+    /// Store manifest bytes exactly as given — the remote's copy, which is
+    /// already canonical. The returned digest is what those bytes hash to;
+    /// the caller compares it with the one it asked for.
+    #[cfg(feature = "daemon")]
+    pub(crate) async fn put_manifest_bytes(&self, bytes: Vec<u8>) -> Result<Digest> {
+        let inner = self.inner.clone();
         blocking(move || inner.put_manifest(bytes)).await
     }
 
@@ -352,6 +403,50 @@ impl Store {
         let inner = self.inner.clone();
         let d = d.clone();
         blocking(move || inner.get_label(&d)).await
+    }
+
+    /// [`Self::set_label`] without the existence check, for the remote tier:
+    /// a label mirrored from the global store describes content this cache may
+    /// not hold yet.
+    #[cfg(feature = "daemon")]
+    pub(crate) async fn set_label_unchecked(&self, d: &Digest, label: &Label) -> Result<()> {
+        let inner = self.inner.clone();
+        let (d, label) = (d.clone(), label.clone());
+        blocking(move || inner.set_label(&d, &label)).await
+    }
+
+    /// [`Self::set_public`] without the existence check, for the same reason.
+    #[cfg(feature = "daemon")]
+    pub(crate) async fn set_public_unchecked(&self, d: &Digest) -> Result<()> {
+        let inner = self.inner.clone();
+        let d = d.clone();
+        blocking(move || inner.set_public(&d)).await
+    }
+
+    /// Drop a cached blob whose bytes live on elsewhere — the remote tier's
+    /// eviction. Under the exclusive store lock, and only while nothing but the
+    /// store links it: a materialization in use pins its blob here no matter
+    /// what the remote holds. Returns the bytes freed, or `None` if it was kept.
+    #[cfg(feature = "daemon")]
+    pub(crate) async fn evict_blob(&self, d: &Digest) -> Result<Option<u64>> {
+        let inner = self.inner.clone();
+        let d = d.clone();
+        blocking(move || {
+            let _guard = inner.lock().acquire(LockMode::Exclusive)?;
+            let st = match space::stat_path(&inner.blob_path(&d)) {
+                Ok(st) => st,
+                Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            if st.nlink > 1 {
+                return Ok(None);
+            }
+            sparse::unlink_if_present(&inner.blob_path(&d))?;
+            Ok(Some(st.allocated))
+        })
+        .await
     }
 
     /// Remove a digest's label. `false` if it had none.
@@ -466,6 +561,69 @@ impl Store {
         blocking(move || inner.list_tags()).await
     }
 
+    // -- repositories ------------------------------------------------------
+
+    /// Replace a repository's metadata wholesale.
+    ///
+    /// Needs no tag to exist yet: marking `heyo/postgres` public before its
+    /// first push is how a publisher says what the repository will be.
+    pub async fn set_repo(&self, r: &RepoName, meta: &RepoMeta) -> Result<()> {
+        meta.validate()?;
+        let inner = self.inner.clone();
+        let (r, meta) = (r.clone(), meta.clone());
+        blocking(move || inner.set_repo(&r, &meta)).await
+    }
+
+    /// A repository's metadata, or `None` if nothing has been said about it.
+    pub async fn get_repo(&self, r: &RepoName) -> Result<Option<RepoMeta>> {
+        let inner = self.inner.clone();
+        let r = r.clone();
+        blocking(move || inner.get_repo(&r)).await
+    }
+
+    pub async fn remove_repo(&self, r: &RepoName) -> Result<bool> {
+        let inner = self.inner.clone();
+        let r = r.clone();
+        blocking(move || sparse::unlink_if_present(&inner.repo_path(&r))).await
+    }
+
+    /// Every repository with metadata, name-ordered.
+    pub async fn list_repos(&self) -> Result<Vec<(RepoName, RepoMeta)>> {
+        let inner = self.inner.clone();
+        blocking(move || inner.list_repos()).await
+    }
+
+    /// Every repository that has a tag or metadata, with its tags. A
+    /// repository nobody described still exists the moment something is
+    /// tagged into it.
+    pub async fn repositories(&self) -> Result<Vec<Repository>> {
+        let mut by_name: std::collections::BTreeMap<RepoName, Repository> =
+            std::collections::BTreeMap::new();
+        for (name, meta) in self.list_repos().await? {
+            by_name.insert(
+                name.clone(),
+                Repository {
+                    name,
+                    meta,
+                    tags: Vec::new(),
+                },
+            );
+        }
+        for (tag, digest) in self.list_tags().await? {
+            let Some(repo) = tag.repo() else { continue };
+            by_name
+                .entry(repo.clone())
+                .or_insert_with(|| Repository {
+                    name: repo,
+                    meta: RepoMeta::default(),
+                    tags: Vec::new(),
+                })
+                .tags
+                .push((tag, digest));
+        }
+        Ok(by_name.into_values().collect())
+    }
+
     /// Map a tag or literal digest to a digest. Does not check existence.
     pub async fn resolve(&self, r: &Ref) -> Result<Digest> {
         match r {
@@ -546,7 +704,11 @@ impl Inner {
     }
 
     fn tag_path(&self, t: &TagName) -> PathBuf {
-        self.root.join("tags").join(t.as_str())
+        self.root.join("tags").join(t.file_name())
+    }
+
+    fn repo_path(&self, r: &RepoName) -> PathBuf {
+        self.root.join("repos").join(r.file_name())
     }
 
     fn label_path(&self, d: &Digest) -> PathBuf {
@@ -560,7 +722,7 @@ impl Inner {
     /// Create the public marker. An empty file whose existence is the whole
     /// message: there is no content to tear, so no tmp-and-rename dance — a
     /// crash leaves either a marker or none, both valid states.
-    fn set_public(&self, d: &Digest) -> Result<()> {
+    pub(crate) fn set_public(&self, d: &Digest) -> Result<()> {
         let dir = self.root.join("public").join(d.shard());
         let p = self.public_path(d);
         std::fs::OpenOptions::new()
@@ -676,6 +838,26 @@ impl Inner {
         sparse::ftruncate(fd, offset).ctx("set blob length")?;
 
         let digest = finish(hasher);
+        self.commit_blob(incoming, &digest, written)
+    }
+
+    fn insert_encoded<R: std::io::Read>(&self, mut r: R, expected: &Digest) -> Result<BlobInfo> {
+        let header = crate::asp::read_header(&mut r).ctx("read remote blob header")?;
+        // The header says exactly what the fill will allocate, so this guard is
+        // the precise one rather than the incremental kind.
+        space::guard(&self.root, header.data_len(), self.min_free_bytes)?;
+        let incoming = Incoming::create(&self.tmp_dir())?;
+        let mut hasher = Sha256::new();
+        let (_, written) =
+            crate::asp::decode_body(&header, r, incoming.as_raw_fd(), |b| hasher.update(b))
+                .ctx(format!("decode remote blob {expected}"))?;
+        let digest = finish(hasher);
+        if &digest != expected {
+            return Err(Error::DigestMismatch {
+                expected: expected.clone(),
+                actual: digest,
+            });
+        }
         self.commit_blob(incoming, &digest, written)
     }
 
@@ -839,30 +1021,60 @@ impl Inner {
 
     /// Tags are the one mutable object, so they use temp + rename. `link`'s
     /// refusal to replace is exactly wrong here.
-    fn set_tag(&self, t: &TagName, d: &Digest) -> Result<()> {
-        let dir = self.root.join("tags");
-        let final_path = self.tag_path(t);
-        let tmp = dir.join(format!(".{}.{}.tmp", t.as_str(), std::process::id()));
-
+    pub(crate) fn set_tag(&self, t: &TagName, d: &Digest) -> Result<()> {
         let body = format!("{d}\n");
-        let write = (|| -> Result<()> {
-            let f = std::fs::File::create(&tmp).ctx(format!("create {}", tmp.display()))?;
-            sparse::pwrite_all(f.as_raw_fd(), body.as_bytes(), 0).ctx("write tag")?;
-            f.sync_all().ctx("fsync tag")?;
-            Ok(())
-        })();
-        if let Err(e) = write {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        if let Err(e) = std::fs::rename(&tmp, &final_path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e).ctx(format!("rename tag into {}", final_path.display()));
-        }
-        space::fsync_dir(&dir)
+        write_replacing(&self.tag_path(t), body.as_bytes(), "tag")
     }
 
-    fn set_label(&self, d: &Digest, label: &Label) -> Result<()> {
+    pub(crate) fn set_repo(&self, r: &RepoName, meta: &RepoMeta) -> Result<()> {
+        write_replacing(&self.repo_path(r), &meta.to_json(), "repository")
+    }
+
+    fn get_repo(&self, r: &RepoName) -> Result<Option<RepoMeta>> {
+        let p = self.repo_path(r);
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).ctx(format!("read {}", p.display())),
+        };
+        // Unreadable metadata is a private, undescribed repository — the safe
+        // reading of a file that no longer says "public".
+        match serde_json::from_slice::<RepoMeta>(&bytes) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) => {
+                tracing::warn!(repo = %r, error = %e, "skipping unreadable repository metadata");
+                Ok(Some(RepoMeta::default()))
+            }
+        }
+    }
+
+    fn list_repos(&self) -> Result<Vec<(RepoName, RepoMeta)>> {
+        let dir = self.root.join("repos");
+        let mut out = Vec::new();
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e).ctx(format!("read {}", dir.display())),
+        };
+        for entry in rd {
+            let entry = entry.ctx("read repository entry")?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(repo) = RepoName::from_file_name(name) else {
+                continue;
+            };
+            if let Some(meta) = self.get_repo(&repo)? {
+                out.push((repo, meta));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    pub(crate) fn set_label(&self, d: &Digest, label: &Label) -> Result<()> {
         let dir = self.root.join("labels").join(d.shard());
         let final_path = self.label_path(d);
         // Same directory as the destination, so the rename is within one
@@ -941,7 +1153,7 @@ impl Inner {
             if name.starts_with('.') {
                 continue;
             }
-            let Ok(tag) = TagName::parse(name) else {
+            let Ok(tag) = TagName::from_file_name(name) else {
                 continue;
             };
             match self.get_tag(&tag) {
@@ -1081,6 +1293,16 @@ impl Inner {
         self.public_path(d)
     }
 
+    #[cfg(feature = "daemon")]
+    pub(crate) fn tag_path_of(&self, t: &TagName) -> PathBuf {
+        self.tag_path(t)
+    }
+
+    #[cfg(feature = "daemon")]
+    pub(crate) fn repo_path_of(&self, r: &RepoName) -> PathBuf {
+        self.repo_path(r)
+    }
+
     /// Whether a digest still names a blob. A plain existence check — the
     /// garbage collector asks it about a label's subject, where the size and
     /// link count a `stat` would also return are of no interest.
@@ -1091,6 +1313,36 @@ impl Inner {
     pub(crate) fn manifest_exists(&self, d: &Digest) -> bool {
         self.manifest_path(d).exists()
     }
+}
+
+/// Replace `path` with `body`: temp file in the same directory, `sync_all`,
+/// rename, fsync the directory. The temp name is short and unique within the
+/// process, so a long namespaced tag cannot push it past `NAME_MAX`, and it
+/// starts with a dot so no listing mistakes it for the real thing.
+pub(crate) fn write_replacing(path: &Path, body: &[u8], what: &str) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().expect("store paths always have a parent");
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write = (|| -> Result<()> {
+        let f = std::fs::File::create(&tmp).ctx(format!("create {}", tmp.display()))?;
+        sparse::pwrite_all(f.as_raw_fd(), body, 0).ctx(format!("write {what}"))?;
+        f.sync_all().ctx(format!("fsync {what}"))?;
+        Ok(())
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).ctx(format!("rename {what} into {}", path.display()));
+    }
+    space::fsync_dir(dir)
 }
 
 fn finish(h: Sha256) -> Digest {

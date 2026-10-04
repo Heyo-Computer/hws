@@ -34,6 +34,27 @@ pub enum Error {
     #[error("invalid label: {0}")]
     Label(#[from] crate::labels::LabelError),
 
+    #[error("invalid repository metadata: {0}")]
+    Repo(#[from] crate::repos::RepoError),
+
+    #[error("repository '{0}' not found")]
+    RepoNotFound(String),
+
+    /// The remote tier (S3) failed or could not be reached. Distinct from
+    /// [`Error::Io`]: the local disk is fine, and the answer is to retry or to
+    /// look at the bucket, not at this host.
+    #[error("remote store: {0}")]
+    Remote(String),
+
+    /// A conditional write lost: someone else changed the object first.
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
+
+    /// A manifest or tag names content the global store does not hold. Upload
+    /// the blobs first; the remote must never hold a pointer to nothing.
+    #[error("{0} is not in the store; upload it first")]
+    Missing(Digest),
+
     #[error(
         "refusing to write {needed} bytes: only {available} free, and {reserve} is reserved \
          (ART_MIN_FREE_BYTES)"
@@ -53,7 +74,9 @@ pub enum Error {
     #[error("source file shrank while being read: {0}")]
     SourceShrank(PathBuf),
 
-    #[error("refusing to punch holes in {path}: it has {nlink} links, so the change would be visible to every one of them")]
+    #[error(
+        "refusing to punch holes in {path}: it has {nlink} links, so the change would be visible to every one of them"
+    )]
     SharedInode { path: PathBuf, nlink: u64 },
 
     #[error("manifest schema version {0} is newer than this build understands")]
@@ -98,6 +121,11 @@ impl Error {
             Error::Digest(_) => "invalid_digest",
             Error::TagName(_) => "invalid_tag",
             Error::Label(_) => "invalid_label",
+            Error::Repo(_) => "invalid_repo",
+            Error::RepoNotFound(_) => "repo_not_found",
+            Error::Remote(_) => "remote_error",
+            Error::PreconditionFailed(_) => "precondition_failed",
+            Error::Missing(_) => "missing_content",
             Error::NoSpace { .. } => "no_space",
             Error::LinkLimit { .. } => "link_limit",
             Error::DigestMismatch { .. } => "digest_mismatch",
@@ -168,8 +196,7 @@ mod tests {
 
     #[test]
     fn io_context_preserves_errno() {
-        let r: std::result::Result<(), io::Error> =
-            Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        let r: std::result::Result<(), io::Error> = Err(io::Error::from_raw_os_error(libc::ENOSPC));
         let e = r.ctx("writing blob").unwrap_err();
         match e {
             Error::Io { source, context } => {

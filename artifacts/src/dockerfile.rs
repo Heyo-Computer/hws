@@ -258,7 +258,10 @@ pub fn dockerfile_entry(m: &Manifest) -> Result<&Entry> {
                 "this manifest has no {DOCKERFILE_ENTRY} entry (it holds: {})",
                 entry_names(m)
             ),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, "not a dockerfile manifest"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not a dockerfile manifest",
+            ),
         })
 }
 
@@ -306,7 +309,11 @@ pub async fn export(store: &Store, r: &Ref, dir: &Path) -> Result<Exported> {
 
     let df = dockerfile_entry(&m)?;
     let dockerfile = store
-        .materialize(&df.digest, &dir.join(DOCKERFILE_ENTRY), Materialize::ReadOnly)
+        .materialize(
+            &df.digest,
+            &dir.join(DOCKERFILE_ENTRY),
+            Materialize::ReadOnly,
+        )
         .await?;
 
     let context = match context_entry(&m) {
@@ -398,7 +405,10 @@ mod tests {
         assert_eq!(s.get_tag(&tag).await.unwrap(), stored.manifest);
         let m = s.get_manifest(&stored.manifest).await.unwrap();
         assert!(is_dockerfile(&m));
-        assert_eq!(dockerfile_entry(&m).unwrap().digest, stored.dockerfile.digest);
+        assert_eq!(
+            dockerfile_entry(&m).unwrap().digest,
+            stored.dockerfile.digest
+        );
         assert!(context_entry(&m).is_none());
         assert_eq!(image_name(&m), Some("web"));
         assert_eq!(size_mb(&m), Some(4096));
@@ -548,7 +558,9 @@ mod tests {
         let p = d.path().join("Dockerfile");
         std::fs::write(&p, vec![b'#'; (MAX_DOCKERFILE_BYTES + 1) as usize]).unwrap();
 
-        let e = put(&s, &p, None, None, &Options::default()).await.unwrap_err();
+        let e = put(&s, &p, None, None, &Options::default())
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("--context"), "{e}");
         assert!(s.list_blobs().await.unwrap().is_empty());
     }
