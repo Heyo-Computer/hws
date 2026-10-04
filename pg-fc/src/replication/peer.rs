@@ -128,6 +128,10 @@ impl PeerClient {
             .await
     }
 
+    pub async fn maintenance_status(&self, id: &str) -> Result<crate::database_maintenance::Operation> {
+        self.get(&format!("/api/database-maintenance/{}", enc(id))).await
+    }
+
     /// Tear down the peer's half. Best-effort by nature — the caller is
     /// detaching whether or not the peer answers.
     pub async fn teardown(&self, database: &str) -> Result<()> {

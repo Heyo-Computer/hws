@@ -34,6 +34,7 @@ mod alerts;
 mod api;
 mod archives;
 mod auth;
+mod database_maintenance;
 mod dedicated;
 mod error;
 mod fleet;

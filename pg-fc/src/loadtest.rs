@@ -949,7 +949,7 @@ async fn postgres_fence_controller_restart_recovers_without_tenant_bringup() {
     orchestrate::local_status(&registry, &rec).await.unwrap();
     assert!(registry.pin_reason(&database).unwrap().contains("fenced"));
 
-    let operation = registry.replication_operation(&database).await;
+    let operation = registry.replication_operation(&database).await.unwrap();
     let other = registry.clone();
     let name = database.clone();
     let mut unfence = tokio::spawn(async move { orchestrate::unfence(&other, &name).await });

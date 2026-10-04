@@ -9,6 +9,7 @@ mod auth;
 mod cancel;
 mod config;
 mod dashboard;
+mod database_maintenance;
 mod dedicated;
 mod dumpsrv;
 mod events;
@@ -255,10 +256,12 @@ async fn handle_conn(
     // credential may open only its own database (so it can never provision a
     // second VM), a shared-password client may not open a dedicated one, and a
     // replication login may open only the database it replicates.
-    let schema = match registry.authorize_route(&info.user, &info.database, info.physical_replication) {
+    let schema =
+        match registry.authorize_route(&info.user, &info.database, info.physical_replication) {
         Ok(schema) => schema,
         Err(reason) => {
-            auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason).await?;
+                auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, &reason)
+                    .await?;
             anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
         }
     };
@@ -266,6 +269,16 @@ async fn handle_conn(
     // pooler's session defaults. Built before writer routing so a session
     // forwarded to a peer carries the same defaults as a local one.
     let startup_raw = client_startup(&registry, &info);
+    if info.physical_replication
+        && let Some(operation) = registry.database_maintenance().rename_for(&schema)
+    {
+        // Authentication resolved an exact physical source. Keep WAL flowing
+        // across a name change without running tenant database bootstrap.
+        let guard = registry
+            .checkout_database_maintenance_exact(&operation.id)
+            .await?;
+        return proxy::splice(client, guard.entry(), &startup_raw).await;
+    }
     if writer_routing::is_routable_tenant(&registry, &info, &schema) {
         match writer_routing::route(&registry, &schema)? {
             writer_routing::Route::Local => {}

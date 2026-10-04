@@ -94,7 +94,7 @@ pub async fn enable_primary(
     database: &str,
     peer_name: &str,
 ) -> Result<ReplRecord> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     if reg.physical().reserves_database(database) || reg.physical_sources().get(database).is_some() {
         bail!("logical replication changes are blocked while physical ownership exists");
     }
@@ -364,7 +364,7 @@ pub fn accept_replica(
 /// write is a no-op when it matches, the schema copy runs in one transaction
 /// against an empty database, and the subscription is skipped when it exists.
 async fn build_replica(reg: &Arc<SchemaRegistry>, req: &wire::ProvisionReplica) -> Result<()> {
-    let _operation = reg.replication_operation(&req.database).await;
+    let _operation = reg.replication_operation(&req.database).await?;
     let rcfg = cfg(reg)?;
     let database = &req.database;
 
@@ -501,7 +501,7 @@ async fn build_replica(reg: &Arc<SchemaRegistry>, req: &wire::ProvisionReplica) 
 /// flushed WAL barrier. This does not alter the subscription or either
 /// replication role and therefore is not promotion/failover.
 pub async fn fence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::FenceResponse> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     fence_locked(reg, database).await
 }
 
@@ -563,7 +563,7 @@ pub async fn fence_selective(
     reg: &Arc<SchemaRegistry>,
     database: &str,
 ) -> Result<wire::FenceResponse> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     let rec = reg.replication().get(database).with_context(|| format!("{database} is not replicating"))?;
     if rec.role != Role::Primary { bail!("{database} is not a replication primary"); }
     let tenant = reg.dedicated().by_database(database)
@@ -779,7 +779,7 @@ pub(super) async fn fence_postgres(
 }
 
 pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     if reg.physical_sources().get(database).is_some_and(|r| r.handoff_candidate.is_some()
         && reg.bound_vm_id(database).as_deref() == Some(&r.source_vm_id)) {
         bail!("physical handoff is authorized and will resume; source cannot be unfenced");
@@ -823,7 +823,7 @@ pub async fn unfence(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
 /// Cut a replica loose: stop applying, drop the subscription, and re-seed the
 /// sequences logical replication never carried.
 pub async fn promote(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::PromoteResponse> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     if reg.physical().reserves_database(database) || reg.physical_sources().get(database).is_some() {
         bail!("physical migration owns this database; logical promotion is disabled");
     }
@@ -884,7 +884,7 @@ pub async fn promote(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::
 /// `max_slot_wal_keep_size` invalidates it. On a replica it is the same work
 /// as a promote minus the sequence re-seed.
 pub async fn detach(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::DetachResponse> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     if reg.physical().reserves_database(database) || reg.physical_sources().get(database).is_some() {
         bail!("physical migration owns this database; logical detach is disabled");
     }
@@ -966,7 +966,7 @@ pub async fn detach(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::D
 /// Logical replication publishes new tables automatically but the subscriber
 /// only notices on a refresh — and the table still has to exist here.
 pub async fn refresh(reg: &Arc<SchemaRegistry>, database: &str) -> Result<()> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     let rec = reg
         .replication()
         .get(database)

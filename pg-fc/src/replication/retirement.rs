@@ -13,7 +13,7 @@ pub async fn retire_previous(
     database: &str,
     req: wire::RetirePreviousRequest,
 ) -> Result<wire::PhysicalRecordJson> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     let source = reg
         .physical_sources()
         .get(database)
@@ -103,7 +103,7 @@ pub async fn accept_retirement(
     req: wire::RetirePreviousPeerRequest,
 ) -> Result<wire::PhysicalRecordJson> {
     let s = &req.standby;
-    let _operation = reg.replication_operation(&s.database).await;
+    let _operation = reg.replication_operation(&s.database).await?;
     let rec = reg
         .physical()
         .get(&s.database)

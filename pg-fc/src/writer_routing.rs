@@ -20,6 +20,7 @@ pub(crate) fn is_routable_tenant(reg: &SchemaRegistry, info: &StartupInfo, db: &
 }
 
 pub(crate) fn route(reg: &SchemaRegistry, db: &str) -> Result<Route> {
+    reg.database_maintenance().check(db)?;
     let bound = reg.bound_vm_id(db);
     if let Some(source) = reg.physical_sources().get(db) {
         if bound.as_deref() == Some(source.source_vm_id.as_str()) {
@@ -153,6 +154,7 @@ async fn validate_sender(reg: &SchemaRegistry, claim: &wire::WriterClaim) -> Res
 }
 
 pub(crate) fn validate_destination(reg: &SchemaRegistry, claim: &wire::WriterClaim, checked_out: &str) -> Result<()> {
+    reg.database_maintenance().check(&claim.database)?;
     if reg.bound_vm_id(&claim.database).as_deref() != Some(checked_out) || !reg.physical_admission_ready(&claim.database)
         || reg.replication().is_fenced(&claim.database) {
         bail!("writer binding changed or admission closed");

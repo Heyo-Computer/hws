@@ -29,7 +29,7 @@ pub async fn reseed_source(reg: &Arc<SchemaRegistry>, database: &str, req: wire:
 }
 
 async fn prepare_source_inner(reg: &Arc<SchemaRegistry>, database: &str, generation: &str, reseed_from: Option<&str>) -> Result<wire::PhysicalRecordJson> {
-    let _guard = reg.replication_operation(database).await;
+    let _guard = reg.replication_operation(database).await?;
     let incoming = reg.physical().get(database).filter(|r| r.phase == PhysicalPhase::Activated);
     let source_vm_id = reg.bound_vm_id(database).context("source database has no durable VM binding")?;
     if !reg.physical_admission_ready(database) { bail!("physical source is fenced or not the current writer"); }
@@ -115,7 +115,7 @@ async fn prepare_source_inner(reg: &Arc<SchemaRegistry>, database: &str, generat
 }
 
 pub async fn accept_candidate(reg: &Arc<SchemaRegistry>, req: wire::PhysicalReplicaRequest) -> Result<PhysicalRecord> {
-    let _operation = reg.replication_operation(&req.database).await;
+    let _operation = reg.replication_operation(&req.database).await?;
     let rcfg = reg.replication_cfg().context("replication disabled")?;
     let _: std::net::Ipv4Addr = req.primary.hostaddr.parse().context("physical source must advertise IPv4")?;
     if req.primary.port == 0 || !matches!(req.primary.sslmode.as_str(), "require" | "disable")
@@ -165,7 +165,7 @@ pub async fn accept_candidate(reg: &Arc<SchemaRegistry>, req: wire::PhysicalRepl
 }
 
 pub async fn source_grant(reg: &Arc<SchemaRegistry>, database: &str) -> Result<wire::PhysicalHandoffGrantJson> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     let source = reg.physical_sources().get(database).context("no physical source operation")?;
     let grant = source.handoff.context("physical handoff has not been authorized")?;
     if reg.bound_vm_id(database).as_deref() != Some(&source.source_vm_id) { bail!("physical grant no longer describes the bound source"); }
@@ -183,7 +183,7 @@ pub async fn source_grant(reg: &Arc<SchemaRegistry>, database: &str) -> Result<w
 /// Explicitly authorize binding a verified remote candidate as a read-only
 /// standby.  This path never fences the source and never creates a handoff.
 pub async fn bind_standby_source(reg: &Arc<SchemaRegistry>, database: &str, generation: &str) -> Result<wire::PhysicalRecordJson> {
-    let _operation = reg.replication_operation(database).await;
+    let _operation = reg.replication_operation(database).await?;
     let source = reg.physical_sources().get(database).context("no physical source preparation")?;
     if source.generation != generation || source.fence.is_some() || source.handoff.is_some()
         || source.handoff_candidate.is_some() || reg.bound_vm_id(database).as_deref() != Some(&source.source_vm_id) {
@@ -212,7 +212,7 @@ pub async fn bind_standby_source(reg: &Arc<SchemaRegistry>, database: &str, gene
 }
 
 pub async fn accept_standby_bind(reg: &Arc<SchemaRegistry>, req: wire::PhysicalStandbyBindRequest) -> Result<wire::PhysicalRecordJson> {
-    let _operation = reg.replication_operation(&req.database).await;
+    let _operation = reg.replication_operation(&req.database).await?;
     let mut rec = reg.physical().get(&req.database).context("no physical candidate preparation")?;
     let candidate = rec.candidate_id.clone().context("physical candidate has no durable VM identity")?;
     let previous = rec.previous_vm_id.clone().context("physical candidate lost old binding")?;
@@ -269,7 +269,7 @@ psql -X -w -At -v ON_ERROR_STOP=1 -h 127.0.0.1 -U "$PGFC_ROLE" -d "$PGFC_DB" -c 
 "#;
 
 pub async fn handoff_source(reg: &Arc<SchemaRegistry>, req: wire::PhysicalHandoffRequest) -> Result<wire::PhysicalRecordJson> {
-    let operation = reg.replication_operation(&req.database).await;
+    let operation = reg.replication_operation(&req.database).await?;
     let source = reg.physical_sources().get(&req.database).context("no physical source preparation")?;
     if source.generation != req.generation || source.source_vm_id != req.source_vm_id
         || reg.bound_vm_id(&req.database).as_deref() != Some(&source.source_vm_id)
@@ -405,7 +405,7 @@ async fn fence_source(reg: &Arc<SchemaRegistry>, source: &PhysicalSourceRecord) 
 }
 
 pub async fn accept_handoff(reg: &Arc<SchemaRegistry>, req: wire::PhysicalHandoffRequest) -> Result<wire::PhysicalRecordJson> {
-    let _operation = reg.replication_operation(&req.database).await;
+    let _operation = reg.replication_operation(&req.database).await?;
     let mut rec = reg.physical().get(&req.database).context("no physical candidate preparation")?;
     let candidate = rec.candidate_id.clone().context("physical candidate has no durable VM identity")?;
     let previous = rec.previous_vm_id.clone().context("physical candidate lost previous VM ownership")?;
@@ -504,7 +504,7 @@ SQL
 "#;
 
 async fn seed(reg: Arc<SchemaRegistry>, req: wire::PhysicalReplicaRequest) -> Result<()> {
-    let _guard = reg.replication_operation(&req.database).await;
+    let _guard = reg.replication_operation(&req.database).await?;
     let mut rec = reg.physical().get(&req.database).context("physical intent disappeared")?;
     if rec.generation != req.generation || rec.source_vm_id != req.source_vm_id
         || rec.predecessor != req.predecessor || rec.handoff_started()

@@ -298,6 +298,47 @@ impl Credentials {
         info!("revoked the dedicated credential for database {database}");
         Ok(true)
     }
+
+    /// Durably move one credential to a new database key without changing
+    /// its login identity or creation metadata.
+    pub fn rename_database(&self, old: &str, new: &str) -> Result<()> {
+        let new = validate_identifier(new, "database")?;
+        if RESERVED_DATABASES.contains(&new.as_str()) {
+            bail!("database name {new:?} is reserved by Postgres");
+        }
+        let mut map = self.by_database.lock().unwrap();
+        if map.contains_key(&new) {
+            if !map.contains_key(old) {
+                return Ok(());
+            }
+            bail!("cannot rename database {old:?}: {new:?} is already provisioned");
+        }
+        let mut next = map.clone();
+        let mut record = next
+            .remove(old)
+            .with_context(|| format!("no dedicated credential for database {old:?}"))?;
+        record.database = new.clone();
+        next.insert(new, record);
+        write_atomic(&self.path, &serialize(&next)).with_context(|| {
+            format!(
+                "persisting dedicated credentials to {}",
+                self.path.display()
+            )
+        })?;
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?.sync_all().with_context(|| {
+            format!(
+                "syncing dedicated credential directory {}",
+                parent.display()
+            )
+        })?;
+        *map = next;
+        Ok(())
+    }
 }
 
 /// A fresh random password, drawn from `/dev/urandom`.
@@ -491,6 +532,30 @@ mod tests {
         assert!(!s.remove("acme").unwrap());
         assert!(!s.is_dedicated("acme"));
         assert!(Credentials::load(s.path.clone()).list().is_empty());
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn rename_is_durable_preserves_credentials_and_rejects_collision() {
+        let s = store();
+        let original = s.create("old_db", "app_role", "hunter2hunter2").unwrap();
+        s.rename_database("old_db", "new_db").unwrap();
+        s.rename_database("old_db", "new_db").unwrap();
+        let loaded = Credentials::load(s.path.clone());
+        let renamed = loaded.by_database("new_db").unwrap();
+        assert_eq!(renamed.role, original.role);
+        assert_eq!(renamed.password, original.password);
+        assert_eq!(renamed.created_at, original.created_at);
+        loaded
+            .create("occupied", "other_role", "hunter2hunter2")
+            .unwrap();
+        assert!(loaded.rename_database("new_db", "occupied").is_err());
+        assert!(loaded.by_database("new_db").is_some());
+        assert!(
+            Credentials::load(s.path.clone())
+                .by_database("new_db")
+                .is_some()
+        );
         let _ = std::fs::remove_file(&s.path);
     }
 

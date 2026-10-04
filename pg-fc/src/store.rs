@@ -382,6 +382,66 @@ impl Store {
         Ok(())
     }
 
+    /// Durably rekey a complete serving binding. A retry after the durable
+    /// rename observes `new` and succeeds; two extant keys are a collision.
+    pub fn rename_database(&self, old: &str, new: &str) -> Result<()> {
+        let mut map = self.map.lock().unwrap();
+        if map.contains_key(new) {
+            anyhow::ensure!(
+                !map.contains_key(old),
+                "cannot rename database {old:?}: {new:?} already has a binding"
+            );
+            return Ok(());
+        }
+        let mut next = map.clone();
+        let record = next
+            .remove(old)
+            .context("rename database has no serving binding")?;
+        next.insert(new.to_string(), record);
+        self.commit_maintenance_snapshot(&mut map, next, "fsync database rename directory")
+    }
+
+    /// Remove exactly the expected live serving binding. Missing is an
+    /// idempotent success; a changed or offloaded binding is never retired.
+    pub fn retire_database(&self, database: &str, expected_vm: &str) -> Result<()> {
+        let mut map = self.map.lock().unwrap();
+        let Some(current) = map.get(database) else {
+            return Ok(());
+        };
+        anyhow::ensure!(current.tier == Tier::Live, "retirement binding is not live");
+        anyhow::ensure!(
+            current.sandbox_id == expected_vm,
+            "retirement serving binding changed"
+        );
+        let mut next = map.clone();
+        next.remove(database);
+        self.commit_maintenance_snapshot(&mut map, next, "fsync database retirement directory")
+    }
+
+    fn commit_maintenance_snapshot(
+        &self,
+        map: &mut HashMap<String, Rec>,
+        next: HashMap<String, Rec>,
+        sync_context: &str,
+    ) -> Result<()> {
+        let (seq, contents) = self.stamp(serialize(&next));
+        let mut newest = self.written.lock().unwrap();
+        write_atomic(&self.path, &contents)?;
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?
+            .sync_all()
+            .context(sync_context.to_string())?;
+        *newest = seq;
+        *map = next;
+        drop(newest);
+        *self.bound_cache.lock().unwrap() = None;
+        Ok(())
+    }
+
     /// Bind `schema` to the archived tier so the next checkout restores it from
     /// S3, **creating the row when none exists**.
     ///
@@ -793,6 +853,26 @@ mod tests {
         assert_eq!(loaded.record("other").unwrap().sandbox_id, "sb-unrelated");
         assert!(store.bound_ids().contains("sb-candidate"));
         assert!(!store.bound_ids().contains("sb-old"));
+    }
+
+    #[test]
+    fn rename_and_retire_are_durable_exact_and_preserve_metadata() {
+        let store = tmp_store("maintenance");
+        store.put("old", "sb-1");
+        store.set_disk_gb("old", 17);
+        store.put("occupied", "sb-2");
+        assert!(store.rename_database("old", "occupied").is_err());
+        assert_eq!(store.record("old").unwrap().sandbox_id, "sb-1");
+        store.rename_database("old", "new").unwrap();
+        store.rename_database("old", "new").unwrap();
+        let loaded = Store::load(store.path.clone());
+        assert_eq!(loaded.record("new").unwrap().disk_gb, 17);
+        assert_eq!(loaded.record("new").unwrap().sandbox_id, "sb-1");
+        assert!(store.retire_database("new", "wrong").is_err());
+        assert!(store.record("new").is_some());
+        store.retire_database("new", "sb-1").unwrap();
+        store.retire_database("new", "sb-1").unwrap();
+        assert!(Store::load(store.path.clone()).record("new").is_none());
     }
 
     #[test]

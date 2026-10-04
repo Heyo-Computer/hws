@@ -627,6 +627,9 @@ pub struct SchemaRegistry {
     replication: Arc<crate::replication::ReplStore>,
     physical: Arc<crate::replication::PhysicalStore>,
     physical_sources: Arc<crate::replication::PhysicalSourceStore>,
+    // Loaded before any recovery workers are started.  An incomplete record is
+    // therefore an admission fence from the first observable instant of boot.
+    database_maintenance: Arc<crate::database_maintenance::Store>,
     replication_ops: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     binding_ops: StdMutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
     // The knobs `PUT /api/config` may change while the pooler runs. The loops
@@ -660,8 +663,16 @@ impl SchemaRegistry {
         let replication = Arc::new(crate::replication::ReplStore::load(
             cfg.replication_file.clone(),
         ));
-        let physical = Arc::new(crate::replication::PhysicalStore::load(cfg.replication_file.with_extension("physical.json"))?);
-        let physical_sources = Arc::new(crate::replication::PhysicalSourceStore::load(cfg.replication_file.with_extension("physical-sources.json"))?);
+        let physical = Arc::new(crate::replication::PhysicalStore::load(
+            cfg.replication_file.with_extension("physical.json"),
+        )?);
+        let physical_sources = Arc::new(crate::replication::PhysicalSourceStore::load(
+            cfg.replication_file.with_extension("physical-sources.json"),
+        )?);
+        let database_maintenance = Arc::new(crate::database_maintenance::Store::load(
+            cfg.replication_file
+                .with_extension("database-maintenance.json"),
+        )?);
         Ok(Self {
             cfg,
             entries: Mutex::new(HashMap::new()),
@@ -682,6 +693,7 @@ impl SchemaRegistry {
             replication,
             physical,
             physical_sources,
+            database_maintenance,
             replication_ops: StdMutex::new(HashMap::new()),
             binding_ops: StdMutex::new(HashMap::new()),
             repl_status: StdMutex::new(HashMap::new()),
@@ -715,9 +727,18 @@ impl SchemaRegistry {
         &self.replication
     }
 
-    pub fn physical(&self) -> &Arc<crate::replication::PhysicalStore> { &self.physical }
-    pub fn physical_sources(&self) -> &Arc<crate::replication::PhysicalSourceStore> { &self.physical_sources }
-    pub fn bound_vm_id(&self, database: &str) -> Option<String> { self.store.record(database).map(|r| r.sandbox_id) }
+    pub fn physical(&self) -> &Arc<crate::replication::PhysicalStore> {
+        &self.physical
+    }
+    pub fn physical_sources(&self) -> &Arc<crate::replication::PhysicalSourceStore> {
+        &self.physical_sources
+    }
+    pub fn database_maintenance(&self) -> &crate::database_maintenance::Store {
+        &self.database_maintenance
+    }
+    pub fn bound_vm_id(&self, database: &str) -> Option<String> {
+        self.store.record(database).map(|r| r.sandbox_id)
+    }
 
     pub fn physical_admission_ready(&self, database: &str) -> bool {
         let bound = self.bound_vm_id(database);
@@ -781,10 +802,179 @@ impl SchemaRegistry {
         Ok(())
     }
 
-    pub async fn replication_operation(&self, database: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = self.replication_ops.lock().unwrap().entry(database.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+    pub(crate) async fn raw_replication_operation(
+        &self,
+        database: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .replication_ops
+            .lock()
+            .unwrap()
+            .entry(database.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
         lock.lock_owned().await
+    }
+
+    pub async fn replication_operation(
+        &self,
+        database: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let guard = self.raw_replication_operation(database).await;
+        // Check after acquisition: begin_database_maintenance takes this same
+        // lock before publishing its journal record, so crossing operations
+        // have a total order and a waiter cannot proceed on a stale precheck.
+        self.database_maintenance.check(database)?;
+        Ok(guard)
+    }
+
+    /// Durably close ordinary admission for a retirement/rename.  Both names'
+    /// operation and binding locks are acquired in lexical order so all earlier
+    /// cold publications drain before the gate becomes visible.
+    pub async fn begin_database_maintenance(
+        &self,
+        operation: crate::database_maintenance::Operation,
+    ) -> Result<()> {
+        let mut names = vec![operation.database.clone()];
+        if let Some(destination) = &operation.destination {
+            names.push(destination.clone());
+        }
+        names.sort();
+        names.dedup();
+        let mut operation_guards = Vec::new();
+        let mut binding_guards = Vec::new();
+        for name in &names {
+            operation_guards.push(self.raw_replication_operation(name).await);
+        }
+        for name in &names {
+            binding_guards.push(self.binding_lock(name).write_owned().await);
+        }
+
+        if let Some(existing) = self.database_maintenance.get(&operation.id) {
+            // Store::begin performs the complete identity comparison and makes
+            // retries of the exact operation harmless.
+            self.database_maintenance.begin(operation.clone())?;
+            if existing.database != operation.database {
+                bail!("maintenance retry changed database");
+            }
+        } else {
+            if self.bound_vm_id(&operation.database).as_deref() != Some(operation.bound_vm.as_str())
+            {
+                bail!("maintenance source is not bound to the exact requested VM");
+            }
+            if self.dedicated.by_database(&operation.database).is_none()
+                || self
+                    .schema_record(&operation.database)
+                    .is_none_or(|r| r.tier != Tier::Live)
+                || self
+                    .physical_sources
+                    .get(&operation.database)
+                    .is_some_and(|r| {
+                        r.fence.is_some() || r.handoff.is_some() || r.handoff_candidate.is_some()
+                    })
+                || self.physical.get(&operation.database).is_some_and(|r| {
+                    !matches!(
+                        r.phase,
+                        crate::replication::PhysicalPhase::Verified
+                            | crate::replication::PhysicalPhase::Standby
+                    )
+                })
+            {
+                bail!(
+                    "maintenance requires a dedicated live database with no active handoff or preparation"
+                );
+            }
+            if let Some(destination) = &operation.destination {
+                if self.bound_vm_id(destination).is_some()
+                    || self.dedicated.by_database(destination).is_some()
+                    || self.replication.get(destination).is_some()
+                    || self.physical.reserves_database(destination)
+                    || self.physical_sources.get(destination).is_some()
+                {
+                    bail!("maintenance destination is already in use");
+                }
+            }
+            self.database_maintenance.begin(operation.clone())?;
+        }
+        // Persistence precedes invalidation: once a warm connection can no
+        // longer be found, every replacement path already observes the fence.
+        let mut entries = self.entries.lock().await;
+        for name in names {
+            entries.remove(&name);
+        }
+        Ok(())
+    }
+
+    /// Reconnect the exact maintenance-owned VM through database `postgres`.
+    /// This cannot create or require the retired tenant database after rename.
+    pub async fn checkout_database_maintenance_exact(
+        &self,
+        operation_id: &str,
+    ) -> Result<ConnGuard> {
+        let operation = self
+            .database_maintenance
+            .get(operation_id)
+            .context("unknown maintenance operation")?;
+        let bound = self.bound_vm_id(&operation.database).or_else(|| {
+            operation
+                .destination
+                .as_deref()
+                .and_then(|db| self.bound_vm_id(db))
+        });
+        if bound.as_deref() != Some(operation.bound_vm.as_str()) {
+            bail!("maintenance source binding changed");
+        }
+        let cell = self
+            .entries
+            .lock()
+            .await
+            .entry(operation.database.clone())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone();
+        let entry = cell
+            .get_or_try_init(|| vm::ensure_fenced_vm(&self.cfg, "postgres", &operation.bound_vm))
+            .await?;
+        if entry.sandbox_id() != operation.bound_vm {
+            bail!("maintenance VM identity changed");
+        }
+        ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout)
+            .await
+            .context("maintenance connection slots exhausted")
+    }
+
+    pub async fn commit_database_maintenance(
+        &self,
+        operation: &crate::database_maintenance::Operation,
+    ) -> Result<()> {
+        // The operation executor owns raw_replication_operation. Ordinary
+        // admission remains fenced across every individual durable write.
+        let mut names = vec![operation.database.clone()];
+        if let Some(new) = &operation.destination {
+            names.push(new.clone());
+        }
+        names.sort();
+        let mut locks = Vec::new();
+        for name in &names {
+            locks.push(self.binding_lock(name).write_owned().await);
+        }
+        if let Some(new) = &operation.destination {
+            self.store.rename_database(&operation.database, new)?;
+            self.dedicated.rename_database(&operation.database, new)?;
+            self.replication.rename_database(&operation.database, new)?;
+            self.physical.rename_database(&operation.database, new)?;
+            self.physical_sources
+                .rename_database(&operation.database, new)?;
+        } else {
+            self.store
+                .retire_database(&operation.database, &operation.bound_vm)?;
+            self.dedicated.remove(&operation.database)?;
+        }
+        let mut entries = self.entries.lock().await;
+        for name in names {
+            entries.remove(&name);
+        }
+        self.repl_status.lock().unwrap().remove(&operation.database);
+        Ok(())
     }
 
     /// Whether replication is enabled on this node (`PG_VM_POOL_REPLICATION`).
@@ -806,8 +996,11 @@ impl SchemaRegistry {
     /// only by a full re-seed, which is why this outranks every storage tier
     /// including emergency disk-pressure eviction.
     pub fn pinned(&self, schema: &str) -> bool {
-        self.cfg.is_keepalive(schema) || self.replication.is_pinned(schema)
-            || self.physical.reserves_database(schema) || self.physical_sources.get(schema).is_some()
+        self.cfg.is_keepalive(schema)
+            || self.replication.is_pinned(schema)
+            || self.physical.reserves_database(schema)
+            || self.physical_sources.get(schema).is_some()
+            || self.database_maintenance.check(schema).is_err()
     }
 
     /// [`Self::pin_reason`] for whichever schema currently binds VM `id`, so a
@@ -830,6 +1023,9 @@ impl SchemaRegistry {
     /// Why `schema` is pinned, for a dashboard refusal that tells the operator
     /// what to do about it. `None` when it isn't.
     pub fn pin_reason(&self, schema: &str) -> Option<String> {
+        if self.database_maintenance.check(schema).is_err() {
+            return Some(format!("{schema} is reserved by database maintenance"));
+        }
         if self.physical.reserves_database(schema) || self.physical_sources.get(schema).is_some() {
             return Some(format!("{schema} is reserved by physical replication; ordinary lifecycle changes are disabled"));
         }
@@ -927,6 +1123,7 @@ impl SchemaRegistry {
         role: &str,
         password: &str,
     ) -> Result<Credential> {
+        self.database_maintenance.check(database)?;
         if self.store.record(database).is_some() && !self.dedicated.is_dedicated(database) {
             bail!(
                 "{database:?} is already an existing pooler schema with its own VM and data; \
@@ -1309,11 +1506,30 @@ impl SchemaRegistry {
     /// precisely the database it is trying to reach.
     pub fn authorize_route(&self, role: &str, database: &str, physical: bool) -> Result<String, String> {
         if physical && let Some(source) = self.physical_sources.by_repl_role(role) {
+            let rename = self.database_maintenance.rename_for(&source.database);
+            if rename.is_none() {
+                self.database_maintenance
+                    .check(&source.database)
+                    .map_err(|e| e.to_string())?;
+            }
             if self.bound_vm_id(&source.database).as_deref() != Some(source.source_vm_id.as_str()) {
+                if !rename.as_ref().is_some_and(|op| {
+                    op.bound_vm == source.source_vm_id
+                        && op
+                            .destination
+                            .as_deref()
+                            .and_then(|db| self.bound_vm_id(db))
+                            .as_deref()
+                            == Some(source.source_vm_id.as_str())
+                }) {
                 return Err("physical source no longer owns the serving binding".into());
+            }
             }
             return Ok(source.database);
         }
+        self.database_maintenance
+            .check(database)
+            .map_err(|e| e.to_string())?;
         authorize_route_in(&self.replication, &self.dedicated, role, database, physical)
     }
 
@@ -1491,13 +1707,18 @@ impl SchemaRegistry {
         let entry = self.warm_entry(&id).await.context("database is not warm; session state is unknown")?;
         let query = async {
             let client = entry.pool.get().await?;
-            let rows = client.query(
+            let rows = client
+                .query(
                 "SELECT pid, datname, usename, application_name, client_addr::text, \
                  state, backend_type, backend_start::text \
                  FROM pg_stat_activity WHERE pid <> pg_backend_pid() ORDER BY pid",
                 &[],
-            ).await?;
-            let sessions: Vec<_> = rows.iter().map(|r| serde_json::json!({
+                )
+                .await?;
+            let sessions: Vec<_> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
                 "pid": r.get::<_, i32>(0),
                 "database": r.get::<_, Option<String>>(1),
                 "username": r.get::<_, Option<String>>(2),
@@ -1506,7 +1727,9 @@ impl SchemaRegistry {
                 "state": r.get::<_, Option<String>>(5),
                 "backend_type": r.get::<_, Option<String>>(6),
                 "backend_start": r.get::<_, Option<String>>(7),
-            })).collect();
+                    })
+                })
+                .collect();
             Ok::<_, anyhow::Error>(serde_json::json!({
                 "database": schema, "sandbox_id": id, "sessions": sessions,
             }))
@@ -1587,7 +1810,15 @@ impl SchemaRegistry {
         // before a replacement CAS, never after it. Independent of the
         // replication-operation mutex, whose callers also use checkout.
         let _binding = self.binding_lock(schema).read_owned().await;
-        if self.physical.get(schema).is_some_and(|r| r.phase == crate::replication::PhysicalPhase::StandbyBinding) {
+        // Recheck under the binding lock.  begin_database_maintenance cannot
+        // return until every checkout which passed an earlier check has left
+        // this publication-critical section.
+        self.database_maintenance.check(schema)?;
+        if self
+            .physical
+            .get(schema)
+            .is_some_and(|r| r.phase == crate::replication::PhysicalPhase::StandbyBinding)
+        {
             bail!("standby binding is in progress; retry after completion");
         }
         // An outgoing grant/fence takes precedence over the older activation
@@ -2119,14 +2350,11 @@ impl SchemaRegistry {
                     if superseded { ", superseded duplicate" } else { "" }
                 );
                 match heyo_sdk::Sandbox::connect(id.clone(), vm::local_opts()) {
-                    Ok(sb) => {
-                        match tokio::time::timeout(UNTRACKED_STOP_TIMEOUT, sb.stop()).await {
+                    Ok(sb) => match tokio::time::timeout(UNTRACKED_STOP_TIMEOUT, sb.stop()).await {
                             Ok(Ok(())) => {
                                 crate::events::journal_info(
                                     "untracked",
-                                    format!(
-                                        "schema {schema}: stopped untracked running VM {id}"
-                                    ),
+                                format!("schema {schema}: stopped untracked running VM {id}"),
                                 );
                                 return true;
                             }
@@ -2134,8 +2362,7 @@ impl SchemaRegistry {
                                 warn!("untracked-reaper: stopping {id} failed: {e:#}")
                             }
                             Err(_) => warn!("untracked-reaper: stopping {id} timed out"),
-                        }
-                    }
+                    },
                     Err(e) => warn!("untracked-reaper: connecting to {id} failed: {e:#}"),
                 }
                 false
@@ -4185,10 +4412,7 @@ impl SchemaRegistry {
                 // is durably in S3 and the space is needed now — if the
                 // daemon confirms the id is gone, remove the leftover dir
                 // ourselves instead of waiting for a sweep pass.
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    self.daemon_state(sandbox_id),
-                )
+                match tokio::time::timeout(Duration::from_secs(5), self.daemon_state(sandbox_id))
                 .await
                 .unwrap_or(DaemonState::Error)
                 {
@@ -4745,8 +4969,7 @@ impl SchemaRegistry {
         // Image the stopped disk. compact_disk's fd-scan wait refuses a disk
         // anything still holds open, so a VM started out-of-band fails this
         // rather than being imaged mid-write.
-        let bytes =
-            crate::imgarchive::compact_disk(&self.cfg, &compact, schema, &rec.sandbox_id)
+        let bytes = crate::imgarchive::compact_disk(&self.cfg, &compact, schema, &rec.sandbox_id)
                 .await
                 .with_context(|| format!("compacting schema {schema}'s data disk"))?;
 
@@ -5068,15 +5291,13 @@ impl SchemaRegistry {
                     }
                     continue;
                 }
-                DaemonState::Gone => {
-                    match by_id.get(&id) {
+                DaemonState::Gone => match by_id.get(&id) {
                         Some((schema, Tier::Live)) => dataloss.push((schema.clone(), id.clone())),
                         Some((schema, _)) => {
                             deletable.push((path, id, format!("offloaded schema {schema}")))
                         }
                         None => deletable.push((path, id, "unreferenced by any schema".into())),
-                    }
-                }
+                },
             }
         }
 
@@ -7102,10 +7323,13 @@ mod tests {
         cfg.replication_file = dir.join("replication.tsv");
         let registry = SchemaRegistry::new(cfg).unwrap();
         for (database, role) in [("publisher", Role::Primary), ("subscriber", Role::Replica)] {
-            registry.replication.create(
+            registry
+                .replication
+                .create(
                 ReplRecord::new(database, role, "peer", "replpassword12"),
                 &|_| false,
-            ).unwrap();
+                )
+                .unwrap();
             for (state, expected) in [
                 (State::Pending, None),
                 (State::Syncing, Some(role)),

@@ -5,7 +5,7 @@ use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
 
-use super::{api, archives, auth, dedicated, fleet, handlers, replication, state::DashState};
+use super::{api, archives, auth, database_maintenance, dedicated, fleet, handlers, replication, state::DashState};
 
 pub fn build(state: DashState) -> Router {
     Router::new()
@@ -37,6 +37,8 @@ pub fn build(state: DashState) -> Router {
         .route("/api/logs/schema/{schema}", get(api::schema_log))
         .route("/api/logs/{which}", get(api::host_log))
         .route("/api/maintenance/{op}", post(api::maintenance))
+        .route("/api/database-maintenance", get(database_maintenance::list).post(database_maintenance::begin))
+        .route("/api/database-maintenance/{id}", get(database_maintenance::get).post(database_maintenance::advance))
         .route("/api/config", get(api::config).put(api::put_config))
         // Cross-host logical replication: peers, pairings, and the
         // node-to-node endpoints a peer drives. All under the same Basic-auth

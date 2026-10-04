@@ -173,6 +173,27 @@ impl PhysicalSourceStore {
         self.journal.lock().unwrap().current.get(database).cloned()
     }
 
+    /// Rekey every current and historical source record together, retaining
+    /// permanent VM, generation, slot, and credential ownership.
+    pub fn rename_database(&self, old: &str, new: &str) -> Result<()> {
+        let mut journal = self.journal.lock().unwrap();
+        let has_old = journal.current.values().chain(journal.history.iter()).any(|r| r.database == old);
+        let has_new = journal.current.values().chain(journal.history.iter()).any(|r| r.database == new);
+        if has_new {
+            if !has_old { return Ok(()); }
+            bail!("cannot rename physical source database {old:?}: {new:?} already exists");
+        }
+        if !has_old { return Ok(()); }
+        let mut next = journal.clone();
+        for record in next.current.values_mut().chain(next.history.iter_mut()) {
+            if record.database == old { record.database = new.to_string(); }
+        }
+        next = source_journal(next.current.values().cloned().collect(), next.history)?;
+        persist_journal(&self.path, &next)?;
+        *journal = next;
+        Ok(())
+    }
+
     pub fn pending_handoffs(&self) -> Vec<PhysicalSourceRecord> {
         self.journal.lock().unwrap().current.values()
             .filter(|r| r.handoff_candidate.is_some() && !r.handoff_complete).cloned().collect()
@@ -410,6 +431,27 @@ impl PhysicalStore {
 
     pub fn get(&self, database: &str) -> Option<PhysicalRecord> {
         self.journal.lock().unwrap().current.get(database).cloned()
+    }
+
+    /// Rekey every current and historical candidate record as one validated
+    /// journal transition. Derived generation and slot identities do not move.
+    pub fn rename_database(&self, old: &str, new: &str) -> Result<()> {
+        let mut journal = self.journal.lock().unwrap();
+        let has_old = journal.current.values().chain(journal.history.iter()).any(|r| r.database == old);
+        let has_new = journal.current.values().chain(journal.history.iter()).any(|r| r.database == new);
+        if has_new {
+            if !has_old { return Ok(()); }
+            bail!("cannot rename physical candidate database {old:?}: {new:?} already exists");
+        }
+        if !has_old { return Ok(()); }
+        let mut next = journal.clone();
+        for record in next.current.values_mut().chain(next.history.iter_mut()) {
+            if record.database == old { record.database = new.to_string(); }
+        }
+        next = candidate_journal(next.current.values().cloned().collect(), next.history)?;
+        persist_journal(&self.path, &next)?;
+        *journal = next;
+        Ok(())
     }
 
     pub fn set_repl(&self, database: &str, generation: &str, login: super::wire::Login) -> Result<()> {
@@ -1092,6 +1134,40 @@ mod tests {
         assert_eq!(PhysicalStore::load(p.clone()).unwrap().list(), store.list());
         let _ = std::fs::remove_file(p);
     }
+
+    #[test]
+    fn physical_renames_are_durable_preserve_identity_and_reject_collisions() {
+        let candidate_path = path("rename-candidate");
+        let candidates = PhysicalStore::load(candidate_path.clone()).unwrap();
+        let original = candidates.create(record("old_db", "g1")).unwrap();
+        candidates.rename_database("old_db", "new_db").unwrap();
+        candidates.rename_database("old_db", "new_db").unwrap();
+        let renamed = PhysicalStore::load(candidate_path.clone()).unwrap().get("new_db").unwrap();
+        assert_eq!(renamed.generation, original.generation);
+        assert_eq!(renamed.slot, original.slot);
+        assert_eq!(renamed.previous_vm_id, original.previous_vm_id);
+        candidates.create(record("occupied", "g2")).unwrap();
+        assert!(candidates.rename_database("new_db", "occupied").is_err());
+        assert!(candidates.get("new_db").is_some());
+
+        let source_path = path("rename-source");
+        let sources = PhysicalSourceStore::load(source_path.clone()).unwrap();
+        let original = sources.create(source("old_db", "sg1")).unwrap();
+        sources.rename_database("old_db", "new_db").unwrap();
+        sources.rename_database("old_db", "new_db").unwrap();
+        let renamed = PhysicalSourceStore::load(source_path.clone()).unwrap().get("new_db").unwrap();
+        assert_eq!(renamed.generation, original.generation);
+        assert_eq!(renamed.slot, original.slot);
+        assert_eq!(renamed.source_vm_id, original.source_vm_id);
+        let mut occupied = source("occupied", "sg2");
+        occupied.source_vm_id = "source-vm-2".into();
+        sources.create(occupied).unwrap();
+        assert!(sources.rename_database("new_db", "occupied").is_err());
+        assert!(sources.get("new_db").is_some());
+        let _ = std::fs::remove_file(candidate_path);
+        let _ = std::fs::remove_file(source_path);
+    }
+
     #[test]
     fn malformed_load_fails() {
         let p = path("malformed"); std::fs::write(&p, b"not json").unwrap();

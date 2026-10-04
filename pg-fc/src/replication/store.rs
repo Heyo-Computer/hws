@@ -243,6 +243,28 @@ impl ReplStore {
         self.by_database.lock().unwrap().get(database).cloned()
     }
 
+    /// Rekey an optional logical-replication audit record while preserving all
+    /// derived object names and credentials exactly as originally recorded.
+    pub fn rename_database(&self, old: &str, new: &str) -> Result<()> {
+        let mut map = self.by_database.lock().unwrap();
+        if map.contains_key(new) {
+            if !map.contains_key(old) {
+                return Ok(());
+            }
+            bail!("cannot rename replication database {old:?}: {new:?} already exists");
+        }
+        let Some(mut record) = map.get(old).cloned() else {
+            return Ok(());
+        };
+        record.database = new.to_string();
+        let mut next = map.clone();
+        next.remove(old);
+        next.insert(new.to_string(), record);
+        write_atomic(&self.path, &serialize(&next))?;
+        *map = next;
+        Ok(())
+    }
+
     /// The record whose replication login is `role`. Logins are unique across
     /// records (enforced by [`Self::create`]) for the same reason dedicated
     /// roles are: the auth path's lookup must have exactly one answer.
@@ -688,6 +710,22 @@ mod tests {
         assert!(s.remove("acme").unwrap());
         assert!(!s.remove("acme").unwrap());
         assert!(ReplStore::load(s.path.clone()).list().is_empty());
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn rename_preserves_replication_identity_and_is_durable() {
+        let s = store();
+        let original = s.create(rec("old_db", Role::Primary), &free).unwrap();
+        s.rename_database("old_db", "new_db").unwrap();
+        s.rename_database("old_db", "new_db").unwrap();
+        let renamed = ReplStore::load(s.path.clone()).get("new_db").unwrap();
+        assert_eq!(renamed.slot, original.slot);
+        assert_eq!(renamed.repl_role, original.repl_role);
+        assert_eq!(renamed.repl_password, original.repl_password);
+        s.create(rec("occupied", Role::Replica), &free).unwrap();
+        assert!(s.rename_database("new_db", "occupied").is_err());
+        assert!(s.get("new_db").is_some());
         let _ = std::fs::remove_file(&s.path);
     }
 
