@@ -3798,9 +3798,13 @@ and the auth service is only asked about a bearer the store does not know.
 
 With federation and the admin gate enabled, unauthenticated browser navigation
 opens `/login`. Sign in using an existing Heyo email/password; Auth must return
-`fleet:admin`. Heyo's platform administrator role is the authority across all
-regional gateways, not an email allowlist or separate dashboard user database.
-Configure each regional Auth origin against the same authoritative user store.
+`fleet:admin` or at least one `namespace:<name>:<tier>` scope. Heyo's auth
+service is the authority across all regional gateways, not an email allowlist
+or a separate dashboard user database. A fleet administrator lands on the
+fleet dashboard; a caller whose grant reaches only namespaces is redirected to
+`/namespace-rollup`, which lists those namespaces with their tier and how much
+is deployed in each, each linking to that namespace's dashboard. Configure
+each regional Auth origin against the same authoritative user store.
 
 Browser sessions use a host-only `Secure`, `HttpOnly`, `SameSite=Strict` cookie.
 Tokens are not stored in JavaScript/local storage, and passwords are sent only to
@@ -3875,8 +3879,11 @@ user in several.
 
 ### Opening the dashboard for one namespace
 
-`/login`'s password form admits platform administrators only. A namespace
-owner reaches the dashboard from Heyo instead: the front end asks the auth
+`/login`'s password form signs in any Heyo account whose grant currently
+reaches something: fleet administrators land on the fleet dashboard, and
+namespace-only callers are redirected to the namespace rollup. Neither can
+*aim* a session at one namespace, though — for that, a namespace owner reaches
+the dashboard from Heyo instead: the front end asks the auth
 service for a token confined to that namespace at the user's own tier
 (`POST /api/auth/namespace-token`, one hour, no refresh), and posts it from a
 form in a new tab to **`POST /login/handoff`** (`token`, `namespace`,

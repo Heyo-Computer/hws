@@ -174,33 +174,67 @@ impl FederatedAuth {
     }
 
     /// Exchange browser credentials only with the configured Heyo authority.
-    /// The returned token still needs a current fleet grant; email and JWT role
-    /// claims are not a second administrator list.
+    /// The returned token still needs a current grant — `fleet:admin`, or at
+    /// least one namespace; email and JWT role claims are not a second
+    /// administrator list.
     pub async fn login(&self, email: &str, password: &str) -> Option<(String, u64)> {
         let url = reqwest::Url::parse(&self.base_url).ok()?;
         // Match the existing Heyo browser-login transport policy: loopback
         // Auth on this host is supported, but never plaintext remote login.
-        if !(url.scheme() == "https" || url.scheme() == "http"
-            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
-            || !url.username().is_empty() || url.password().is_some()
-            || url.query().is_some() || url.fragment().is_some() { return None; }
-        let mut response = self.http.post(format!("{}/api/auth/login", self.base_url))
-            .json(&serde_json::json!({"email":email,"password":password})).send().await.ok()?;
-        if !response.status().is_success() { return None; }
+        if !(url.scheme() == "https"
+            || url.scheme() == "http"
+                && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        let mut response = self
+            .http
+            .post(format!("{}/api/auth/login", self.base_url))
+            .json(&serde_json::json!({"email":email,"password":password}))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.ok()? {
-            if bytes.len() + chunk.len() > 65536 { return None; }
+            if bytes.len() + chunk.len() > 65536 {
+                return None;
+            }
             bytes.extend_from_slice(&chunk);
         }
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        if value.get("success")?.as_bool()? != true { return None; }
-        let token = value.pointer("/data/tokens/accessToken")?.as_str()?;
-        if token.is_empty() || token.len() > 3800
-            || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+        if value.get("success")?.as_bool()? != true {
             return None;
         }
-        if !self.resolve(token).await?.fleet { return None; }
-        let lifetime = value.pointer("/data/tokens/expiresIn").and_then(|v| v.as_u64()).unwrap_or(3600).min(86400);
+        let token = value.pointer("/data/tokens/accessToken")?.as_str()?;
+        if token.is_empty()
+            || token.len() > 3800
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return None;
+        }
+        // The grant decides, not the login response's own claims: a fleet
+        // admin gets the fleet console, and a caller with namespaces gets the
+        // namespace rollup. A bearer that reaches nothing at all is still
+        // refused — signing somebody in only to tell them they can see
+        // nothing is worse than no sign-in.
+        let grant = self.resolve(token).await?;
+        if !grant.fleet && grant.namespaces.is_empty() {
+            return None;
+        }
+        let lifetime = value
+            .pointer("/data/tokens/expiresIn")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600)
+            .min(86400);
         Some((token.to_owned(), lifetime))
     }
 
@@ -318,7 +352,9 @@ impl FederatedAuth {
                             continue;
                         }
                     };
-                    let slot = namespaces.entry((*ns).to_string()).or_insert(AdminScope::None);
+                    let slot = namespaces
+                        .entry((*ns).to_string())
+                        .or_insert(AdminScope::None);
                     if granted.satisfies(*slot) {
                         *slot = granted;
                     }
@@ -345,10 +381,10 @@ mod tests {
         let (ns, fleet) = FederatedAuth::parse_scopes(&s(&[
             "namespace:team-a:admin",
             "namespace:team-b:view",
-            "namespace:team-b:admin", // stronger duplicate wins
-            "namespace:team-c:owner", // unknown tier
+            "namespace:team-b:admin",   // stronger duplicate wins
+            "namespace:team-c:owner",   // unknown tier
             "namespace:bad name:admin", // invalid namespace
-            "billing:read",           // not ours
+            "billing:read",             // not ours
         ]));
         assert!(!fleet);
         assert_eq!(ns.get("team-a"), Some(&AdminScope::Admin));
@@ -367,7 +403,10 @@ mod tests {
         body: Arc<serde_json::Value>,
     }
 
-    async fn scopes(State(m): State<Mock>, headers: HeaderMap) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    async fn scopes(
+        State(m): State<Mock>,
+        headers: HeaderMap,
+    ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
         m.calls.fetch_add(1, Ordering::SeqCst);
         let ok = headers
             .get("authorization")
@@ -385,8 +424,13 @@ mod tests {
 
     async fn serve(body: serde_json::Value) -> (String, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mock = Mock { calls: calls.clone(), body: Arc::new(body) };
-        let app = Router::new().route("/api/auth/scopes", get(scopes)).with_state(mock);
+        let mock = Mock {
+            calls: calls.clone(),
+            body: Arc::new(body),
+        };
+        let app = Router::new()
+            .route("/api/auth/scopes", get(scopes))
+            .with_state(mock);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -406,7 +450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_login_requires_current_fleet_scope_not_email_or_claimed_role() {
+    async fn browser_login_takes_fleet_or_namespace_scopes_not_email_or_claimed_role() {
         use axum::routing::post;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -414,23 +458,47 @@ mod tests {
             .route("/api/auth/login", post(|Json(body): Json<serde_json::Value>| async move {
                 assert_eq!(body["password"], "p&ss word");
                 let token = match body["email"].as_str().unwrap() {
-                    "first@example.com" => "first", "second@example.net" => "second", _ => "ordinary",
+                    "first@example.com" => "first", "second@example.net" => "second",
+                    "admin@heyo.computer" => "ordinary", _ => "nobody",
                 };
                 Json(serde_json::json!({"success":true,"data":{"tokens":{"accessToken":token,"expiresIn":123}}}))
             }))
             .route("/api/auth/scopes", get(|headers: HeaderMap| async move {
-                let admin = matches!(headers.get("authorization").and_then(|h| h.to_str().ok()), Some("Bearer first" | "Bearer second"));
-                // An administrator-looking email and platformRole alone must
-                // not overcome a credential restricted to one namespace.
+                let bearer = headers.get("authorization").and_then(|h| h.to_str().ok());
+                let scopes = match bearer {
+                    // Two fleet admins, by scope.
+                    Some("Bearer first" | "Bearer second") => vec!["fleet:admin"],
+                    // An administrator-looking email and platformRole with one
+                    // namespace: a confined grant, not a fleet one — the claim
+                    // never mattered, but the namespace is a real sign-in now.
+                    Some("Bearer ordinary") => vec!["namespace:team-a:admin"],
+                    // And a bearer that reaches nothing at all is nobody's
+                    // sign-in, whatever the login response said.
+                    _ => vec![] as Vec<&str>,
+                };
                 Json(serde_json::json!({"success":true,"data":{
                     "subject":{"userId":"u1","email":"admin@heyo.computer","platformRole":"admin"},
-                    "scopes":if admin {vec!["fleet:admin"]} else {vec!["namespace:team-a:admin"]},"expiresIn":123}}))
+                    "scopes":scopes,"expiresIn":123}}))
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let auth = FederatedAuth::new(url, 60, 5);
-        assert_eq!(auth.login("first@example.com", "p&ss word").await, Some(("first".into(),123)));
-        assert_eq!(auth.login("second@example.net", "p&ss word").await, Some(("second".into(),123)));
-        assert!(auth.login("admin@heyo.computer", "p&ss word").await.is_none());
+        assert_eq!(
+            auth.login("first@example.com", "p&ss word").await,
+            Some(("first".into(), 123))
+        );
+        assert_eq!(
+            auth.login("second@example.net", "p&ss word").await,
+            Some(("second".into(), 123))
+        );
+        // The namespace-only caller signs in: the dashboard's client-side nudge
+        // takes them to the rollup. Their `platformRole` claim did not make
+        // them fleet — it simply is not a privilege here.
+        assert_eq!(
+            auth.login("admin@heyo.computer", "p&ss word").await,
+            Some(("ordinary".into(), 123))
+        );
+        // A grant that reaches neither the fleet nor any namespace is a refusal.
+        assert_eq!(auth.login("nobody@example.org", "p&ss word").await, None);
         server.abort();
     }
 
@@ -442,19 +510,41 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let captured = calls.clone();
         let app = Router::new()
-            .route("/api/auth/login", post(|| async { axum::response::Redirect::temporary("/capture") }))
-            .route("/capture", post(move || { captured.fetch_add(1, Ordering::SeqCst); async { "unexpected" } }));
+            .route(
+                "/api/auth/login",
+                post(|| async { axum::response::Redirect::temporary("/capture") }),
+            )
+            .route(
+                "/capture",
+                post(move || {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    async { "unexpected" }
+                }),
+            );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        assert!(FederatedAuth::new(url,60,5).login("a@b", "test").await.is_none());
-        assert_eq!(calls.load(Ordering::SeqCst),0);
-        assert!(FederatedAuth::new("http://auth.example.com".into(),60,1).login("a@b", "test").await.is_none());
+        assert!(
+            FederatedAuth::new(url, 60, 5)
+                .login("a@b", "test")
+                .await
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            FederatedAuth::new("http://auth.example.com".into(), 60, 1)
+                .login("a@b", "test")
+                .await
+                .is_none()
+        );
         server.abort();
     }
 
     #[tokio::test]
     async fn the_namespace_owner_is_taken_from_the_grant_and_falls_back_to_the_subject() {
         let (url, _) = serve(good_body()).await;
-        let g = FederatedAuth::new(url, 60, 5).resolve("good").await.expect("resolved");
+        let g = FederatedAuth::new(url, 60, 5)
+            .resolve("good")
+            .await
+            .expect("resolved");
         assert_eq!(g.account_for("team-a"), Some("acc-team-a"));
         // A namespace the auth service named no owner for bills the caller.
         assert_eq!(g.account_for("team-b"), Some("acc"));
@@ -464,7 +554,10 @@ mod tests {
         let mut old = good_body();
         old["data"].as_object_mut().unwrap().remove("namespaces");
         let (url, _) = serve(old).await;
-        let g = FederatedAuth::new(url, 60, 5).resolve("good").await.expect("resolved");
+        let g = FederatedAuth::new(url, 60, 5)
+            .resolve("good")
+            .await
+            .expect("resolved");
         assert!(g.accounts.is_empty());
         assert_eq!(g.account_for("team-a"), Some("acc"));
     }
@@ -500,6 +593,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let dead = FederatedAuth::new("http://127.0.0.1:1".into(), 60, 1);
-        assert!(dead.resolve("good").await.is_none(), "an outage fails closed");
+        assert!(
+            dead.resolve("good").await.is_none(),
+            "an outage fails closed"
+        );
     }
 }

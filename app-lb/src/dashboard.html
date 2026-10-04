@@ -2626,6 +2626,28 @@ async function applyNamespaceTier() {
   banner.hidden = false;
 }
 
+// A caller that is behind a namespace wall but has no pinned view is on the
+// wrong page: every fleet-wide section below will refuse it, and the page that
+// answers about exactly its namespaces is the rollup. Say so briefly, then
+// take it there. `replace` rather than `assign`, and a sessionStorage flag so
+// the nudge happens once per tab: going Back must land here and *stay*, or the
+// two pages would bounce the tab between them forever.
+(function nudgeConfinedCallersToTheRollup() {
+  if (pinnedNamespace || localView) return; // a narrowed view has nowhere better to go
+  const flag = "app-lb-rollup-nudge";
+  let seen = false;
+  try { seen = !!sessionStorage.getItem(flag); } catch (_) { /* storage refused: nudge anyway */ }
+  if (seen) return;
+  api("GET", "whoami").then(who => {
+    if (!who.ok || !who.data || who.data.fleet || !who.data.confined) return;
+    try { sessionStorage.setItem(flag, "1"); } catch (_) { /* best effort, the replace still ends the loop */ }
+    const banner = $("ns-banner");
+    banner.textContent = "This account reaches namespaces rather than the whole fleet — taking you to your namespaces…";
+    banner.hidden = false;
+    setTimeout(() => location.replace("/namespace-rollup"), 1500);
+  });
+})();
+
 applyNamespaceTier();
 poll();
 // Second, independent loop. Started after `poll` so `depsById` is usually already

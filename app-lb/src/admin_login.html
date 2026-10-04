@@ -15,7 +15,7 @@ p { line-height:1.5; color:var(--text-muted); }
 </style></head>
 <body><main>
 <h1>Heyo control plane</h1>
-<p>Sign in with your Heyo administrator account. The same account works in every configured region.</p>
+<p>Sign in with your Heyo account. Fleet administrators get the whole control plane; namespace owners land on their own namespaces. The same account works in every configured region.</p>
 <p id="home-hint" hidden>Managing a namespace? Open its dashboard from <a id="home-link" href="{{HOME_URL}}">Heyo</a> instead.</p>
 <form id="login">
   <label>Email<input name="email" type="email" autocomplete="username" maxlength="320" required></label>
@@ -36,7 +36,7 @@ document.querySelector('#login').addEventListener('submit', async e => {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({email:form.elements.email.value, password:form.elements.password.value})
     });
-    if (!r.ok) throw new Error('Sign-in refused or unavailable. This form is for Heyo platform administrators; namespace owners open the dashboard from Heyo.');
+    if (!r.ok) throw new Error('Sign-in refused or unavailable. Your Heyo account must reach the fleet or at least one namespace.');
     location.assign('/dashboard');
   } catch (e) { error.textContent = e.message; }
   finally { form.elements.password.value = ''; button.disabled = false; }

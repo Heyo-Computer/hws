@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{APP_NAME}} namespaces</title>
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
+<style>
+  /* ------------------------------------------------------------------------
+     The namespace rollup, layered on ui/heyo.css — the same sheet the
+     dashboard, directory, siem, disks and network pages serve, so the six
+     read as one product.
+
+     **These names are aliases, not a second palette.** These pages were
+     written against `--surface`/`--plane`/`--text-2`; each now resolves to a
+     shared token rather than being renamed at several hundred call sites.
+     `var()` resolves at use time, so switching the theme still switches
+     everything — and there is one place to look when a colour is wrong.
+
+     `--series-1..3`, `--grid` and `--axis` are *not* aliased: they are shared
+     tokens under the same names, chosen for colour-vision separation and
+     validated against both grounds. Do not retint them to match the accent.
+     ------------------------------------------------------------------------ */
+  :root {
+    --plane: var(--bg-dark);
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+    --success-text: var(--success);
+  }
+
+  /* Section headings and small labels take the display face, which is most of
+     what makes a page read as part of this system. */
+  .section-title, thead th, table th, .k {
+    font-family: var(--font-display);
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  /* The card styles below are the directory's, kept as a copy for the same
+     reason every page keeps its own: each is `include_str!`d into the binary
+     and there is no build step to share anything through. */
+  * { box-sizing: border-box; }
+  body { padding: 32px 24px 64px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+
+  h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  .lede { color: var(--text-2); margin: 0 0 28px; }
+
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+
+  /* The whole card is the link, exactly as on the directory: this page exists
+     to be clicked — each namespace card opens that namespace's dashboard. */
+  a.card {
+    display: block; text-decoration: none; color: inherit;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 0; padding: 16px 18px;
+    transition: border-color .12s ease, transform .12s ease, box-shadow .12s ease;
+  }
+  a.card:hover {
+    border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.07);
+  }
+  a.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .id { font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
+  .meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
+
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 0; flex: none; margin-left: auto; }
+  .tag.admin { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.view  { background: color-mix(in srgb, var(--muted) 22%, transparent); color: var(--text-2); }
+
+  .desc { color: var(--muted); font-size: 12.5px; margin: 0 0 10px; overflow-wrap: anywhere; }
+  .empty {
+    border: 1px dashed var(--grid); border-radius: 0;
+    padding: 28px; text-align: center; color: var(--text-2);
+  }
+  .note { margin-top: 26px; color: var(--muted); font-size: 12.5px; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    background: color-mix(in srgb, var(--muted) 16%, transparent);
+    padding: 1px 5px; border-radius: 0;
+  }
+</style>
+<!-- The theme used to be read from localStorage by a blocking script here.
+     It is now stamped on <html> by the server from a cookie, which is both
+     flash-free and shared across the fleet — localStorage is per-origin, so
+     the choice did not survive a hop to ci or app-obs. See ui/theme.js. -->
+</head>
+<body>
+<div class="wrap">
+<header class="topbar">
+    <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
+    <button class="topbar-toggle" type="button" aria-expanded="false" aria-controls="topbar-nav" aria-label="Toggle navigation"><span class="bars"><span></span></span></button>
+    <nav class="topbar-nav" id="topbar-nav">
+      <a href="/">Directory</a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/namespace-rollup" aria-current="page">Namespaces</a>
+      <a href="/siem">Security</a>
+      <a href="/storage">Disks</a>
+      <a href="/plugins">Plugins</a>
+      <a href="/network">Network</a>
+      <a href="/metrics">Metrics</a>
+    </nav>
+    <div class="topbar-right">
+      <span class="topbar-user">{{WHO}}</span>
+      {{SESSION_ACTION}}
+      <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+    </div>
+  </header>
+  <h1>Your namespaces</h1>
+  <p class="lede">Every namespace this account reaches, and what is deployed in
+     each. Open one for its dashboard.</p>
+
+  <div class="grid" id="rollup" aria-live="polite"><div class="empty">Loading…</div></div>
+</div>
+<script>
+"use strict";
+
+// Hamburger menu: collapse the nav on narrow screens. The open/closed state
+// lives on the nav (`.open`) and is mirrored to the button's `aria-expanded`
+// so assistive tech reads it correctly. Clicking a link or escaping closes it.
+(function setupNavToggle() {
+  var btn = document.querySelector(".topbar-toggle");
+  var nav = document.querySelector(".topbar-nav");
+  if (!btn || !nav) return;
+  var close = function () { nav.classList.remove("open"); btn.setAttribute("aria-expanded", "false"); };
+  btn.addEventListener("click", function () {
+    var open = nav.classList.toggle("open");
+    btn.setAttribute("aria-expanded", String(open));
+  });
+  nav.addEventListener("click", function (e) { if (e.target.closest("a")) close(); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") close(); });
+})();
+
+// The namespace names here come back from the admin API, which takes them
+// from deployment specs and declarations — both this origin controls, but
+// both are attacker-shaped on a multi-tenant fleet, so every interpolation
+// goes through this rather than into the markup raw.
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+
+// `{{HOME_URL}}` is `APP_LB_HOME_URL` — the Heyo front end a namespace user
+// opened this dashboard from, linked when the session runs out.
+var HOME_URL = "{{HOME_URL}}";
+
+async function api(method, path) {
+  var opts = { method: method, headers: { accept: "application/json" } };
+  try {
+    var r = await fetch(path, opts);
+    var text = await r.text(), data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { message: text }; }
+    return { ok: r.ok, status: r.status, data: data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+// Which tier this caller holds where. `/whoami` spells the answer
+// differently per credential — a map of namespaces for a federated grant,
+// one namespace plus an `admin_scope` for an app-token — and an unconfined
+// caller (`fleet: true`) is admin everywhere it is listed, since the rollup
+// only names namespaces the caller can already act in.
+function tiers(who) {
+  if (!who) return {};
+  if (who.fleet) return function () { return "admin"; };
+  if (who.namespaces && typeof who.namespaces === "object") return function (ns) {
+    return who.namespaces[ns] || "view";
+  };
+  if (typeof who.namespace === "string") return function (ns) {
+    return ns === who.namespace ? (who.admin_scope || "view") : "none";
+  };
+  return function () { return "none"; };
+}
+
+function sessionExpired() {
+  document.getElementById("rollup").innerHTML =
+    '<div class="empty">Your session has run out. ' +
+    '<a href="/login">Sign in again</a>' +
+    (HOME_URL ? ' or open the dashboard from <a href="' + esc(HOME_URL) + '">Heyo</a>.' : '.') +
+    "</div>";
+}
+
+async function render() {
+  var who, list;
+  try {
+    var pair = await Promise.all([api("GET", "/whoami"), api("GET", "/namespaces")]);
+    who = pair[0]; list = pair[1];
+  } catch (e) {
+    document.getElementById("rollup").innerHTML =
+      '<div class="empty">The namespace list could not be read.</div>';
+    return;
+  }
+  if (who.status === 401) { sessionExpired(); return; }
+  var tierOf = tiers(who.data);
+  var rows = (list.ok ? list.data : null) || [];
+  if (!rows.length) {
+    document.getElementById("rollup").innerHTML =
+      '<div class="empty">Nothing here yet. A namespace appears when a deployment ' +
+      "is registered in it or it is declared — with the credential this account " +
+      "reaches.</div>";
+    return;
+  }
+  document.getElementById("rollup").innerHTML = rows.map(function (n) {
+    var tier = tierOf(n.namespace);
+    return '<a class="card" href="/dashboard?namespace=' + encodeURIComponent(n.namespace) + '">' +
+      '<div class="card-head"><span class="id">' + esc(n.namespace) + "</span>" +
+      '<span class="tag ' + esc(tier) + '">' + (tier === "admin" ? "admin" : tier === "view" ? "read-only" : esc(tier)) + "</span></div>" +
+      (n.description ? '<p class="desc">' + esc(n.description) + "</p>" : "") +
+      '<div class="meta">' + n.deployments + (n.deployments === 1 ? " deployment" : " deployments") +
+      (n.declared ? " · declared" : "") + "</div></a>";
+  }).join("");
+}
+
+render();
+</script>
+</body>
+</html>
