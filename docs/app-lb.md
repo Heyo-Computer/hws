@@ -118,6 +118,10 @@ These are summarized here. The details are in [app-lb-auth](app-lb-auth.md).
 | `APP_LB_AUTH_CACHE_SECS` | `60` | How long a resolved federated grant is cached. |
 | `APP_LB_AUTH_TIMEOUT_SECS` | `5` | Timeout for one grant lookup. The gate fails closed. |
 | `APP_LB_HOME_URL` | unset | Front-end URL linked from `/login` and from expired namespace sessions. |
+| `APP_LB_ONBOARDING_MCP_URL` | unset | Hosted MCP endpoint the dashboard's "Get started" card tells namespace users to install (e.g. `https://mcp.us2.heyo.work/mcp`). Unset leaves that step out. |
+| `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` | `7776000` (90 days) | Longest lifetime a namespace admin may mint a token for; also the default when they ask for none. |
+| `APP_LB_PUBLIC_IMAGE_CATALOG_URL` | unset | Cloud base URL serving `/public-images/{name}/meta`. Used to resolve the "Get started" fastcar spec's image download and digest. |
+| `APP_LB_ONBOARDING_FASTCAR_IMAGE` | `fastcar` | Catalog name of the image that spec deploys. |
 
 ### TLS and certificates
 

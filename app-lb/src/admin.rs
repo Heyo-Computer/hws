@@ -259,6 +259,9 @@ struct AdminState {
     /// dashboard from, linked when their session is refused or runs out. They
     /// cannot sign in here directly — see [`browser_login::handoff`].
     home_url: Option<Arc<str>>,
+    /// What the dashboard's "Get started" card shows a namespace user, and the
+    /// cap on the tokens such a user may mint. See `onboarding.rs`.
+    onboarding: Arc<crate::onboarding::Onboarding>,
 }
 
 /// `APP_LB_HOME_URL`, when it is an absolute http(s) URL.
@@ -402,6 +405,7 @@ impl AdminApi {
                     .filter(|s| !s.is_empty())
                     .map(Arc::from),
                 home_url: home_url_from_env(),
+                onboarding: Arc::new(crate::onboarding::Onboarding::from_env()),
             },
         }
     }
@@ -540,6 +544,36 @@ impl Caller {
         }
     }
 
+    /// Whether this caller administers *all* of `ns` — the bar for handling
+    /// that namespace's tokens. A namespace token narrowed to a few
+    /// deployments does not clear it: anything it minted would reach the rest
+    /// of the room, and a credential must never mint one wider than itself.
+    fn administers_namespace(&self, ns: &str) -> bool {
+        use crate::tokens::AdminScope;
+        match self {
+            Self::Ungated | Self::Operator => true,
+            Self::Token(t) if t.covers_fleet() => t.admin == AdminScope::Admin,
+            Self::Token(t) => {
+                t.namespace.as_deref() == Some(ns)
+                    && t.admin == AdminScope::Admin
+                    && (t.deployments.is_empty() || t.deployments.iter().any(|d| d == "*"))
+            }
+            Self::Federated(g) => {
+                g.fleet || g.namespaces.get(ns).is_some_and(|s| *s == AdminScope::Admin)
+            }
+        }
+    }
+
+    /// Who this caller is, for the record a token it mints keeps. `None` for
+    /// the operator, whose tokens have always gone unattributed.
+    fn principal(&self) -> Option<String> {
+        match self {
+            Self::Ungated | Self::Operator => None,
+            Self::Token(t) => Some(format!("token:{}", t.id)),
+            Self::Federated(g) => Some(format!("user:{}", g.subject.user_id)),
+        }
+    }
+
     /// The single namespace this caller is confined to, when it reaches exactly
     /// one — the namespace a deployment spec may omit and have filled in. A
     /// namespace token always has exactly one; a federated grant may name
@@ -609,6 +643,7 @@ fn narrows_itself(matched: &str) -> bool {
             | "/namespaces"
             | "/auth-providers"
             | "/whoami"
+            | "/onboarding"
     )
 }
 
@@ -624,6 +659,13 @@ fn is_secret_route(matched: &str) -> bool {
 /// is handled by `narrows_itself` instead, like `/secrets` on `GET`.
 fn is_auth_provider_route(matched: &str) -> bool {
     matches!(matched, "/auth-providers" | "/auth-providers/:namespace/:name")
+}
+
+/// The app-token routes, walled by namespace in their handlers: a confined
+/// caller may mint, list, re-scope and revoke only tokens confined to a
+/// namespace it administers. See [`confine_new_token`].
+fn is_token_route(matched: &str) -> bool {
+    matches!(matched, "/tokens" | "/tokens/:id")
 }
 
 /// Fleet reads a namespace-confined caller may reach with `?namespace=`. The
@@ -836,6 +878,9 @@ fn decide_access(
             // the handler measures against the caller's reach, and then only
             // through gateways that take the caller's own identity.
             None if is_fleet_namespace_route(matched) && caller.confined() => {}
+            // A namespace administrator mints and revokes that namespace's
+            // tokens; the handlers keep every token they touch inside it.
+            None if is_token_route(matched) && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -2257,6 +2302,95 @@ fn own_namespaces(caller: Option<&Caller>) -> Vec<String> {
 /// yet. An empty room whose name the token already carries is not information,
 /// and a namespace that vanishes from the picker until its first deployment
 /// exists is a worse answer than one that reads zero.
+#[derive(Debug, Deserialize)]
+struct OnboardingQuery {
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+/// `GET /onboarding[?namespace=]` — everything the "Get started" card shows a
+/// namespace user: whether the namespace is still empty, the MCP endpoint to
+/// install, the lifetime cap on a token they mint for it, and a fastcar spec
+/// built for this namespace on this fleet. See `onboarding.rs`.
+///
+/// The namespace defaults to the caller's only one. Everything returned is
+/// about a namespace the caller already reaches, and none of it is secret.
+async fn onboarding(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Query(q): Query<OnboardingQuery>,
+) -> Response {
+    use crate::onboarding::{HEYO_PROVIDER, ImageLookup, fastcar_id, fastcar_spec};
+
+    let caller = caller.as_deref();
+    let ns = q
+        .namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|ns| !ns.is_empty())
+        .or_else(|| caller.and_then(Caller::sole_namespace))
+        .map(str::to_string);
+    let Some(ns) = ns else {
+        return err(StatusCode::BAD_REQUEST, "name the namespace: ?namespace=<name>").into_response();
+    };
+    if !crate::config::is_valid_namespace(&ns) {
+        return err(StatusCode::BAD_REQUEST, format!("\"{ns}\" is not a namespace")).into_response();
+    }
+    if caller.is_some_and(|c| !c.reaches_namespace(&ns)) {
+        return err(
+            StatusCode::FORBIDDEN,
+            format!("this credential cannot reach the \"{ns}\" namespace"),
+        )
+        .into_response();
+    }
+
+    let deployments = state
+        .registry
+        .deployments()
+        .values()
+        .filter(|d| d.spec.namespace == ns)
+        .count();
+    let gated = state.auth_providers.get(&ns, HEYO_PROVIDER).is_some();
+    let id = fastcar_id(&ns);
+    let host = state.deploy_base_domain.as_deref().map(|base| format!("{id}.{base}"));
+    let url = host.as_ref().and_then(|h| {
+        state.public_url.of(&crate::config::RouteRule {
+            host: Some(h.clone()),
+            ..Default::default()
+        })
+    });
+
+    let lookup = state.onboarding.fastcar_image().await;
+    let (image_status, image_note) = lookup.status();
+    let image = match &lookup {
+        ImageLookup::Found(i) => Some(i),
+        _ => None,
+    };
+    let spec = fastcar_spec(&ns, &state.onboarding.fastcar_image, image, host.as_deref(), gated);
+
+    Json(serde_json::json!({
+        "namespace": ns,
+        "deployments": deployments,
+        "can_mint": caller.is_none_or(|c| c.administers_namespace(&ns)),
+        "mcp": {
+            "name": "heyo",
+            "url": state.onboarding.mcp_url,
+        },
+        "token": {
+            "max_ttl_secs": state.onboarding.tenant_token_max_ttl_secs,
+        },
+        "fastcar": {
+            "id": id,
+            "url": url,
+            "gated": gated,
+            "image": image_status,
+            "note": image_note,
+            "spec": spec,
+        },
+    }))
+    .into_response()
+}
+
 async fn namespaces(
     State(state): State<AdminState>,
     caller: Option<axum::Extension<Caller>>,
@@ -5984,6 +6118,9 @@ fn router(state: AdminState) -> Router {
         // `/namespaces` does — a scoped token gets its own providers rather than
         // a 403. The item reads and every write are on the CRUD side below.
         .route("/auth-providers", get(list_auth_providers))
+        // The dashboard's "Get started" card. View tier, and it answers only
+        // about a namespace the caller reaches; nothing in it is a secret.
+        .route("/onboarding", get(onboarding))
         .route("/feeds", get(feeds_index))
         .route("/feeds/:namespace", get(feed_rss))
         // Where DNS should point. View tier: it is the answer to "what do I
@@ -6421,12 +6558,141 @@ fn persist_tokens(state: &AdminState) -> Result<(), Box<Response>> {
     })
 }
 
+/// The confined caller among those a token route was reached by, if any.
+/// The operator, an ungated build and an unconfined token keep the token
+/// routes exactly as they were: fleet-wide, with no namespace policy.
+fn confined(caller: Option<&Caller>) -> Option<&Caller> {
+    caller.filter(|c| c.confined())
+}
+
+/// What a namespace-confined caller may mint: a token walled into a namespace
+/// it administers, that expires within the tenant cap. Fills in the cap when
+/// no lifetime was asked for, so a tenant's token always runs out.
+///
+/// Nothing else needs checking. A token confined to a namespace can never
+/// reach past it whatever its `deployments` say, and administering the whole
+/// namespace is already the most any confined credential can hold — so the
+/// new token cannot be wider than the one that minted it.
+fn confine_new_token(
+    caller: &Caller,
+    req: &mut crate::tokens::NewToken,
+    max_ttl: u64,
+) -> Result<(), Response> {
+    let ns = req
+        .namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|ns| !ns.is_empty())
+        .map(str::to_string);
+    let Some(ns) = ns else {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "a namespace credential mints namespace tokens: set `namespace` to the one you administer",
+        )
+        .into_response());
+    };
+    if !caller.administers_namespace(&ns) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("this credential cannot mint tokens for the \"{ns}\" namespace"),
+        )
+        .into_response());
+    }
+    req.namespace = Some(ns);
+    match req.expires_in_secs {
+        None => req.expires_in_secs = Some(max_ttl),
+        Some(secs) if secs > max_ttl => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "a namespace token may live at most {max_ttl} seconds ({} days)",
+                    max_ttl / 86_400
+                ),
+            )
+            .into_response());
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+/// The same policy for a re-scope: the token must stay in a namespace the
+/// caller administers and keep an expiry within the cap from now.
+fn confine_token_patch(
+    caller: &Caller,
+    patch: &crate::tokens::TokenPatch,
+    max_ttl: u64,
+    now: u64,
+) -> Result<(), Response> {
+    match &patch.namespace {
+        Some(None) => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "a namespace credential cannot lift a token's namespace wall",
+            )
+            .into_response());
+        }
+        Some(Some(ns)) if !caller.administers_namespace(ns.trim()) => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                format!("this credential cannot move a token into the \"{}\" namespace", ns.trim()),
+            )
+            .into_response());
+        }
+        _ => {}
+    }
+    match patch.expires_at {
+        Some(None) => Err(err(
+            StatusCode::FORBIDDEN,
+            "a namespace token must expire; this credential cannot clear the expiry",
+        )
+        .into_response()),
+        Some(Some(at)) if at > now.saturating_add(max_ttl) => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "a namespace token may expire at most {max_ttl} seconds ({} days) from now",
+                max_ttl / 86_400
+            ),
+        )
+        .into_response()),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `caller` may see and handle `token`. A confined caller sees only the
+/// tokens of namespaces it administers; everyone else sees them all.
+fn token_visible(caller: Option<&Caller>, token: &crate::tokens::TokenSummary) -> bool {
+    confined(caller).is_none_or(|c| {
+        token
+            .namespace
+            .as_deref()
+            .is_some_and(|ns| c.administers_namespace(ns))
+    })
+}
+
+/// The one refusal for a token id a caller cannot see, worded as the one for an
+/// id that does not exist so the two cannot be told apart.
+fn no_token(id: &str) -> Response {
+    err(StatusCode::NOT_FOUND, format!("no token {id:?}")).into_response()
+}
+
 async fn mint_token(
     State(state): State<AdminState>,
-    Json(req): Json<crate::tokens::NewToken>,
+    caller: Option<axum::Extension<Caller>>,
+    Json(mut req): Json<crate::tokens::NewToken>,
 ) -> Response {
+    let caller = caller.as_deref();
+    let mut minted_by = None;
+    if let Some(c) = confined(caller) {
+        if let Err(refused) =
+            confine_new_token(c, &mut req, state.onboarding.tenant_token_max_ttl_secs)
+        {
+            return refused;
+        }
+        minted_by = c.principal();
+    }
     let name = req.name.clone();
-    let (summary, token) = match state.tokens.mint(req, now_secs()) {
+    let (summary, token) = match state.tokens.mint_by(req, now_secs(), minted_by) {
         Ok(v) => v,
         Err(e) => return token_error(e),
     };
@@ -6440,34 +6706,61 @@ async fn mint_token(
         token = %summary.id,
         name = %name,
         admin = ?summary.admin,
+        namespace = ?summary.namespace,
         deployments = ?summary.deployments,
+        minted_by = ?summary.minted_by,
         "app-token minted",
     );
     (StatusCode::CREATED, Json(MintedToken { summary, token })).into_response()
 }
 
-async fn list_tokens(State(state): State<AdminState>) -> impl IntoResponse {
+async fn list_tokens(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
     // Expired tokens already fail verification; drop them here so the listing
     // shows live credentials rather than a graveyard that looks like one.
     if state.tokens.sweep_expired(now_secs()) > 0 {
         let _ = state.tokens.persist();
     }
-    Json(state.tokens.list())
+    let caller = caller.as_deref();
+    let tokens: Vec<_> = state
+        .tokens
+        .list()
+        .into_iter()
+        .filter(|t| token_visible(caller, t))
+        .collect();
+    Json(tokens)
 }
 
-async fn get_token(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
-    match state.tokens.get(&id) {
-        Some(t) => Json(t.summary()).into_response(),
-        None => err(StatusCode::NOT_FOUND, format!("no token {id:?}")).into_response(),
+async fn get_token(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.tokens.get(&id).map(|t| t.summary()) {
+        Some(t) if token_visible(caller.as_deref(), &t) => Json(t).into_response(),
+        _ => no_token(&id),
     }
 }
 
 async fn patch_token(
     State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
     Path(id): Path<String>,
     Json(patch): Json<crate::tokens::TokenPatch>,
 ) -> Response {
+    let caller = caller.as_deref();
     let before = state.tokens.get(&id);
+    if !before.as_ref().is_some_and(|t| token_visible(caller, &t.summary())) {
+        return no_token(&id);
+    }
+    if let Some(c) = confined(caller)
+        && let Err(refused) =
+            confine_token_patch(c, &patch, state.onboarding.tenant_token_max_ttl_secs, now_secs())
+    {
+        return refused;
+    }
     let summary = match state.tokens.patch(&id, patch) {
         Ok(s) => s,
         Err(e) => return token_error(e),
@@ -6478,14 +6771,21 @@ async fn patch_token(
         }
         return *e;
     }
-    tracing::info!(token = %id, admin = ?summary.admin, deployments = ?summary.deployments, "app-token updated");
+    tracing::info!(token = %id, admin = ?summary.admin, namespace = ?summary.namespace, deployments = ?summary.deployments, "app-token updated");
     Json(summary).into_response()
 }
 
-async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+async fn revoke_token(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Path(id): Path<String>,
+) -> Response {
     let before = state.tokens.get(&id);
+    if !before.as_ref().is_some_and(|t| token_visible(caller.as_deref(), &t.summary())) {
+        return no_token(&id);
+    }
     if !state.tokens.revoke(&id) {
-        return err(StatusCode::NOT_FOUND, format!("no token {id:?}")).into_response();
+        return no_token(&id);
     }
     if let Err(e) = persist_tokens(&state) {
         // A revocation that did not reach disk would come back at the next
@@ -6823,6 +7123,216 @@ mod tests {
                 )),
             );
             Fixture { state: api.state, registry, root, mutations, inactive }
+        }
+
+        /// The token routes for a namespace-confined caller, end to end through
+        /// the handlers: what it may mint, see, re-scope and revoke.
+        mod tenant_tokens {
+            use super::*;
+            use crate::tokens::{AdminScope, NewToken, TokenPatch};
+
+            fn new(name: &str, ns: Option<&str>, admin: AdminScope, ttl: Option<u64>) -> NewToken {
+                NewToken {
+                    name: name.into(),
+                    admin,
+                    namespace: ns.map(str::to_string),
+                    deployments: vec![],
+                    expires_in_secs: ttl,
+                }
+            }
+
+            /// A token in the store, as the caller that presents it.
+            fn token_caller(f: &Fixture, req: NewToken) -> (Caller, String) {
+                let (summary, _) = f.state.tokens.mint(req, now_secs()).unwrap();
+                (Caller::Token(f.state.tokens.get(&summary.id).unwrap()), summary.id)
+            }
+
+            fn federated(ns: &[(&str, AdminScope)]) -> Caller {
+                Caller::Federated(Arc::new(crate::federated::Grant {
+                    subject: serde_json::from_value(serde_json::json!({"userId": "u1"})).unwrap(),
+                    namespaces: ns.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
+                    accounts: Default::default(),
+                    fleet: false,
+                }))
+            }
+
+            async fn body(r: Response) -> (StatusCode, serde_json::Value) {
+                let status = r.status();
+                let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+            }
+
+            async fn mint_as(f: &Fixture, c: Option<&Caller>, req: NewToken) -> (StatusCode, serde_json::Value) {
+                body(mint_token(State(f.state.clone()), c.cloned().map(axum::Extension), Json(req)).await).await
+            }
+
+            #[tokio::test]
+            async fn a_namespace_admin_mints_into_its_own_namespace_with_an_expiry() {
+                let f = fixture(true).await;
+                let (c, id) = token_caller(&f, new("ops", Some("team-a"), AdminScope::Admin, None));
+                let (status, v) = mint_as(&f, Some(&c), new("claude-code", Some("team-a"), AdminScope::Admin, None)).await;
+                assert_eq!(status, StatusCode::CREATED, "{v}");
+                assert_eq!(v["namespace"], "team-a");
+                assert_eq!(v["minted_by"], format!("token:{id}"));
+                let max = f.state.onboarding.tenant_token_max_ttl_secs;
+                let lifetime = v["expires_at"].as_u64().unwrap() - v["created_at"].as_u64().unwrap();
+                assert_eq!(lifetime, max, "an unasked-for lifetime is the cap, never forever");
+                assert!(v["token"].as_str().unwrap().starts_with("applb_"));
+            }
+
+            #[tokio::test]
+            async fn a_namespace_admin_cannot_mint_past_its_wall() {
+                let f = fixture(true).await;
+                let (c, _) = token_caller(&f, new("ops", Some("team-a"), AdminScope::Admin, None));
+                let max = f.state.onboarding.tenant_token_max_ttl_secs;
+                for (req, want) in [
+                    (new("x", Some("team-b"), AdminScope::Admin, None), StatusCode::FORBIDDEN),
+                    (new("x", None, AdminScope::Admin, None), StatusCode::FORBIDDEN),
+                    (new("x", Some(" "), AdminScope::View, None), StatusCode::FORBIDDEN),
+                    (new("x", Some("team-a"), AdminScope::Admin, Some(max + 1)), StatusCode::BAD_REQUEST),
+                ] {
+                    let (status, v) = mint_as(&f, Some(&c), req).await;
+                    assert_eq!(status, want, "{v}");
+                }
+                // `"*"` inside a namespace is still only that namespace.
+                let mut star = new("x", Some("team-a"), AdminScope::Admin, Some(60));
+                star.deployments = vec!["*".into()];
+                let (status, v) = mint_as(&f, Some(&c), star).await;
+                assert_eq!(status, StatusCode::CREATED);
+                let minted = f.state.tokens.get(v["id"].as_str().unwrap()).unwrap();
+                assert!(!minted.covers_fleet());
+            }
+
+            #[tokio::test]
+            async fn only_a_whole_namespace_admin_may_mint() {
+                let f = fixture(true).await;
+                let (viewer, _) = token_caller(&f, new("v", Some("team-a"), AdminScope::View, None));
+                let mut narrow = new("n", Some("team-a"), AdminScope::Admin, None);
+                narrow.deployments = vec!["web".into()];
+                let (narrow, _) = token_caller(&f, narrow);
+                for c in [viewer, narrow] {
+                    let (status, _) = mint_as(&f, Some(&c), new("x", Some("team-a"), AdminScope::None, None)).await;
+                    assert_eq!(status, StatusCode::FORBIDDEN);
+                }
+            }
+
+            #[tokio::test]
+            async fn a_federated_user_mints_where_it_is_admin() {
+                let f = fixture(true).await;
+                let c = federated(&[("team-a", AdminScope::Admin), ("team-b", AdminScope::View)]);
+                let (status, v) = mint_as(&f, Some(&c), new("x", Some("team-a"), AdminScope::Admin, None)).await;
+                assert_eq!(status, StatusCode::CREATED);
+                assert_eq!(v["minted_by"], "user:u1");
+                let (status, _) = mint_as(&f, Some(&c), new("x", Some("team-b"), AdminScope::View, None)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+
+            #[tokio::test]
+            async fn the_operator_is_unchanged() {
+                let f = fixture(true).await;
+                let (status, v) = mint_as(&f, Some(&Caller::Operator), new("fleet", None, AdminScope::Admin, None)).await;
+                assert_eq!(status, StatusCode::CREATED);
+                assert!(v.get("expires_at").is_none(), "the operator still chooses no expiry");
+                assert!(v.get("minted_by").is_none());
+                let (status, _) = mint_as(&f, None, new("ungated", None, AdminScope::Admin, None)).await;
+                assert_eq!(status, StatusCode::CREATED);
+            }
+
+            #[tokio::test]
+            async fn a_namespace_admin_sees_and_handles_only_its_own_tokens() {
+                let f = fixture(true).await;
+                let (c, own_id) = token_caller(&f, new("ops", Some("team-a"), AdminScope::Admin, None));
+                let (other, _) = f.state.tokens.mint(new("b", Some("team-b"), AdminScope::Admin, None), now_secs()).unwrap();
+                let (fleet, _) = f.state.tokens.mint(new("fleet", None, AdminScope::Admin, None), now_secs()).unwrap();
+                let ext = || Some(axum::Extension(c.clone()));
+
+                let listed = list_tokens(State(f.state.clone()), ext()).await.into_response();
+                let (_, v) = body(listed).await;
+                let ids: Vec<_> = v.as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect();
+                assert_eq!(ids, vec![own_id.clone()]);
+
+                // The operator still sees all three.
+                let (_, v) = body(list_tokens(State(f.state.clone()), None).await.into_response()).await;
+                assert_eq!(v.as_array().unwrap().len(), 3);
+
+                // Another namespace's token and a fleet token read as missing.
+                for id in [other.id.clone(), fleet.id.clone(), "nope".into()] {
+                    let (status, v) = body(get_token(State(f.state.clone()), ext(), Path(id.clone())).await).await;
+                    assert_eq!(status, StatusCode::NOT_FOUND);
+                    assert_eq!(v["error"], format!("no token {id:?}"));
+                    let (status, _) = body(revoke_token(State(f.state.clone()), ext(), Path(id.clone())).await).await;
+                    assert_eq!(status, StatusCode::NOT_FOUND);
+                    let rename = TokenPatch { name: Some("mine now".into()), ..Default::default() };
+                    let (status, _) = body(patch_token(State(f.state.clone()), ext(), Path(id), Json(rename)).await).await;
+                    assert_eq!(status, StatusCode::NOT_FOUND);
+                }
+                assert!(f.state.tokens.get(&other.id).is_some());
+                assert!(f.state.tokens.get(&fleet.id).is_some());
+            }
+
+            #[tokio::test]
+            async fn a_re_scope_cannot_widen_a_namespace_token() {
+                let f = fixture(true).await;
+                let (c, _) = token_caller(&f, new("ops", Some("team-a"), AdminScope::Admin, None));
+                let (target, _) = f.state.tokens.mint(new("t", Some("team-a"), AdminScope::View, Some(60)), now_secs()).unwrap();
+                let max = f.state.onboarding.tenant_token_max_ttl_secs;
+                let patch = |p: TokenPatch| {
+                    let state = f.state.clone();
+                    let c = c.clone();
+                    let id = target.id.clone();
+                    async move { body(patch_token(State(state), Some(axum::Extension(c)), Path(id), Json(p)).await).await.0 }
+                };
+                assert_eq!(patch(TokenPatch { namespace: Some(None), ..Default::default() }).await, StatusCode::FORBIDDEN);
+                assert_eq!(patch(TokenPatch { namespace: Some(Some("team-b".into())), ..Default::default() }).await, StatusCode::FORBIDDEN);
+                assert_eq!(patch(TokenPatch { expires_at: Some(None), ..Default::default() }).await, StatusCode::FORBIDDEN);
+                assert_eq!(
+                    patch(TokenPatch { expires_at: Some(Some(now_secs() + max + 60)), ..Default::default() }).await,
+                    StatusCode::BAD_REQUEST
+                );
+                assert_eq!(patch(TokenPatch { admin: Some(AdminScope::Admin), ..Default::default() }).await, StatusCode::OK);
+                assert_eq!(f.state.tokens.get(&target.id).unwrap().namespace.as_deref(), Some("team-a"));
+            }
+
+            #[tokio::test]
+            async fn a_namespace_admin_revokes_its_own_tokens() {
+                let f = fixture(true).await;
+                let (c, _) = token_caller(&f, new("ops", Some("team-a"), AdminScope::Admin, None));
+                let (target, _) = f.state.tokens.mint(new("t", Some("team-a"), AdminScope::View, Some(60)), now_secs()).unwrap();
+                let r = revoke_token(State(f.state.clone()), Some(axum::Extension(c)), Path(target.id.clone())).await;
+                assert_eq!(r.status(), StatusCode::NO_CONTENT);
+                assert!(f.state.tokens.get(&target.id).is_none());
+            }
+
+            #[tokio::test]
+            async fn onboarding_answers_about_a_reachable_namespace_only() {
+                let f = fixture(true).await;
+                let c = federated(&[("team-a", AdminScope::Admin)]);
+                let ask = |c: Option<Caller>, ns: Option<&str>| {
+                    let state = f.state.clone();
+                    let q = OnboardingQuery { namespace: ns.map(str::to_string) };
+                    async move { body(onboarding(State(state), c.map(axum::Extension), Query(q)).await).await }
+                };
+                // The namespace defaults to the caller's only one.
+                let (status, v) = ask(Some(c.clone()), None).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                assert_eq!(v["namespace"], "team-a");
+                assert_eq!(v["deployments"], 0);
+                assert_eq!(v["can_mint"], true);
+                assert_eq!(v["fastcar"]["id"], "fastcar-team-a");
+                assert_eq!(v["fastcar"]["spec"]["namespace"], "team-a");
+                // No catalog in the test environment, and it says so.
+                assert_eq!(v["fastcar"]["image"], "unconfigured");
+                let spec: crate::config::DeploymentSpec =
+                    serde_json::from_value(v["fastcar"]["spec"].clone()).unwrap();
+                spec.validate().unwrap();
+
+                let (status, _) = ask(Some(c.clone()), Some("team-b")).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                let (status, _) = ask(Some(Caller::Operator), None).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                let (status, _) = ask(Some(Caller::Operator), Some("../x")).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
         }
 
         mod retirement_tests {
@@ -8363,9 +8873,12 @@ mod tests {
             // `/deployments` narrows (list) or is checked in the handler
             // (create), so the gate lets it through.
             assert!(matches!(at("/deployments", "/deployments"), Verdict::Allow(_)));
-            // The routes that see past a namespace stay closed: minting tokens
-            // would be an escalation, the job history is fleet state.
-            assert!(matches!(at("/tokens", "/tokens"), Verdict::Forbidden(_)));
+            // Token routes are walled in the handler: a namespace admin mints
+            // only tokens confined to its own namespace (`tenant_tokens`).
+            assert!(matches!(at("/tokens", "/tokens"), Verdict::Allow(_)));
+            assert!(matches!(at("/tokens/:id", "/tokens/abc"), Verdict::Allow(_)));
+            // The routes that see past a namespace stay closed: the job
+            // history is fleet state.
             assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
             assert!(matches!(at("/services", "/services"), Verdict::Forbidden(_)));
             assert!(matches!(at("/fleet", "/fleet"), Verdict::Forbidden(_)));
@@ -8810,7 +9323,8 @@ mod tests {
             let at = |m: &str, p: &str| federated_at(&t, &g, m, p, None, AdminScope::Admin);
             assert!(matches!(at("/deployments", "/deployments"), Verdict::Allow(_)));
             assert!(matches!(at("/metrics", "/metrics"), Verdict::Allow(_)));
-            assert!(matches!(at("/tokens", "/tokens"), Verdict::Forbidden(_)));
+            // Walled in the handler, like `/secrets`.
+            assert!(matches!(at("/tokens", "/tokens"), Verdict::Allow(_)));
             assert!(matches!(at("/secrets", "/secrets"), Verdict::Allow(_)));
             assert!(matches!(at("/ingress", "/ingress"), Verdict::Allow(_)));
             assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));

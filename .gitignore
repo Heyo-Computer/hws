@@ -19,3 +19,6 @@ examples/**/dist/
 
 # OS / editor cruft
 .DS_Store
+
+# rootfs:
+**/*.ext4

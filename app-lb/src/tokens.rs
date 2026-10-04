@@ -126,6 +126,11 @@ pub struct AppToken {
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// Who minted it, when that was a namespace-confined caller rather than an
+    /// operator: the minting token's id, or the federated user's id. A tenant
+    /// mints its own credentials, so the record says which of its people did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minted_by: Option<String>,
     /// Hex `sha256(secret)`. Never leaves this module.
     #[serde(rename = "secret_sha256")]
     hash: String,
@@ -207,6 +212,7 @@ impl AppToken {
             deployments: self.deployments.clone(),
             created_at: self.created_at,
             expires_at: self.expires_at,
+            minted_by: self.minted_by.clone(),
             last_used_at: match self.last_used() {
                 0 => None,
                 n => Some(n),
@@ -228,6 +234,8 @@ pub struct TokenSummary {
     pub created_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minted_by: Option<String>,
     /// `None` means the token has never authenticated anything — or has not
     /// since the last time the store was written. See [`AppToken::last_used_at`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -362,6 +370,17 @@ impl TokenStore {
     /// Mint a token. Returns the summary and the secret — the secret is returned
     /// here and nowhere else, ever.
     pub fn mint(&self, req: NewToken, now: u64) -> Result<(TokenSummary, String), TokenError> {
+        self.mint_by(req, now, None)
+    }
+
+    /// [`mint`](Self::mint), recording who asked. Not a field of [`NewToken`]
+    /// because it must come from the authenticated caller, never the body.
+    pub fn mint_by(
+        &self,
+        req: NewToken,
+        now: u64,
+        minted_by: Option<String>,
+    ) -> Result<(TokenSummary, String), TokenError> {
         let name = req.name.trim().to_string();
         if name.is_empty() {
             return Err(TokenError::EmptyName);
@@ -382,6 +401,7 @@ impl TokenStore {
             deployments: req.deployments,
             created_at: now,
             expires_at: req.expires_in_secs.map(|s| now.saturating_add(s)),
+            minted_by,
             hash: hash_secret(&secret),
             last_used_at: 0,
             live_last_used: Arc::new(AtomicU64::new(0)),

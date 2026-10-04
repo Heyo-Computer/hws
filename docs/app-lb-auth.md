@@ -104,11 +104,23 @@ heyctl token mint agent-runner --admin admin -d sb-7f3a9c --expires-in 24
 
 A token scoped to specific deployments is refused fleet-wide routes (create deployment, list all, secrets, minting), so it cannot mint itself a wider one. `/metrics` narrows its answer to what the token can see instead of refusing.
 
+### Namespace admins mint their own tokens
+
+A caller that administers a whole namespace may use the token routes for that namespace. That means a namespace token with `admin` tier and no `deployments` list, or a federated `namespace:<ns>:admin` grant. This is how a namespace user gets a token for the hosted MCP server: the dashboard's "Get started" card mints one.
+
+- Mint (`POST /tokens`): `namespace` is required and must be one the caller administers. `expires_in_secs` is capped by `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` (default 90 days); when it is omitted, the cap is used, so a tenant token always expires. The token records `minted_by` (`token:<id>` or `user:<userId>`).
+- List and read: only tokens confined to namespaces the caller administers. Any other id answers `404 no token "<id>"`, the same as one that does not exist.
+- Re-scope (`PATCH`): the token cannot be moved out of the caller's namespaces, have its wall lifted (`"namespace": null`), lose its expiry, or get an expiry past the cap.
+- Revoke: as for reading.
+
+A namespace token narrowed to particular deployments, and a `view`-tier caller, cannot mint: a token they minted would reach past their own scope.
+
 | Route | Does |
 | --- | --- |
 | `POST /tokens` | Mint |
 | `GET /tokens` | List (never shows a secret) |
 | `PATCH /tokens/:id` | Re-scope, rename or change expiry without changing the secret |
+| `GET /tokens/:id` | One token's summary |
 | `DELETE /tokens/:id` | Revoke; takes effect on the next request |
 
 Present a token as `Authorization: Bearer applb_…`. The shell WebSocket, and only that route, also accepts `?app_token=…`, because a browser's `WebSocket` cannot set headers. Tokens in URLs end up in logs, so mint short-lived ones for that.
@@ -123,7 +135,7 @@ On a fleet whose deployments belong to customers, set `APP_LB_AUTH_URL` (plus `A
 | `namespace:<name>:view` | View tier in `<name>`: directory, `/metrics`, `/security`, list and get |
 | `fleet:admin` | Unconfined, like the Basic operator |
 
-Unknown scope strings are ignored. The tier is checked against the namespace of the deployment a route names. A federated caller is confined like a namespace token: listings narrow to its namespaces, it cannot register into or move deployments out of other namespaces, and fleet routes (tokens, secrets, workflows, `/jobs`, disks, block rules) are closed. No grant ever contains the `default` namespace.
+Unknown scope strings are ignored. The tier is checked against the namespace of the deployment a route names. A federated caller is confined like a namespace token: listings narrow to its namespaces, it cannot register into or move deployments out of other namespaces, fleet routes (workflows, `/jobs`, disks, block rules) are closed, and secrets and tokens are walled per namespace in their handlers. No grant ever contains the `default` namespace.
 
 Answers are cached by the SHA-256 of the bearer for `APP_LB_AUTH_CACHE_SECS`; refusals are cached for 5 seconds. A scope withdrawn upstream therefore lingers for up to the cache TTL. If the auth service is unreachable, the request is refused.
 

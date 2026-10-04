@@ -41,6 +41,7 @@ mod metrics;
 mod mounts;
 mod namespaces;
 mod obs;
+mod onboarding;
 mod plugins;
 mod proxy;
 mod request_control;

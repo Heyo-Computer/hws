@@ -7,6 +7,7 @@ Heyo Web Services documentation. These pages are also published at
 
 - [Overview](overview.md) — what HWS is and how the components fit together
 - [Installation](installation.md) — stand up a host and register a first deployment
+- [Onboarding](onboarding.md) — a new user's path: namespace, MCP token, first deployment
 - [Multi-region](multi-region.md) — one platform across several regions
 
 ## Routing and deployments

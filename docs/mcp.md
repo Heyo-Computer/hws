@@ -27,7 +27,18 @@ npm run build        # compiles to mcp/dist/
 npm test             # optional: node --test over dist/*.test.js
 ```
 
-### Claude Code
+### Claude Code, hosted server
+
+Heyo runs the server at `https://mcp.us2.heyo.work/mcp` (streamable HTTP). Point Claude Code at it with an app-lb token:
+
+```sh
+claude mcp add --transport http heyo https://mcp.us2.heyo.work/mcp \
+  --header "Authorization: Bearer applb_…"
+```
+
+A namespace user mints that token from the app-lb dashboard's "Get started" card (or **App-tokens → New token**). It is an `admin`-tier token confined to their namespace and expires within 90 days; see [app-lb auth](app-lb-auth.md#namespace-admins-mint-their-own-tokens). The `applb_*` tools work with it. The app-obs and ci tools do not yet, because those gates live in the `default` namespace (see [Limits and known gaps](#limits-and-known-gaps)).
+
+### Claude Code, local server
 
 ```sh
 claude mcp add heyo \

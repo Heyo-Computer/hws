@@ -315,6 +315,14 @@
 body[data-tier="view"] #local-view button:not(#dep-prev):not(#dep-next),
 body[data-tier="view"] [data-admin-only] { display: none; }
 #ns-banner a { margin-left: .5em; }
+/* The "Get started" card a namespace user sees first: three numbered steps. */
+#get-started ol { margin: 0; padding-left: 1.4em; display: grid; gap: 18px; }
+#get-started .gs-step { display: block; margin-bottom: 4px; }
+#get-started textarea, #get-started input.mono { width: 100%; box-sizing: border-box; font-size: 12px; }
+#get-started textarea { min-height: 14em; resize: vertical; }
+#get-started .gs-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+#get-started .gs-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+#get-started .gs-head h2 { margin: 0; font-size: 15px; }
 /* Workloads: namespace × deployment with a cell per server. Wide fleets
    scroll sideways inside the card rather than widening the page. */
 .wl-scroll { overflow-x: auto; }
@@ -351,6 +359,7 @@ button.cellbtn:hover .tag, button.cellbtn:focus-visible .tag { outline: 1px soli
       <a href="/plugins" data-local-nav>Plugins</a>
       <a href="/network" id="network-nav">Network</a>
       <a href="/metrics" data-local-nav>Metrics</a>
+      <a href="#get-started" id="gs-open" hidden>Get started</a>
     </nav>
     <div class="topbar-right">
       <!-- `uptime`, `livedot` and `updated` keep their ids: the poll loop
@@ -366,6 +375,10 @@ button.cellbtn:hover .tag, button.cellbtn:focus-visible .tag { outline: 1px soli
   </header>
 
   <div class="card" id="ns-banner" hidden role="status"></div>
+
+  <!-- First steps for a namespace user, filled from GET /onboarding: a token
+       for Claude Code, the hosted MCP server, and a first deployment. -->
+  <section class="card" id="get-started" hidden aria-labelledby="gs-title"></section>
 
   <section aria-labelledby="workloads-title" data-fleet-only>
     <div class="section-title" id="workloads-title">Workloads <span class="count" id="workloads-count"></span></div>
@@ -481,12 +494,14 @@ button.cellbtn:hover .tag, button.cellbtn:focus-visible .tag { outline: 1px soli
   </div>
   <div class="card" id="namespaces" data-fleet-only></div>
 
-  <div class="section-title" data-fleet-only>
+  <!-- Not fleet-only: a namespace admin mints and revokes its own namespace's
+       tokens here, and the server lists only those. -->
+  <div class="section-title" data-admin-only>
     App-tokens <span class="count" id="tokens-count"></span>
     <span class="spacer"></span>
     <button class="btn mini" id="token-new">New token</button>
   </div>
-  <div class="card" id="tokens" data-fleet-only></div>
+  <div class="card" id="tokens" data-admin-only></div>
 
   <div class="section-title" data-fleet-only>
     Deploy jobs <span class="count" id="jobs-count"></span>
@@ -1564,10 +1579,14 @@ function tokenForm() {
         <option value="admin">admin — full CRUD</option>
       </select>
     </label>
-    <label>Namespace (blank for none)
-      <input id="tk-ns" list="tk-ns-list" placeholder="sam" autocomplete="off"
-             spellcheck="false">
-    </label>
+    ${pinnedNamespace
+      ? `<label>Namespace
+           <input id="tk-ns" value="${esc(pinnedNamespace)}" readonly>
+         </label>`
+      : `<label>Namespace (blank for none)
+           <input id="tk-ns" list="tk-ns-list" placeholder="sam" autocomplete="off"
+                  spellcheck="false">
+         </label>`}
     <datalist id="tk-ns-list">
       ${knownNamespaces.map(n => `<option value="${esc(n)}"></option>`).join("")}
     </datalist>
@@ -1581,9 +1600,13 @@ function tokenForm() {
          one can be walled off before anything is in it. The datalist offers the
          ones that already exist without refusing a new one. -->
     <div class="note" id="tk-ns-note"></div>
-    <label>Expires in (hours, blank for never)
-      <input id="tk-ttl" placeholder="" inputmode="numeric" autocomplete="off">
-    </label>`;
+    ${pinnedNamespace
+      ? `<label>Expires in (hours, at most ${tenantMaxTtlHours()})
+           <input id="tk-ttl" value="${tenantMaxTtlHours()}" inputmode="numeric" autocomplete="off">
+         </label>`
+      : `<label>Expires in (hours, blank for never)
+           <input id="tk-ttl" placeholder="" inputmode="numeric" autocomplete="off">
+         </label>`}`;
 }
 
 // What the two scope fields mean together, said before it is minted rather
@@ -1616,7 +1639,15 @@ function tokenScopeNote() {
   el.textContent = where + api;
 }
 
-function openNewToken() {
+// A namespace token must expire; the server caps its lifetime and says what
+// the cap is on GET /onboarding. 90 days until that answer arrives.
+function tenantMaxTtlHours() {
+  const secs = onboardingInfo && onboardingInfo.token && onboardingInfo.token.max_ttl_secs;
+  return Math.floor((secs || 90 * 86400) / 3600);
+}
+
+// `preset` fills the form in, for the "Get started" card's mint step.
+function openNewToken(preset) {
   openModal(
     "New app-token",
     "A scoped, revocable credential. The secret is shown once and cannot be retrieved again.",
@@ -1650,6 +1681,10 @@ function openNewToken() {
   );
   // The form is in the DOM once openModal returns, so the note can be wired and
   // shown for the default selection rather than only after the first keystroke.
+  if (preset && preset.name) {
+    $("tk-name").value = preset.name;
+    if (preset.admin) $("tk-admin").value = preset.admin;
+  }
   ["tk-ns", "tk-scope", "tk-admin"].forEach(id => {
     const el = $(id);
     if (el) el.addEventListener("input", tokenScopeNote);
@@ -1662,6 +1697,10 @@ function openNewToken() {
 // only copyable, because a clipboard write can silently fail on an insecure
 // origin and losing this means reminting.
 function showMintedToken(t) {
+  // Kept in memory only, so the "Get started" card's install command can carry
+  // it until the page is closed. Never written anywhere.
+  if (pinnedNamespace && t.admin === "admin") { mintedSecret = t.token; renderGetStarted(); }
+  const mcpUrl = pinnedNamespace && onboardingInfo && onboardingInfo.mcp && onboardingInfo.mcp.url;
   openModal(
     "Token minted",
     "Copy it now. This is the only time it is shown — only its hash is stored.",
@@ -1676,6 +1715,13 @@ function showMintedToken(t) {
      </div>
      <input id="tk-secret" class="mono" readonly value="${esc(t.token)}"
             style="width:100%" onclick="this.select()">
+     ${mcpUrl && t.admin === "admin"
+        ? `<div class="note" style="margin-top:10px">
+             Connect Claude Code to Heyo's MCP server with it:
+             <input class="mono" readonly style="width:100%;margin-top:6px"
+                    onclick="this.select()" value="${esc(mcpInstallCommand(mcpUrl, t.token))}">
+           </div>`
+        : ""}
      ${t.admin === "none"
         ? `<div class="note" style="margin-top:10px">
              This token has no admin scope, so it reaches no admin route and
@@ -1727,7 +1773,7 @@ $("tokens").addEventListener("click", async (e) => {
   );
 });
 
-$("token-new").addEventListener("click", openNewToken);
+$("token-new").addEventListener("click", () => openNewToken());
 
 // ---- Deploy jobs --------------------------------------------------------
 
@@ -2123,6 +2169,7 @@ function closeModal() {
   clearInterval(modalTimer);
   modalTimer = null;
   interacting = false;
+  if (pinnedNamespace) renderGetStarted();   // pick up a token minted in the modal
   if (!paused) { poll(); pollSlow(); }   // immediate refresh with the new state
 }
 function modalErr(msg) { $("modal-err").textContent = msg; $("modal-ok").disabled = false; }
@@ -2745,7 +2792,8 @@ async function pollSlow() {
     const [certs, secrets, tokens, jobs, security, namespaces] = await Promise.all([
       pinnedNamespace ? skipped : api("GET", "certs"),
       api("GET", pinnedNamespace ? "secrets?namespace=" + encodeURIComponent(pinnedNamespace) : "secrets"),
-      pinnedNamespace ? skipped : api("GET", "tokens"),
+      // A namespace admin gets its own namespace's tokens; the server narrows.
+      api("GET", "tokens"),
       pinnedNamespace ? skipped : api("GET", "jobs"),
       // Ten seconds, not two: repeats fold into an open alert over a suppression
       // window measured in minutes, so a faster poll would spend a request per
@@ -2808,6 +2856,137 @@ function sessionExpired() {
   banner.hidden = false;
 }
 
+// ---- Get started ---------------------------------------------------------
+// A namespace user's first three steps, from GET /onboarding (onboarding.rs):
+// mint a token, install the hosted MCP server in Claude Code with it, and
+// deploy fastcar. Shown while the namespace is empty, or when asked for.
+let onboardingInfo = null;
+let mintedSecret = "";      // the token just minted here, for the install command
+let gsWanted = false;       // opened from the nav, so shown even when not empty
+// "Hide" lasts for this page view only. Nothing is stored: the card stops
+// showing by itself once the namespace has a deployment in it.
+let gsHidden = false;
+
+function gsDismiss() {
+  gsHidden = true;
+  gsWanted = false;
+  renderGetStarted();
+}
+
+function mcpInstallCommand(url, token) {
+  return `claude mcp add --transport http heyo ${url} --header "Authorization: Bearer ${token}"`;
+}
+
+function claudeDeployPrompt(info) {
+  return `Using the heyo MCP server, deploy this app-lb spec with applb_deploy, `
+    + `then poll applb_job (if it starts one) and applb_get_deployment until the deployment `
+    + `${esc(info.fastcar.id)} is registered, and tell me its URL.`;
+}
+
+async function copyFrom(id) {
+  const el = $(id);
+  if (!el) return;
+  el.select();
+  try { await navigator.clipboard.writeText(el.value); toast("Copied"); }
+  catch { toast("Selected — copy with your keyboard"); }
+}
+
+function renderGetStarted() {
+  const card = $("get-started");
+  const info = onboardingInfo;
+  if (!pinnedNamespace || !info) { card.hidden = true; return; }
+  $("gs-open").hidden = false;
+  const show = gsWanted || (!gsHidden && (info.deployments === 0 || pageParams.get("onboarding") === "1"));
+  card.hidden = !show;
+  if (!show || interacting) return;
+
+  const fc = info.fastcar;
+  const mcpUrl = info.mcp && info.mcp.url;
+  const token = mintedSecret || "applb_…";
+  const spec = JSON.stringify(fc.spec, null, 2);
+  const imageNote = fc.image === "ok" ? ""
+    : `<div class="note">${esc(fc.note || "The fastcar image could not be resolved.")}</div>`;
+  const gateNote = fc.gated
+    ? `It sits behind Heyo sign-in (the namespace's <code>heyo</code> provider); only <code>/api/health</code> is open.`
+    : `<strong>This namespace has no <code>heyo</code> sign-in provider</strong>, so this spec has no gate:
+       fastcar is an agent with a shell, so add one before you share the URL.`;
+
+  card.innerHTML = `
+    <div class="gs-head">
+      <h2 id="gs-title">Get started with ${esc(info.namespace)}</h2>
+      <span class="spacer"></span>
+      <button class="btn mini" id="gs-dismiss">Hide</button>
+    </div>
+    <ol>
+      <li><strong class="gs-step">Mint a token for Claude Code</strong>
+        ${info.can_mint
+          ? `An admin token confined to <code>${esc(info.namespace)}</code>, expiring in
+             ${Math.round(info.token.max_ttl_secs / 86400)} days. The secret is shown once.
+             <div class="gs-row">
+               <button class="btn primary mini" id="gs-mint">${mintedSecret ? "Mint another" : "Mint token"}</button>
+               ${mintedSecret ? `<span class="tag ok">minted — it is in the command below</span>` : ""}
+             </div>`
+          : `<div class="note">Your access to this namespace is read-only, so you cannot mint
+             tokens for it. Ask a namespace admin for one.</div>`}
+      </li>
+      <li><strong class="gs-step">Install the Heyo MCP server</strong>
+        ${mcpUrl
+          ? `Endpoint: <code>${esc(mcpUrl)}</code>. Run this in a terminal, then restart Claude Code:
+             <input id="gs-mcp" class="mono" readonly value="${esc(mcpInstallCommand(mcpUrl, token))}">
+             <div class="gs-row"><button class="btn mini" data-copy="gs-mcp">Copy command</button>
+               ${mintedSecret ? "" : `<span class="note">Replace <code>applb_…</code> with your token.</span>`}</div>
+             <div class="note">The app-lb tools (<code>applb_*</code>) work with a namespace token;
+               the logs and CI tools are not available to namespace tokens yet.</div>`
+          : `<div class="note">This load balancer has no hosted MCP endpoint configured
+             (<code>APP_LB_ONBOARDING_MCP_URL</code>). Use the token with <code>heyctl</code> instead.</div>`}
+      </li>
+      <li><strong class="gs-step">Deploy fastcar</strong>
+        fastcar is an agent workspace, prebuilt as a public Firecracker image. This spec runs it in
+        mock mode, so it boots without any model keys. ${gateNote}
+        ${imageNote}
+        <textarea id="gs-spec" class="mono" readonly spellcheck="false">${esc(spec)}</textarea>
+        <div class="gs-row">
+          <button class="btn mini" data-copy="gs-spec">Copy spec</button>
+          <span class="note">Paste the spec into Claude Code with this request:</span>
+        </div>
+        <input id="gs-prompt" class="mono" readonly value="${claudeDeployPrompt(info)}">
+        <div class="gs-row"><button class="btn mini" data-copy="gs-prompt">Copy request</button>
+          <span class="note">Or save it as <code>fastcar.json</code> and run
+          <code>heyctl apply -f fastcar.json</code>.</span></div>
+        ${fc.url ? `<div class="note">It will answer at <a href="${esc(fc.url)}" target="_blank" rel="noopener">${esc(fc.url)}</a>
+          — the first request boots the VM, which takes a minute or two.</div>` : ""}
+        <div class="note">To run it for real, store your keys as namespace secrets and reference them
+          with <code>vm.env_from</code>: <code>INCEPTION_API_KEY</code>, <code>OPENROUTER_API_KEY</code>
+          and optionally <code>TAVILY_API_KEY</code>. Then set <code>FASTCAR_MOCK</code> to <code>0</code>.</div>
+      </li>
+    </ol>`;
+}
+
+$("get-started").addEventListener("click", (e) => {
+  const copy = e.target.closest("[data-copy]");
+  if (copy) { copyFrom(copy.dataset.copy); return; }
+  if (e.target.closest("#gs-dismiss")) { gsDismiss(); return; }
+  if (e.target.closest("#gs-mint")) {
+    openNewToken({ name: "claude-code-" + pinnedNamespace, admin: "admin" });
+  }
+});
+$("gs-open").addEventListener("click", (e) => {
+  e.preventDefault();
+  gsWanted = true;
+  gsHidden = false;
+  renderGetStarted();
+  $("get-started").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+async function loadGetStarted() {
+  if (!pinnedNamespace) return;
+  const res = await api("GET", "onboarding?namespace=" + encodeURIComponent(pinnedNamespace))
+    .catch(() => ({ ok: false }));
+  if (!res.ok) return;
+  onboardingInfo = res.data;
+  renderGetStarted();
+}
+
 // Which tier this caller holds in the pinned namespace, from /whoami. A view
 // grant gets the page without the controls it would only be refused at.
 async function applyNamespaceTier() {
@@ -2824,6 +3003,7 @@ async function applyNamespaceTier() {
 }
 
 applyNamespaceTier();
+loadGetStarted();
 poll();
 // Second, independent loop. Started after `poll` so `depsById` is usually already
 // populated by the time `renderCerts` cross-references it for routed hostnames.

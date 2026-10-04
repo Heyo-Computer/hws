@@ -608,6 +608,10 @@ Configuration is environment-only:
 | `APP_LB_AUTH_CACHE_SECS` | `60` | How long a resolved grant is trusted before re-fetching (never past the token's own expiry). Also the ceiling on revocation latency |
 | `APP_LB_AUTH_TIMEOUT_SECS` | `5` | Timeout for one scopes lookup. An unreachable auth service fails closed |
 | `APP_LB_HOME_URL` | *(unset)* | The Heyo front end namespace users open the dashboard from (e.g. `https://heyo.computer/namespaces`). Linked from `/login` and when a [namespace session](#opening-the-dashboard-for-one-namespace) is refused or expires |
+| `APP_LB_ONBOARDING_MCP_URL` | *(unset)* | Hosted MCP endpoint the dashboard's "Get started" card tells namespace users to install (e.g. `https://mcp.us2.heyo.work/mcp`). Unset leaves that step out. |
+| `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` | `7776000` (90 days) | Longest lifetime a namespace admin may mint a token for; also the default when they ask for none. |
+| `APP_LB_PUBLIC_IMAGE_CATALOG_URL` | *(unset)* | Cloud base URL serving `/public-images/{name}/meta`. Used to resolve the "Get started" fastcar spec's image download and digest. |
+| `APP_LB_ONBOARDING_FASTCAR_IMAGE` | `fastcar` | Catalog name of the image that spec deploys. |
 | `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY`. The fallback cert when ACME is on |
 | `APP_LB_TLS_KEY` | *(unset)* | PEM private-key path |
 | `APP_LB_PROXY_TLS_ADDR` | `0.0.0.0:6189` | HTTPS listener (bound when ACME is on or cert+key are set) |
