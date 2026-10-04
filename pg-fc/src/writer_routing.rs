@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use axum::{body::to_bytes, extract::Request, http::{StatusCode, header}, response::{IntoResponse, Response}};
 use hyper_util::rt::TokioIo;
 
-use crate::{peers::Peer, registry::SchemaRegistry, replication::{PhysicalPhase, Role, State, peer::PeerClient, wire}, startup::{ClientStream, StartupInfo}};
+use crate::{peers::Peer, registry::SchemaRegistry, replication::{PhysicalPhase, Role, peer::PeerClient, wire}, startup::{ClientStream, StartupInfo}};
 
 // JSON represents startup bytes as decimal integers, up to four bytes each.
 const MAX_TUNNEL_JSON: usize = 64 * 1024;
@@ -36,7 +36,7 @@ pub(crate) fn route(reg: &SchemaRegistry, db: &str) -> Result<Route> {
         }
     }
     if let Some(candidate) = reg.physical().get(db) {
-        if candidate.phase == PhysicalPhase::Standby {
+        if candidate.phase == PhysicalPhase::Standby && candidate.predecessor.is_some() {
             return Ok(if candidate.candidate_id.as_deref() == bound.as_deref() { Route::Local }
                 else { Route::Unavailable("physical standby binding mismatch") });
         }
@@ -46,8 +46,15 @@ pub(crate) fn route(reg: &SchemaRegistry, db: &str) -> Result<Route> {
                 && reg.physical_admission_ready(db) { Route::Local }
                 else { Route::Unavailable("physical handoff is not activated on this binding") });
         }
-        if candidate.phase == PhysicalPhase::Verified && candidate.predecessor.is_none() {
-            if candidate.previous_vm_id != bound { return Ok(Route::Unavailable("initial replica binding changed")); }
+        if candidate.predecessor.is_none() && matches!(candidate.phase,
+            PhysicalPhase::Verified | PhysicalPhase::StandbyBinding | PhysicalPhase::Standby) {
+            let expected_binding = match candidate.phase {
+                PhysicalPhase::Verified => candidate.previous_vm_id == bound,
+                PhysicalPhase::StandbyBinding => candidate.previous_vm_id == bound || candidate.candidate_id == bound,
+                PhysicalPhase::Standby => candidate.candidate_id == bound,
+                _ => unreachable!(),
+            };
+            if bound.is_none() || !expected_binding { return Ok(Route::Unavailable("initial replica binding changed")); }
             let peer = reg.peers().get(&candidate.source_node).context("initial physical source names an unknown peer")?;
             return Ok(Route::Peer { peer, claim: wire::WriterClaim {
                 kind: wire::WriterClaimKind::InitialSource, database: db.into(), generation: candidate.generation,
@@ -133,7 +140,7 @@ async fn validate_sender(reg: &SchemaRegistry, claim: &wire::WriterClaim) -> Res
     match claim.kind {
         wire::WriterClaimKind::InitialSource => {
             let rec = client.physical_status(&claim.database).await?;
-            if rec.phase != "verified" || rec.generation != claim.generation
+            if !matches!(rec.phase.as_str(), "verified" | "standbybinding" | "standby") || rec.generation != claim.generation
                 || rec.candidate_id.as_deref() != Some(claim.candidate_id.as_str())
                 || rec.source_node != local_node(reg)? || rec.source_vm_id != claim.source_vm_id
                 || rec.system_identifier != claim.system_identifier || rec.pg_major != claim.pg_major {
@@ -164,11 +171,13 @@ pub(crate) fn validate_destination(reg: &SchemaRegistry, claim: &wire::WriterCla
         wire::WriterClaimKind::InitialSource => {
             let source = reg.physical_sources().get(&claim.database).context("no matching physical source preparation")?;
             let logical = reg.replication().get(&claim.database).context("initial source lost logical pairing")?;
+            // Physical ownership is authoritative after preparation. Retiring
+            // the logical subscriber/slot must not revoke the physical writer.
             if source.generation != claim.generation || source.predecessor.is_some()
                 || source.source_vm_id != claim.source_vm_id || checked_out != claim.source_vm_id
                 || source.system_identifier != claim.system_identifier || source.pg_major != claim.pg_major
                 || source.peer != claim.sender_node || source.handoff.is_some() || source.fence.is_some()
-                || logical.role != Role::Primary || !matches!(logical.state, State::Active | State::Syncing) {
+                || logical.role != Role::Primary || logical.peer != source.peer {
                 bail!("initial source writer claim mismatch");
             }
         }

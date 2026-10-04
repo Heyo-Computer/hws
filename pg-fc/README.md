@@ -1250,6 +1250,48 @@ writer authority. A later handoff still requires the ordinary explicit source
 grant and fence. This recovery path therefore makes no zero-downtime writer
 failover claim.
 
+#### Retiring a replaced bootstrap logical replica
+
+For an initial physical preparation (`predecessor` absent), ordinary tenant
+connections continue forwarding to the source writer before, during, and after
+standby binding. The bound physical guest remains read-only; binding it does
+not promote it. Both peers must advertise `physical_standby_writer_routing`
+before a bootstrap standby bind is accepted. Upgrade both poolers first; do not
+downgrade either to the legacy local-read-only routing while this binding is in
+service. Reseeded standbys retain their existing local read-only behavior.
+
+After binding and verifying the physical standby, POST on the source writer:
+
+```text
+/api/replication/<database>/retire-previous
+{"generation":"<exact-generation>","previous_vm_id":"<old-logical-vm>","candidate_id":"<retained-physical-vm>"}
+```
+
+This is an explicit destructive operation for the previous bootstrap logical
+replica only. It refuses a serving binding, any current or historical physical
+source/candidate VM, and mismatched identities. It verifies the writer and a
+streaming standby that has replayed a fresh source LSN, journals the previous
+guest's creation timestamp and PostgreSQL system identifier, closes its tenant
+database to new connections, and refuses deletion while clients, prepared
+transactions, or other user databases remain. Existing clients are not killed.
+It deletes only the named VM and confirms absence before recording completion.
+Missing creation identity or uncertain daemon responses fail closed.
+
+Retry the identical request after interruption; no background deletion starts
+without this request. Completed VM retirement is never repeated. The source
+then removes only the old, inactive logical slot. A still-active slot reports
+incomplete cleanup and needs the same request retried. The physical slot,
+shared replication login, and all ownership history remain intact. The logical
+record remains compatibility metadata, not proof of physical-stream health.
+`GET /api/replication/<database>/physical` exposes the retirement receipt.
+Once a retirement is journaled, older poolers cannot read that new journal
+field; binary rollback must retain support for it.
+
+This does not retire an entire database or a former physical writer. For
+consumer investigation, `GET /api/schemas/<database>/sessions` returns session
+identities from the currently bound, already-warm VM, without SQL text or
+credentials. An unavailable/cold VM is an error, never an empty-session proof.
+
 #### Planned physical handoff
 
 POST `/api/replication/<database>/physical-handoff` on the source with the

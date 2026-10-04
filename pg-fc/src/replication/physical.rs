@@ -147,7 +147,7 @@ pub async fn accept_candidate(reg: &Arc<SchemaRegistry>, req: wire::PhysicalRepl
     if reg.physical().get(&req.database).is_some_and(|r| r.generation == req.generation) {
         reg.physical().set_repl(&req.database, &req.generation, req.repl.clone())?;
     }
-    let intent = PhysicalRecord { database: req.database.clone(), generation: req.generation.clone(), predecessor: req.predecessor.clone(), candidate_name: PhysicalRecord::candidate_name(&req.generation), repl: Some(req.repl.clone()), candidate_id: None, previous_vm_id: Some(previous.clone()), source_node: req.source_node.clone(), source_vm_id: req.source_vm_id.clone(), system_identifier: req.system_identifier.clone(), pg_major: req.pg_major, slot: req.slot.clone(), phase: PhysicalPhase::Intent, handoff_barrier: None, standby_lsn: None, last_error: None };
+    let intent = PhysicalRecord { database: req.database.clone(), generation: req.generation.clone(), predecessor: req.predecessor.clone(), candidate_name: PhysicalRecord::candidate_name(&req.generation), repl: Some(req.repl.clone()), candidate_id: None, previous_vm_id: Some(previous.clone()), source_node: req.source_node.clone(), source_vm_id: req.source_vm_id.clone(), system_identifier: req.system_identifier.clone(), pg_major: req.pg_major, slot: req.slot.clone(), phase: PhysicalPhase::Intent, handoff_barrier: None, standby_lsn: None, previous_retirement: None, last_error: None };
     let rec = if let Some(prior) = &req.reseed_from {
         if req.predecessor.as_deref() != Some(prior) { bail!("physical reseed ancestry mismatch"); }
         let old = reg.physical().get(&req.database).context("physical reseed requires prior candidate ownership")?;
@@ -193,8 +193,11 @@ pub async fn bind_standby_source(reg: &Arc<SchemaRegistry>, database: &str, gene
     let client = PeerClient::new(peer, reg.replication_cfg().context("replication disabled")?.peer_timeout)?;
     let info = client.node_info().await?;
     if info.node != source.peer || !info.physical_standby_bind { bail!("peer does not support physical standby binding"); }
+    if source.predecessor.is_none() && !info.physical_standby_writer_routing {
+        bail!("upgrade peer writer routing before binding a bootstrap standby");
+    }
     let target = client.physical_status(database).await?;
-    if target.generation != generation || !matches!(target.phase.as_str(), "verified" | "standby_binding" | "standby") || target.source_vm_id != source.source_vm_id
+    if target.generation != generation || !matches!(target.phase.as_str(), "verified" | "standbybinding" | "standby_binding" | "standby") || target.source_vm_id != source.source_vm_id
         || target.source_node != reg.replication_cfg().unwrap().node_name || target.system_identifier != source.system_identifier
         || target.pg_major != source.pg_major { bail!("peer does not own the exact verified standby candidate"); }
     if target.phase != "verified" { return Ok(target); }
@@ -224,6 +227,9 @@ pub async fn accept_standby_bind(reg: &Arc<SchemaRegistry>, req: wire::PhysicalS
     let peer = reg.peers().get(&rec.source_node).context("physical source peer is missing")?;
     let info = PeerClient::new(peer, reg.replication_cfg().context("replication disabled")?.peer_timeout)?.node_info().await?;
     if info.node != rec.source_node || !info.physical_standby_bind { bail!("source identity/capability changed"); }
+    if rec.predecessor.is_none() && !info.physical_standby_writer_routing {
+        bail!("upgrade source writer routing before binding a bootstrap standby");
+    }
     // Persist authorization before guest I/O: replay lag or a restart must
     // resume this candidate and this LSN, not require a new bind request.
     reg.physical().begin_standby_binding(&req.database, &req.generation, &req.source_lsn)?;

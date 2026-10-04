@@ -1483,6 +1483,37 @@ impl SchemaRegistry {
         self.store.record(schema)
     }
 
+    /// Inspect the existing guest without waking or provisioning a database.
+    /// Never expose query text: it may contain credentials or application data.
+    pub async fn database_sessions(&self, schema: &str) -> Result<serde_json::Value> {
+        let _binding = self.binding_lock(schema).read_owned().await;
+        let id = self.bound_vm_id(schema).context("database has no VM binding")?;
+        let entry = self.warm_entry(&id).await.context("database is not warm; session state is unknown")?;
+        let query = async {
+            let client = entry.pool.get().await?;
+            let rows = client.query(
+                "SELECT pid, datname, usename, application_name, client_addr::text, \
+                 state, backend_type, backend_start::text \
+                 FROM pg_stat_activity WHERE pid <> pg_backend_pid() ORDER BY pid",
+                &[],
+            ).await?;
+            let sessions: Vec<_> = rows.iter().map(|r| serde_json::json!({
+                "pid": r.get::<_, i32>(0),
+                "database": r.get::<_, Option<String>>(1),
+                "username": r.get::<_, Option<String>>(2),
+                "application_name": r.get::<_, Option<String>>(3),
+                "client_address": r.get::<_, Option<String>>(4),
+                "state": r.get::<_, Option<String>>(5),
+                "backend_type": r.get::<_, Option<String>>(6),
+                "backend_start": r.get::<_, Option<String>>(7),
+            })).collect();
+            Ok::<_, anyhow::Error>(serde_json::json!({
+                "database": schema, "sandbox_id": id, "sessions": sessions,
+            }))
+        };
+        tokio::time::timeout(STATS_TIMEOUT, query).await.context("session inspection timed out")?
+    }
+
     /// Live database stats for a warm, pooler-managed VM, read over the pooler's
     /// own warm Postgres pool — the *same* safe TCP path the liveness probe uses,
     /// **not** a guest console exec, so it never disturbs the VM. `None` when the

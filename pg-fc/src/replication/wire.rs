@@ -75,6 +75,9 @@ pub struct NodeInfo {
     pub physical_reseed: bool,
     #[serde(default)]
     pub physical_standby_bind: bool,
+    /// Bootstrap standby binding preserves the ordinary tenant writer route.
+    #[serde(default)]
+    pub physical_standby_writer_routing: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -82,6 +85,20 @@ pub struct PhysicalPrepareRequest { pub generation: String }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct PhysicalReseedRequest { pub generation: String, pub prior_generation: String }
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RetirePreviousRequest {
+    pub generation: String,
+    pub previous_vm_id: String,
+    pub candidate_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct RetirePreviousPeerRequest {
+    pub standby: PhysicalStandbyBindRequest,
+    pub previous_vm_id: String,
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct PhysicalStandbyBindRequest {
@@ -153,6 +170,8 @@ pub struct PhysicalRecordJson {
     pub system_identifier: String,
     #[serde(default)]
     pub pg_major: u32,
+    #[serde(default)]
+    pub previous_retirement: Option<super::physical_store::PreviousRetirement>,
     pub last_error: Option<String>,
 }
 
@@ -161,6 +180,7 @@ impl From<&crate::replication::PhysicalRecord> for PhysicalRecordJson {
         database: r.database.clone(), generation: r.generation.clone(), phase: format!("{:?}", r.phase).to_lowercase(),
         candidate_id: r.candidate_id.clone(), previous_vm_id: r.previous_vm_id.clone(), source_vm_id: r.source_vm_id.clone(), last_error: r.last_error.clone(),
         source_node: r.source_node.clone(), system_identifier: r.system_identifier.clone(), pg_major: r.pg_major,
+        previous_retirement: r.previous_retirement.clone(),
     }}
 }
 
@@ -357,6 +377,16 @@ pub struct DetachResponse {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_peer_does_not_claim_writer_preserving_standby_support() {
+        let info: NodeInfo = serde_json::from_value(serde_json::json!({
+            "node": "peer", "replication_enabled": true, "tls": true,
+            "physical_standby_bind": true,
+        })).unwrap();
+        assert!(info.physical_standby_bind);
+        assert!(!info.physical_standby_writer_routing);
+    }
+
     fn provision() -> ProvisionReplica {
         ProvisionReplica {
             database: "acme".into(),
@@ -426,7 +456,7 @@ mod tests {
             candidate_name: "repl-seed-g1".into(), candidate_id: Some("candidate-e1".into()),
             previous_vm_id: Some("old-e0".into()), source_node: "us3".into(), source_vm_id: "source-u0".into(),
             system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(),
-            phase: crate::replication::PhysicalPhase::Verified, handoff_barrier: None, standby_lsn: None, last_error: None,
+            phase: crate::replication::PhysicalPhase::Verified, handoff_barrier: None, standby_lsn: None, previous_retirement: None, last_error: None,
             repl: Some(Login { role: "repl_acme".into(), password: "not-for-status".into() }),
         };
         let mut value = serde_json::to_value(PhysicalRecordJson::from(&record)).unwrap();

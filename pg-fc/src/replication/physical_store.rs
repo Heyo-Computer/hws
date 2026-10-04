@@ -69,6 +69,15 @@ pub struct PhysicalFence {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct PreviousRetirement {
+    pub vm_id: String,
+    pub created_at: String,
+    pub system_identifier: String,
+    pub deleted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhysicalRecord {
     pub database: String,
     pub generation: String,
@@ -91,6 +100,8 @@ pub struct PhysicalRecord {
     pub handoff_barrier: Option<String>,
     #[serde(default)]
     pub standby_lsn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_retirement: Option<PreviousRetirement>,
     pub last_error: Option<String>,
 }
 
@@ -579,6 +590,9 @@ impl PhysicalStore {
         let mut journal = self.journal.lock().unwrap();
         let current = journal.current.get(database).context("no physical candidate")?;
         if current.generation != generation { bail!("stale physical handoff generation"); }
+        if current.previous_retirement.as_ref().is_some_and(|r| !r.deleted) {
+            bail!("finish previous replica retirement before handoff");
+        }
         if current.handoff_started() {
             if current.handoff_barrier.as_deref() == Some(barrier) { return Ok(current.clone()); }
             bail!("physical handoff barrier changed");
@@ -617,6 +631,39 @@ impl PhysicalStore {
         })
     }
 
+    /// Retain ownership forever, even after the resource is deleted. Only the
+    /// explicit retirement executor may bypass ordinary cleanup protection.
+    pub fn record_previous_retirement(&self, database: &str, generation: &str, retirement: PreviousRetirement) -> Result<()> {
+        let mut journal = self.journal.lock().unwrap();
+        let current = journal.current.get(database).context("no physical candidate")?;
+        if current.generation != generation || current.predecessor.is_some()
+            || current.phase != PhysicalPhase::Standby
+            || current.previous_vm_id.as_deref() != Some(retirement.vm_id.as_str()) {
+            bail!("retirement requires the exact replaced bootstrap replica");
+        }
+        match &current.previous_retirement {
+            Some(old) if old.vm_id != retirement.vm_id || old.created_at != retirement.created_at
+                || old.system_identifier != retirement.system_identifier || old.deleted && !retirement.deleted => {
+                bail!("retirement identity or completion changed");
+            }
+            None if retirement.deleted => bail!("retirement must be journaled before deletion"),
+            _ => {}
+        }
+        let mut next = journal.clone();
+        let updated = next.current.get_mut(database).unwrap();
+        updated.previous_retirement = Some(retirement);
+        validate_record(updated)?;
+        persist_journal(&self.path, &next)?;
+        *journal = next;
+        Ok(())
+    }
+
+    pub fn is_candidate_vm(&self, id: &str) -> bool {
+        let journal = self.journal.lock().unwrap();
+        journal.current.values().chain(journal.history.iter())
+            .any(|r| r.candidate_id.as_deref() == Some(id))
+    }
+
     pub fn reserves_database(&self, database: &str) -> bool {
         self.journal.lock().unwrap().current.contains_key(database)
     }
@@ -642,6 +689,13 @@ fn phase_number(phase: PhysicalPhase) -> u8 {
 fn validate_record(record: &PhysicalRecord) -> Result<()> {
     validate_pg_identifier("database", &record.database)?;
     validate_generation(&record.generation)?;
+    if let Some(retired) = &record.previous_retirement {
+        if record.previous_vm_id.as_deref() != Some(retired.vm_id.as_str())
+            || retired.created_at.is_empty() || retired.system_identifier.is_empty()
+            || !retired.system_identifier.bytes().all(|c| c.is_ascii_digit()) {
+            bail!("invalid previous replica retirement identity");
+        }
+    }
     if let Some(login) = &record.repl { validate_login(login)?; }
     if let Some(predecessor) = &record.predecessor {
         validate_generation(predecessor)?;
@@ -903,13 +957,48 @@ mod tests {
         std::env::temp_dir().join(format!("pgfc-physical-{label}-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
     }
     fn record(database: &str, generation: &str) -> PhysicalRecord {
-        PhysicalRecord { database: database.into(), generation: generation.into(), predecessor: None, candidate_name: PhysicalRecord::candidate_name(generation), repl: None, candidate_id: None, previous_vm_id: Some("logical-vm-1".into()), source_node: "eu2".into(), source_vm_id: "source-vm-1".into(), system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(), phase: PhysicalPhase::Intent, handoff_barrier: None, standby_lsn: None, last_error: None }
+        PhysicalRecord { database: database.into(), generation: generation.into(), predecessor: None, candidate_name: PhysicalRecord::candidate_name(generation), repl: None, candidate_id: None, previous_vm_id: Some("logical-vm-1".into()), source_node: "eu2".into(), source_vm_id: "source-vm-1".into(), system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(), phase: PhysicalPhase::Intent, handoff_barrier: None, standby_lsn: None, previous_retirement: None, last_error: None }
     }
     fn source(database: &str, generation: &str) -> PhysicalSourceRecord {
         PhysicalSourceRecord { database: database.into(), generation: generation.into(), predecessor: None, source_vm_id: "source-vm-1".into(),
             repl: None, fence: None,
             system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(),
             source_lsn: "0/16B6C50".into(), peer: "eu1".into(), handoff_candidate: None, handoff_complete: false, handoff: None, last_error: None }
+    }
+
+    #[test]
+    fn retirement_survives_restart_without_releasing_or_reusing_identity() {
+        let p = path("retirement");
+        let store = PhysicalStore::load(p.clone()).unwrap();
+        store.create(record("acme", "g1")).unwrap();
+        let intent = PreviousRetirement { vm_id: "logical-vm-1".into(), created_at: "2026-09-01T00:00:00Z".into(), system_identifier: "987654321".into(), deleted: false };
+        assert!(store.record_previous_retirement("acme", "g1", intent.clone()).is_err());
+        for (from, to, id) in [(PhysicalPhase::Intent, PhysicalPhase::Creating, None),
+            (PhysicalPhase::Creating, PhysicalPhase::Candidate, Some("candidate-2".into())),
+            (PhysicalPhase::Candidate, PhysicalPhase::Seeding, None),
+            (PhysicalPhase::Seeding, PhysicalPhase::Verified, None)] {
+            store.advance("acme", "g1", from, to, id).unwrap();
+        }
+        assert!(store.record_previous_retirement("acme", "g1", intent.clone()).is_err());
+        store.begin_standby_binding("acme", "g1", "0/121").unwrap();
+        store.advance("acme", "g1", PhysicalPhase::StandbyBinding, PhysicalPhase::Standby, None).unwrap();
+        assert!(store.record_previous_retirement("acme", "g1", PreviousRetirement { deleted: true, ..intent.clone() }).is_err());
+        assert!(store.record_previous_retirement("acme", "stale", intent.clone()).is_err());
+        assert!(store.record_previous_retirement("acme", "g1", PreviousRetirement { vm_id: "candidate-2".into(), ..intent.clone() }).is_err());
+        store.record_previous_retirement("acme", "g1", intent.clone()).unwrap();
+        let store = PhysicalStore::load(p.clone()).unwrap();
+        assert_eq!(store.get("acme").unwrap().previous_retirement, Some(intent.clone()));
+        assert!(store.begin_handoff("acme", "g1", "0/122").is_err());
+        assert!(store.record_previous_retirement("acme", "g1", PreviousRetirement { created_at: "2026-10-04T00:00:00Z".into(), ..intent.clone() }).is_err());
+        assert!(store.record_previous_retirement("acme", "g1", PreviousRetirement { system_identifier: "111".into(), ..intent.clone() }).is_err());
+        store.record_previous_retirement("acme", "g1", PreviousRetirement { deleted: true, ..intent.clone() }).unwrap();
+        let store = PhysicalStore::load(p.clone()).unwrap();
+        assert!(store.get("acme").unwrap().previous_retirement.unwrap().deleted);
+        assert!(store.owns_vm("logical-vm-1"));
+        assert!(!store.is_candidate_vm("logical-vm-1"));
+        assert!(store.is_candidate_vm("candidate-2"));
+        assert!(store.record_previous_retirement("acme", "g1", intent).is_err());
+        std::fs::remove_file(p).unwrap();
     }
 
     #[test]

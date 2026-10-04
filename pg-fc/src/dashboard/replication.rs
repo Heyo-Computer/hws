@@ -407,6 +407,7 @@ pub async fn api_node_info(State(st): State<DashState>) -> Json<wire::NodeInfo> 
         physical_successor: true,
         physical_reseed: true,
         physical_standby_bind: true,
+        physical_standby_writer_routing: true,
     })
 }
 
@@ -430,6 +431,18 @@ pub async fn api_physical_standby_bind(State(st): State<DashState>, Path(db): Pa
 
 pub async fn api_accept_physical_standby_bind(State(st): State<DashState>, Json(req): Json<wire::PhysicalStandbyBindRequest>) -> Response {
     match crate::replication::physical::accept_standby_bind(&st.registry, req).await {
+        Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_retire_previous(State(st): State<DashState>, Path(db): Path<String>, Json(req): Json<wire::RetirePreviousRequest>) -> Response {
+    match crate::replication::retirement::retire_previous(&st.registry, &db, req).await {
+        Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_accept_retirement(State(st): State<DashState>, Json(req): Json<wire::RetirePreviousPeerRequest>) -> Response {
+    match crate::replication::retirement::accept_retirement(&st.registry, req).await {
         Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
     }
 }

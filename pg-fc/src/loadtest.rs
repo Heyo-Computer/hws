@@ -1077,7 +1077,7 @@ async fn physical_handoff_restart_admission_and_source_grant_are_fail_closed() {
         candidate_name: PhysicalRecord::candidate_name("g1"), repl: None, candidate_id: None,
         previous_vm_id: Some("sb-old".into()), source_node: "us3".into(), source_vm_id: "sb-source".into(),
         system_identifier: "123456".into(), pg_major: 18, slot: "physical_acme".into(),
-        phase: P::Intent, handoff_barrier: None, standby_lsn: None, last_error: None }).unwrap();
+        phase: P::Intent, handoff_barrier: None, standby_lsn: None, previous_retirement: None, last_error: None }).unwrap();
     for (from, to, id) in [(P::Intent, P::Creating, None), (P::Creating, P::Candidate, Some("sb-candidate".into())),
         (P::Candidate, P::Seeding, None), (P::Seeding, P::Verified, None)] {
         assert!(reg.physical_admission_ready("acme"), "preparation must preserve the old serving database");
@@ -1157,7 +1157,7 @@ async fn writer_tunnel_preserves_postgres_auth_and_session() {
         candidate_name: "repl-seed-writer-test".into(), repl: None, candidate_id: None,
         previous_vm_id: Some("sb-previous".into()), source_node: "source".into(), source_vm_id: "sb-source".into(),
         system_identifier: system.clone(), pg_major: 18, slot: "writer_slot".into(), phase: P::Intent,
-        handoff_barrier: None, standby_lsn: None, last_error: None,
+        handoff_barrier: None, standby_lsn: None, previous_retirement: None, last_error: None,
     }).unwrap();
     for (from, to, id) in [(P::Intent, P::Creating, None), (P::Creating, P::Candidate, Some(vm.into())), (P::Candidate, P::Seeding, None), (P::Seeding, P::Verified, None)] {
         reg.physical().advance(&database, "writer-test", from, to, id).unwrap();
@@ -1253,7 +1253,7 @@ async fn physical_three_transfers_preserve_revocation_and_replication_credential
         let intent = PhysicalRecord { database: "acme".into(), generation: generation.clone(), predecessor,
             candidate_name: PhysicalRecord::candidate_name(&generation), repl: Some(login.clone()), candidate_id: None,
             previous_vm_id: Some(previous_vm.clone()), source_node: ["us3", "eu1"][source_idx].into(), source_vm_id: source_vm.clone(),
-            system_identifier: "123456".into(), pg_major: 18, slot: source.slot.clone(), phase: P::Intent, handoff_barrier: None, standby_lsn: None, last_error: None };
+            system_identifier: "123456".into(), pg_major: 18, slot: source.slot.clone(), phase: P::Intent, handoff_barrier: None, standby_lsn: None, previous_retirement: None, last_error: None };
         if round == 0 { target_reg.physical().create(intent).unwrap(); }
         else { target_reg.physical().create_successor(intent, &target_reg.physical_sources().get("acme").unwrap(), &previous_vm).unwrap(); }
         for (from, to, id) in [(P::Intent, P::Creating, None), (P::Creating, P::Candidate, Some(candidate.into())), (P::Candidate, P::Seeding, None), (P::Seeding, P::Verified, None)] {
@@ -1263,6 +1263,22 @@ async fn physical_three_transfers_preserve_revocation_and_replication_credential
             let Route::Peer { claim, .. } = route(target_reg, "acme").unwrap() else { panic!("verified initial replica must route to source") };
             assert_eq!(claim.kind, crate::replication::wire::WriterClaimKind::InitialSource);
             assert_eq!(claim.source_vm_id, "u0");
+            target_reg.physical().begin_standby_binding("acme", &generation, "0/100").unwrap();
+            let check_route_after_restart = || {
+                let restarted = crate::registry::SchemaRegistry::new(configs[target_idx].clone()).unwrap();
+                let Route::Peer { claim, .. } = route(&restarted, "acme").unwrap() else { panic!("binding a standby must preserve the writer route") };
+                assert_eq!(claim.source_vm_id, "u0");
+                assert_eq!(claim.candidate_id, "e1");
+                assert_eq!(claim.kind, crate::replication::wire::WriterClaimKind::InitialSource);
+            };
+            check_route_after_restart();
+            target_reg.commit_physical_binding("acme", &previous_vm, candidate).await.unwrap();
+            check_route_after_restart();
+            target_reg.physical().advance("acme", &generation, P::StandbyBinding, P::Standby, None).unwrap();
+            check_route_after_restart();
+            target_reg.commit_physical_binding("acme", candidate, "wrong-binding").await.unwrap();
+            assert!(matches!(route(target_reg, "acme").unwrap(), Route::Unavailable(_)));
+            target_reg.commit_physical_binding("acme", "wrong-binding", candidate).await.unwrap();
         }
         source_reg.physical_sources().authorize_handoff("acme", &generation, candidate).unwrap();
         assert!(crate::replication::orchestrate::unfence(source_reg, "acme").await.is_err());

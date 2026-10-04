@@ -61,6 +61,7 @@ pub mod orchestrate;
 pub mod peer;
 pub mod physical;
 pub mod physical_store;
+pub mod retirement;
 pub mod sql;
 pub mod store;
 pub mod wire;

@@ -300,6 +300,14 @@ pub async fn schema(State(st): State<DashState>, Path(schema): Path<String>) -> 
     .into_response()
 }
 
+/// Read-only session identity on the currently bound, already-warm guest.
+pub async fn sessions(State(st): State<DashState>, Path(schema): Path<String>) -> Response {
+    match st.registry.database_sessions(&schema).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => fail(StatusCode::CONFLICT, format!("{error:#}")),
+    }
+}
+
 /// `POST /api/schemas/{schema}/{action}`.
 ///
 /// Refusals are 409 (the schema's state forbids it, and the caller can change
