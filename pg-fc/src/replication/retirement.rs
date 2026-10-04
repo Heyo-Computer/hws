@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use heyo_sdk::{HeyoError, Sandbox};
+use heyo_sdk::{HeyoClient, HeyoError, RequestOptions, Sandbox};
 
 use super::{PhysicalPhase, Role, peer::PeerClient, physical_store::PreviousRetirement, wire};
 use crate::{registry::SchemaRegistry, vm};
@@ -133,6 +133,12 @@ pub async fn accept_retirement(
     if rec.previous_retirement.as_ref().is_some_and(|r| r.deleted) {
         return Ok((&rec).into());
     }
+    let disk = reg
+        .cfg()
+        .run_dir
+        .as_ref()
+        .context("PG_VM_POOL_RUN_DIR is required to verify disk reclamation")?
+        .join(&req.previous_vm_id);
     let peer = reg
         .peers()
         .get(&s.source_node)
@@ -166,12 +172,26 @@ pub async fn accept_retirement(
         bail!("retained replica is not streaming and caught up");
     }
     let old = Sandbox::connect(req.previous_vm_id.clone(), vm::local_opts())?;
-    let info = match old.get().await {
-        Ok(info) => Some(serde_json::to_value(info)?),
+    // SDK 0.1.5's SandboxInfo discards created_at. Keep the incarnation
+    // timestamp by reading the same authenticated endpoint as raw JSON.
+    let client = HeyoClient::new(vm::local_opts())?;
+    let info = match client
+        .request::<serde_json::Value>(
+            reqwest::Method::GET,
+            &format!("/deployed-sandboxes/{}", req.previous_vm_id),
+            None::<&()>,
+            RequestOptions::default(),
+        )
+        .await
+    {
+        Ok(info) => Some(info),
         Err(HeyoError::NotFound(_)) if rec.previous_retirement.is_some() => None,
         Err(error) => return Err(error.into()),
     };
     let mut retirement = if let Some(info) = info {
+        if info.get("id").and_then(|v| v.as_str()) != Some(req.previous_vm_id.as_str()) {
+            bail!("daemon returned a different VM identity");
+        }
         let created = info
             .get("created_at")
             .and_then(|v| v.as_str())
@@ -209,17 +229,26 @@ pub async fn accept_retirement(
         if drained.exit_code != 0 || drained.stdout.trim() != "t" {
             bail!("previous replica still has clients or other databases; retry after they finish");
         }
-        old.kill().await?;
-        match old.get().await {
-            Err(HeyoError::NotFound(_)) => {}
-            _ => bail!("previous VM deletion is not confirmed; retry the same retirement"),
-        }
         intent
     } else {
         rec.previous_retirement
             .clone()
             .context("missing retirement intent")?
     };
+    vm::kill_and_reclaim(
+        reg.cfg(),
+        &old,
+        &s.database,
+        "replaced by verified physical standby",
+    )
+    .await?;
+    match old.get().await {
+        Err(HeyoError::NotFound(_)) => {}
+        _ => bail!("previous VM deletion is not confirmed; retry the same retirement"),
+    }
+    if tokio::fs::try_exists(&disk).await? {
+        bail!("previous VM removed but its disk remains; retry the same retirement");
+    }
     retirement.deleted = true;
     reg.physical()
         .record_previous_retirement(&s.database, &s.generation, retirement)?;
