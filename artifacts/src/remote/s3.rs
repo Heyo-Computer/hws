@@ -169,8 +169,15 @@ impl S3Remote {
             for (k, v) in &req.headers {
                 b = b.header(*k, v);
             }
+            // hyper sends no `Content-Length` for an empty body, and S3 answers a
+            // PUT or POST without one with 411 — a public marker and a
+            // registry's empty objects are exactly such bodies.
             if let Some(body) = &req.body {
-                b = b.body(body.clone());
+                b = b
+                    .header(reqwest::header::CONTENT_LENGTH, body.len())
+                    .body(body.clone());
+            } else if req.method == reqwest::Method::PUT || req.method == reqwest::Method::POST {
+                b = b.header(reqwest::header::CONTENT_LENGTH, 0);
             }
             let resp = b.send().await.map_err(|e| {
                 Error::Remote(format!("{} {}: {e}", req.method, self.show(req.key)))
@@ -607,6 +614,30 @@ mod tests {
             part_size: DEFAULT_PART_SIZE,
             concurrency: DEFAULT_CONCURRENCY,
         }
+    }
+
+    /// S3 refuses a PUT with no `Content-Length` (411), and hyper omits the
+    /// header for an empty body — which is what a public marker is.
+    #[tokio::test]
+    async fn an_empty_put_says_its_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\netag: \"e\"\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_lowercase()
+        });
+        let r = S3Remote::new(settings(Some(&format!("http://{addr}")))).unwrap();
+        r.put("public/aa/marker", Vec::new(), Cond::Always)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.contains("\r\ncontent-length: 0\r\n"), "{request}");
     }
 
     #[test]
