@@ -106,6 +106,13 @@ export interface Config {
    * is public. Survives `withForwardedAuth`, which spreads the config it is given.
    */
   readonly http?: boolean;
+  /**
+   * What the caller of this request may do in the artifact store with this
+   * server's key, decided per request by `authorizeArtCaller` (`artscope.ts`).
+   * Unset means unconfined, which is right for stdio (the caller is the
+   * operator) and for a server without the key (the store judges the caller).
+   */
+  readonly artScope?: import("./artscope.js").ArtScope;
 }
 
 function trimUrl(raw: string): string {

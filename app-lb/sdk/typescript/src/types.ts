@@ -373,6 +373,16 @@ export interface JwtSpec {
   login_url?: string;
   /** The query parameter the hosted sign-in reads the return URL from. Only with `login_url`; defaults to `redirect_uri`. */
   login_redirect_param?: string;
+  /**
+   * Scoped sign-in: the issuer's OAuth authorization endpoint. With
+   * `token_url`, a token-less browser is sent through an authorization-code
+   * flow (PKCE S256) asking for this deployment's namespace; the token that
+   * comes back must name this host (`gateHost`) and namespace, and app-lb keeps
+   * a host-only session. Cannot be combined with a `cookie_domain` realm.
+   */
+  authorize_url?: string;
+  /** Scoped sign-in: the issuer's token endpoint, called server to server. */
+  token_url?: string;
 }
 
 export interface DeploymentSpec {

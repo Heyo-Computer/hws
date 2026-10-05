@@ -61,14 +61,10 @@ pub struct S3Config {
 
 #[derive(Debug, Clone)]
 pub struct ArtifactsConfig {
-    /// Base URL of one central `art serve`.
-    ///
-    /// One, not per-host: the store is per-host and per-user (its own
-    /// `examples/artifacts.json` pins it to a single replica, because "each VM
-    /// has its own disk, so N replicas are N independent stores"). Every
-    /// upload lands here — whether the orchestrator pushes the bytes after
-    /// reading them out of the guest, or the guest pushes them itself (see
-    /// `guest_url`) — so there is one store and nothing to sync.
+    /// HTTP endpoint of the logical artifact store. All release participants
+    /// must use the same global bucket/prefix, via the hub or regional caches.
+    /// `ART_S3_BUCKET` belongs to art, not CI's separate raw-S3 sink. A daemon
+    /// without a remote tier remains a standalone local store.
     pub url: String,
     pub token: Option<String>,
     /// The base URL a *guest* uses to reach the same store, when it differs

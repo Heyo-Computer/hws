@@ -1831,8 +1831,26 @@ The database retains artifact provenance; ordinary build-tag cleanup must not
 delete release tags. Releasing these roots needs an explicit retirement policy,
 not the short-lived build-artifact age limit.
 
-This path currently requires `CI_ARTIFACT_SINK=artifacts`. Disk and S3 sinks fail
-admission because they do not implement verified release retention. Older
+This path uses the **global art store** through `CI_ARTIFACT_SINK=artifacts`.
+Set `CI_ARTIFACT_URL` to its authenticated HTTP endpoint, and resolve
+`CI_ARTIFACT_TOKEN` from the canonical `artifacts/api-key` HeyoSecret. If set,
+`CI_ARTIFACT_GUEST_URL` must address the same logical store. Use a stable endpoint
+reachable from all build and deployment regions; no region is hardcoded in CI.
+The art servers own `ART_S3_BUCKET`, prefix and credentials. CI must not select
+its raw `s3` sink just because art uses S3 internally: that bypasses manifests,
+global tags and release-retention roots. Regional caches must share the same
+bucket/prefix and finish backfill/verification before they are interchangeable.
+
+The release catalog remains in CI's existing database. Bytes, manifests and
+`release-*` roots live in art's global store. A successful retention write goes
+through art's remote-first API before CI marks a build ready. Deploy/rollback
+fetch by the recorded digest, not `latest`, and never rebuild the selected release.
+Cache eviction or replacement is safe only after the migration runbook confirms
+there are no local-only artifacts; a configured S3 variable alone is not proof.
+See [the global-store migration runbook](../artifacts/docs/runbook-global-store-migration.md).
+
+Disk and raw-S3 sinks fail admission because they do not implement verified
+release retention. Older
 version-1 catalog registrations do not acquire these pins automatically and must
 not be treated as retained releases. No shared policies are changed by installing
 this code; activation and environment promotion are separate steps.

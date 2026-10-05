@@ -152,7 +152,9 @@ credential that git cannot send.
 The VM is disposable. Its `disk_size_gb` disk holds only `REMOTE_CACHE_DIR`,
 which re-hydrates from the bucket, so it needs no `vm.workspace`.
 `REMOTE_APPLB_URL` is the region's public admin URL, because a VM cannot reach
-the host's loopback admin listener. For another region, change the route,
+the host's loopback admin listener. `REMOTE_DEFAULT_ACCOUNT=heyo` lets a
+namespace `applb_` token, which carries no Heyo account, create a namespace's
+first repo; such namespaces share the `heyo` account's bucket. For another region, change the route,
 `REMOTE_PUBLIC_URL` and `REMOTE_APPLB_URL`.
 
 ## Test
