@@ -1817,9 +1817,10 @@ Submit path filters do not reduce the build: every configured workflow runs,
 with `changed()` evaluating against an unknown/full change set. Other job and
 step conditions still apply; a skipped required producer cannot seal a release.
 These workflows may run build/test shell and `ci/upload-artifact`, but not
-deployment/publication builtins. Build admission strips upload aliases and public
-publication flags so it cannot move `latest`. Shell commands are trusted merged
-repository code and must themselves be build-only.
+deployment/publication builtins. Build admission strips upload aliases so it
+cannot move `latest`. Explicit public download flags are preserved because host
+self-update consumes public digest URLs; this does not select a running version.
+Shell commands are trusted merged repository code and must themselves be build-only.
 
 Only complete successful results produce a version-2 catalog bundle. It records
 the exact revision, build ID and every component's digest, size and provenance.

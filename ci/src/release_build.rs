@@ -120,7 +120,8 @@ fn plans(policy: &Policy, source: &GitPatchSource) -> Result<Vec<Plan>> {
                 if step.uses.as_deref() == Some("ci/upload-artifact") {
                     // A build is not a deployment or a publication of 'latest'.
                     step.with.remove("alias");
-                    step.with.insert("public".into(), "false".into());
+                    // Preserve explicit public downloads: host self-update
+                    // consumes digest URLs without artifact-store credentials.
                 }
             }
         }
@@ -574,7 +575,7 @@ mod tests {
         for plan in plans {
             assert_eq!(plan.jobs.len(), 1);
             assert!(plan.jobs[0].condition.as_ref().unwrap().contains("changed"));
-            assert_eq!(plan.jobs[0].steps[1].with.get("public").unwrap(), "false");
+            assert_eq!(plan.jobs[0].steps[1].with.get("public").unwrap(), "true");
             assert!(!plan.jobs[0].steps[1].with.contains_key("alias"));
         }
         source
