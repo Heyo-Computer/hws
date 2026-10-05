@@ -21,6 +21,7 @@
 //! | variable | default | meaning |
 //! | --- | --- | --- |
 //! | `APP_LB_ONBOARDING_MCP_URL` | unset | the hosted MCP endpoint; without it the card leaves that step out |
+//! | `APP_LB_ONBOARDING_MCP_NAME` | `heyo` | the name the install command gives the server in the user's MCP client |
 //! | `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` | 90 days | the longest a namespace-confined caller may mint a token for |
 //! | `APP_LB_PUBLIC_IMAGE_CATALOG_URL` | unset | cloud's base URL, serving `/public-images/{name}/meta` |
 //! | `APP_LB_ONBOARDING_FASTCAR_IMAGE` | `fastcar` | the catalog name the fastcar spec deploys |
@@ -34,6 +35,10 @@ use serde_json::{Value, json};
 /// `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` says otherwise. A tenant's tokens always
 /// expire: one that never does is a credential nobody remembers to revoke.
 pub const DEFAULT_TENANT_TOKEN_MAX_TTL_SECS: u64 = 90 * 86_400;
+
+/// The name the install command registers the MCP server under, unless
+/// `APP_LB_ONBOARDING_MCP_NAME` names another.
+pub const DEFAULT_MCP_NAME: &str = "heyo";
 
 /// The catalog image the fastcar spec deploys, unless
 /// `APP_LB_ONBOARDING_FASTCAR_IMAGE` names another.
@@ -49,6 +54,10 @@ const MAX_LABEL: usize = 63;
 
 pub struct Onboarding {
     pub mcp_url: Option<String>,
+    /// What the user's MCP client calls this server. Each region's MCP server
+    /// only accepts tokens its own app-lb minted, so a user of two regions adds
+    /// two servers, and a distinct name per region keeps them apart.
+    pub mcp_name: String,
     pub tenant_token_max_ttl_secs: u64,
     catalog_url: Option<reqwest::Url>,
     pub fastcar_image: String,
@@ -59,6 +68,7 @@ impl std::fmt::Debug for Onboarding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Onboarding")
             .field("mcp_url", &self.mcp_url)
+            .field("mcp_name", &self.mcp_name)
             .field("tenant_token_max_ttl_secs", &self.tenant_token_max_ttl_secs)
             .field(
                 "catalog_url",
@@ -100,6 +110,27 @@ fn https_url(var: &str, raw: Option<String>) -> Option<reqwest::Url> {
     }
 }
 
+/// The configured server name, if it is safe to paste into a shell command and
+/// a JSON key unquoted; otherwise the default, with a warning.
+fn mcp_name(raw: Option<String>) -> String {
+    let Some(raw) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return DEFAULT_MCP_NAME.to_string();
+    };
+    let ok = raw.len() <= 64
+        && raw.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        raw
+    } else {
+        tracing::warn!(
+            variable = "APP_LB_ONBOARDING_MCP_NAME",
+            value = %raw,
+            "ignoring: use letters, digits, '-' and '_' only"
+        );
+        DEFAULT_MCP_NAME.to_string()
+    }
+}
+
 impl Onboarding {
     pub fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(k).ok())
@@ -115,6 +146,7 @@ impl Onboarding {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_FASTCAR_IMAGE.to_string());
         Self {
+            mcp_name: mcp_name(get("APP_LB_ONBOARDING_MCP_NAME")),
             mcp_url: https_url(
                 "APP_LB_ONBOARDING_MCP_URL",
                 get("APP_LB_ONBOARDING_MCP_URL"),
@@ -332,6 +364,21 @@ pub fn fastcar_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mcp_name_defaults_and_refuses_anything_a_shell_would_read() {
+        let with = |v: &str| {
+            Onboarding::from_lookup(|k| (k == "APP_LB_ONBOARDING_MCP_NAME").then(|| v.to_string()))
+                .mcp_name
+        };
+        assert_eq!(Onboarding::default().mcp_name, "heyo");
+        assert_eq!(with(" heyo-us5 "), "heyo-us5");
+        assert_eq!(with("heyo_us2"), "heyo_us2");
+        let long = "a".repeat(65);
+        for bad in ["", "-x", "a b", "x;rm", "x\"q", long.as_str()] {
+            assert_eq!(with(bad), "heyo", "accepted {bad:?}");
+        }
+    }
 
     fn image() -> CatalogImage {
         CatalogImage {
