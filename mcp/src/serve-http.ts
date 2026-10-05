@@ -14,6 +14,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 import type { Config } from "./config.js";
 import { configured, credentialFaults, faultBanner, withForwardedAuth } from "./config.js";
+import { authorizeArtCaller, checkArtRequest } from "./artscope.js";
 import { buildTools, createServer } from "./server.js";
 import { identityFrom, identityRequired, Unauthenticated } from "./identity.js";
 
@@ -24,7 +25,7 @@ const MCP_PATH = "/mcp";
  * with this server's store key (`x-api-key`) and the caller's own bearer for
  * the gate, exactly as the `art_*` tools send them. It exists for bytes too
  * large to pass through a tool call: an agent with `curl` uploads a bundle
- * with `PUT /art/blobs/sha256:<hex>` and then tags it with `art_*` tools (or
+ * with `PUT /art/blobs/<hex digest>` and then tags it with `art_*` tools (or
  * more gateway requests), without base64 in the conversation.
  *
  * Only the store's API paths are forwarded, never its dashboard, and only
@@ -37,7 +38,8 @@ const ART_METHODS = new Set(["GET", "HEAD", "PUT", "DELETE"]);
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "content-length", "etag", "last-modified", "cache-control"];
 
 async function forwardToArt(config: Config, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-  const art = withForwardedAuth(config, req.headers).art;
+  const scoped = await authorizeArtCaller(config, withForwardedAuth(config, req.headers), req.headers);
+  const art = scoped.art;
   if (!art) {
     json(res, 503, { error: "the artifact store is not configured on this server (ART_URL)" });
     return;
@@ -51,6 +53,16 @@ async function forwardToArt(config: Config, req: IncomingMessage, res: ServerRes
   if (!ART_METHODS.has(method)) {
     json(res, 405, { error: `${method} is not forwarded; GET, HEAD, PUT and DELETE are` });
     return;
+  }
+  if (scoped.artScope) {
+    const verdict = checkArtRequest(scoped.artScope, method, rest);
+    // A listing would have to be buffered to filter it; `art_list_tags` does that.
+    const refused =
+      verdict.refused ?? (verdict.filterTagsTo !== undefined ? "list tags with art_list_tags, which filters to your namespace" : undefined);
+    if (refused) {
+      json(res, 403, { error: refused });
+      return;
+    }
   }
   const headers: Record<string, string> = { ...(art.headers ?? {}) };
   if (art.auth) headers.authorization = art.auth;
@@ -147,7 +159,7 @@ export async function serveHttp(config: Config, port: number, host: string): Pro
     // A hosted instance without an app-lb credential of its own acts as the
     // caller: their bearer goes upstream, and the tool set is rebuilt for it.
     // With a configured credential this is the shared config and shared tools.
-    const requestConfig = withForwardedAuth(config, req.headers);
+    const requestConfig = await authorizeArtCaller(config, withForwardedAuth(config, req.headers), req.headers);
     const requestTools = requestConfig === config ? tools : buildTools(requestConfig);
     const server = createServer(requestConfig, requestTools);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
