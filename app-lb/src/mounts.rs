@@ -539,6 +539,7 @@ mod tests {
     fn the_sweep_removes_only_trees_nothing_names() {
         let root = scratch("sweep");
         let store = MountStore::new(root.clone(), 1);
+        let now = crate::deployment::now_secs();
 
         for name in [DIGEST, OTHER, &format!("{DIGEST}-s1")] {
             std::fs::create_dir_all(root.join(name)).unwrap();
@@ -549,8 +550,8 @@ mod tests {
         // A file at the root is not a tree and must be left alone.
         std::fs::write(root.join("README"), b"x").unwrap();
 
-        // Everything was created just now, so nothing is old enough yet.
-        assert_eq!(store.sweep(&HashSet::from([DIGEST.to_string()])).0, 0);
+        // Use the captured clock so setup crossing a second cannot expire trees.
+        assert_eq!(store.sweep_at(&HashSet::from([DIGEST.to_string()]), now).0, 0);
 
         // An hour later, everything here is past a one-second window.
         let later = crate::deployment::now_secs() + 3600;
