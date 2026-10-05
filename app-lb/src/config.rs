@@ -2475,6 +2475,32 @@ pub struct JwtSpec {
     /// the issuer expects — `return_to`, `next`, `rd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_redirect_param: Option<String>,
+    /// **Scoped sign-in**: the issuer's OAuth 2.0 authorization endpoint, for a
+    /// browser that reaches this gate with no session. Set together with
+    /// [`token_url`](Self::token_url); the Heyo auth API serves both at
+    /// `/oauth/authorize` and `/oauth/token`.
+    ///
+    /// The difference from [`login_url`](Self::login_url) is where the
+    /// credential ends up. With `login_url` the issuer leaves its token in a
+    /// cookie on a domain it shares with this host, so every host under that
+    /// domain — other tenants' deployments included — receives it. With this,
+    /// app-lb asks the issuer for access to *this deployment's namespace*
+    /// (`scope=namespace:<ns>`, plus PKCE `S256` and `state`), the issuer
+    /// decides whether the person may reach it, and the code it returns is
+    /// exchanged server to server for a token naming this one host
+    /// (`gateHost`) and namespace. The gate verifies it against this policy,
+    /// checks both claims, and keeps its own host-only session; the token never
+    /// sits in a browser at all.
+    ///
+    /// Must be `https://` (or loopback `http://`). Cannot be combined with a
+    /// shared session realm (`cookie_domain`): a session issued for one
+    /// namespace must not be honoured by a sibling gate in another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize_url: Option<String>,
+    /// The issuer's token endpoint, which the gate calls server to server to
+    /// redeem the code from [`authorize_url`](Self::authorize_url).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_url: Option<String>,
 }
 
 fn default_subject_claim() -> String {
@@ -2517,6 +2543,8 @@ impl JwtSpec {
             login_endpoint: None,
             login_url: None,
             login_redirect_param: None,
+            authorize_url: None,
+            token_url: None,
         }
     }
 
@@ -2562,6 +2590,17 @@ impl JwtSpec {
             login_endpoint: None,
             login_url: None,
             login_redirect_param: None,
+            authorize_url: None,
+            token_url: None,
+        }
+    }
+
+    /// The authorization and token endpoints, when this gate runs the scoped
+    /// sign-in flow. See [`authorize_url`](Self::authorize_url).
+    pub fn scoped_signin(&self) -> Option<(&str, &str)> {
+        match (&self.authorize_url, &self.token_url) {
+            (Some(a), Some(t)) => Some((a.as_str(), t.as_str())),
+            _ => None,
         }
     }
 
@@ -2612,14 +2651,21 @@ impl JwtSpec {
             .iter()
             .map(|(claim, value)| format!("{claim}={value}"))
             .collect();
-        format!(
+        let mut material = format!(
             "{key}|{}|{}|{}|{}|{}",
             algorithms.join(","),
             self.issuer,
             self.audience.as_deref().unwrap_or(""),
             require.join(","),
             self.subject_claim,
-        )
+        );
+        // Appended only when set, so a policy without scoped sign-in hashes what
+        // it hashed before the field existed. In the material because the
+        // issuer behind it decides who gets a session here.
+        if let Some((authorize, token)) = self.scoped_signin() {
+            material.push_str(&format!("|signin={authorize}|{token}"));
+        }
+        material
     }
 
     /// Whether the key material is a shared secret, which is what decides the
@@ -2753,8 +2799,29 @@ impl JwtSpec {
                 return Err(SpecError::LoginUrlWithoutCookie);
             }
         }
+        match (&self.authorize_url, &self.token_url) {
+            (None, None) => {}
+            (Some(authorize), Some(token)) => {
+                for url in [authorize, token] {
+                    if jwks_url_problem(url.trim()).is_some() {
+                        return Err(SpecError::BadScopedSignin(url.trim().to_string()));
+                    }
+                }
+            }
+            _ => return Err(SpecError::ScopedSigninIncomplete),
+        }
         Ok(())
     }
+}
+
+/// A shared session realm would let a session issued for one namespace's
+/// deployment admit a browser at a sibling gate in another, whose identical
+/// policy fingerprint is no evidence the issuer would have said yes there.
+fn check_signin_realm(jwt: &Option<JwtSpec>, cookie_domain: &Option<String>) -> Result<(), SpecError> {
+    if cookie_domain.is_some() && jwt.as_ref().is_some_and(|j| j.scoped_signin().is_some()) {
+        return Err(SpecError::ScopedSigninWithRealm);
+    }
+    Ok(())
 }
 
 /// What is wrong with a JWKS URL, or `None`.
@@ -3289,6 +3356,7 @@ impl AuthGate {
         {
             return Err(SpecError::BadCookieDomain(d.clone()));
         }
+        check_signin_realm(&self.jwt, &self.cookie_domain)?;
 
         // The provider redirects the browser to `<host><callback>`, and that
         // request has to route back to *this* deployment or the login can never
@@ -3903,6 +3971,13 @@ pub enum SpecError {
     /// `jwt.login_url` set with no `jwt.cookie` to carry the token back on the
     /// return navigation — the redirect would loop forever.
     LoginUrlWithoutCookie,
+    /// `jwt.authorize_url` or `jwt.token_url` that is not `https://` (or a
+    /// loopback `http://`).
+    BadScopedSignin(String),
+    /// One of `jwt.authorize_url` and `jwt.token_url` without the other.
+    ScopedSigninIncomplete,
+    /// Scoped sign-in on a gate that shares sessions across a `cookie_domain`.
+    ScopedSigninWithRealm,
     EmptyJwtClaimName,
     JwtLeewayTooLarge {
         secs: u64,
@@ -4348,6 +4423,22 @@ impl std::fmt::Display for SpecError {
                  token-less browser is redirected to. http:// is allowed only to a loopback \
                  address, for an issuer running on this host: a browser redirected to \
                  plaintext elsewhere can have the sign-in intercepted"
+            ),
+            Self::BadScopedSignin(u) => write!(
+                f,
+                "auth.jwt.authorize_url and auth.jwt.token_url must be https:// URLs ({u:?} is \
+                 not); http:// is allowed only to a loopback address"
+            ),
+            Self::ScopedSigninIncomplete => write!(
+                f,
+                "auth.jwt.authorize_url and auth.jwt.token_url go together: the browser is sent \
+                 to the first, and the code it brings back is redeemed at the second"
+            ),
+            Self::ScopedSigninWithRealm => write!(
+                f,
+                "scoped sign-in (auth.jwt.authorize_url) cannot share sessions across \
+                 cookie_domain: each session is issued for one host and one namespace, and a \
+                 realm would let a sibling gate in another namespace honour it"
             ),
             Self::LoginUrlWithoutCookie => write!(
                 f,
@@ -5304,6 +5395,7 @@ impl AuthProviderSpec {
         {
             return Err(SpecError::BadCookieDomain(d.clone()));
         }
+        check_signin_realm(&self.jwt, &self.cookie_domain)?;
         validate_identity(
             &self.provider,
             &self.client_id,
@@ -8351,6 +8443,35 @@ mod tests {
             ok["cookie"] = serde_json::json!("heyo_access_token");
             ok["login_url"] = serde_json::json!("https://auth.example.com/login");
             assert_eq!(with_jwt(r#""jwt""#, ok).validate(), Ok(()));
+        }
+
+        /// Scoped sign-in: both endpoints or neither, https (loopback http
+        /// aside), and never alongside a shared session realm.
+        #[test]
+        fn scoped_signin_needs_both_https_endpoints_and_no_realm() {
+            let mut half = heyo_block();
+            half["authorize_url"] = serde_json::json!("https://auth.example.com/oauth/authorize");
+            assert_eq!(
+                with_jwt(r#""jwt""#, half).validate().unwrap_err(),
+                SpecError::ScopedSigninIncomplete,
+            );
+
+            let mut plaintext = heyo_block();
+            plaintext["authorize_url"] = serde_json::json!("https://auth.example.com/oauth/authorize");
+            plaintext["token_url"] = serde_json::json!("http://auth.example.com/oauth/token");
+            assert!(matches!(
+                with_jwt(r#""jwt""#, plaintext).validate().unwrap_err(),
+                SpecError::BadScopedSignin(_),
+            ));
+
+            let mut ok = heyo_block();
+            ok["authorize_url"] = serde_json::json!("https://auth.example.com/oauth/authorize");
+            ok["token_url"] = serde_json::json!("http://127.0.0.1:3001/oauth/token");
+            assert_eq!(with_jwt(r#""jwt""#, ok.clone()).validate(), Ok(()));
+
+            let mut realm = with_jwt(r#""jwt""#, ok);
+            realm.auth.as_mut().unwrap().cookie_domain = Some("example.com".into());
+            assert_eq!(realm.validate().unwrap_err(), SpecError::ScopedSigninWithRealm);
         }
 
         /// `algorithms` has no default, because the only available default would

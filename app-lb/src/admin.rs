@@ -2623,6 +2623,12 @@ struct CreateProviderBody {
     login_url: Option<String>,
     #[serde(default)]
     login_redirect_param: Option<String>,
+    /// Scoped sign-in endpoints, laid over the policy like the fields above.
+    /// See [`crate::config::JwtSpec::authorize_url`].
+    #[serde(default)]
+    authorize_url: Option<String>,
+    #[serde(default)]
+    token_url: Option<String>,
 }
 
 impl CreateProviderBody {
@@ -2631,19 +2637,26 @@ impl CreateProviderBody {
             || self.cookie.is_some()
             || self.login_url.is_some()
             || self.login_redirect_param.is_some()
+            || self.authorize_url.is_some()
+            || self.token_url.is_some()
     }
+}
+
+/// The request-only fields [`apply_jwt_tweaks`] lays over a JWT policy.
+struct JwtTweaks {
+    require: Option<BTreeMap<String, serde_json::Value>>,
+    cookie: Option<String>,
+    login_url: Option<String>,
+    login_redirect_param: Option<String>,
+    authorize_url: Option<String>,
+    token_url: Option<String>,
 }
 
 /// Lay the request-only tweaks over a materialised JWT policy. `require` is
 /// merged claim by claim, so a preset's `role` check survives an added
 /// `accountId`.
-fn apply_jwt_tweaks(
-    jwt: &mut crate::config::JwtSpec,
-    require: Option<BTreeMap<String, serde_json::Value>>,
-    cookie: Option<String>,
-    login_url: Option<String>,
-    login_redirect_param: Option<String>,
-) {
+fn apply_jwt_tweaks(jwt: &mut crate::config::JwtSpec, tweaks: JwtTweaks) {
+    let JwtTweaks { require, cookie, login_url, login_redirect_param, authorize_url, token_url } = tweaks;
     if let Some(require) = require {
         jwt.require.extend(require);
     }
@@ -2655,6 +2668,12 @@ fn apply_jwt_tweaks(
     }
     if login_redirect_param.is_some() {
         jwt.login_redirect_param = login_redirect_param;
+    }
+    if authorize_url.is_some() {
+        jwt.authorize_url = authorize_url;
+    }
+    if token_url.is_some() {
+        jwt.token_url = token_url;
     }
 }
 
@@ -2693,7 +2712,14 @@ async fn create_auth_provider(
     Json(body): Json<CreateProviderBody>,
 ) -> Response {
     let has_tweaks = body.has_jwt_tweaks();
-    let tweaks = (body.require, body.cookie, body.login_url, body.login_redirect_param);
+    let tweaks = JwtTweaks {
+        require: body.require,
+        cookie: body.cookie,
+        login_url: body.login_url,
+        login_redirect_param: body.login_redirect_param,
+        authorize_url: body.authorize_url,
+        token_url: body.token_url,
+    };
     let mut spec = body.spec;
 
     // Apply the preset before validation, so what is stored and what is checked
@@ -2754,13 +2780,13 @@ async fn create_auth_provider(
         let Some(jwt) = spec.jwt.as_mut() else {
             return err(
                 StatusCode::BAD_REQUEST,
-                "`require`, `cookie`, `login_url` and `login_redirect_param` tune a JWT \
-                 policy, and this provider has none — name a `preset` or send a `jwt` block",
+                "`require`, `cookie`, `login_url`, `login_redirect_param`, `authorize_url` and \
+                 `token_url` tune a JWT policy, and this provider has none — name a `preset` or \
+                 send a `jwt` block",
             )
             .into_response();
         };
-        let (require, cookie, login_url, login_redirect_param) = tweaks;
-        apply_jwt_tweaks(jwt, require, cookie, login_url, login_redirect_param);
+        apply_jwt_tweaks(jwt, tweaks);
     }
 
     // Bind the secret references to this provider's own namespace before
@@ -6808,12 +6834,25 @@ mod tests {
         let body: CreateProviderBody = serde_json::from_value(serde_json::json!({
             "name": "heyo", "namespace": "acme", "preset": "heyo-jwks",
             "require": {"accountId": ["acct-1"]}, "cookie": "heyo_token",
-            "login_url": "https://auth.example/login"
+            "login_url": "https://auth.example/login",
+            "authorize_url": "https://auth.example/oauth/authorize",
+            "token_url": "https://auth.example/oauth/token"
         }))
         .unwrap();
         assert!(body.has_jwt_tweaks());
         let mut jwt = crate::config::JwtSpec::heyo_jwks("https://auth.example/.well-known/jwks.json".into());
-        apply_jwt_tweaks(&mut jwt, body.require, body.cookie, body.login_url, body.login_redirect_param);
+        apply_jwt_tweaks(&mut jwt, JwtTweaks {
+            require: body.require,
+            cookie: body.cookie,
+            login_url: body.login_url,
+            login_redirect_param: body.login_redirect_param,
+            authorize_url: body.authorize_url,
+            token_url: body.token_url,
+        });
+        assert_eq!(
+            jwt.scoped_signin(),
+            Some(("https://auth.example/oauth/authorize", "https://auth.example/oauth/token")),
+        );
         // The preset's role check survives; the account check is added.
         assert_eq!(jwt.require["role"], serde_json::json!(["user", "admin"]));
         assert_eq!(jwt.require["accountId"], serde_json::json!(["acct-1"]));

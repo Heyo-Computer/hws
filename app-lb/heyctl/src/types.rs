@@ -609,6 +609,12 @@ pub struct JwtSpec {
     /// The query parameter that sign-in page reads the return URL from.
     /// `redirect_uri` when unset.
     pub login_redirect_param: Option<String>,
+    /// Scoped sign-in: the issuer's authorization endpoint. With `token_url`,
+    /// a token-less browser is sent through an OAuth code flow for this
+    /// deployment's namespace and gets a host-only app-lb session.
+    pub authorize_url: Option<String>,
+    /// Scoped sign-in: where app-lb redeems the code, server to server.
+    pub token_url: Option<String>,
 }
 
 impl JwtSpec {

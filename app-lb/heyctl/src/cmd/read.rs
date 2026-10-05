@@ -1034,6 +1034,13 @@ fn describe_provider(p: &AuthProviderView) {
             output::field("JWT cookie", format!("{cookie} (when no Authorization header)"));
         }
         match (&jwt.login_url, &jwt.cookie) {
+            _ if jwt.authorize_url.is_some() => output::field(
+                "Browser sign-in",
+                format!(
+                    "scoped: {} asks for namespace access, then a host-only app-lb session",
+                    jwt.authorize_url.as_deref().unwrap_or_default()
+                ),
+            ),
             (Some(url), Some(cookie)) => {
                 output::field(
                     "Browser sign-in",
