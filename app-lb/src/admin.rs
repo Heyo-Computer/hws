@@ -2376,7 +2376,7 @@ async fn onboarding(
         "deployments": deployments,
         "can_mint": caller.is_none_or(|c| c.administers_namespace(&ns)),
         "mcp": {
-            "name": "heyo",
+            "name": state.onboarding.mcp_name,
             "url": state.onboarding.mcp_url,
         },
         "token": {

@@ -320,6 +320,8 @@ body[data-tier="view"] [data-admin-only] { display: none; }
 #get-started .gs-step { display: block; margin-bottom: 4px; }
 #get-started textarea, #get-started input.mono { width: 100%; box-sizing: border-box; font-size: 12px; }
 #get-started textarea { min-height: 14em; resize: vertical; }
+#get-started #gs-mcp-json { min-height: 9em; }
+#get-started details { margin-top: 6px; }
 #get-started .gs-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
 #get-started .gs-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 #get-started .gs-head h2 { margin: 0; font-size: 15px; }
@@ -1718,7 +1720,7 @@ function showMintedToken(t) {
             style="width:100%" onclick="this.select()">
      ${mcpUrl && t.admin === "admin"
         ? `<div class="note" style="margin-top:10px">
-             Connect Claude Code to Heyo's MCP server with it:
+             Add it to Claude Code as the <code>${esc(mcpName())}</code> MCP server:
              <input class="mono" readonly style="width:100%;margin-top:6px"
                     onclick="this.select()" value="${esc(mcpInstallCommand(mcpUrl, t.token))}">
            </div>`
@@ -2874,12 +2876,24 @@ function gsDismiss() {
   renderGetStarted();
 }
 
+// The name the user's MCP client gives this server (APP_LB_ONBOARDING_MCP_NAME,
+// validated server-side to letters, digits, '-' and '_', so it is safe unquoted).
+function mcpName() {
+  return (onboardingInfo && onboardingInfo.mcp && onboardingInfo.mcp.name) || "heyo";
+}
+
 function mcpInstallCommand(url, token) {
-  return `claude mcp add --transport http heyo ${url} --header "Authorization: Bearer ${token}"`;
+  return `claude mcp add --transport http ${mcpName()} ${url} --header "Authorization: Bearer ${token}"`;
+}
+
+// The same server for any client that reads an `mcpServers` JSON file.
+function mcpClientConfig(url, token) {
+  return JSON.stringify({ mcpServers: { [mcpName()]: {
+    type: "http", url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2);
 }
 
 function claudeDeployPrompt(info) {
-  return `Using the heyo MCP server, deploy this app-lb spec with applb_deploy, `
+  return `Using the ${esc(mcpName())} MCP server, deploy this app-lb spec with applb_deploy, `
     + `then poll applb_job (if it starts one) and applb_get_deployment until the deployment `
     + `${esc(info.fastcar.id)} is registered, and tell me its URL.`;
 }
@@ -2930,14 +2944,26 @@ function renderGetStarted() {
           : `<div class="note">Your access to this namespace is read-only, so you cannot mint
              tokens for it. Ask a namespace admin for one.</div>`}
       </li>
-      <li><strong class="gs-step">Install the Heyo MCP server</strong>
+      <li><strong class="gs-step">Add the Heyo MCP server to Claude Code</strong>
         ${mcpUrl
-          ? `Endpoint: <code>${esc(mcpUrl)}</code>. Run this in a terminal, then restart Claude Code:
+          ? `${mintedSecret ? "" : `<div class="note"><strong>Mint a token in step 1 first.</strong>
+               The command below fills it in; until then it shows <code>applb_…</code>.</div>`}
+             Endpoint: <code>${esc(mcpUrl)}</code>. Run this in a terminal:
              <input id="gs-mcp" class="mono" readonly value="${esc(mcpInstallCommand(mcpUrl, token))}">
-             <div class="gs-row"><button class="btn mini" data-copy="gs-mcp">Copy command</button>
-               ${mintedSecret ? "" : `<span class="note">Replace <code>applb_…</code> with your token.</span>`}</div>
-             <div class="note">The app-lb tools (<code>applb_*</code>) work with a namespace token;
-               the logs and CI tools are not available to namespace tokens yet.</div>`
+             <div class="gs-row"><button class="btn mini" data-copy="gs-mcp">Copy command</button></div>
+             <div class="note">Then restart Claude Code and run <code>/mcp</code>:
+               <code>${esc(mcpName())}</code> should be listed as connected. To check it end to end, ask
+               Claude to <em>run heyo_status on the ${esc(mcpName())} MCP server</em>.</div>
+             <details><summary class="note">Another MCP client that takes a URL and headers (Cursor, for one)</summary>
+               <textarea id="gs-mcp-json" class="mono" readonly spellcheck="false">${esc(mcpClientConfig(mcpUrl, token))}</textarea>
+               <div class="gs-row"><button class="btn mini" data-copy="gs-mcp-json">Copy config</button>
+                 <span class="note">Add it to the client's <code>mcpServers</code> settings.</span></div>
+             </details>
+             <div class="note">The token is the server's whole authority: it acts only in
+               <code>${esc(info.namespace)}</code>. With it you get the app-lb tools (<code>applb_*</code>),
+               git repos (<code>repo_*</code>), and the artifact store (<code>art_*</code>) under
+               <code>${esc(info.namespace)}/…</code> tags. Logs and CI tools need a fleet token.
+               When the token expires, mint another and run the command again.</div>`
           : `<div class="note">This load balancer has no hosted MCP endpoint configured
              (<code>APP_LB_ONBOARDING_MCP_URL</code>). Use the token with <code>heyctl</code> instead.</div>`}
       </li>
