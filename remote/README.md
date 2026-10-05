@@ -130,9 +130,30 @@ Use one canonical `remote` credential across regions.
 
 ## Deploying
 
-`deploy/remote.json` fronts it as a static (`proxy_pass`) deployment with **no
-app-lb `auth` gate**: git clients and app-lb builds authenticate to remote
-itself, and a gate in front would demand a second credential git cannot send.
+`deploy/remote.json` runs it as an app-lb managed VM, built from
+`remote/Dockerfile` with the repository root as the build context (the crate
+depends on `../heyosecret-client`):
+
+```sh
+heyctl create secret remote-s3 --from-env access-key-id=AK --from-env secret-access-key=SK
+heyctl create secret remote --from-env admin-token=TOKEN
+heyctl apply -f remote/deploy/remote.json
+heyctl build remote --wait
+```
+
+The canonical values live in HeyoSecret at `remote-s3/access-key-id`,
+`remote-s3/secret-access-key` and `remote/admin-token`. Every region loads
+the same three into its app-lb.
+
+The deployment has **no app-lb `auth` gate**. git clients and app-lb builds
+authenticate to remote itself, and a gate in front would demand a second
+credential that git cannot send.
+
+The VM is disposable. Its `disk_size_gb` disk holds only `REMOTE_CACHE_DIR`,
+which re-hydrates from the bucket, so it needs no `vm.workspace`.
+`REMOTE_APPLB_URL` is the region's public admin URL, because a VM cannot reach
+the host's loopback admin listener. For another region, change the route,
+`REMOTE_PUBLIC_URL` and `REMOTE_APPLB_URL`.
 
 ## Test
 
