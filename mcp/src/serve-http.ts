@@ -9,7 +9,8 @@
  */
 
 import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
-import { Readable } from "node:stream";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import type { Config } from "./config.js";
@@ -72,31 +73,45 @@ async function forwardToArt(config: Config, req: IncomingMessage, res: ServerRes
     const v = req.headers[h];
     if (typeof v === "string") headers[h] = v;
   }
+  // node:http rather than fetch. fetch (undici) waits at most 300s for the
+  // response headers, and the store sends them only once the whole body has
+  // arrived, so every upload longer than five minutes was aborted halfway: the
+  // 2 GB fastcar rootfs died at 303s with 210 MB still unsent. A plain request
+  // has no such clock; the server's own requestTimeout bounds the whole thing.
+  const target = new URL(`${art.baseUrl}${rest}${url.search}`);
+  const send = target.protocol === "https:" ? httpsRequest : httpRequest;
   const hasBody = method === "PUT";
-  let upstream: Response;
+  let upstream: IncomingMessage;
   try {
-    upstream = await fetch(`${art.baseUrl}${rest}${url.search}`, {
-      method,
-      headers,
-      body: hasBody ? (Readable.toWeb(req) as ReadableStream) : undefined,
-      // Required by fetch for a streamed request body.
-      ...(hasBody ? { duplex: "half" } : {}),
-    } as RequestInit);
+    upstream = await new Promise<IncomingMessage>((resolve, reject) => {
+      const up = send(target, { method, headers }, resolve);
+      up.on("error", reject);
+      // A caller who goes away mid-upload takes the upstream request with it.
+      req.on("close", () => {
+        if (!req.complete) up.destroy();
+      });
+      if (hasBody) req.pipe(up);
+      else up.end();
+    });
   } catch (e) {
-    json(res, 502, { error: `artifact store unreachable: ${e instanceof Error ? e.message : String(e)}` });
+    console.error("art gateway: upstream request failed:", e);
+    if (!res.headersSent) {
+      json(res, 502, { error: `artifact store unreachable: ${e instanceof Error ? e.message : String(e)}` });
+    }
     return;
   }
   const out: Record<string, string> = {};
   for (const h of FORWARDED_RESPONSE_HEADERS) {
-    const v = upstream.headers.get(h);
-    if (v) out[h] = v;
+    const v = upstream.headers[h];
+    if (typeof v === "string") out[h] = v;
   }
-  res.writeHead(upstream.status, out);
-  if (!upstream.body || method === "HEAD") {
+  res.writeHead(upstream.statusCode ?? 502, out);
+  if (method === "HEAD") {
+    upstream.resume();
     res.end();
     return;
   }
-  Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream).pipe(res);
+  upstream.pipe(res);
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {
