@@ -21,6 +21,9 @@ pub enum Mode {
 pub struct Policy {
     pub repository: String,
     pub workflow_id: String,
+    /// The same bundle must have completed successfully in these environments.
+    #[serde(default)]
+    pub requires: Vec<String>,
     #[serde(default)]
     pub mode: Mode,
     pub network: Option<String>,
@@ -37,6 +40,8 @@ pub struct Request {
     pub environment: String,
     pub bundle_id: String,
     pub request_id: String,
+    #[serde(default)]
+    pub recover: bool,
 }
 
 pub fn policies(raw: Option<&str>) -> Result<BTreeMap<String, Policy>> {
@@ -58,6 +63,22 @@ pub fn policies(raw: Option<&str>) -> Result<BTreeMap<String, Policy>> {
             "environment requires repository and workflow scope"
         );
         plan(name, policy)?;
+        let mut pending = policy.requires.clone();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(dependency) = pending.pop() {
+            ensure!(dependency != *name, "environment prerequisite cycle");
+            if !visited.insert(dependency.clone()) {
+                continue;
+            }
+            let prerequisite = policies
+                .get(&dependency)
+                .ok_or_else(|| anyhow::anyhow!("unknown prerequisite {dependency}"))?;
+            ensure!(
+                crate::repos::same_repo(&policy.repository, &prerequisite.repository),
+                "prerequisite must use the same repository"
+            );
+            pending.extend(prerequisite.requires.clone());
+        }
     }
     Ok(policies)
 }
@@ -322,6 +343,26 @@ async fn persist(
         !automatic || !env.get::<bool, _>("automation_held"),
         "environment automation is held"
     );
+    if request.recover {
+        ensure!(!automatic, "recovery must be requested manually");
+        ensure!(
+            env.get::<Option<String>, _>("current_bundle").as_deref()
+                == Some(request.bundle_id.as_str()),
+            "recovery must restore the last complete successful release"
+        );
+        let failed: bool = sqlx::query_scalar("SELECT coalesce((SELECT r.status IN ('failure','cancelled') FROM ci_release_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 ORDER BY p.created_at DESC,p.run_id DESC LIMIT 1),false)")
+            .bind(&request.environment).fetch_one(&mut *tx).await?;
+        ensure!(failed, "recovery requires a settled failed promotion");
+    } else {
+        for prerequisite in &policy.requires {
+            let passed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.bundle_id=$2 AND p.completed_at IS NOT NULL AND r.status='success')")
+                .bind(prerequisite).bind(&request.bundle_id).fetch_one(&mut *tx).await?;
+            ensure!(
+                passed,
+                "release must first succeed in prerequisite {prerequisite}"
+            );
+        }
+    }
     let run_id = crate::vm::new_id();
     let run = crate::store::RunRequest {
         workflow_id: policy.workflow_id.clone(),
@@ -367,8 +408,17 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
         let history: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(p) || jsonb_build_object('status',r.status,'error',r.error,
             'deployments',(SELECT coalesce(jsonb_agg(jsonb_build_object('service',d.service_id,'revision',d.sha,'status',d.status)),'[]')
             FROM ci_service_deployment d WHERE d.run_id=p.run_id)) FROM ci_release_promotion p JOIN ci_run r ON r.id=p.run_id
-            WHERE p.environment=$1 ORDER BY p.created_at DESC LIMIT 20").bind(&name).fetch_all(d.store.pool()).await?;
-        environments.push(json!({"name":name,"mode":policy.mode,"repository":policy.repository,"state":state,"history":history}));
+            WHERE p.environment=$1 ORDER BY p.created_at DESC,p.run_id DESC LIMIT 20").bind(&name).fetch_all(d.store.pool()).await?;
+        let recovery_required = history
+            .first()
+            .is_some_and(|p| matches!(p["status"].as_str(), Some("failure" | "cancelled")));
+        let recovery_bundle = if recovery_required {
+            state.as_ref().and_then(|s| s["current_bundle"].as_str())
+        } else {
+            None
+        };
+        environments.push(json!({"name":name,"mode":policy.mode,"repository":policy.repository,"requires":policy.requires,
+            "state":state,"history":history,"recovery_required":recovery_required,"recovery_bundle":recovery_bundle}));
     }
     Ok(json!({"environments":environments}))
 }
@@ -496,6 +546,7 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
                 environment,
                 bundle_id: id.clone(),
                 request_id: format!("auto-{id}"),
+                recover: false,
             },
             "environment-policy",
             true,
@@ -531,6 +582,7 @@ mod tests {
         let environments = policies(Some(&raw("CI_RELEASE_ENVIRONMENTS"))).unwrap();
         assert_eq!(environments["hws-stage"].mode, Mode::Automatic);
         assert_eq!(environments["hws-production"].mode, Mode::Manual);
+        assert_eq!(environments["hws-production"].requires, ["hws-stage"]);
         for (name, policy) in environments {
             let plan = plan(&name, &policy).unwrap();
             assert_eq!(plan.jobs[1].needs, [plan.jobs[0].base_id.clone()]);
@@ -555,12 +607,53 @@ mod tests {
         Policy {
             repository: "repo".into(),
             workflow_id: "platform".into(),
+            requires: Vec::new(),
             mode: Mode::Manual,
             network: None,
             workflow: "on: promotion\njobs:\n  first:\n    steps: [{uses: ci/rollout-service}]\n  second:\n    needs: [first]\n    steps: [{uses: ci/rollout-service}]\n".into(),
             service_targets: BTreeMap::new(),
             placements: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn prerequisite_graph_rejects_missing_cross_repository_and_cycles() {
+        let mut configured = BTreeMap::from([
+            ("stage", policy()),
+            (
+                "production",
+                Policy {
+                    requires: vec!["stage".into()],
+                    ..policy()
+                },
+            ),
+        ]);
+        let validate = |config: &BTreeMap<&str, Policy>| {
+            policies(Some(&serde_yaml::to_string(config).unwrap()))
+        };
+        assert!(validate(&configured).is_ok());
+        configured.get_mut("stage").unwrap().requires = vec!["production".into()];
+        assert!(
+            validate(&configured)
+                .unwrap_err()
+                .to_string()
+                .contains("cycle")
+        );
+        configured.get_mut("stage").unwrap().requires = vec!["missing".into()];
+        assert!(
+            validate(&configured)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown prerequisite")
+        );
+        configured.get_mut("stage").unwrap().requires.clear();
+        configured.get_mut("stage").unwrap().repository = "other-repo".into();
+        assert!(
+            validate(&configured)
+                .unwrap_err()
+                .to_string()
+                .contains("same repository")
+        );
     }
 
     #[test]
@@ -644,8 +737,13 @@ mod tests {
         store.migrate().await.unwrap();
         let policy = policy();
         let plan = plan("stage", &policy).unwrap();
-        for id in ["old", "new"] {
-            let revision = if id == "old" { "a" } else { "b" }.repeat(40);
+        for id in ["old", "new", "candidate"] {
+            let revision = match id {
+                "old" => "a",
+                "new" => "b",
+                _ => "c",
+            }
+            .repeat(40);
             let manifest = json!({"version":2,"retained":true,"build_id":id,"repository":"repo","revision":revision,
                 "components":{"api":{"id":"artifact","run_id":"build","workflow":"api.yml","job":"linux",
                 "name":"binary","sink":"artifacts","uri":"retained-api","sha256":"d".repeat(64),"size_bytes":73}}});
@@ -655,7 +753,7 @@ mod tests {
                 .bind(id).bind(&manifest).bind(hex::encode(Sha256::digest(serde_json::to_vec(&manifest).unwrap())))
                 .execute(store.pool()).await.unwrap();
         }
-        sqlx::query("UPDATE ci_release_build SET created_at=CASE WHEN id='old' THEN now()-interval '2 hours' ELSE now()-interval '1 hour' END")
+        sqlx::query("UPDATE ci_release_build SET created_at=CASE WHEN id='new' THEN now()-interval '1 hour' ELSE now()-interval '2 hours' END")
             .execute(store.pool()).await.unwrap();
         sqlx::query("UPDATE ci_release_bundle SET created_at=CASE WHEN id='old' THEN now() ELSE now()-interval '30 minutes' END")
             .execute(store.pool()).await.unwrap();
@@ -669,6 +767,7 @@ mod tests {
             environment: "stage".into(),
             bundle_id: "old".into(),
             request_id: "first".into(),
+            recover: false,
         };
         let source = serde_json::to_vec(&crate::trigger::GitPatchSource {
             base_revision: "a".repeat(40),
@@ -678,6 +777,17 @@ mod tests {
             changes: crate::paths::Changes::unknown("retained release"),
         })
         .unwrap();
+        request.recover = true;
+        assert!(
+            persist(
+                &store, &request, &policy, &bundle, &plan, &source, "alice", false
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("last complete")
+        );
+        request.recover = false;
         let (a, b) = tokio::join!(
             persist(
                 &store, &request, &policy, &bundle, &plan, &source, "alice", false
@@ -764,6 +874,32 @@ mod tests {
             active.as_deref(),
             Some(run.as_str()),
             "run completion must not hide an unresolved rollout"
+        );
+        let waiting_policy = Policy {
+            requires: vec!["stage".into()],
+            ..policy.clone()
+        };
+        let waiting_request = Request {
+            environment: "waiting-production".into(),
+            bundle_id: "old".into(),
+            request_id: "waiting".into(),
+            recover: false,
+        };
+        assert!(
+            persist(
+                &store,
+                &waiting_request,
+                &waiting_policy,
+                &bundle,
+                &plan,
+                &source,
+                "alice",
+                false
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("prerequisite stage")
         );
         sqlx::query("UPDATE ci_service_deployment SET status='passed' WHERE id='rollout'")
             .execute(store.pool())
@@ -876,5 +1012,124 @@ mod tests {
         set_automation(&store, &automatic, toggle(false))
             .await
             .unwrap();
+        // A passed different bundle is not sufficient, for either admission mode.
+        let gated = Policy {
+            requires: vec!["stage".into()],
+            ..automatic.clone()
+        };
+        let mut gated_request = Request {
+            environment: "gated-production".into(),
+            bundle_id: "candidate".into(),
+            request_id: "gated".into(),
+            recover: false,
+        };
+        let candidate = super::bundle(&store, "candidate").await.unwrap();
+        for auto in [false, true] {
+            let error = persist(
+                &store,
+                &gated_request,
+                &gated,
+                &candidate,
+                &plan,
+                &source,
+                "operator",
+                auto,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("prerequisite stage"));
+        }
+        gated_request.bundle_id = "new".into();
+        persist(
+            &store,
+            &gated_request,
+            &gated,
+            &bundle,
+            &plan,
+            &source,
+            "operator",
+            false,
+        )
+        .await
+        .unwrap();
+
+        // A -> B succeeded; C fails. Recovery must restore B, never A.
+        request.bundle_id = "candidate".into();
+        request.request_id = "partial-failure".into();
+        let failed = persist(
+            &store, &request, &policy, &candidate, &plan, &source, "operator", false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1")
+            .bind(failed["run_id"].as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        request.recover = true;
+        request.request_id = "recovery".into();
+        request.bundle_id = "new".into();
+        assert!(
+            persist(
+                &store, &request, &policy, &bundle, &plan, &source, "operator", false
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("in progress")
+        );
+        finish(&store).await.unwrap();
+        request.bundle_id = "old".into();
+        let old = super::bundle(&store, "old").await.unwrap();
+        assert!(
+            persist(
+                &store, &request, &policy, &old, &plan, &source, "operator", false
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("last complete")
+        );
+        request.bundle_id = "new".into();
+        // Policy changes must not block recovery to the known-good release.
+        let changed_policy = Policy {
+            requires: vec!["new-prerequisite".into()],
+            ..policy.clone()
+        };
+        let recovered = persist(
+            &store,
+            &request,
+            &changed_policy,
+            &bundle,
+            &plan,
+            &source,
+            "operator",
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id=$1")
+            .bind(recovered["run_id"].as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        finish(&store).await.unwrap();
+        let state = sqlx::query("SELECT * FROM ci_release_environment WHERE name='stage'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(state.get::<String, _>("current_bundle"), "new");
+        assert_eq!(state.get::<String, _>("previous_bundle"), "old");
+        assert!(state.get::<bool, _>("automation_held"));
+        request.request_id = "not-a-failure".into();
+        assert!(
+            persist(
+                &store, &request, &policy, &bundle, &plan, &source, "operator", false
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("settled failed")
+        );
     }
 }

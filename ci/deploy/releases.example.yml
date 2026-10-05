@@ -78,6 +78,7 @@ CI_RELEASE_ENVIRONMENTS:
     workflow_id: public
     network: platform
     mode: manual
+    requires: [hws-stage]
     workflow: *promotion
     service_targets:
       first-orchestrator:

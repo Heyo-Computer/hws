@@ -18,6 +18,17 @@ This document is an activation procedure, not a record of a live deployment.
   production may be manual. Both permit manual selection and rollback.
 - A manual promotion holds automation. Resume is explicit. Existing jobs are not
   migrated or killed by an automation hold.
+- Optional `requires: [environment-name]` policies require the exact bundle to
+  have a settled successful promotion in each named environment. This applies to
+  both manual and automatic deployment, including undoing a successful release.
+  Unknown environments, cross-repository dependencies and cycles are rejected.
+- After a failed partial deployment, **Recover failed deployment** restores the
+  last completely successful release, not the previous release. For A → B → C,
+  where C fails, recovery restores B; after a successful B, **Roll back** selects A.
+  Recovery waits for the active rollout to settle and keeps automation held.
+  It bypasses new prerequisites only for that exact known-good recovery target.
+  Without a recorded successful release, there is no inferred recovery target.
+  This is a new managed deployment, not Uber's in-progress rollback signal.
 
 ## Checked example, not live configuration
 

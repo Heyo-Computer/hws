@@ -1850,6 +1850,12 @@ below. Environment names are installation-wide and each belongs to one repositor
 use distinct names such as `hws-stage` and `retail-stage`. This is not an atomic
 multi-repository release.
 
+Optional `requires: [hws-stage]` requires a settled successful promotion of the
+exact same bundle in every named prerequisite. Both manual and automatic
+admissions enforce it. Prerequisites must exist, use the same repository and form
+an acyclic graph. This records that a release passed stage; it does not assert
+that stage still runs that release or that the environment is currently healthy.
+
 The embedded workflow uses `on: promotion`, with unconditional non-matrix jobs
 forming one sequential `needs` chain. Supported actions are `ci/rollout-service`,
 `ci/rollout-host-app-lb`, `ci/promote-service-archive`,
@@ -1883,6 +1889,17 @@ a new request ID; automation does not silently repeat an attempted release.
 The app-lb control panel's `/releases` page exposes these controls and rollback
 by promoting the previous retained bundle. Re-deploying the current bundle does
 not erase the previous distinct rollback target. No rebuild occurs on rollback.
+
+After failure, the panel instead offers **Recover failed deployment**, selecting
+the last completely successful bundle (`current_bundle`), not `previous_bundle`.
+The request adds `"recover":true`; CI checks the latest promotion failed or was
+cancelled, all active rollout work has settled, and the requested bundle is that
+exact recovery target. This explicit manual recovery keeps automation held and
+can restore the known-good release despite newly added prerequisites. Ordinary
+manual requests cannot bypass prerequisites. With no successful release recorded,
+recovery is unavailable. Recovery is another managed deployment, not interruption
+of a running rollout. `GET /release-environments` includes `requires`,
+`recovery_required` and `recovery_bundle` for the panel.
 
 ### Release target resolution
 

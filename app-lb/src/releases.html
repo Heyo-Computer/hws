@@ -83,10 +83,13 @@
       return `<article class="card" data-env="${i}"><h3>${esc(e.name)}</h3>
         <p>${esc(e.mode)} policy · automation ${s.automation_held ? 'held' : e.mode === 'automatic' ? 'enabled' : 'off'}</p>
         <p>Last complete success: <strong>${esc(label(s.current_bundle))}</strong><br>Previous: ${esc(label(s.previous_bundle))}</p>
+        ${(e.requires || []).length ? `<p>Requires this release to have passed: ${e.requires.map(esc).join(', ')}</p>` : ''}
+        ${e.recovery_required ? `<p>Deployment failed; regions may have mixed versions. ${e.recovery_bundle ? `Recover to ${esc(label(e.recovery_bundle))}.` : 'No successful release is recorded; select a known-good release manually.'} ${s.active_run ? 'Waiting for rollout settlement before recovery.' : ''}</p>` : ''}
         ${s.active_run ? `<p>Deployment in progress: <code>${esc(s.active_run)}</code></p>` : ''}
         <div class="row"><label>Release<select class="selection" ${!choices.length ? 'disabled' : ''}>${choices.map(r => `<option value="${esc(r.id)}">${esc(label(r.id))}</option>`).join('')}</select></label>
         <button class="btn" data-action="deploy" ${s.active_run || !choices.length ? 'disabled' : ''}>Deploy selected</button>
-        <button class="btn" data-action="rollback" ${s.active_run || !s.previous_bundle ? 'disabled' : ''}>Roll back</button>
+        <button class="btn" data-action="rollback" ${s.active_run || e.recovery_required || !s.previous_bundle ? 'disabled' : ''}>Roll back</button>
+        ${e.recovery_required ? `<button class="btn" data-action="recover" ${s.active_run || !e.recovery_bundle ? 'disabled' : ''}>Recover failed deployment</button>` : ''}
         <button class="btn" data-action="automation" ${e.mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button></div>
         <details><summary>Deployment history</summary>${(e.history || []).map(p => `<p><code>${esc(p.run_id)}</code> · ${esc(label(p.bundle_id))} · ${esc(p.status)} ${esc(p.error || '')}<br>${(p.deployments || []).map(d => `${esc(d.service)}: ${esc(d.status)} (${esc(d.revision)})`).join('<br>')}</p>`).join('') || '<p>No deployments.</p>'}</details></article>`;
     }).join('') || '<p>No environments configured. Set CI_RELEASE_ENVIRONMENTS before deploying.</p>';
@@ -113,12 +116,13 @@
         perform(() => api('release-automation', {environment:e.name,held:!s.automation_held}));
       return;
     }
-    const bundle = button.dataset.action === 'rollback' ? s.previous_bundle : card.querySelector('select').value;
+    const recover = button.dataset.action === 'recover';
+    const bundle = recover ? e.recovery_bundle : button.dataset.action === 'rollback' ? s.previous_bundle : card.querySelector('select').value;
     if (!confirm(`Deploy ${label(bundle)} to ${e.name}? Automation will remain held. Running services will be changed.`)) return;
-    const key = `${e.name}:${bundle}`;
+    const key = `${e.name}:${bundle}:${recover}`;
     if (!pending.has(key)) pending.set(key, crypto.randomUUID());
     perform(async () => {
-      await api('release-promotions', {environment:e.name,bundle_id:bundle,request_id:pending.get(key)});
+      await api('release-promotions', {environment:e.name,bundle_id:bundle,request_id:pending.get(key),recover});
       pending.delete(key);
     });
   };
