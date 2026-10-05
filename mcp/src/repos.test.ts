@@ -259,7 +259,7 @@ test("the remote is reached as the caller, whatever kind of credential they hold
   assert.equal(withForwardedAuth(base, {}).remote?.auth, "Bearer hrm_operator_x");
 });
 
-test("the /art gateway forwards the store API with the store key, and nothing else", async () => {
+test("the /art gateway forwards the store API, with the store key only for a caller app-lb vouches for", async () => {
   const seen: { method: string; url: string; key?: string; auth?: string; body: string }[] = [];
   const store = createServer((req, res) => {
     let body = "";
@@ -278,11 +278,24 @@ test("the /art gateway forwards the store API with the store key, and nothing el
   });
   await new Promise<void>((r) => store.listen(0, "127.0.0.1", r));
   const storePort = (store.address() as { port: number }).port;
+  // app-lb's /whoami, which is what lets the gateway hand this caller the key.
+  const applb = createServer((req, res) => {
+    const ok = req.url === "/whoami" && req.headers.authorization === "Bearer applb_1_caller";
+    res.writeHead(ok ? 200 : 401, { "content-type": "application/json" });
+    res.end(JSON.stringify(ok ? { caller: "app-token", admin_scope: "admin", fleet: true } : { error: "no" }));
+  });
+  await new Promise<void>((r) => applb.listen(0, "127.0.0.1", r));
+  const applbPort = (applb.address() as { port: number }).port;
   const gwPort = 19_000 + Math.floor(Math.random() * 1000);
   const prev = process.env.HEYO_MCP_REQUIRE_IDENTITY;
   process.env.HEYO_MCP_REQUIRE_IDENTITY = "0";
   const gateway = await serveHttp(
-    loadConfig({ ART_URL: `http://127.0.0.1:${storePort}`, ART_API_KEY: "store-key", HEYO_MCP_HTTP_PORT: String(gwPort) }),
+    loadConfig({
+      ART_URL: `http://127.0.0.1:${storePort}`,
+      ART_API_KEY: "store-key",
+      APPLB_URL: `http://127.0.0.1:${applbPort}`,
+      HEYO_MCP_HTTP_PORT: String(gwPort),
+    }),
     gwPort,
     "127.0.0.1",
   );
@@ -302,6 +315,9 @@ test("the /art gateway forwards the store API with the store key, and nothing el
     assert.equal(seen[0]!.body, "payload");
     assert.equal(seen[0]!.key, "store-key");
     assert.equal(seen[0]!.auth, "Bearer applb_1_caller", "the caller's app-token goes to the gate");
+    // The anonymous GET went without the key: the store decides what an
+    // anonymous caller may read (public blobs), not this server's key.
+    assert.equal(seen[1]!.key, undefined, "an anonymous caller was sent with the store key");
 
     assert.equal((await fetch(`${base}/art/dashboard`)).status, 404, "the dashboard is not forwarded");
     assert.equal((await fetch(`${base}/art/tags/x`, { method: "POST" })).status, 405);
@@ -310,6 +326,7 @@ test("the /art gateway forwards the store API with the store key, and nothing el
     if (prev === undefined) delete process.env.HEYO_MCP_REQUIRE_IDENTITY;
     else process.env.HEYO_MCP_REQUIRE_IDENTITY = prev;
     store.close();
+    applb.close();
     gateway.close();
   }
 });
