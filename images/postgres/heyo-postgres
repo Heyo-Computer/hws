@@ -1,0 +1,74 @@
+#!/bin/sh
+# Start PostgreSQL on /workspace with password authentication.
+#
+# Run from app-lb's start_command, which is the only process that receives the
+# deployment's env_vars:
+#
+#   "start_command": "/usr/local/bin/heyo-postgres"
+#
+# Environment:
+#   POSTGRES_PASSWORD  required; the superuser's password, set on first init
+#   POSTGRES_USER      superuser name (default: postgres)
+#   POSTGRES_DB        database created on first init (default: none)
+#   PGDATA             data directory (default: /workspace/pgdata)
+#   PGPORT             listen port (default: 5432)
+#
+# The password is applied only when the cluster is first created. Changing
+# POSTGRES_PASSWORD afterwards does not rotate it — use ALTER ROLE for that.
+#
+# Without --foreground the server is started in the background and this exits
+# once it accepts connections, which is what a start_command wants.
+
+set -eu
+
+PGDATA="${PGDATA:-/workspace/pgdata}"
+PGPORT="${PGPORT:-5432}"
+PGUSER_NAME="${POSTGRES_USER:-postgres}"
+PGBIN=/usr/lib/postgresql/current/bin
+export PATH="$PGBIN:$PATH"
+
+if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+    echo "heyo-postgres: POSTGRES_PASSWORD is not set." >&2
+    echo "  This image never starts without a password: every TCP client is" >&2
+    echo "  authenticated with scram-sha-256. Set it in the deployment's" >&2
+    echo "  env_vars or env_from (a HeyoSecret)." >&2
+    exit 64
+fi
+
+mkdir -p "$PGDATA" /run/postgresql
+chown postgres:postgres "$PGDATA" /run/postgresql
+chmod 700 "$PGDATA"
+
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
+    echo "heyo-postgres: initializing a new cluster in $PGDATA"
+    pwfile="$(mktemp)"
+    printf '%s\n' "$POSTGRES_PASSWORD" > "$pwfile"
+    chown postgres "$pwfile"
+    gosu postgres initdb --pgdata="$PGDATA" --username="$PGUSER_NAME" \
+        --encoding=UTF8 --locale=en_US.UTF-8 \
+        --auth-local=peer --auth-host=scram-sha-256 --pwfile="$pwfile" >/dev/null
+    rm -f "$pwfile"
+    cat >> "$PGDATA/postgresql.conf" <<EOF
+
+# heyo-postgres
+listen_addresses = '*'
+password_encryption = scram-sha-256
+logging_collector = on
+EOF
+    cat >> "$PGDATA/pg_hba.conf" <<EOF
+
+# heyo-postgres: any address, always with a password.
+host all all 0.0.0.0/0 scram-sha-256
+host all all ::/0      scram-sha-256
+EOF
+    if [ -n "${POSTGRES_DB:-}" ]; then
+        gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -p $PGPORT" -w start >/dev/null
+        gosu postgres createdb -p "$PGPORT" -U "$PGUSER_NAME" "$POSTGRES_DB"
+        gosu postgres pg_ctl -D "$PGDATA" -m fast -w stop >/dev/null
+    fi
+fi
+
+if [ "${1:-}" = "--foreground" ]; then
+    exec gosu postgres postgres -D "$PGDATA" -p "$PGPORT"
+fi
+gosu postgres pg_ctl -D "$PGDATA" -o "-p $PGPORT" -l "$PGDATA/startup.log" -w start
