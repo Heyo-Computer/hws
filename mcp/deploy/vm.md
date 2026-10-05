@@ -53,6 +53,30 @@ was working.
 
 This is also what makes the VM's `0.0.0.0` bind acceptable. See below.
 
+## The one credential it may hold: the artifact store's key
+
+The store answers to a single key (`ART_API_KEY`), not to the caller's token.
+So the shared global store is reachable through this server only if the server
+holds that key, delivered with `env_from` from the `artifacts` secret. With
+`/mcp` public, that key would otherwise act for anyone. `src/artscope.ts`
+decides, per request, who it acts for:
+
+- **Nobody anonymous.** A request without an `applb_…` bearer is sent to the
+  store *without* the key, which leaves it the store's anonymous reads of
+  public blobs.
+- **Nobody app-lb does not vouch for.** The bearer is checked with app-lb's
+  `GET /whoami` (`APPLB_URL`), and the answer is cached for 30s. Anything that
+  is not a verified app-token with an admin tier gets no key.
+- **A fleet token** gets the whole store, read-only at the `view` tier.
+- **A namespace token** gets its own corner of the store: refs under `<ns>/`,
+  content-addressed blobs and manifests by digest, and a tag listing filtered
+  to `<ns>/`. Nothing store-wide (`/usage`, `/blobs`, `/manifests`,
+  `/repos` listings) and nothing else's tags. A view-tier token, or one
+  confined to particular deployments, is read-only.
+
+The check sits on the one requester every art tool uses and on the `/art`
+gateway, so `art_request`'s raw HTTP is held to it too.
+
 ## Preconditions (not in this manifest — apply separately)
 
 1. **Add `app-token` to the admin deployment's gate.** Confirm the id first

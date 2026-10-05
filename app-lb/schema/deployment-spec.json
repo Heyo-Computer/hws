@@ -691,6 +691,13 @@
             "null"
           ]
         },
+        "authorize_url": {
+          "description": "**Scoped sign-in**: the issuer's OAuth 2.0 authorization endpoint, for a\nbrowser that reaches this gate with no session. Set together with\n[`token_url`](Self::token_url); the Heyo auth API serves both at\n`/oauth/authorize` and `/oauth/token`.\n\nThe difference from [`login_url`](Self::login_url) is where the\ncredential ends up. With `login_url` the issuer leaves its token in a\ncookie on a domain it shares with this host, so every host under that\ndomain — other tenants' deployments included — receives it. With this,\napp-lb asks the issuer for access to *this deployment's namespace*\n(`scope=namespace:<ns>`, plus PKCE `S256` and `state`), the issuer\ndecides whether the person may reach it, and the code it returns is\nexchanged server to server for a token naming this one host\n(`gateHost`) and namespace. The gate verifies it against this policy,\nchecks both claims, and keeps its own host-only session; the token never\nsits in a browser at all.\n\nMust be `https://` (or loopback `http://`). Cannot be combined with a\nshared session realm (`cookie_domain`): a session issued for one\nnamespace must not be honoured by a sibling gate in another.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "cookie": {
           "description": "A cookie to read the token from when there is no `Authorization` header.\n\nFor a browser application whose sign-in put the JWT in a cookie — common,\nand the only way a page navigation can carry a credential at all, since a\nbrowser cannot set a header on one. The `Authorization` header still wins\nwhen both are present: a request that says what it is presenting means it.",
           "type": [
@@ -776,6 +783,13 @@
           "description": "Which claim holds the stable user id forwarded as `x-auth-request-user`.\n`sub` unless the issuer says otherwise — the Heyo auth API uses `userId`.",
           "type": "string",
           "default": "sub"
+        },
+        "token_url": {
+          "description": "The issuer's token endpoint, which the gate calls server to server to\nredeem the code from [`authorize_url`](Self::authorize_url).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
