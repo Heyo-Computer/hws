@@ -5610,6 +5610,28 @@ mod tests {
     }
 
     #[test]
+    fn the_git_remote_spec_is_a_valid_ungated_vm_with_secret_credentials() {
+        let mut spec: DeploymentSpec =
+            serde_json::from_str(include_str!("../../remote/deploy/remote.json")).unwrap();
+        spec.normalize();
+        spec.validate().unwrap();
+        // git sends one credential, to the remote itself; a gate in front would
+        // demand a second one that git cannot send.
+        assert!(spec.auth.is_none());
+        let vm = spec.vm.as_ref().unwrap();
+        // The cache is disposable (the bucket is the authority), so no workspace
+        // capture: a replaced VM re-hydrates from S3.
+        assert!(vm.workspace.is_none());
+        for env in ["REMOTE_S3_ACCESS_KEY_ID", "REMOTE_S3_SECRET_ACCESS_KEY", "REMOTE_ADMIN_TOKEN"] {
+            assert!(vm.env_from.iter().any(|s| s.env.as_deref() == Some(env)), "{env}");
+            assert!(!vm.env_vars.as_ref().is_some_and(|v| v.contains_key(env)), "{env} must come from a secret");
+        }
+        // A VM cannot reach the host's loopback admin listener.
+        let applb = &vm.env_vars.as_ref().unwrap()["REMOTE_APPLB_URL"];
+        assert!(!applb.contains("127.0.0.1"), "{applb}");
+    }
+
+    #[test]
     fn managed_nats_template_preserves_single_writer_storage_and_private_access() {
         let mut spec: DeploymentSpec = serde_json::from_str(include_str!("../examples/nats/managed.json")).unwrap();
         spec.normalize();
