@@ -23,8 +23,14 @@
 //! | `APP_LB_ONBOARDING_MCP_URL` | unset | the hosted MCP endpoint; without it the card leaves that step out |
 //! | `APP_LB_ONBOARDING_MCP_NAME` | `heyo` | the name the install command gives the server in the user's MCP client |
 //! | `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` | 90 days | the longest a namespace-confined caller may mint a token for |
-//! | `APP_LB_PUBLIC_IMAGE_CATALOG_URL` | unset | cloud's base URL, serving `/public-images/{name}/meta` |
-//! | `APP_LB_ONBOARDING_FASTCAR_IMAGE` | `fastcar` | the catalog name the fastcar spec deploys |
+//! | `APP_LB_ONBOARDING_HUB_URL` | unset | the public artifact hub (`https://hub.heyo.work`): where the fastcar image is pulled from, and the "browse public images" link |
+//! | `APP_LB_ONBOARDING_FASTCAR_REF` | `heyo/fastcar:latest` | the public hub repository and tag the fastcar spec pulls |
+//! | `APP_LB_PUBLIC_IMAGE_CATALOG_URL` | unset | cloud's base URL, serving `/public-images/{name}/meta`; used for fastcar only when no hub is set |
+//! | `APP_LB_ONBOARDING_FASTCAR_IMAGE` | `fastcar` | the image name the fastcar spec boots: a catalog name, or the base name a hub pull is materialized under |
+//!
+//! With a hub, the spec carries an `artifact` block naming a public repository,
+//! so app-lb pulls the rootfs anonymously and verifies it by digest: no key, no
+//! catalog, and the same bytes on every fleet that can reach the hub.
 
 use std::time::Duration;
 
@@ -39,6 +45,10 @@ pub const DEFAULT_TENANT_TOKEN_MAX_TTL_SECS: u64 = 90 * 86_400;
 /// The name the install command registers the MCP server under, unless
 /// `APP_LB_ONBOARDING_MCP_NAME` names another.
 pub const DEFAULT_MCP_NAME: &str = "heyo";
+
+/// The hub repository and tag the fastcar spec pulls, unless
+/// `APP_LB_ONBOARDING_FASTCAR_REF` names another.
+pub const DEFAULT_FASTCAR_REF: &str = "heyo/fastcar:latest";
 
 /// The catalog image the fastcar spec deploys, unless
 /// `APP_LB_ONBOARDING_FASTCAR_IMAGE` names another.
@@ -60,6 +70,9 @@ pub struct Onboarding {
     pub mcp_name: String,
     pub tenant_token_max_ttl_secs: u64,
     catalog_url: Option<reqwest::Url>,
+    /// The public hub, when there is one: the fastcar image comes from it.
+    pub hub_url: Option<reqwest::Url>,
+    pub fastcar_ref: String,
     pub fastcar_image: String,
     http: reqwest::Client,
 }
@@ -74,6 +87,8 @@ impl std::fmt::Debug for Onboarding {
                 "catalog_url",
                 &self.catalog_url.as_ref().map(reqwest::Url::as_str),
             )
+            .field("hub_url", &self.hub_url.as_ref().map(reqwest::Url::as_str))
+            .field("fastcar_ref", &self.fastcar_ref)
             .field("fastcar_image", &self.fastcar_image)
             .finish()
     }
@@ -145,8 +160,18 @@ impl Onboarding {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_FASTCAR_IMAGE.to_string());
+        let fastcar_ref = match get("APP_LB_ONBOARDING_FASTCAR_REF").map(|v| v.trim().to_string()) {
+            Some(r) if crate::config::is_valid_artifact_ref(&r) => r,
+            Some(r) if !r.is_empty() => {
+                tracing::warn!(variable = "APP_LB_ONBOARDING_FASTCAR_REF", value = %r, "ignoring: not an artifact reference");
+                DEFAULT_FASTCAR_REF.to_string()
+            }
+            _ => DEFAULT_FASTCAR_REF.to_string(),
+        };
         Self {
             mcp_name: mcp_name(get("APP_LB_ONBOARDING_MCP_NAME")),
+            hub_url: https_url("APP_LB_ONBOARDING_HUB_URL", get("APP_LB_ONBOARDING_HUB_URL")),
+            fastcar_ref,
             mcp_url: https_url(
                 "APP_LB_ONBOARDING_MCP_URL",
                 get("APP_LB_ONBOARDING_MCP_URL"),
@@ -175,6 +200,36 @@ impl Onboarding {
             .pop_if_empty()
             .extend(["public-images", id]);
         Some(url.into())
+    }
+
+    /// The hub's base URL as a store address (no trailing slash), which is what
+    /// `artifact.store` takes.
+    pub fn hub_store(&self) -> Option<String> {
+        self.hub_url.as_ref().map(|u| u.as_str().trim_end_matches('/').to_string())
+    }
+
+    /// The hub's browsable page, for the "browse public images" link.
+    pub fn hub_page(&self) -> Option<String> {
+        self.hub_store().map(|s| format!("{s}/hub"))
+    }
+
+    /// Whether the hub has the fastcar tag, asked the way app-lb's own pull will
+    /// ask: anonymously. A tag that answers here is one a deployment can pull.
+    pub async fn hub_fastcar(&self) -> HubLookup {
+        let Some(store) = self.hub_store() else {
+            return HubLookup::Unconfigured;
+        };
+        let reference: String = form_urlencoded::byte_serialize(self.fastcar_ref.as_bytes()).collect();
+        match self.http.get(format!("{store}/tags/{reference}")).send().await {
+            Ok(r) if r.status().is_success() => HubLookup::Found,
+            // A private or missing tag both answer an anonymous caller this way,
+            // and both mean the same thing here: nobody can pull it without a key.
+            Ok(r) if matches!(r.status(), reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::UNAUTHORIZED) => {
+                HubLookup::NotPublic
+            }
+            Ok(r) => HubLookup::Failed(format!("the hub answered {}", r.status())),
+            Err(e) => HubLookup::Failed(format!("the hub did not answer: {e}")),
+        }
     }
 
     /// Look the fastcar image up in the public catalog.
@@ -221,6 +276,33 @@ impl Onboarding {
                 sha256: meta.sha256.filter(|s| !s.trim().is_empty()),
             }),
             None => ImageLookup::Failed("the catalog URL cannot take a path".into()),
+        }
+    }
+}
+
+/// Whether the public hub serves the fastcar tag to anyone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubLookup {
+    Found,
+    /// Missing, or in a repository that is not public: an anonymous pull fails.
+    NotPublic,
+    /// `APP_LB_ONBOARDING_HUB_URL` is unset.
+    Unconfigured,
+    Failed(String),
+}
+
+impl HubLookup {
+    /// The status the card shows beside the spec, in the same vocabulary as
+    /// [`ImageLookup::status`].
+    pub fn status(&self, reference: &str) -> (&'static str, Option<String>) {
+        match self {
+            Self::Found => ("ok", None),
+            Self::NotPublic => (
+                "not_found",
+                Some(format!("the hub has no public {reference} yet; the pull will fail until it is pushed and its repository made public")),
+            ),
+            Self::Unconfigured => ("unconfigured", Some("no public hub is configured".into())),
+            Self::Failed(why) => ("error", Some(why.clone())),
         }
     }
 }
@@ -292,6 +374,9 @@ pub fn fastcar_id(namespace: &str) -> String {
 ///
 /// - `image`: the catalog record, when there is one. Without it the spec names
 ///   the image alone and works only on a host that already holds it.
+/// - `hub`: `(store, reference)` on the public hub. When given it wins over the
+///   catalog: the spec pulls the rootfs with an `artifact` block, anonymously,
+///   and app-lb materializes it under `image_name`.
 /// - `host`: the hostname the fleet will route, when it generates them. The
 ///   spec then pins it, so `FASTCAR_PUBLIC_URL` can be filled in. Without one
 ///   the route is path-only and the fleet's own host rules apply.
@@ -302,6 +387,7 @@ pub fn fastcar_spec(
     namespace: &str,
     image_name: &str,
     image: Option<&CatalogImage>,
+    hub: Option<(&str, &str)>,
     host: Option<&str>,
     gated: bool,
 ) -> Value {
@@ -323,6 +409,7 @@ pub fn fastcar_spec(
         "disk_size_gb": 10,
         "env_vars": env,
     });
+    let image = if hub.is_some() { None } else { image };
     if let Some(image) = image {
         vm["image_download_url"] = json!(image.download_url);
         vm["image_size_bytes"] = json!(image.size_bytes);
@@ -352,6 +439,15 @@ pub fn fastcar_spec(
         },
         "health": { "path": "/api/health", "timeout_secs": 2 },
     });
+    if let Some((store, reference)) = hub {
+        // No `auth`: the repository is public, so the pull needs no key, and a
+        // tenant has none to give it.
+        spec["artifact"] = json!({
+            "store": store,
+            "ref": reference,
+            "image_name": image_name,
+        });
+    }
     if gated {
         spec["auth"] = json!({
             "provider_ref": HEYO_PROVIDER,
@@ -400,7 +496,7 @@ mod tests {
             (None, None, false),
             (Some(image()), None, true),
         ] {
-            let spec = parse(fastcar_spec("acme", "fastcar", img.as_ref(), host, gated));
+            let spec = parse(fastcar_spec("acme", "fastcar", img.as_ref(), None, host, gated));
             spec.validate().expect("the onboarding spec must validate");
             assert_eq!(spec.namespace, "acme");
             assert_eq!(spec.id, "fastcar-acme");
@@ -408,8 +504,40 @@ mod tests {
     }
 
     #[test]
+    fn a_hub_image_is_an_anonymous_artifact_pull_and_wins_over_the_catalog() {
+        let hub = Some(("https://hub.heyo.work", "heyo/fastcar:latest"));
+        let v = fastcar_spec("acme", "fastcar", Some(&image()), hub, Some("fastcar-acme.us5.heyo.work"), true);
+        assert_eq!(v["artifact"]["store"], "https://hub.heyo.work");
+        assert_eq!(v["artifact"]["ref"], "heyo/fastcar:latest");
+        assert_eq!(v["artifact"]["image_name"], "fastcar");
+        assert!(v["artifact"].get("auth").is_none(), "a public pull needs no key");
+        assert!(v["vm"].get("image_download_url").is_none(), "the catalog download must not ride along");
+        let spec = parse(v);
+        spec.validate().expect("the hub spec must validate");
+        assert!(spec.artifact.is_some());
+    }
+
+    #[test]
+    fn the_hub_and_its_reference_come_from_config() {
+        let o = Onboarding::from_lookup(|k| match k {
+            "APP_LB_ONBOARDING_HUB_URL" => Some("https://hub.heyo.work/".into()),
+            "APP_LB_ONBOARDING_FASTCAR_REF" => Some("heyo/fastcar:e8d940f".into()),
+            _ => None,
+        });
+        assert_eq!(o.hub_store().as_deref(), Some("https://hub.heyo.work"));
+        assert_eq!(o.hub_page().as_deref(), Some("https://hub.heyo.work/hub"));
+        assert_eq!(o.fastcar_ref, "heyo/fastcar:e8d940f");
+
+        let d = Onboarding::default();
+        assert!(d.hub_store().is_none());
+        assert_eq!(d.fastcar_ref, DEFAULT_FASTCAR_REF);
+        let bad = Onboarding::from_lookup(|k| (k == "APP_LB_ONBOARDING_FASTCAR_REF").then(|| "no spaces allowed".into()));
+        assert_eq!(bad.fastcar_ref, DEFAULT_FASTCAR_REF);
+    }
+
+    #[test]
     fn a_catalog_image_carries_its_download_and_digest() {
-        let v = fastcar_spec("acme", "fastcar", Some(&image()), None, false);
+        let v = fastcar_spec("acme", "fastcar", Some(&image()), None, None, false);
         assert_eq!(
             v["vm"]["image_download_url"],
             "https://cloud.example/public-images/im-1"
@@ -417,18 +545,14 @@ mod tests {
         assert_eq!(v["vm"]["image_size_bytes"], 1_234);
         assert_eq!(v["vm"]["image_sha256"], "ab".repeat(32));
 
-        let bare = fastcar_spec("acme", "fastcar", None, None, false);
+        let bare = fastcar_spec("acme", "fastcar", None, None, None, false);
         assert!(bare["vm"].get("image_download_url").is_none());
         assert_eq!(bare["vm"]["image"], "fastcar");
     }
 
     #[test]
     fn a_known_host_is_pinned_and_becomes_the_public_url() {
-        let v = fastcar_spec(
-            "acme",
-            "fastcar",
-            None,
-            Some("fastcar-acme.us2.heyo.work"),
+        let v = fastcar_spec("acme", "fastcar", None, None, Some("fastcar-acme.us2.heyo.work"),
             false,
         );
         assert_eq!(v["routes"][0]["host"], "fastcar-acme.us2.heyo.work");
@@ -437,19 +561,19 @@ mod tests {
             "https://fastcar-acme.us2.heyo.work"
         );
 
-        let v = fastcar_spec("acme", "fastcar", None, None, false);
+        let v = fastcar_spec("acme", "fastcar", None, None, None, false);
         assert_eq!(v["routes"][0]["path_prefix"], "/");
         assert!(v["vm"]["env_vars"].get("FASTCAR_PUBLIC_URL").is_none());
     }
 
     #[test]
     fn the_gate_is_the_namespace_heyo_provider_with_health_left_open() {
-        let v = fastcar_spec("acme", "fastcar", None, None, true);
+        let v = fastcar_spec("acme", "fastcar", None, None, None, true);
         assert_eq!(v["auth"]["provider_ref"], "heyo");
         assert_eq!(v["auth"]["public_paths"][0]["path"], "/api/health");
         assert_eq!(v["auth"]["public_paths"][0]["scope"], "public");
         assert!(
-            fastcar_spec("acme", "fastcar", None, None, false)
+            fastcar_spec("acme", "fastcar", None, None, None, false)
                 .get("auth")
                 .is_none()
         );

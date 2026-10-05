@@ -29,13 +29,31 @@ Without `APP_LB_ONBOARDING_MCP_URL`, the card leaves the MCP step out and points
 
 ## The fastcar spec
 
-[fastcar](https://github.com/Heyo-Computer/fastcar) is an agent workspace. The spec runs it from the public Firecracker image named `APP_LB_ONBOARDING_FASTCAR_IMAGE` (`fastcar`):
+[fastcar](https://github.com/Heyo-Computer/fastcar) is an agent workspace. The spec runs it from a public Firecracker image:
+
+- **From the hub.** With `APP_LB_ONBOARDING_HUB_URL` set (`https://hub.heyo.work`), the spec carries an `artifact` block naming the public repository `APP_LB_ONBOARDING_FASTCAR_REF` (`heyo/fastcar:latest`). app-lb pulls the rootfs anonymously, verifies it by digest, and boots it as `APP_LB_ONBOARDING_FASTCAR_IMAGE` (`fastcar`). No key and no catalog are needed, and every fleet that can reach the hub gets the same bytes. Claude's `applb_deploy` starts the pull itself; with `heyctl`, run `heyctl pull fastcar-<namespace> --wait` after `apply`. Before showing the spec, the card checks anonymously that the tag is pullable.
+- **From the catalog.** Without a hub, the image named `APP_LB_ONBOARDING_FASTCAR_IMAGE` comes from the public image catalog, as below.
+
+The card also links to the hub's browsable page (`<hub>/hub`), where users can find other public images and, with the `art_*` MCP tools, publish their own under `<namespace>/…`.
+
+The spec itself:
 
 - **Mock mode.** `FASTCAR_MOCK=1`, so it boots without model keys. The image's own Postgres holds its state on a 10 GB data disk.
 - **Size and scaling.** `medium` size class, at most one VM, scaled to zero after 30 minutes idle.
 - **Address.** The deployment is `fastcar-<namespace>`. When the fleet generates hostnames, it answers at `fastcar-<namespace>.<base domain>`.
 - **Sign-in.** It sits behind the namespace's `heyo` provider. Only `/api/health` is public. fastcar is an agent with a shell, so it is never deployed ungated. If the namespace has no `heyo` provider, the card says so and the spec has no gate.
-- **Image download.** With `APP_LB_PUBLIC_IMAGE_CATALOG_URL` set, the spec carries the catalog download URL, size and digest, which the daemon verifies the image against. Without it, the spec works only on a host that already holds the image.
+- **Image download (catalog only).** With `APP_LB_PUBLIC_IMAGE_CATALOG_URL` set and no hub, the spec carries the catalog download URL, size and digest, which the daemon verifies the image against. Without either, the spec works only on a host that already holds the image.
+
+### Publishing the fastcar image
+
+The hub image is built from a clean checkout of a fastcar commit, never from a working tree, because the Dockerfile copies the whole repository. Push it as both a moving tag and an immutable one, then make the repository public:
+
+```sh
+git -C fastcar worktree add --detach /tmp/fastcar-src <commit>
+(cd /tmp/fastcar-src && heyvm mvm build --local-only -f deploy/image/Dockerfile -c . -n fastcar-hub)
+heyctl artifact push --image fastcar-hub --registry-url <store> --tag heyo/fastcar:<commit> --public
+heyctl artifact push --image fastcar-hub --registry-url <store> --tag heyo/fastcar:latest
+```
 
 To run fastcar for real, store `INCEPTION_API_KEY`, `OPENROUTER_API_KEY` and optionally `TAVILY_API_KEY` as namespace secrets. Reference them from `vm.env_from`, then set `FASTCAR_MOCK=0`.
 
@@ -50,10 +68,13 @@ This is a view-tier route. It answers only about a namespace the caller reaches.
   "can_mint": true,
   "mcp": { "name": "heyo", "url": "https://mcp.us2.heyo.work/mcp" },
   "token": { "max_ttl_secs": 7776000 },
+  "hub": { "url": "https://hub.heyo.work/hub" },
   "fastcar": {
     "id": "fastcar-acme",
     "url": "https://fastcar-acme.us2.heyo.work",
     "gated": true,
+    "source": "hub",
+    "ref": "heyo/fastcar:latest",
     "image": "ok",
     "note": null,
     "spec": { "id": "fastcar-acme", "namespace": "acme", "…": "…" }
