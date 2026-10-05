@@ -225,7 +225,7 @@ test("art_publish_files publishes a tar.gz that tar itself can read", async () =
 
 test("art_fetch resolves a tag to its entry, verifies the digest, and returns text", async () => {
   const bytes = new TextEncoder().encode("hello world");
-  const digest = "sha256:" + createHash("sha256").update(bytes).digest("hex");
+  const digest = createHash("sha256").update(bytes).digest("hex");
   let serve = bytes;
   const stub = stubFetch((c) => {
     if (c.url.includes("/manifests/")) return { body: { kind: "generic", entries: [{ name: "x", digest, size: 11 }] } };
@@ -237,7 +237,7 @@ test("art_fetch resolves a tag to its entry, verifies the digest, and returns te
     assert.equal(out.text, "hello world");
     assert.equal(out.digest, digest);
     serve = new TextEncoder().encode("tampered!!!");
-    await assert.rejects(tool(tools(), "art_fetch").handler({ reference: "my-tag" }), /not sha256/);
+    await assert.rejects(tool(tools(), "art_fetch").handler({ reference: "my-tag" }), /hashing to [0-9a-f]{64}, not [0-9a-f]{64}; nothing was kept/);
   } finally {
     stub.restore();
   }

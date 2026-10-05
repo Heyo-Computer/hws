@@ -25,7 +25,7 @@ const MCP_PATH = "/mcp";
  * with this server's store key (`x-api-key`) and the caller's own bearer for
  * the gate, exactly as the `art_*` tools send them. It exists for bytes too
  * large to pass through a tool call: an agent with `curl` uploads a bundle
- * with `PUT /art/blobs/sha256:<hex>` and then tags it with `art_*` tools (or
+ * with `PUT /art/blobs/<hex digest>` and then tags it with `art_*` tools (or
  * more gateway requests), without base64 in the conversation.
  *
  * Only the store's API paths are forwarded, never its dashboard, and only

@@ -33,7 +33,8 @@ export type ArtScope =
   | { readonly kind: "namespace"; readonly namespace: string; readonly write: boolean };
 
 const NAMESPACE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
-const DIGEST = /^sha256:[0-9a-f]{64}$/;
+// The store spells digests as bare hex; a `sha256:` prefix is accepted too.
+const DIGEST = /^(sha256:)?[0-9a-f]{64}$/;
 
 /**
  * app-lb's `GET /whoami` answer for an app-token, reduced to its reach into the
