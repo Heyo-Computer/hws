@@ -263,6 +263,9 @@ fn config_from_env() -> LbConfig {
     if let Ok(v) = std::env::var("APP_LB_DEPLOY_BASE_DOMAIN") {
         cfg.deploy_base_domain = Some(v.trim().to_string()).filter(|d| !d.is_empty());
     }
+    if let Ok(v) = std::env::var("APP_LB_STRIP_COOKIES") {
+        cfg.strip_cookies = crate::request_control::parse_cookie_names(&v);
+    }
     if let Ok(v) = std::env::var("APP_LB_UPDATE_SHELL") {
         cfg.update_shell = v;
     }
@@ -1041,7 +1044,7 @@ fn main() {
         control: Arc::new(request_control::RequestControl::new(
             registry.clone(), metrics.clone(), challenges, auth, guard.clone(),
             event_feed, auth_providers.clone(), secrets.clone(),
-        )),
+        ).with_stripped_cookies(cfg.strip_cookies.clone())),
         metrics,
         access_log: obs.as_ref().and_then(|o| o.access.clone()),
         security: siem.as_ref().map(|s| s.sink.clone()),

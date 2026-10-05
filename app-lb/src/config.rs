@@ -221,6 +221,19 @@ pub struct LbConfig {
     /// [`deploy_host_base`]: LbConfig::deploy_host_base
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_base_domain: Option<String>,
+    /// Cookies removed from every request before it is forwarded to a VM or
+    /// upstream, whatever the deployment (`APP_LB_STRIP_COOKIES`).
+    ///
+    /// A sign-in cookie set on a parent domain (`Domain=.example.com`) is sent
+    /// by the browser to every host under it, and app-lb otherwise passes the
+    /// `Cookie` header through untouched. On a host where tenants share that
+    /// domain, one tenant's deployment would receive every other signed-in
+    /// user's token. Naming the cookie here keeps it between the browser and
+    /// app-lb: gates still read it, since they run before forwarding, and the
+    /// deployment's code never sees it. Names match exactly (cookie names are
+    /// case-sensitive).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip_cookies: Vec<String>,
     /// Shell that a static deployment's `update.commands` run through. They are
     /// written as shell lines (`git pull && cargo build --release`), so there is
     /// one; pointing this at `bash` buys bashisms.
@@ -319,6 +332,7 @@ impl Default for LbConfig {
             public_ips: Vec::new(),
             route53_zone_id: None,
             deploy_base_domain: None,
+            strip_cookies: Vec::new(),
             update_shell: default_update_shell(),
             build_timeout_secs: default_build_timeout_secs(),
             heyvm_home: None,

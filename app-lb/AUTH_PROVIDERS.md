@@ -222,6 +222,14 @@ So the page at `login_url` has two jobs and no others:
    `Domain=.example.com`);
 2. redirect back to the URL it was handed, and to nowhere else.
 
+A cookie on `Domain=.example.com` goes to **every** host under it, not only the
+gated ones, and app-lb forwards the `Cookie` header to the deployment as it
+arrived. Where other people's deployments share that domain, set
+`APP_LB_STRIP_COOKIES` to the cookie's name (`heyo_token` for the Heyo auth
+service). app-lb then removes it from every forwarded request, on every
+deployment. Gates still read it, because they run before forwarding, but no
+deployment's code ever sees it.
+
 That is the entire contract. The Heyo auth service implements it at `GET /login`
 (see `auth/src/routes/login.routes.ts`, configured by `LOGIN_COOKIE_NAME`,
 `LOGIN_COOKIE_DOMAIN` and `LOGIN_ALLOWED_REDIRECT_HOSTS` — the return URL
