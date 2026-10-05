@@ -92,9 +92,17 @@ pub struct Principal {
     pub repos: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_id: Option<String>,
+    /// What a page calls this caller: an email when the credential carries
+    /// one, else the subject.
+    #[serde(skip)]
+    pub display: Option<String>,
 }
 
 impl Principal {
+    pub fn display(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.subject)
+    }
+
     pub fn tier_in(&self, ns: &str) -> Option<Tier> {
         self.fleet.max(self.namespaces.get(ns).copied())
     }
@@ -151,6 +159,7 @@ impl TokenRecord {
             own_account: None,
             repos: Some(self.repos.clone()),
             token_id: Some(self.id.clone()),
+            display: None,
         }
     }
 
@@ -313,6 +322,7 @@ impl Authenticator {
                 own_account: self.default_account.clone(),
                 repos: None,
                 token_id: None,
+                display: None,
             }));
         }
         let key: [u8; 32] = Sha256::digest(bearer.as_bytes()).into();
@@ -340,6 +350,52 @@ impl Authenticator {
         });
         self.upstream.put(key, p.clone());
         p
+    }
+
+    /// Whether a Heyo email/password sign-in is possible here.
+    pub fn can_login(&self) -> bool {
+        self.auth_url.is_some()
+    }
+
+    /// Exchange a Heyo email and password for an access token, as app-lb's
+    /// dashboard sign-in does (`app-lb/src/federated.rs` `login`). The token
+    /// is the session: every later request resolves it through
+    /// `/api/auth/scopes`, so the namespaces it reaches are exactly the ones
+    /// app-lb would grant it. Returns the token and its lifetime in seconds.
+    pub async fn login(&self, email: &str, password: &str) -> Option<(String, u64)> {
+        let base = self.auth_url.as_ref()?;
+        let url = reqwest::Url::parse(base).ok()?;
+        // Never send a password over plaintext to anything but loopback.
+        let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+        if !(url.scheme() == "https" || url.scheme() == "http" && loopback) {
+            tracing::warn!("REMOTE_AUTH_URL is not https; refusing to send a password to it");
+            return None;
+        }
+        let resp = self
+            .http
+            .post(format!("{base}/api/auth/login"))
+            .json(&serde_json::json!({ "email": email, "password": password }))
+            .send()
+            .await
+            .inspect_err(|e| tracing::warn!(error = %e, "auth service unreachable for sign-in"))
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            return None;
+        }
+        let token = body.pointer("/data/tokens/accessToken")?.as_str()?;
+        if !cookie_safe(token) {
+            return None;
+        }
+        let lifetime = body
+            .pointer("/data/tokens/expiresIn")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600)
+            .min(86_400);
+        Some((token.to_string(), lifetime))
     }
 
     async fn repo_token(&self, bearer: &str) -> Option<Principal> {
@@ -516,6 +572,27 @@ impl Authenticator {
     }
 }
 
+/// Whether a bearer can be a cookie value as-is: the alphabet of JWTs and of
+/// every token shape here.
+pub fn cookie_safe(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 3800
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// Seconds until a JWT's `exp`, read without verifying it: only to size a
+/// cookie, never to trust it. `None` for anything that is not a JWT.
+pub fn jwt_remaining(token: &str, now: u64) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exp")?.as_u64()?.checked_sub(now)
+}
+
 /// The Heyo auth service's `/api/auth/scopes` envelope, in the grammar app-lb
 /// consumes: `namespace:<ns>:admin|view` and `fleet:admin`.
 pub fn principal_from_scopes(body: &serde_json::Value) -> Option<Principal> {
@@ -570,6 +647,11 @@ pub fn principal_from_scopes(body: &serde_json::Value) -> Option<Principal> {
             .map(String::from),
         repos: None,
         token_id: None,
+        display: data
+            .pointer("/subject/email")
+            .and_then(|v| v.as_str())
+            .filter(|e| !e.is_empty())
+            .map(String::from),
     })
 }
 
@@ -620,6 +702,7 @@ pub fn principal_from_whoami(body: &serde_json::Value) -> Option<Principal> {
         own_account: None,
         repos: None,
         token_id: None,
+        display: None,
     })
 }
 

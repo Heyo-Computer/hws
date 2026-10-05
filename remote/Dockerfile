@@ -6,7 +6,8 @@
 #
 # and an app-lb `build` block needs `"context": "."` beside
 # `"dockerfile": "remote/Dockerfile"`: the crate depends on
-# `../heyosecret-client` by path, so the context must hold both.
+# `../heyosecret-client` and includes `../ui` by path, so the context must
+# hold all three.
 #
 # The heyvm build pipeline is docker build -> docker export -> mke2fs, which
 # discards OCI metadata (ENTRYPOINT/CMD/ENV are NOT used). The VM boots straight
@@ -16,6 +17,8 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /app/remote
 COPY heyosecret-client /app/heyosecret-client
+# The web UI includes the shared stylesheet, fonts and top bar by path.
+COPY ui /app/ui
 COPY remote/Cargo.toml remote/Cargo.lock ./
 COPY remote/src ./src
 COPY remote/tests ./tests

@@ -81,6 +81,49 @@ git sends a token as the password of Basic auth (any username), or with
 `git -c http.extraHeader="Authorization: Bearer <token>"`. app-lb builds use
 username `x-access-token`, which is app-lb's default.
 
+## Web UI
+
+The same host serves a server-rendered UI, modelled on GitHub's:
+
+- a dashboard of your repos and namespaces;
+- a namespace page, with **New repository** and **Tokens** for admins;
+- per repo: the code tab (file tree, last commit per file, rendered README,
+  clone URL), file view with line anchors, raw, history, commits with diffs,
+  branches, tags and settings (delete).
+
+**Permissions come from app-lb.** The UI keeps no permission model of its own.
+A browser session is a bearer in a cookie, resolved by the same providers as
+the API:
+
+- **Sign in with a Heyo email and password.** The password is posted to
+  `REMOTE_AUTH_URL`'s `/api/auth/login`, as app-lb's dashboard does. The
+  token's namespaces come from `/api/auth/scopes`, which are the grants app-lb
+  enforces.
+- **Paste a token.** An `applb_` token is resolved by app-lb's `GET /whoami`.
+- **Handoff.** The Heyo front end can `POST /-/handoff` a form of `token` and
+  `namespace`, like app-lb's `/login/handoff`.
+
+A person sees only the namespaces they reach, and only the repos a repo token
+is confined to. A repo they cannot read is a 404, not a 403. Writes (create,
+delete, mint, revoke) need admin in the namespace.
+
+Cookies and forms:
+
+- The cookie is `HttpOnly` and `SameSite=Lax`. It is `__Host-heyo-git` and
+  `Secure` when `REMOTE_PUBLIC_URL` is https, and `heyo_git` otherwise.
+- Every form post must carry this origin. The exception is `/-/handoff`, which
+  can only sign a browser in.
+- READMEs are rendered with raw HTML shown as text.
+- Raw files are served as `text/plain` under a `sandbox` CSP, except raster
+  images.
+
+There is no app-lb gate in front, for two reasons: git cannot pass a sign-in
+page, and the gate forwards an identity but no namespaces.
+
+The UI's own paths sit under `/-/` and `/__ui/`. `REMOTE_WEB=0` turns the UI
+off. The theme cookie follows `REMOTE_UI_COOKIE_DOMAIN`, else
+`HEYO_UI_COOKIE_DOMAIN` (see `ui/README.md`).
+
 ## API
 
 | | |
@@ -117,6 +160,7 @@ username `x-access-token`, which is app-lb's default.
 | `REMOTE_MAX_PUSH_MB` | `512` | |
 | `REMOTE_ALLOW_FORCE_PUSH` | off | `receive.denyNonFastForwards` otherwise |
 | `REMOTE_MAX_TOKEN_TTL_SECS` | 30 days | cap on a token's `ttl_secs`; `0` (no expiry) is allowed |
+| `REMOTE_WEB` | on | `0` serves the API and git only, with no web UI |
 
 The S3 credential needs these permissions on `<prefix>-*`:
 
@@ -174,7 +218,9 @@ real `git` client. It covers:
 - a clone through the instance with the cold cache;
 - a stale concurrent push refused, then landed after a rebase;
 - a commit with no git, and a stale `base` refused with 409;
-- delete.
+- delete;
+- the web UI: each session sees only the namespaces a stub app-lb and auth
+  service grant it, and browsing, forms, origin checks and handoff all work.
 
 ## Not done yet
 

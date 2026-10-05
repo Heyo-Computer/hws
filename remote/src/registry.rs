@@ -195,6 +195,21 @@ impl Registry {
         Ok(Some(b))
     }
 
+    /// Every namespace that has a binding, for an unconfined caller's view.
+    pub async fn namespaces(&self) -> Result<Vec<String>> {
+        let mut out: Vec<String> = self
+            .store
+            .list(&self.control_bucket, "namespaces/")
+            .await?
+            .iter()
+            .filter_map(|k| k.strip_prefix("namespaces/")?.strip_suffix(".json"))
+            .filter(|ns| valid_namespace(ns))
+            .map(String::from)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
     /// Bind `ns` to `account_id`'s bucket, creating the bucket, unless it is
     /// already bound, in which case the existing binding wins whoever asks.
     pub async fn bind(&self, ns: &str, account_id: &str) -> Result<NamespaceBinding> {
