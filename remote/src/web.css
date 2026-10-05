@@ -1,0 +1,162 @@
+/* heyo git: the repository vocabulary on top of ui/heyo.css. Colours are only
+   ever shared tokens, so both themes follow. */
+
+.ico { width: 14px; height: 14px; vertical-align: -2px; color: var(--text-muted); }
+.ico-dir { color: var(--accent); }
+
+.narrow { max-width: 460px; margin: var(--gap-5) auto; }
+.narrow.wide { max-width: 860px; }
+.narrow .card { margin-bottom: var(--gap-4); }
+.or { text-align: center; color: var(--text-muted); margin: var(--gap-2) 0 var(--gap-4); }
+
+.layout { display: grid; grid-template-columns: 260px 1fr; gap: var(--gap-5); align-items: start; }
+.sidebar { position: sticky; top: 68px; }
+.sidebar h3 { margin-top: var(--gap-5); }
+.who { display: flex; gap: var(--gap-3); align-items: center; }
+.side-list, .repo-list, .commit-list, .ref-list { list-style: none; margin: 0; padding: 0; }
+.side-list li { padding: var(--gap-1) 0; }
+.section-head { margin-bottom: var(--gap-3); }
+.section-head h2 { margin: 0; }
+
+.repo-list li { padding: var(--gap-4) 0; border-bottom: 1px solid var(--border-color); }
+.repo-list li:first-child { border-top: 1px solid var(--border-color); }
+.repo-name { font-size: 15px; }
+.desc { margin: var(--gap-1) 0 var(--gap-2); color: var(--text-secondary); }
+
+.avatar {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; flex: none;
+  border: 1px solid var(--accent); border-radius: 50%;
+  color: var(--accent); background: var(--bg-elevated);
+  font-family: var(--font-display); font-size: 8px; letter-spacing: 0.5px;
+  vertical-align: middle;
+}
+
+/* Repo header and tabs, GitHub's underline nav. */
+.repo-head { margin: 0 0 var(--gap-4); border-bottom: 1px solid var(--border-color); }
+.repo-title { font-family: var(--font-body); text-transform: none; letter-spacing: 0; font-size: 18px; font-weight: 400; margin-bottom: var(--gap-2); }
+.repo-title .ico { width: 16px; height: 16px; }
+.repo-title .pill { vertical-align: 3px; }
+.sep { color: var(--text-muted); }
+.tabs { display: flex; gap: var(--gap-1); overflow-x: auto; margin-top: var(--gap-3); }
+.tabs a {
+  padding: var(--gap-2) var(--gap-3); color: var(--text-secondary);
+  border-bottom: 2px solid transparent; white-space: nowrap;
+}
+.tabs a:hover { color: var(--text-primary); border-bottom-color: var(--border-accent); }
+.tabs a[aria-current="page"] { color: var(--text-primary); border-bottom-color: var(--accent); }
+.count {
+  display: inline-block; min-width: 18px; padding: 0 6px; margin-left: 2px;
+  border-radius: 9px; background: var(--bg-elevated); color: var(--text-secondary);
+  font-size: 11px; text-align: center;
+}
+
+.toolbar { margin-bottom: var(--gap-3); }
+.crumbs { font-size: 14px; word-break: break-all; }
+
+/* Dropdowns are <details>: no script, keyboard works. */
+.dropdown { position: relative; display: inline-block; }
+.dropdown > summary { list-style: none; }
+.dropdown > summary::-webkit-details-marker { display: none; }
+.dropdown-menu {
+  position: absolute; z-index: 10; top: calc(100% + 4px); left: 0;
+  min-width: 260px; max-height: 360px; overflow-y: auto;
+  padding: var(--gap-3); background: var(--bg-panel);
+  border: 1px solid var(--border-accent); box-shadow: 0 8px 24px var(--accent-shadow);
+}
+.clone-dd .dropdown-menu { left: auto; right: 0; min-width: 360px; }
+.dropdown-menu label { margin-top: var(--gap-2); }
+.dd-item { display: block; padding: var(--gap-1) var(--gap-2); color: var(--text-secondary); }
+.dd-item:hover, .dd-item[aria-current="true"] { background: var(--bg-elevated); color: var(--text-primary); }
+.clone-box { display: flex; gap: var(--gap-2); align-items: center; margin: var(--gap-2) 0; }
+
+/* The file browser: a commit bar on top of a bordered table. */
+.files { border: 1px solid var(--border-color); margin-bottom: var(--gap-5); }
+.commit-bar {
+  display: flex; align-items: center; gap: var(--gap-2); flex-wrap: wrap;
+  padding: var(--gap-3); background: var(--bg-elevated); border-bottom: 1px solid var(--border-color);
+}
+.commit-bar .subject { color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%; }
+.commit-bar .history { margin-left: var(--gap-3); color: var(--text-secondary); }
+.file-table td { border-bottom: 1px solid var(--border-color); padding: 7px var(--gap-3); vertical-align: middle; }
+.file-table tr:last-child td { border-bottom: 0; }
+.file-table td.name { width: 30%; white-space: nowrap; }
+.file-table td.name a { color: var(--text-primary); }
+.file-table td.name a:hover { color: var(--accent); }
+.file-table td.msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 0; }
+.file-table td.num { width: 1%; white-space: nowrap; }
+.file-head { padding: var(--gap-2) var(--gap-3); border-bottom: 1px solid var(--border-color); }
+.btn[aria-current="true"] { border-color: var(--accent); color: var(--accent); }
+.btn.disabled { opacity: 0.45; pointer-events: none; }
+
+/* Source and diffs share one table shape: a gutter and a line. */
+table.code { font-size: 12px; }
+table.code td { border: 0; padding: 0 var(--gap-3); line-height: 20px; }
+table.code tbody tr:hover td { background: transparent; }
+table.code td.lc { white-space: pre; color: var(--text-primary); width: 100%; }
+table.code td.ln { width: 1%; text-align: right; user-select: none; }
+table.code td.ln a { color: var(--text-muted); }
+table.code tr:target td { background: color-mix(in srgb, var(--warning) 18%, transparent); }
+table.code td.sign { width: 1%; color: var(--text-muted); user-select: none; }
+table.diff tr.ins td { background: color-mix(in srgb, var(--success) 14%, transparent); }
+table.diff tr.rem td { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+table.diff tr.hunk td { background: color-mix(in srgb, var(--series-1) 14%, transparent); color: var(--text-muted); }
+.image-view { padding: var(--gap-5); text-align: center; }
+.image-view img { max-width: 100%; }
+.plain { border: 0; margin: 0; white-space: pre-wrap; }
+
+/* Commits */
+.timeline { margin-bottom: var(--gap-5); }
+.timeline .day { font-family: var(--font-body); text-transform: none; letter-spacing: 0; color: var(--text-muted); font-size: 12px; }
+.commit-list { border: 1px solid var(--border-color); }
+.commit-list li { padding: var(--gap-3); border-bottom: 1px solid var(--border-color); flex-wrap: nowrap; }
+.commit-list li:last-child { border-bottom: 0; }
+.commit-list .subject { color: var(--text-primary); }
+.pager { justify-content: center; margin: var(--gap-4) 0; }
+.commit-head { margin-bottom: var(--gap-4); }
+.commit-subject { font-family: var(--font-body); text-transform: none; letter-spacing: 0; font-size: 16px; font-weight: 600; }
+.commit-body { background: transparent; border: 0; padding: 0; white-space: pre-wrap; color: var(--text-secondary); }
+.add { color: var(--success); }
+.del { color: var(--danger); }
+.diff-file { border: 1px solid var(--border-color); margin-bottom: var(--gap-4); }
+.diff-head { padding: var(--gap-2) var(--gap-3); background: var(--bg-elevated); border-bottom: 1px solid var(--border-color); flex-wrap: nowrap; }
+.diff-head .mono { word-break: break-all; }
+.diff-note { padding: var(--gap-3); margin: 0; }
+.st-added { border-color: var(--success); color: var(--success); }
+.st-deleted { border-color: var(--danger); color: var(--danger); }
+.st-renamed { border-color: var(--warning); color: var(--warning); }
+
+/* Branches and tags */
+.card.flush { padding: 0; }
+.ref-list li { padding: var(--gap-3) var(--gap-4); border-bottom: 1px solid var(--border-color); flex-wrap: nowrap; }
+.ref-list li:last-child { border-bottom: 0; }
+
+.quick h4 { font-family: var(--font-body); text-transform: none; letter-spacing: 0; margin-top: var(--gap-4); }
+.danger-zone { border-color: var(--danger); margin-top: var(--gap-4); }
+
+/* A rendered README: body type, not the label face. */
+.readme .card-head { border-bottom: 1px solid var(--border-color); padding-bottom: var(--gap-2); }
+.markdown { font-size: 14px; line-height: 1.6; color: var(--text-primary); overflow-wrap: break-word; }
+.blob-md { padding: var(--gap-4) var(--gap-5); }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 {
+  font-family: var(--font-body); text-transform: none; letter-spacing: 0; font-weight: 600;
+  margin: var(--gap-5) 0 var(--gap-3);
+}
+.markdown h1 { font-size: 24px; padding-bottom: var(--gap-2); border-bottom: 1px solid var(--border-color); }
+.markdown h2 { font-size: 19px; padding-bottom: var(--gap-2); border-bottom: 1px solid var(--border-color); }
+.markdown h3 { font-size: 16px; }
+.markdown p, .markdown li { color: var(--text-primary); }
+.markdown code { background: var(--bg-elevated); padding: 1px 5px; }
+.markdown pre code { background: transparent; padding: 0; }
+.markdown blockquote { margin: 0 0 var(--gap-4); padding: 0 var(--gap-4); border-left: 3px solid var(--border-accent); color: var(--text-secondary); }
+.markdown table { width: auto; margin-bottom: var(--gap-4); }
+.markdown table td, .markdown table th { border: 1px solid var(--border-color); padding: var(--gap-2) var(--gap-3); }
+.markdown img { max-width: 100%; }
+
+@media (max-width: 760px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { position: static; }
+  .commit-bar .subject { max-width: 100%; }
+  .file-table td.msg { display: none; }
+  .clone-dd .dropdown-menu { min-width: 280px; }
+}

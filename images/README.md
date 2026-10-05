@@ -9,6 +9,9 @@ pullable by anyone without a key.
 | `heyo/debian` | `13`, `trixie`, `latest` | [`debian/`](debian/Dockerfile) |
 | `heyo/ubuntu` | `26.04`, `latest`; `24.04` | [`ubuntu/`](ubuntu/Dockerfile) (`UBUNTU_VERSION`) |
 | `heyo/postgres` | `18`, `latest` | [`postgres/`](postgres/README.md) |
+| `heyo/bun` | `1.4.2`, `1.4`, `1`, `latest` | [`bun/`](bun/README.md) |
+| `heyo/meilisearch` | `1.54.3`, `1.54`, `latest` | [`meilisearch/`](meilisearch/README.md) |
+| `heyo/minecraft` | `java25`, `latest` | [`minecraft/`](minecraft/README.md) (jar downloaded at first start) |
 
 ## The base images
 

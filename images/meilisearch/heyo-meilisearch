@@ -1,0 +1,40 @@
+#!/bin/sh
+# Start Meilisearch on /workspace with a master key.
+#
+# Run from app-lb's start_command, which is the only process that receives the
+# deployment's env_vars:
+#
+#   "start_command": "/usr/local/bin/heyo-meilisearch"
+#
+# Environment (Meilisearch's own variables; these are the defaults this sets):
+#   MEILI_MASTER_KEY  required, at least 16 bytes
+#   MEILI_ENV         production
+#   MEILI_DB_PATH     /workspace/meilisearch/data.ms
+#   MEILI_DUMP_DIR    /workspace/meilisearch/dumps
+#   MEILI_HTTP_ADDR   0.0.0.0:7700
+# Any other MEILI_* variable passes straight through to meilisearch.
+#
+# Without --foreground it starts in the background, logging beside the
+# database, and returns at once, which is what a start_command wants.
+
+set -eu
+
+if [ -z "${MEILI_MASTER_KEY:-}" ]; then
+    echo "heyo-meilisearch: MEILI_MASTER_KEY is not set." >&2
+    echo "  This image never starts without one: every request but /health needs" >&2
+    echo "  a key. Set at least 16 bytes in env_vars or env_from (a HeyoSecret)." >&2
+    exit 64
+fi
+
+export MEILI_ENV="${MEILI_ENV:-production}"
+export MEILI_DB_PATH="${MEILI_DB_PATH:-/workspace/meilisearch/data.ms}"
+export MEILI_DUMP_DIR="${MEILI_DUMP_DIR:-$(dirname "$MEILI_DB_PATH")/dumps}"
+export MEILI_HTTP_ADDR="${MEILI_HTTP_ADDR:-0.0.0.0:7700}"
+export MEILI_NO_ANALYTICS="${MEILI_NO_ANALYTICS:-true}"
+dir="$(dirname "$MEILI_DB_PATH")"
+mkdir -p "$dir" "$MEILI_DUMP_DIR"
+
+if [ "${1:-}" = "--foreground" ]; then
+    exec meilisearch
+fi
+setsid nohup meilisearch </dev/null >>"$dir/meilisearch.log" 2>&1 &

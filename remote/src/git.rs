@@ -35,7 +35,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::registry::{self, RepoState};
 use crate::store::{Cond, Put, Store};
@@ -131,6 +131,15 @@ pub struct Exclusive {
     pub etag: Option<String>,
 }
 
+/// A hydrated cache held shared, for the web UI's reads.
+pub struct ReadView {
+    /// Held for its drop: no push rewrites the refs while this lives.
+    #[allow(dead_code)]
+    guard: OwnedRwLockReadGuard<()>,
+    pub path: PathBuf,
+    pub state: RepoState,
+}
+
 impl GitService {
     pub fn new(
         git_bin: String,
@@ -183,14 +192,21 @@ impl GitService {
     }
 
     /// Run git to completion; stdout on success, stderr in the error.
-    pub async fn run(&self, mut cmd: tokio::process::Command) -> Result<String, GitError> {
+    pub async fn run(&self, cmd: tokio::process::Command) -> Result<String, GitError> {
+        self.run_bytes(cmd)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// [`run`](Self::run), for output that may not be text (a blob).
+    pub async fn run_bytes(&self, mut cmd: tokio::process::Command) -> Result<Vec<u8>, GitError> {
         let out = cmd
             .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| GitError::internal(format!("cannot run {}: {e}", self.git_bin)))?;
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            Ok(out.stdout)
         } else {
             Err(GitError::internal(format!(
                 "git failed ({}): {}",
@@ -319,6 +335,19 @@ impl GitService {
             path,
             state,
             etag,
+        })
+    }
+
+    /// A hydrated cache held shared, for browsing: pushes wait until the
+    /// view is dropped, other readers do not.
+    pub async fn read(&self, r: &RepoRef) -> Result<ReadView, GitError> {
+        let guard = self.lock_for(r).write_owned().await;
+        let path = self.cache_path(r);
+        let (state, _) = self.hydrate(r, &path).await?;
+        Ok(ReadView {
+            guard: guard.downgrade(),
+            path,
+            state,
         })
     }
 

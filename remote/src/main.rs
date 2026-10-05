@@ -11,6 +11,10 @@
 //! - **an app-lb build**: `build.repo` set to the clone URL, with an `hrm_`
 //!   read token as `build.auth`.
 //!
+//! People browse them in a server-rendered web UI on the same host (see
+//! `web.rs`), which sees exactly the namespaces app-lb grants the signed-in
+//! account.
+//!
 //! The object store is the authority (see `git.rs` for the push protocol), so
 //! one instance per region can serve the same repos. Authentication follows
 //! app-lb's provider model (see `auth.rs`).
@@ -19,12 +23,18 @@
 
 mod api;
 mod auth;
+mod browse;
 mod commit;
 mod config;
 mod git;
+// The shared look, theme cookie and top bar, included rather than depended on
+// as the other apps do. See `ui/README.md`.
+#[path = "../../ui/ui.rs"]
+mod heyo_ui;
 mod registry;
 mod sigv4;
 mod store;
+mod web;
 
 use std::sync::Arc;
 
@@ -117,6 +127,7 @@ async fn main() {
         registry,
         auth,
         git,
+        ui: Arc::new(heyo_ui::CookieConfig::from_env("REMOTE")),
     };
     if let Err(e) = axum::serve(listener, api::router(state))
         .with_graceful_shutdown(shutdown_signal())
