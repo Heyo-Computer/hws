@@ -2363,13 +2363,26 @@ async fn onboarding(
         })
     });
 
-    let lookup = state.onboarding.fastcar_image().await;
-    let (image_status, image_note) = lookup.status();
+    // The hub, when one is configured, is the source; the catalog otherwise.
+    let ob = &state.onboarding;
+    let hub_store = ob.hub_store();
+    let (source, image_status, image_note, lookup) = match &hub_store {
+        Some(_) => {
+            let (status, note) = ob.hub_fastcar().await.status(&ob.fastcar_ref);
+            ("hub", status, note, None)
+        }
+        None => {
+            let lookup = ob.fastcar_image().await;
+            let (status, note) = lookup.status();
+            ("catalog", status, note, Some(lookup))
+        }
+    };
     let image = match &lookup {
-        ImageLookup::Found(i) => Some(i),
+        Some(ImageLookup::Found(i)) => Some(i),
         _ => None,
     };
-    let spec = fastcar_spec(&ns, &state.onboarding.fastcar_image, image, host.as_deref(), gated);
+    let hub = hub_store.as_deref().map(|store| (store, ob.fastcar_ref.as_str()));
+    let spec = fastcar_spec(&ns, &ob.fastcar_image, image, hub, host.as_deref(), gated);
 
     Json(serde_json::json!({
         "namespace": ns,
@@ -2382,10 +2395,15 @@ async fn onboarding(
         "token": {
             "max_ttl_secs": state.onboarding.tenant_token_max_ttl_secs,
         },
+        "hub": {
+            "url": state.onboarding.hub_page(),
+        },
         "fastcar": {
             "id": id,
             "url": url,
             "gated": gated,
+            "source": source,
+            "ref": hub_store.as_ref().map(|_| state.onboarding.fastcar_ref.clone()),
             "image": image_status,
             "note": image_note,
             "spec": spec,
