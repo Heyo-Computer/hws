@@ -67,13 +67,13 @@ async function resolveBlob(
 ): Promise<{ digest: string; name?: string; size?: number; manifest?: string }> {
   let m: Manifest | undefined;
   try {
-    m = (await clients.art({ path: `/manifests/${encodeURIComponent(reference)}` })) as Manifest;
+    const asked = DIGEST.test(reference) ? bare(reference) : reference;
+    m = (await clients.art({ path: `/manifests/${encodeURIComponent(asked)}` })) as Manifest;
   } catch (e) {
     if (!(e instanceof ServiceError && (e.status === 404 || e.status === 400)) || !DIGEST.test(reference)) throw e;
   }
   if (!m) {
-    const digest = reference.startsWith("sha256:") ? reference : `sha256:${reference}`;
-    return { digest };
+    return { digest: bare(reference) };
   }
   const entries = m.entries ?? [];
   const pick = entry ? entries.find((e) => e.name === entry) : entries.length === 1 ? entries[0] : undefined;
@@ -83,7 +83,7 @@ async function resolveBlob(
         "name the one you want with `entry`.",
     );
   }
-  return { digest: pick.digest, name: pick.name, size: pick.size, manifest: reference };
+  return { digest: bare(pick.digest), name: pick.name, size: pick.size, manifest: reference };
 }
 
 /** Whether these bytes are text a model can read as-is. */
@@ -162,8 +162,18 @@ async function bytesOf(args: Record<string, unknown>, http = false): Promise<Uin
   );
 }
 
+/**
+ * The store's spelling of a digest: 64 lowercase hex characters, no `sha256:`
+ * prefix. The store refuses the prefixed form everywhere (`invalid digest …
+ * got 71`), in blob paths and manifest entries alike.
+ */
 function sha256(bytes: Uint8Array): string {
-  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** A digest as the store spells it, whichever way the caller wrote it. */
+function bare(digest: string): string {
+  return digest.startsWith("sha256:") ? digest.slice("sha256:".length) : digest;
 }
 
 interface ManifestEntry {
@@ -427,7 +437,7 @@ export function artifactTools(clients: Clients, config: Config): Tool[] {
           expectBytes: true,
         })) as Uint8Array;
         const got = sha256(bytes);
-        if (got !== (target.digest.startsWith("sha256:") ? target.digest : `sha256:${target.digest}`)) {
+        if (got !== target.digest) {
           throw new Error(`the store returned bytes hashing to ${got}, not ${target.digest}; nothing was kept.`);
         }
         const meta = { reference: ref, digest: target.digest, name: target.name, size: bytes.byteLength };
