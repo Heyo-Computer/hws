@@ -352,7 +352,7 @@ test("deployment_logs refuses a deployment app-lb will not show this credential"
     );
     const out = await tool(tools, "deployment_logs").handler({ id: "other-ns-app" });
 
-    assert.match(out, /not visible to this credential/);
+    assert.match(out, /is visible to this credential, so its logs are not either/);
     assert.doesNotMatch(out, /someone else's logs/);
     assert.ok(
       !stub.calls.some((c) => c.url.startsWith("https://obs.example.com")),
