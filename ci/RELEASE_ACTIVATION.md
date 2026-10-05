@@ -11,6 +11,13 @@ This document is an activation procedure, not a record of a live deployment.
   platform database or global CI execution lock is introduced.
 - The HTTP artifact service retains release content by dedicated `release-*`
   tags. Those tags must not be removed by ordinary short-lived build cleanup.
+- Use Sam's global art store through `CI_ARTIFACT_SINK=artifacts`, with a stable
+  authenticated endpoint reachable from every CI region. Art owns S3 credentials;
+  S3 is authoritative and regional art disks are caches. CI's raw `s3` sink does
+  not provide the manifest/tag retention contract and is not interchangeable.
+- Before replacing an existing standalone art instance with a disposable cache,
+  verify its backfill using `artifacts/docs/runbook-global-store-migration.md`.
+  A verified global cache does not require a new disk-preserving VM update path.
 - CI executes existing managed rollout actions. app-lb's control panel reads and
   changes CI state through authenticated ingress; it is not a rollout authority.
 - An environment is a named repository-specific policy, not a hardcoded region.
@@ -66,6 +73,19 @@ artifact retention failure/retry. Promotion tests exercise retained provenance,
 manifest tampering, distinct revisions, duplicate requests, independent
 environments, unresolved rollout receipts, failure/hold/resume, and preservation
 of the previous version. These are real database checks, not VM rollouts.
+
+The Linux artifact integration test uses real art HTTP servers with independent
+caches and one filesystem-backed remote:
+
+```sh
+cargo test --locked --manifest-path ci/Cargo.toml --bin ci \
+  artifacts::tests::global_store_release_survives_region_cache_loss_and_build_cleanup
+```
+
+It checks cross-cache retention, build-tag deletion and remote garbage collection,
+retrieval after deleting both caches, and refusal to acknowledge a new release
+pin when the authoritative remote is unavailable. It does not test live S3,
+deployed credentials, or the backfill status of existing regional stores.
 
 The control-panel HTTP test starts a real app-lb, with fixture auth and HTTPS CI
 ingress. Enable native CA roots **for this fixture build** so it can trust its
