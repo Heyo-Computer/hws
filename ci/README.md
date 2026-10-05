@@ -1839,6 +1839,9 @@ this code; activation and environment promotion are separate steps.
 
 ### Environment promotion of retained releases
 
+See [verification and activation](RELEASE_ACTIVATION.md) for the tested policy
+example, verification commands, supported scope and staged activation procedure.
+
 `CI_RELEASE_ENVIRONMENTS` is an optional operator-owned YAML map keyed by named
 environment. Each entry contains `repository`, `workflow_id`, `mode` (`manual`
 by default, or `automatic`), optional `network`, `workflow`, `service_targets`

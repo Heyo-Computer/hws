@@ -1,0 +1,98 @@
+# Review-only example, never loaded automatically. Each top-level value is
+# installed separately as the correspondingly named CI environment variable.
+# Replace scope/network/targets and provision secret references before use.
+# This example releases orchestrator only, not the complete Heyo platform.
+CI_RELEASE_POLICIES:
+  https://github.com/Heyo-Computer/hws.git:
+    submission_mode: merge_only
+    workflow_path: .ci/workflows/regional-release.yml
+    workflow: |
+      on: release
+      jobs:
+        merge:
+          steps:
+            - uses: ci/merge-release
+              with:
+                manifests: '[]'
+                token: ${{ secrets.GIT_AUTH_TOKEN }}
+
+CI_RELEASE_BUILDS:
+  https://github.com/Heyo-Computer/hws.git:
+    workflow_id: public
+    git_ref: refs/heads/main
+    network: platform
+    daily_utc_minute: 120
+    components:
+      orchestrator:
+        workflow: .ci/workflows/orchestrator.yml
+        job: release
+        artifact: orchestrator-linux
+
+CI_RELEASE_ENVIRONMENTS:
+  hws-stage:
+    repository: https://github.com/Heyo-Computer/hws.git
+    workflow_id: public
+    network: platform
+    mode: automatic
+    workflow: &promotion |
+      on: promotion
+      jobs:
+        first-region:
+          timeout-minutes: 60
+          steps:
+            - uses: ci/rollout-service
+              with:
+                target: first-orchestrator
+                token: ${{ secrets.APP_LB_TOKEN }}
+                workflow: .ci/workflows/orchestrator.yml
+                artifact: orchestrator-linux
+        second-region:
+          needs: [first-region]
+          timeout-minutes: 60
+          steps:
+            - uses: ci/rollout-service
+              with:
+                target: second-orchestrator
+                token: ${{ secrets.APP_LB_TOKEN }}
+                workflow: .ci/workflows/orchestrator.yml
+                artifact: orchestrator-linux
+    service_targets:
+      first-orchestrator:
+        url: https://first-stage.invalid
+        deployment: orchestrator-first
+        namespace: default
+        mount_path: /opt/orchestrator-release
+        revision_env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
+        start_command: /opt/orchestrator-release/start.sh
+        working_directory: /opt/orchestrator-release
+      second-orchestrator:
+        url: https://second-stage.invalid
+        deployment: orchestrator-second
+        namespace: default
+        mount_path: /opt/orchestrator-release
+        revision_env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
+        start_command: /opt/orchestrator-release/start.sh
+        working_directory: /opt/orchestrator-release
+  hws-production:
+    repository: https://github.com/Heyo-Computer/hws.git
+    workflow_id: public
+    network: platform
+    mode: manual
+    workflow: *promotion
+    service_targets:
+      first-orchestrator:
+        url: https://first-production.invalid
+        deployment: orchestrator-first
+        namespace: default
+        mount_path: /opt/orchestrator-release
+        revision_env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
+        start_command: /opt/orchestrator-release/start.sh
+        working_directory: /opt/orchestrator-release
+      second-orchestrator:
+        url: https://second-production.invalid
+        deployment: orchestrator-second
+        namespace: default
+        mount_path: /opt/orchestrator-release
+        revision_env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
+        start_command: /opt/orchestrator-release/start.sh
+        working_directory: /opt/orchestrator-release

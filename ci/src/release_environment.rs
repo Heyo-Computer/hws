@@ -461,6 +461,17 @@ pub fn spawn(d: Arc<Dispatcher>) {
     });
 }
 
+async fn latest_ready(store: &Store, repository: &str) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT c.id FROM ci_release_bundle c JOIN ci_release_build b ON b.id=c.build_id
+        WHERE c.repository=$1 AND b.status='ready' AND c.manifest->>'retained'='true'
+        ORDER BY b.created_at DESC,b.id DESC LIMIT 1",
+    )
+    .bind(repository)
+    .fetch_optional(store.pool())
+    .await?)
+}
+
 async fn reconcile(d: &Dispatcher) -> Result<()> {
     finish(&d.store).await?;
     for (environment, policy) in policies(d.config.release_environments.as_deref())? {
@@ -472,14 +483,7 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
         if held {
             continue;
         }
-        let id: Option<String> = sqlx::query_scalar(
-            "SELECT c.id FROM ci_release_bundle c JOIN ci_release_build b ON b.id=c.build_id
-            WHERE c.repository=$1 AND b.status='ready' AND c.manifest->>'retained'='true'
-            ORDER BY b.created_at DESC,b.id DESC LIMIT 1",
-        )
-        .bind(&policy.repository)
-        .fetch_optional(d.store.pool())
-        .await?;
+        let id = latest_ready(&d.store, &policy.repository).await?;
         let Some(id) = id else { continue };
         let attempted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_promotion WHERE environment=$1 AND bundle_id=$2)")
             .bind(&environment).bind(&id).fetch_one(d.store.pool()).await?;
@@ -507,6 +511,45 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn example_separates_submission_build_and_environment_policy() {
+        let config: BTreeMap<String, serde_yaml::Value> =
+            serde_yaml::from_str(include_str!("../deploy/releases.example.yml")).unwrap();
+        let raw = |name: &str| serde_yaml::to_string(&config[name]).unwrap();
+        let repository = "https://github.com/Heyo-Computer/hws.git";
+        let submission =
+            crate::release_policy::select(Some(&raw("CI_RELEASE_POLICIES")), repository)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            submission.submission_mode,
+            crate::release_policy::SubmissionMode::MergeOnly
+        );
+        let builds = crate::release_build::policies(Some(&raw("CI_RELEASE_BUILDS"))).unwrap();
+        assert_eq!(builds[repository].daily_utc_minute, Some(120));
+        let environments = policies(Some(&raw("CI_RELEASE_ENVIRONMENTS"))).unwrap();
+        assert_eq!(environments["hws-stage"].mode, Mode::Automatic);
+        assert_eq!(environments["hws-production"].mode, Mode::Manual);
+        for (name, policy) in environments {
+            let plan = plan(&name, &policy).unwrap();
+            assert_eq!(plan.jobs[1].needs, [plan.jobs[0].base_id.clone()]);
+            for target in policy.service_targets.values() {
+                crate::service_rollout::validate_target(target).unwrap();
+            }
+            for job in plan.jobs {
+                let step = &job.steps[0];
+                assert!(policy.service_targets.contains_key(&step.with["target"]));
+                assert!(
+                    builds[repository]
+                        .components
+                        .values()
+                        .any(|selection| selection.workflow == step.with["workflow"]
+                            && selection.artifact == step.with["artifact"])
+                );
+            }
+        }
+    }
 
     fn policy() -> Policy {
         Policy {
@@ -602,12 +645,26 @@ mod tests {
         let policy = policy();
         let plan = plan("stage", &policy).unwrap();
         for id in ["old", "new"] {
-            sqlx::query("INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,status) VALUES($1,'repo',$1,'revision','refs/heads/main','{}','test','ready')")
-                .bind(id).execute(store.pool()).await.unwrap();
-            sqlx::query("INSERT INTO ci_release_bundle(id,repository,name,manifest,manifest_sha256,created_by,build_id) VALUES($1,'repo',$1,'{}','hash','test',$1)")
-                .bind(id).execute(store.pool()).await.unwrap();
+            let revision = if id == "old" { "a" } else { "b" }.repeat(40);
+            let manifest = json!({"version":2,"retained":true,"build_id":id,"repository":"repo","revision":revision,
+                "components":{"api":{"id":"artifact","run_id":"build","workflow":"api.yml","job":"linux",
+                "name":"binary","sink":"artifacts","uri":"retained-api","sha256":"d".repeat(64),"size_bytes":73}}});
+            sqlx::query("INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,status) VALUES($1,'repo',$1,$2,'refs/heads/main','{}','test','ready')")
+                .bind(id).bind(&revision).execute(store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_release_bundle(id,repository,name,manifest,manifest_sha256,created_by,build_id) VALUES($1,'repo',$1,$2,$3,'test',$1)")
+                .bind(id).bind(&manifest).bind(hex::encode(Sha256::digest(serde_json::to_vec(&manifest).unwrap())))
+                .execute(store.pool()).await.unwrap();
         }
-        let bundle = json!({"manifest":{"repository":"repo","revision":"revision"},"git_ref":"refs/heads/main"});
+        sqlx::query("UPDATE ci_release_build SET created_at=CASE WHEN id='old' THEN now()-interval '2 hours' ELSE now()-interval '1 hour' END")
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_release_bundle SET created_at=CASE WHEN id='old' THEN now() ELSE now()-interval '30 minutes' END")
+            .execute(store.pool()).await.unwrap();
+        assert_eq!(
+            latest_ready(&store, "repo").await.unwrap().as_deref(),
+            Some("new"),
+            "a slow old build must not displace a newer build"
+        );
+        let mut bundle = super::bundle(&store, "old").await.unwrap();
         let mut request = Request {
             environment: "stage".into(),
             bundle_id: "old".into(),
@@ -631,6 +688,34 @@ mod tests {
         );
         let run = a.unwrap()["run_id"].as_str().unwrap().to_owned();
         assert_eq!(b.unwrap()["run_id"], run);
+        assert_eq!(
+            crate::release::deployment_source(&store, &run)
+                .await
+                .unwrap()
+                .0,
+            "a".repeat(40)
+        );
+        let artifact = crate::submission::artifact(&store, &run, "api.yml", "binary", None)
+            .await
+            .unwrap();
+        assert_eq!(artifact.size_bytes, 73);
+        assert_eq!(artifact.digest.as_deref(), Some("d".repeat(64).as_str()));
+        assert!(
+            crate::release::get(&store, &run).await.unwrap().is_none(),
+            "promotion must not fabricate a Git receipt"
+        );
+        sqlx::query("UPDATE ci_release_bundle SET manifest=jsonb_set(manifest,'{revision}','\"tampered\"') WHERE id='old'")
+            .execute(store.pool()).await.unwrap();
+        assert!(
+            crate::release::deployment_source(&store, &run)
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE ci_release_bundle SET manifest=$1 WHERE id='old'")
+            .bind(&bundle["manifest"])
+            .execute(store.pool())
+            .await
+            .unwrap();
         request.request_id = "second".into();
         assert!(
             persist(
@@ -651,6 +736,39 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
+        let job: String =
+            sqlx::query_scalar("SELECT id FROM ci_job WHERE run_id=$1 AND base_id='first'")
+                .bind(&run)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        store
+            .create_step(
+                "rollout-step",
+                &job,
+                0,
+                "rollout",
+                Some("ci/rollout-service"),
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES('rollout','rollout-step',$1,$2,'api','hash','running','revision','refs/heads/main')")
+            .bind(&run).bind(&job).execute(store.pool()).await.unwrap();
+        finish(&store).await.unwrap();
+        let active: Option<String> =
+            sqlx::query_scalar("SELECT active_run FROM ci_release_environment WHERE name='stage'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            active.as_deref(),
+            Some(run.as_str()),
+            "run completion must not hide an unresolved rollout"
+        );
+        sqlx::query("UPDATE ci_service_deployment SET status='passed' WHERE id='rollout'")
+            .execute(store.pool())
+            .await
+            .unwrap();
         finish(&store).await.unwrap();
         let state = sqlx::query("SELECT * FROM ci_release_environment WHERE name='stage'")
             .fetch_one(store.pool())
@@ -661,6 +779,7 @@ mod tests {
         assert!(state.get::<bool, _>("automation_held"));
         request.environment = "stage".into();
         request.bundle_id = "new".into();
+        bundle = super::bundle(&store, "new").await.unwrap();
         assert!(
             persist(
                 &store, &request, &policy, &bundle, &plan, &source, "policy", true
