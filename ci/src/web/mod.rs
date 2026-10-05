@@ -85,6 +85,7 @@ pub fn router(
         .route("/__ui/{*path}", get(ui_asset))
         .route("/", get(runs_page))
         // Behind the identity gate, never a repository-token/public machine API.
+        .route("/releases", get(release_catalog).post(register_release))
         .route("/maintenance", get(maintenance_status))
         .route("/maintenance/{id}/{action}", post(maintenance_action))
         .route("/maintenance/runners/{runner}", get(runner_maintenance_status))
@@ -154,6 +155,35 @@ pub fn router(
         .merge(api::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), instance_http::route))
         .with_state(state)
+}
+
+async fn release_catalog(
+    State(state): State<AppState>, headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    if let Err(response) = may_manage(&state, &headers).await { return response; }
+    match crate::release_catalog::list(&state.store, query.get("before").map(String::as_str)).await {
+        Ok(releases) => Json(serde_json::json!({"releases":releases})).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "cannot list release catalog");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn register_release(
+    State(state): State<AppState>, headers: HeaderMap,
+    Json(request): Json<crate::release_catalog::Request>,
+) -> axum::response::Response {
+    let who = match may_manage(&state, &headers).await {
+        Ok(who) => who,
+        Err(response) => return response,
+    };
+    let actor = who.as_ref().map(|who| who.subject.as_str()).unwrap_or("local-admin");
+    match crate::release_catalog::register(&state.store, request, actor).await {
+        Ok(release) => Json(release).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+    }
 }
 
 async fn maintenance_admin(state: &AppState, headers: &HeaderMap) -> Result<Identity, axum::response::Response> {

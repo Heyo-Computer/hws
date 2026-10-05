@@ -6,11 +6,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionMode {
+    #[default]
+    MergeAndDeploy,
+    MergeOnly,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub workflow_path: String,
     pub workflow: String,
+    /// Opt-in separation of submission publication from environment deployment.
+    #[serde(default)]
+    pub submission_mode: SubmissionMode,
     #[serde(default)]
     pub service_targets: BTreeMap<String, service_rollout::Target>,
     /// Job ID -> existing maintenance target alias of its coordinator host.
@@ -69,9 +80,11 @@ fn exclusive(step: &crate::workflow::Step, keys: &[&str]) -> Result<()> {
 }
 
 pub async fn prepare(d: &Dispatcher, repository: &str, policy: &Policy) -> Result<Plan> {
-    let mut plan = Plan::build(&Workflow::parse(&policy.workflow_path, &policy.workflow)?)?;
+    let mut plan = submission_plan(policy)?;
+    let mut effective = policy.clone();
+    effective.placements.retain(|id, _| plan.jobs.iter().any(|job| &job.base_id == id));
     let mut snapshot = Snapshot { digest: String::new(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), token_expressions: Vec::new() };
-    let mut aliases: Vec<String> = policy.placements.values().cloned().collect();
+    let mut aliases: Vec<String> = effective.placements.values().cloned().collect();
     for job in &plan.jobs {
         for step in &job.steps {
             if let Some(token) = step.with.get("token") {
@@ -98,9 +111,23 @@ pub async fn prepare(d: &Dispatcher, repository: &str, policy: &Policy) -> Resul
             snapshot.maintenance.insert(alias, target);
         }
     }
-    bind(&mut plan, repository, policy, &snapshot)?;
+    bind(&mut plan, repository, &effective, &snapshot)?;
     snapshot.digest = hex::encode(Sha256::digest(serde_json::to_vec(&(policy, &snapshot))?));
     for job in &mut plan.jobs { job.release_policy = Some(snapshot.clone()); }
+    Ok(plan)
+}
+
+fn submission_plan(policy: &Policy) -> Result<Plan> {
+    let mut plan = Plan::build(&Workflow::parse(&policy.workflow_path, &policy.workflow)?)?;
+    crate::submission::validate_release_plan(&plan).map_err(anyhow::Error::msg)?;
+    // Validate placements before filtering so typos still fail admission.
+    ensure!(policy.placements.keys().all(|id| plan.jobs.iter().any(|j| &j.base_id == id)),
+        "release placement names an unknown job");
+    if policy.submission_mode == SubmissionMode::MergeOnly {
+        // validate_release_plan proves this is one unconditional, single-step
+        // job. Existing submission membership still gates its publication.
+        plan.jobs.retain(|job| job.steps.iter().any(|s| s.uses.as_deref() == Some("ci/merge-release")));
+    }
     Ok(plan)
 }
 
@@ -178,7 +205,31 @@ mod tests {
 
     fn policy() -> Policy {
         Policy { workflow_path: ".ci/workflows/regional-release.yml".into(), workflow: RELEASE.into(),
+            submission_mode: SubmissionMode::MergeAndDeploy,
             service_targets: BTreeMap::new(), placements: BTreeMap::new() }
+    }
+
+    #[test]
+    fn merge_only_excludes_deployment_but_preserves_publication_validation() {
+        let mut policy = policy();
+        assert_eq!(submission_plan(&policy).unwrap().jobs.len(), 3);
+        policy.submission_mode = SubmissionMode::MergeOnly;
+        let plan = submission_plan(&policy).unwrap();
+        assert_eq!(plan.jobs.len(), 1);
+        assert_eq!(plan.jobs[0].steps[0].uses.as_deref(), Some("ci/merge-release"));
+        assert!(crate::submission::validate_release_plan(&plan).is_ok());
+        policy.workflow = policy.workflow.replace("manifests: '[]'", "manifests: '[\"Cargo.toml\"]'");
+        assert!(submission_plan(&policy).is_err());
+    }
+
+    #[test]
+    fn old_policies_keep_deploying_and_unknown_modes_are_rejected() {
+        let mut value = serde_json::to_value(policy()).unwrap();
+        value.as_object_mut().unwrap().remove("submission_mode");
+        assert_eq!(serde_json::from_value::<Policy>(value.clone()).unwrap().submission_mode,
+            SubmissionMode::MergeAndDeploy);
+        value["submission_mode"] = serde_json::json!("merge_onyl");
+        assert!(serde_json::from_value::<Policy>(value).is_err());
     }
 
     fn snapshot() -> Snapshot {

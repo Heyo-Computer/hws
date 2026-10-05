@@ -1719,6 +1719,66 @@ Candidate `on: release` files are ignored for enrolled repositories; deleting or
 renaming one does not remove the operator policy. Candidate validation workflows
 remain candidate-owned. Partial submissions remain validation-only.
 
+`submission_mode` defaults to `merge_and_deploy`, preserving existing behavior.
+An operator can set `submission_mode: merge_only` to admit only the existing
+unconditional `ci/merge-release` job after all submission validations succeed.
+Deployment jobs and their target lookups are excluded from that submission;
+the submitted source cannot select this mode. The retained job and policy digest
+are persisted, so changing policy does not rewrite already admitted runs.
+This option does not defer validation builds or create a daily build scheduler.
+Do not enable it until operators are ready for automatic per-submit deployment
+to stop. Update all regional CI apps before changing shared policy.
+
+### Immutable release catalog (foundation)
+
+The catalog is separate from `ci_release`, which records publication to Git.
+`POST /releases` registers explicitly selected artifacts from one successfully
+published and fully validated submission. It returns a bundle ID, a manifest
+SHA256 and the manifest. `GET /releases` lists up to 100 bundles; pass the last
+bundle's ID as `before` to continue. Both routes use the existing dashboard
+admin/origin checks. Keep them behind app-lb's identity gate, **not** in
+`public_paths`; authenticated browser requests use `Accept: text/html` even
+though these endpoints return JSON. No repository submit token grants access.
+
+Example registration body (IDs and workflow/artifact names come from CI):
+
+```json
+{
+  "name": "2026-10-05.1",
+  "publication_run_id": "the-successful-publication-run",
+  "components": {
+    "cloud": {
+      "workflow": ".ci/workflows/cloud.yml",
+      "artifact": "cloud-linux",
+      "job": "build-linux"
+    }
+  }
+}
+```
+
+CI resolves the immutable revision, artifact ID, producer, digest, size and
+storage location from its own records. Registration rejects failed/incomplete
+validation, unpublished source, artifacts outside that submission, ambiguous
+producers, missing digests and runner-local disk artifacts. Concurrent identical
+registrations return the same bundle; reusing a repository's release name for
+different contents fails. A manifest cannot be edited through the API. Database
+references prevent deletion of its artifact provenance. External artifact-store
+retention must also retain catalog-referenced blobs; a database reference alone
+does not prevent S3 lifecycle expiry or operator deletion.
+
+This foundation does **not** schedule daily builds, deploy a bundle, alter an
+environment's current version, implement rollback, or add UI controls. A bundle
+only covers its explicitly selected components. Path-filtered submit builds
+must not be presented as a complete daily platform release. The next layer must
+freeze a main revision at its cutoff, build the configured component set with
+existing CI jobs, verify complete results and artifact availability, and then
+seal the release. Environment promotion must reuse those exact artifacts.
+Stage automatic policy and production manual policy will be operator-owned;
+manual deployment in an automatic environment needs an explicit hold/resume so
+automation cannot immediately overwrite the operator's selected version.
+
+### Release target resolution
+
 The operator workflow uses existing actions with logical aliases:
 
 - `ci/rollout-service`: `with.target` resolves through `service_targets`, whose

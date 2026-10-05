@@ -44,6 +44,7 @@ mod plan;
 mod pool;
 mod regional_update;
 mod release;
+mod release_catalog;
 mod release_git;
 mod release_policy;
 mod repos;

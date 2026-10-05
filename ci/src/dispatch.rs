@@ -358,6 +358,10 @@ impl Dispatcher {
         // until something changes should say so at the terminal that made it,
         // not only on a page nobody has open.
         let mut warnings: Vec<String> = Vec::new();
+        if !partial && release_policy.as_ref().is_some_and(|p|
+            p.submission_mode == crate::release_policy::SubmissionMode::MergeOnly) {
+            warnings.push("operator policy: validate and merge only; this submission will not deploy".into());
+        }
 
         for (source_index, source) in sources.iter().enumerate() {
             let mut files = crate::trigger::find_workflows(&workspace.root, &source.pattern)?;

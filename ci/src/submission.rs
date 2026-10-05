@@ -608,6 +608,52 @@ jobs:
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn release_catalog_pins_provenance_and_rejects_replacement() {
+        use crate::release_catalog::{self, Request, Selection};
+        let (store, _, _dir) = fixture().await;
+        add_run(&store, "release", "release.yml", "success").await;
+        add_run(&store, "build", "cloud.yml", "success").await;
+        add_run(&store, "unrelated", "cloud.yml", "success").await;
+        let mut tx = store.pool().begin().await.unwrap();
+        record(&mut tx, "release", &["build".into()]).await.unwrap();
+        tx.commit().await.unwrap();
+        for (id, digest) in [("build", "a"), ("unrelated", "b")] {
+            sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri)
+                VALUES($1,$1,$2,'cloud','s3',$3,37,$4)")
+                .bind(id).bind(format!("{id}.check")).bind(digest.repeat(64))
+                .bind(format!("s3://builds/{id}/cloud")).execute(store.pool()).await.unwrap();
+        }
+        let request = Request { name: "daily-1".into(), publication_run_id: "release".into(),
+            components: std::collections::BTreeMap::from([("cloud".into(), Selection {
+                workflow: "cloud.yml".into(), artifact: "cloud".into(), job: "check".into(),
+            })]) };
+        assert!(release_catalog::register(&store, request.clone(), "admin").await.is_err());
+        sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status)
+            VALUES('release','hash','source','base','refs/heads/main','{}','source','{}','published')")
+            .execute(store.pool()).await.unwrap();
+        let (a,b) = tokio::join!(release_catalog::register(&store, request.clone(), "admin-a"),
+            release_catalog::register(&store, request.clone(), "admin-b"));
+        let a = a.unwrap();
+        assert_eq!(a, b.unwrap());
+        assert_eq!(a["manifest"]["components"]["cloud"]["sha256"], "a".repeat(64));
+        assert_eq!(a["manifest"]["components"]["cloud"]["run_id"], "build");
+        assert_eq!(release_catalog::list(&store, None).await.unwrap().len(), 1);
+        assert!(sqlx::query("DELETE FROM ci_artifact WHERE id='build'").execute(store.pool()).await.is_err());
+        sqlx::query("UPDATE ci_artifact SET digest=$1 WHERE id='build'").bind("c".repeat(64))
+            .execute(store.pool()).await.unwrap();
+        assert!(release_catalog::register(&store, request.clone(), "admin").await.unwrap_err()
+            .to_string().contains("different immutable contents"));
+        let saved = release_catalog::list(&store, None).await.unwrap();
+        assert_eq!(saved[0]["manifest"]["components"]["cloud"]["sha256"], "a".repeat(64));
+        sqlx::query("UPDATE ci_artifact SET sink='disk' WHERE id='build'").execute(store.pool()).await.unwrap();
+        let mut other = request.clone(); other.name = "daily-2".into();
+        assert!(release_catalog::register(&store, other, "admin").await.unwrap_err().to_string().contains("shared storage"));
+        sqlx::query("UPDATE ci_job SET status='failure' WHERE run_id='build'").execute(store.pool()).await.unwrap();
+        assert!(release_catalog::register(&store, request, "admin").await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
     async fn admission_is_atomic_and_bad_persisted_evidence_is_rejected() {
         let (store, _, _dir) = fixture().await;
         add_run(&store, "release", "release.yml", "running").await;
