@@ -103,12 +103,57 @@ impl OwnedRequestInfo {
     fn borrowed(&self) -> RequestInfo<'_> { RequestInfo { host: &self.host, path: &self.path, query: self.query.as_deref(), cookies: self.cookies.clone(), secure: self.secure, wants_html: self.wants_html, fronts_admin_api: self.fronts_admin_api, bearer: self.bearer.clone(), client: self.client } }
 }
 
+/// Split `APP_LB_STRIP_COOKIES` into cookie names: comma-separated, trimmed,
+/// empties dropped.
+pub fn parse_cookie_names(raw: &str) -> Vec<String> {
+    raw.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()
+}
+
+/// The `Cookie` header to forward with `names` removed, or `None` when nothing
+/// needs to change. Every `Cookie` header on the request is considered (HTTP/2
+/// may split them), and the survivors are joined into one with `"; "`, which
+/// is how RFC 9113 says they recombine for HTTP/1.1. `Some(None)` means no
+/// cookie survives and the header should go. A header that is not valid
+/// visible ASCII cannot be parsed into pairs, so it is dropped whole rather
+/// than forwarded with a named cookie possibly still inside it.
+fn strip_cookies(headers: &http::HeaderMap, names: &[String]) -> Option<Option<http::HeaderValue>> {
+    if names.is_empty() || !headers.contains_key(http::header::COOKIE) {
+        return None;
+    }
+    let mut kept = Vec::new();
+    let mut changed = false;
+    for value in headers.get_all(http::header::COOKIE) {
+        let Ok(text) = value.to_str() else {
+            changed = true;
+            continue;
+        };
+        for pair in text.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let name = pair.split_once('=').map_or(pair, |(n, _)| n).trim();
+            if names.iter().any(|n| n == name) {
+                changed = true;
+            } else {
+                kept.push(pair);
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    if kept.is_empty() {
+        return Some(None);
+    }
+    // Every piece came from a valid header value and `"; "` is visible ASCII,
+    // so the join is a valid value too; fall back to removal regardless.
+    Some(http::HeaderValue::from_str(&kept.join("; ")).ok())
+}
+
 /// Manager-side authority boundary. Workers supply request data and execute the
 /// resulting transport instructions; stores and admission counters remain here.
 pub struct RequestControl {
     registry: Arc<Registry>, metrics: Arc<Metrics>, challenges: Arc<ChallengeTable>, auth: Arc<Authenticator>,
     guard: Arc<Guard>, feed: Arc<Feed>, auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
     secrets: Arc<crate::secrets::SecretStore>,
+    strip_cookies: Arc<[String]>,
 }
 
 const MAX_ATTEMPTS: usize = 3;
@@ -157,6 +202,10 @@ pub struct RequestState {
     identity: Option<Identity>,
     route_prefix: Option<String>,
     gateway_token: Option<String>,
+    /// The upstream `Cookie` header once `APP_LB_STRIP_COOKIES` has been
+    /// applied: `None` leaves the request's own header alone, `Some(None)`
+    /// removes it, `Some(Some(v))` replaces it.
+    cookie_rewrite: Option<Option<http::HeaderValue>>,
     forward_identity: bool,
     pending_login: Option<PendingLogin>,
 }
@@ -198,6 +247,11 @@ impl RequestState {
         }
         if let Some(prefix) = self.route_prefix.as_deref() {
             out.push(HeaderModification::RewriteUri(strip_uri_prefix(uri, prefix)));
+        }
+        match &self.cookie_rewrite {
+            None => {}
+            Some(None) => out.push(HeaderModification::Remove(http::header::COOKIE)),
+            Some(Some(v)) => out.push(HeaderModification::Set(http::header::COOKIE, v.clone())),
         }
         if self.deployment.as_ref().is_some_and(|d| d.spec.auth.is_some()) {
             out.extend(crate::auth::IDENTITY_HEADERS.iter().map(|name| HeaderModification::Remove(http::HeaderName::from_static(name))));
@@ -372,7 +426,13 @@ impl RequestState {
 impl RequestControl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(registry: Arc<Registry>, metrics: Arc<Metrics>, challenges: Arc<ChallengeTable>, auth: Arc<Authenticator>, guard: Arc<Guard>, feed: Arc<Feed>, auth_providers: Arc<crate::auth_providers::AuthProviderStore>, secrets: Arc<crate::secrets::SecretStore>) -> Self {
-        Self { registry, metrics, challenges, auth, guard, feed, auth_providers, secrets }
+        Self { registry, metrics, challenges, auth, guard, feed, auth_providers, secrets, strip_cookies: Arc::from([]) }
+    }
+
+    /// Remove these cookies from every forwarded request (`APP_LB_STRIP_COOKIES`).
+    pub fn with_stripped_cookies(mut self, names: Vec<String>) -> Self {
+        self.strip_cookies = names.into();
+        self
     }
 
     pub async fn next_peer(&self, state: &mut RequestState) -> Result<Peer, RequestError> {
@@ -426,6 +486,7 @@ impl RequestControl {
             return RequestDecision::Respond(ResponseData::plain(503, "deployment is under maintenance\n"));
         }
         state.route_prefix = matched_strip_prefix(&deployment, host.as_deref(), &path);
+        state.cookie_rewrite = strip_cookies(&head.headers, &self.strip_cookies);
         if let Some(mut gate) = deployment.spec.auth.clone() {
             if let Some(name) = gate.provider_ref.as_deref() {
                 match self.auth_providers.get(&deployment.spec.namespace, name) {
@@ -826,5 +887,89 @@ mod tests {
         let current = Deployment::new(regional);
         assert!(check_flat_admission_refresh(&previous, &current).is_err());
         assert!(check_flat_admission_refresh(&current, &previous).is_err());
+    }
+
+    fn cookies(values: &[&str]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for v in values { headers.append(http::header::COOKIE, v.parse().unwrap()); }
+        headers
+    }
+
+    #[test]
+    fn parse_cookie_names_trims_and_drops_empties() {
+        assert_eq!(parse_cookie_names(" heyo_token , ,applb_session,"), ["heyo_token", "applb_session"]);
+        assert!(parse_cookie_names("").is_empty());
+    }
+
+    #[test]
+    fn strip_cookies_removes_only_named_cookies_across_headers() {
+        let names = vec!["heyo_token".to_string()];
+        let out = strip_cookies(&cookies(&["a=1; heyo_token=secret", "b=2"]), &names);
+        assert_eq!(out, Some(Some(http::HeaderValue::from_static("a=1; b=2"))));
+        // Exact, case-sensitive names: neither a prefix nor a different case matches.
+        assert_eq!(strip_cookies(&cookies(&["heyo_token_x=1; Heyo_Token=2"]), &names), None);
+        // A value may itself contain `=`; only the name decides.
+        let out = strip_cookies(&cookies(&["x=a=b; heyo_token=c=d"]), &names);
+        assert_eq!(out, Some(Some(http::HeaderValue::from_static("x=a=b"))));
+    }
+
+    #[test]
+    fn strip_cookies_removes_the_header_when_nothing_survives() {
+        let names = vec!["heyo_token".to_string()];
+        assert_eq!(strip_cookies(&cookies(&["heyo_token=secret"]), &names), Some(None));
+        assert_eq!(strip_cookies(&cookies(&[" heyo_token=a ;heyo_token=b;"]), &names), Some(None));
+    }
+
+    #[test]
+    fn strip_cookies_leaves_requests_alone_without_a_match_or_a_list() {
+        let names = vec!["heyo_token".to_string()];
+        assert_eq!(strip_cookies(&cookies(&["a=1"]), &names), None);
+        assert_eq!(strip_cookies(&http::HeaderMap::new(), &names), None);
+        assert_eq!(strip_cookies(&cookies(&["heyo_token=secret"]), &[]), None);
+    }
+
+    #[test]
+    fn strip_cookies_drops_an_unparseable_header_rather_than_forwarding_it() {
+        let names = vec!["heyo_token".to_string()];
+        let mut headers = cookies(&["a=1"]);
+        headers.append(http::header::COOKIE, http::HeaderValue::from_bytes(b"heyo_token=\xff").unwrap());
+        assert_eq!(strip_cookies(&headers, &names), Some(Some(http::HeaderValue::from_static("a=1"))));
+    }
+
+    #[tokio::test]
+    async fn configured_cookies_never_reach_the_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new(dir.path().join("state.json")));
+        let secrets = Arc::new(crate::secrets::SecretStore::new(dir.path().join("secrets"), None));
+        let control = RequestControl::new(
+            registry.clone(), Arc::new(Metrics::new()), Arc::new(ChallengeTable::new()),
+            Arc::new(Authenticator::new(vec![7; 32], secrets.clone(), None, None)),
+            Arc::new(Guard::new(dir.path().join("guard"), true)), Arc::new(Feed::new()),
+            Arc::new(crate::auth_providers::AuthProviderStore::new(dir.path().join("providers"))),
+            secrets,
+        ).with_stripped_cookies(vec!["heyo_token".into()]);
+        registry.upsert(serde_json::from_value(serde_json::json!({
+            "id":"app", "routes":[{"host":"app.example"}], "upstreams":["127.0.0.1:8000"]
+        })).unwrap());
+        let uri: http::Uri = "http://app.example/".parse().unwrap();
+        let head = |values: &[&str]| RequestHead {
+            method: http::Method::GET, uri: uri.clone(), headers: cookies(values), peer: None, tls_terminated: false,
+        };
+        let cookie_mods = |state: &RequestState| state.forwarding_modifications(&uri).unwrap().into_iter()
+            .filter(|m| matches!(m, HeaderModification::Remove(n) | HeaderModification::Set(n, _) if n == http::header::COOKIE))
+            .collect::<Vec<_>>();
+
+        let mut state = RequestState::default();
+        assert!(matches!(control.decide(&head(&["a=1; heyo_token=secret"]), &mut state).await, RequestDecision::Proxy));
+        assert!(matches!(cookie_mods(&state).as_slice(),
+            [HeaderModification::Set(_, v)] if v == "a=1"));
+
+        let mut state = RequestState::default();
+        assert!(matches!(control.decide(&head(&["heyo_token=secret"]), &mut state).await, RequestDecision::Proxy));
+        assert!(matches!(cookie_mods(&state).as_slice(), [HeaderModification::Remove(_)]));
+
+        let mut state = RequestState::default();
+        assert!(matches!(control.decide(&head(&["a=1"]), &mut state).await, RequestDecision::Proxy));
+        assert!(cookie_mods(&state).is_empty());
     }
 }
