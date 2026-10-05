@@ -1,0 +1,53 @@
+{
+  "id": "heyo-mcp",
+  "routes": [
+    { "host": "mcp.heyo.work" }
+  ],
+  "vm": {
+    "driver": "firecracker",
+    "image": "heyo-mcp",
+    "port": 9650,
+    "start_command": "setsid nohup node /opt/heyo-mcp/dist/index.js </dev/null >/var/log/heyo-mcp.log 2>&1 &",
+    "size_class": "small",
+    "ttl_seconds": 3600,
+    "env_vars": {
+      "HEYO_MCP_HTTP_HOST": "0.0.0.0",
+      "HEYO_MCP_HTTP_PORT": "9650",
+      "HEYO_MCP_REQUIRE_IDENTITY": "0",
+      "HEYO_MCP_TIMEOUT_MS": "30000",
+      "HEYO_MCP_PUBLIC_URL": "https://mcp.heyo.work",
+      "APPLB_URL": "https://admin.us5.heyo.work",
+      "REMOTE_URL": "https://git.us5.heyo.work",
+      "ART_URL": "https://hub.heyo.work"
+    },
+    "env_from": [
+      { "secret": "artifacts", "key": "api-key", "as": "ART_API_KEY" }
+    ]
+  },
+  "build": {
+    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
+    "ref": "main",
+    "dockerfile": "mcp/deploy/image/Dockerfile",
+    "context": "mcp",
+    "image_name": "heyo-mcp",
+    "image_size_mb": 768,
+    "auth": { "secret": "github", "key": "token" }
+  },
+  "auth": {
+    "provider": "app-token",
+    "public_paths": [
+      { "path": "/healthz", "scope": "public" },
+      { "path": "/mcp", "scope": "public" }
+    ]
+  },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 2,
+    "warm_pool": 0,
+    "target_concurrency": 10,
+    "scale_to_zero_after_secs": 300,
+    "cold_start_timeout_secs": 120,
+    "drain_timeout_secs": 30
+  },
+  "health": { "path": "/healthz", "timeout_secs": 2 }
+}
