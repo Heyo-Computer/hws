@@ -608,6 +608,7 @@ Configuration is environment-only:
 | `APP_LB_AUTH_CACHE_SECS` | `60` | How long a resolved grant is trusted before re-fetching (never past the token's own expiry). Also the ceiling on revocation latency |
 | `APP_LB_AUTH_TIMEOUT_SECS` | `5` | Timeout for one scopes lookup. An unreachable auth service fails closed |
 | `APP_LB_HOME_URL` | *(unset)* | The Heyo front end namespace users open the dashboard from (e.g. `https://heyo.computer/namespaces`). Linked from `/login` and when a [namespace session](#opening-the-dashboard-for-one-namespace) is refused or expires |
+| `APP_LB_STRIP_COOKIES` | *(unset)* | Comma-separated cookie names removed from every request before it reaches a VM or upstream, on every deployment. Gates still read them. Set it to any sign-in cookie scoped to a parent domain that tenants share (on a managed host, `heyo_token`), or every deployment under that domain receives every signed-in user's token |
 | `APP_LB_ONBOARDING_MCP_URL` | *(unset)* | Hosted MCP endpoint the dashboard's "Get started" card tells namespace users to install (e.g. `https://mcp.us2.heyo.work/mcp`). Unset leaves that step out. |
 | `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` | `7776000` (90 days) | Longest lifetime a namespace admin may mint a token for; also the default when they ask for none. |
 | `APP_LB_PUBLIC_IMAGE_CATALOG_URL` | *(unset)* | Cloud base URL serving `/public-images/{name}/meta`. Used to resolve the "Get started" fastcar spec's image download and digest. |

@@ -2,11 +2,11 @@
 //!
 //! ## One store, and who moves the bytes into it
 //!
-//! A runner never has a store of its own. The `artifacts` sink is per-host,
-//! per-user and single-replica (its own `examples/artifacts.json` pins it to
-//! one, because "each VM has its own disk, so N replicas are N independent
-//! stores"), so a fleet of runners each pushing to a local store would produce
-//! N stores that disagree. One central `art serve`.
+//! A runner never owns release storage. With `ART_S3_BUCKET`, Sam's global
+//! `art` store writes through to one authoritative bucket; regional daemons
+//! are caches, not independent stores. CI uses its HTTP API, not CI's separate
+//! raw-S3 sink. Controller and guest endpoints must address that same logical
+//! store. Without a remote tier, separate art roots remain separate stores.
 //!
 //! Who *moves the bytes* there is a separate question, answered by
 //! [`ArtifactSink::guest_push`]. The orchestrator's own path — read the file out
@@ -22,16 +22,16 @@
 //!
 //! ## Three constraints of the `artifacts` store shape the design
 //!
-//! - **Tag names cannot contain `/`** — the charset is `[A-Za-z0-9_.-]`, max 64
-//!   characters. So a tag is a flattened `ci-<workflow>-<run>-<name>`, and the
-//!   real coordinates go in the manifest's `annotations`.
+//! - **CI uses flat tags** (`ci-<workflow>-<run>-<name>`) for compatibility.
+//!   The global store also accepts namespaced `repo:tag` references. Release
+//!   retention uses separate `release-*` roots and never moves a live alias.
 //! - **Annotations must stay content-only.** The manifest is addressed by its
 //!   own hash and carries no timestamp field on purpose, so an unchanged
 //!   re-import dedupes. Putting a build time in an annotation would change the
 //!   digest and destroy that. Mutable build metadata lives in `ci_artifact`,
 //!   keyed by digest.
-//! - **There is no `GET /tags/{name}`** despite the README; a tag resolves
-//!   through `GET /manifests/{tag}`.
+//! - **Deployments use digests, not mutable tags.** Tags resolve through
+//!   `GET /manifests/{tag}`; the global store also exposes `GET /tags/{name}`.
 //!
 //! ## Labels: what a person sees in the store
 //!
@@ -1049,6 +1049,69 @@ mod tests {
             public: false,
             alias: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn global_store_release_survives_region_cache_loss_and_build_cleanup() {
+        use ::artifacts::{config::Config, http::{router, ServeState}, registry::Registry,
+            remote::Remote, store::Store};
+        use std::time::Duration;
+
+        async fn region(root: PathBuf, remote: Remote) -> (ArtifactsSink, tokio::task::JoinHandle<()>) {
+            let store = Store::open(&Config { root: root.clone(), min_free_bytes: 0,
+                gc_min_age: Duration::ZERO, heyvm_images_dir: root.join("images") }).unwrap();
+            let registry = Registry::new(store, Some(remote), Default::default());
+            let app = router(ServeState::new(registry, Some("fixture-key".into()), false));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            (ArtifactsSink::new(ArtifactsConfig { url, token: Some("fixture-key".into()), guest_url: None }), server)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = dir.path().join("bucket");
+        let remote = Remote::fs(bucket.clone()).unwrap();
+        let (first, first_server) = region(dir.path().join("first"), remote.clone()).await;
+        let (second, second_server) = region(dir.path().join("second"), remote.clone()).await;
+        let bytes = b"immutable release\0from first region\n".to_vec();
+        let build = first.put(&aref(), bytes.clone()).await.unwrap();
+        // Pin through a different, initially empty cache: no process-local
+        // store or mock HTTP response can satisfy this assertion.
+        let retained = second.retain(&build, "build/component/digest").await.unwrap();
+        assert_eq!(retained.digest, Some(hex::encode(Sha256::digest(&bytes))));
+        assert_eq!(second.get(&retained).await.unwrap(), bytes);
+        assert_eq!(first.retain(&build, "build/component/digest").await.unwrap(), retained);
+
+        first.auth(first.http.delete(format!("{}/tags/{}", first.config.url, build.uri)))
+            .send().await.unwrap().error_for_status().unwrap();
+        // A distinct unpinned blob proves that GC actually sweeps, while the
+        // release root preserves the selected bytes independently of build tags.
+        let orphan = b"unreferenced build scratch";
+        let orphan_digest = hex::encode(Sha256::digest(orphan));
+        first.auth(first.http.put(format!("{}/blobs/{orphan_digest}", first.config.url)))
+            .body(orphan.to_vec()).send().await.unwrap().error_for_status().unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let swept = ::artifacts::s3ops::gc(&remote, Duration::ZERO, false).await.unwrap();
+        assert_eq!(swept.blobs_removed, 1);
+
+        first_server.abort(); second_server.abort();
+        let _ = first_server.await; let _ = second_server.await;
+        std::fs::remove_dir_all(dir.path().join("first")).unwrap();
+        std::fs::remove_dir_all(dir.path().join("second")).unwrap();
+        let (replacement, replacement_server) = region(dir.path().join("replacement"), remote).await;
+        assert_eq!(replacement.get(&retained).await.unwrap(), bytes);
+        let manifest: Value = replacement.auth(replacement.http.get(format!(
+            "{}/manifests/{}", replacement.config.url, retained.uri)))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(manifest["entries"][0]["digest"], retained.digest.as_deref().unwrap());
+        // Warm reads do not prove a durable write. Make the remote unusable:
+        // retention must fail, even though the blob/manifest are cached.
+        std::fs::rename(&bucket, dir.path().join("offline-bucket")).unwrap();
+        std::fs::write(&bucket, b"remote unavailable").unwrap();
+        assert!(replacement.retain(&retained, "another-release").await.is_err());
+        replacement_server.abort();
+        let _ = replacement_server.await;
     }
 
     #[test]

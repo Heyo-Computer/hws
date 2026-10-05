@@ -342,7 +342,7 @@ impl Authenticator {
         // app-lb's own endpoints first — they live under the deployment's
         // hostname, so they have to be claimed before the app sees them.
         if req.path == gate.callback_path() {
-            return Decision::Answered(self.callback(gate, deployment_id, req).await);
+            return Decision::Answered(self.callback(gate, deployment_id, deployment_namespace, req).await);
         }
         if req.path == gate.logout_path() {
             return Decision::Answered(self.logout(gate, req));
@@ -350,7 +350,7 @@ impl Authenticator {
         if req.path == gate.login_path() {
             // An explicit sign-in link. Always starts a fresh flow, so it also
             // works as "switch account" after a logout.
-            return Decision::Answered(self.start(gate, deployment_id, req, "/"));
+            return Decision::Answered(self.start(gate, deployment_id, deployment_namespace, req, "/"));
         }
 
         // A path the sign-in gate does not sit in front of. That has never
@@ -422,7 +422,7 @@ impl Authenticator {
         if let Some(policy) = gate.jwt_policy()
             && let Some(presented) = self.jwt_candidate(policy, req)
         {
-            match self.verify_jwt(policy, &presented).await {
+            match self.verify_jwt(policy, &presented, req.host, Some(deployment_namespace)).await {
                 Ok(identity) => {
                     tracing::debug!(
                         deployment = %deployment_id,
@@ -556,7 +556,7 @@ impl Authenticator {
                     Some(q) if !q.is_empty() => format!("{}?{}", req.path, q),
                     _ => req.path.to_string(),
                 };
-                Decision::Answered(self.start(gate, deployment_id, req, &return_to))
+                Decision::Answered(self.start(gate, deployment_id, deployment_namespace, req, &return_to))
             }
         }
     }
@@ -615,7 +615,7 @@ impl Authenticator {
         if want == crate::tokens::AdminScope::None
             && let Some(policy) = gate.jwt_policy()
             && let Some(presented) = self.jwt_candidate(policy, req)
-            && let Ok(identity) = self.verify_jwt(policy, &presented).await
+            && let Ok(identity) = self.verify_jwt(policy, &presented, req.host, Some(deployment_namespace)).await
         {
             return Decision::Allow(Box::new(Some(identity)));
         }
@@ -713,11 +713,33 @@ impl Authenticator {
     }
 
     /// Verify a presented token and turn its claims into an identity.
+    ///
+    /// A token that says where it may be used is held to it, whichever way it
+    /// arrived: a `gateHost` claim must name the host this request reached, and
+    /// a `namespace` claim the namespace of the deployment behind it (when the
+    /// caller knows it). A scoped sign-in token minted for one host is
+    /// otherwise a bearer credential for every gate that trusts the issuer.
     async fn verify_jwt(
         &self,
         policy: &crate::config::JwtSpec,
         token: &str,
+        host: &str,
+        namespace: Option<&str>,
     ) -> Result<Identity, crate::jwt::JwtError> {
+        self.verify_jwt_claims(policy, token, host, namespace)
+            .await
+            .map(|(identity, _)| identity)
+    }
+
+    /// [`verify_jwt`](Self::verify_jwt), keeping the claims for a caller that
+    /// needs more than the identity.
+    async fn verify_jwt_claims(
+        &self,
+        policy: &crate::config::JwtSpec,
+        token: &str,
+        host: &str,
+        namespace: Option<&str>,
+    ) -> Result<(Identity, crate::jwt::Claims), crate::jwt::JwtError> {
         // Resolved per request rather than at registration, so rotating the
         // secret in the store takes effect on the next request instead of on the
         // next time somebody re-registers the deployment.
@@ -737,6 +759,17 @@ impl Authenticator {
 
         let claims = crate::jwt::verify(token, policy, key.as_ref(), &self.jwks, now_secs()).await?;
 
+        if let Some(bound) = claims.string("gateHost")
+            && !bound.eq_ignore_ascii_case(&bare_host(host))
+        {
+            return Err(crate::jwt::JwtError::Claim("the token was issued for another host"));
+        }
+        if let (Some(bound), Some(namespace)) = (claims.string("namespace"), namespace)
+            && bound != namespace
+        {
+            return Err(crate::jwt::JwtError::Claim("the token was issued for another namespace"));
+        }
+
         // The subject is the one claim a gate cannot do without: it is what goes
         // upstream as `x-auth-request-user`, and a token missing it means
         // `subject_claim` names something this issuer does not send. Refused
@@ -746,7 +779,7 @@ impl Authenticator {
             .string(&policy.subject_claim)
             .ok_or_else(|| crate::jwt::JwtError::Require(policy.subject_claim.clone()))?;
 
-        Ok(Identity {
+        let identity = Identity {
             subject,
             // Optional: a token issued to a service has no address, and a gate
             // that required one would refuse exactly the machine-to-machine case
@@ -760,7 +793,8 @@ impl Authenticator {
             // A JWT is its own credential; there is no session behind it and
             // nothing to mint one from.
             session_token: None,
-        })
+        };
+        Ok((identity, claims))
     }
 
     /// Begin a sign-in: redirect to Google, remembering where to come back to.
@@ -768,9 +802,15 @@ impl Authenticator {
         &self,
         gate: &AuthGate,
         deployment_id: &str,
+        namespace: &str,
         req: &RequestInfo<'_>,
         return_to: &str,
     ) -> Response {
+        if let Some(policy) = gate.jwt_policy()
+            && let Some((authorize_url, _)) = policy.scoped_signin()
+        {
+            return self.start_scoped(gate, deployment_id, namespace, req, return_to, authorize_url);
+        }
         if req.wants_html && gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some()) {
             return self.heyo_login_page(gate, deployment_id, req, return_to);
         }
@@ -902,6 +942,7 @@ impl Authenticator {
         &self,
         gate: &AuthGate,
         deployment_id: &str,
+        namespace: &str,
         req: &RequestInfo<'_>,
     ) -> Response {
         let params = query_pairs(req.query);
@@ -926,7 +967,7 @@ impl Authenticator {
             // Usually a bookmarked callback URL or a cookie dropped by a
             // `SameSite` policy, not an attack. Start over rather than dead-end.
             tracing::debug!(deployment = %deployment_id, "sign-in callback with no flow cookie");
-            return self.start(gate, deployment_id, req, "/");
+            return self.start(gate, deployment_id, namespace, req, "/");
         }
         let verified: Vec<Flow> = presented
             .iter()
@@ -945,7 +986,7 @@ impl Authenticator {
             return Response::text(400, "the sign-in state could not be verified\n");
         };
         if flow.exp <= now_secs() {
-            return self.start(gate, deployment_id, req, &flow.return_to);
+            return self.start(gate, deployment_id, namespace, req, &flow.return_to);
         }
         // The state parameter came back through the browser; the nonce it is
         // compared against came from a signed cookie. Constant-time because the
@@ -957,6 +998,14 @@ impl Authenticator {
             );
             self.observe_auth(deployment_id, req, crate::siem::AuthAction::SigninState, None);
             return Response::text(400, "the sign-in state did not match\n");
+        }
+
+        if let Some(policy) = gate.jwt_policy()
+            && let Some((_, token_url)) = policy.scoped_signin()
+        {
+            return self
+                .finish_scoped(gate, deployment_id, namespace, req, policy, token_url, code, flow)
+                .await;
         }
 
         let Some((client_id, client_secret)) = gate.google_credentials() else {
@@ -1079,6 +1128,198 @@ impl Authenticator {
                 clear_cookie(FLOW_COOKIE, req.secure, None),
             ],
         )
+    }
+
+    /// Begin a scoped sign-in: send the browser to the issuer's authorization
+    /// endpoint asking for this deployment's namespace. See
+    /// [`JwtSpec::authorize_url`](crate::config::JwtSpec::authorize_url).
+    ///
+    /// The same flow cookie, `state` and PKCE as the Google path; what differs
+    /// is the `scope`, which is this gate telling the issuer what access it
+    /// needs, and the issuer deciding.
+    fn start_scoped(
+        &self,
+        gate: &AuthGate,
+        deployment_id: &str,
+        namespace: &str,
+        req: &RequestInfo<'_>,
+        return_to: &str,
+        authorize_url: &str,
+    ) -> Response {
+        if !req.wants_html {
+            let login = format!("{}{}", origin(req), gate.login_path());
+            return Response::json(
+                401,
+                serde_json::json!({
+                    "error": "authentication required",
+                    "login_url": login,
+                    "detail": "sign in in a browser, or present a token from this deployment's \
+                               issuer as `Authorization: Bearer …`",
+                })
+                .to_string()
+                    + "\n",
+            );
+        }
+        let nonce = random_token();
+        let verifier = random_token();
+        let flow = Flow {
+            nonce: nonce.clone(),
+            return_to: safe_return_path(return_to),
+            verifier: verifier.clone(),
+            deployment: deployment_id.to_string(),
+            exp: now_secs() + FLOW_TTL.as_secs(),
+        };
+        let sep = if authorize_url.contains('?') { '&' } else { '?' };
+        let url = format!(
+            "{authorize_url}{sep}{}",
+            form_urlencoded::Serializer::new(String::new())
+                .append_pair("response_type", "code")
+                .append_pair("redirect_uri", &self.redirect_uri(gate, req))
+                .append_pair("scope", &format!("namespace:{namespace}"))
+                .append_pair("state", &nonce)
+                .append_pair("code_challenge", &pkce_challenge(&verifier))
+                .append_pair("code_challenge_method", "S256")
+                .finish()
+        );
+        Response::redirect(
+            url,
+            vec![set_cookie(
+                FLOW_COOKIE,
+                &self.sign(&flow.encode()),
+                req.secure,
+                Some(FLOW_TTL.as_secs()),
+                None,
+            )],
+        )
+    }
+
+    /// Finish a scoped sign-in once the flow cookie and `state` have checked
+    /// out: redeem the code, verify the token against this gate's policy, and
+    /// insist it names this host and this deployment's namespace.
+    ///
+    /// The claims are *required* here, not merely checked when present: the
+    /// token came back from an exchange this gate asked to be scoped, and one
+    /// that is not means the issuer ignored the request.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_scoped(
+        &self,
+        gate: &AuthGate,
+        deployment_id: &str,
+        namespace: &str,
+        req: &RequestInfo<'_>,
+        policy: &crate::config::JwtSpec,
+        token_url: &str,
+        code: &str,
+        flow: &Flow,
+    ) -> Response {
+        let redirect_uri = self.redirect_uri(gate, req);
+        let token = match self.exchange_scoped(token_url, code, &flow.verifier, &redirect_uri).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(deployment = %deployment_id, error = %e, "scoped sign-in exchange failed");
+                self.observe_auth(deployment_id, req, crate::siem::AuthAction::SigninExchange, None);
+                return Response::text(502, "could not complete sign-in with the issuer\n");
+            }
+        };
+        let (identity, claims) = match self
+            .verify_jwt_claims(policy, &token, req.host, Some(namespace))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(deployment = %deployment_id, error = %e, "scoped sign-in token rejected");
+                self.observe_auth(deployment_id, req, crate::siem::AuthAction::SigninToken, None);
+                return Response::text(403, format!("sign-in was rejected: {e}\n"));
+            }
+        };
+        if claims.string("gateHost").is_none() || claims.string("namespace").is_none() {
+            tracing::warn!(
+                deployment = %deployment_id,
+                "scoped sign-in token carries no gateHost or namespace; refusing",
+            );
+            self.observe_auth(deployment_id, req, crate::siem::AuthAction::SigninToken, None);
+            return Response::text(403, "sign-in was rejected: the token is not scoped to this host\n");
+        }
+
+        // The session ends when the token would have, if that is sooner: the
+        // issuer's lifetime is its statement of how long this grant holds.
+        let token_exp = claims
+            .get("exp")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX);
+        let exp = (now_secs() + gate.session_ttl_secs).min(token_exp);
+        let session = Session {
+            subject: identity.subject.clone(),
+            email: identity.email.clone(),
+            name: identity.name.clone(),
+            hosted_domain: None,
+            deployment: deployment_id.to_string(),
+            policy: gate.policy_fingerprint(),
+            exp,
+            token: None,
+            token_id: None,
+        };
+        tracing::info!(
+            deployment = %deployment_id,
+            namespace = %namespace,
+            subject = %identity.subject,
+            "scoped sign-in succeeded",
+        );
+        Response::redirect(
+            format!("{}{}", origin(req), flow.return_to),
+            vec![
+                // Host-only, always: validation refuses a realm on this flow.
+                set_cookie(
+                    &gate.cookie_name,
+                    &self.sign(&session.encode()),
+                    req.secure,
+                    Some(exp.saturating_sub(now_secs())),
+                    None,
+                ),
+                clear_cookie(FLOW_COOKIE, req.secure, None),
+            ],
+        )
+    }
+
+    /// Redeem a scoped sign-in code at the issuer's token endpoint. A public
+    /// client: the PKCE verifier is the proof, as RFC 7636 intends.
+    async fn exchange_scoped(
+        &self,
+        token_url: &str,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<String, String> {
+        let response = self
+            .http
+            .post(token_url)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", verifier),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the token endpoint: {e}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("could not read the token response: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "the issuer rejected the exchange (HTTP {status}): {}",
+                body.chars().take(300).collect::<String>()
+            ));
+        }
+        #[derive(Deserialize)]
+        struct ScopedToken {
+            access_token: String,
+        }
+        serde_json::from_str::<ScopedToken>(&body)
+            .map(|t| t.access_token)
+            .map_err(|e| format!("token response was not the expected JSON: {e}"))
     }
 
     /// Mint the app-token a session presents upstream, if this gate asks for
@@ -1592,6 +1833,18 @@ fn pkce_challenge(verifier: &str) -> String {
 }
 
 /// `https://host` or `http://host`, for building absolute URLs.
+/// A request host without port or trailing dot, lowercased — the form a
+/// `gateHost` claim names.
+fn bare_host(host: &str) -> String {
+    let host = host.trim_end_matches('.');
+    let host = match host.rsplit_once(':') {
+        // An IPv6 literal keeps its colons; only a trailing `:port` goes.
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && !h.ends_with(':') => h,
+        _ => host,
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
 fn origin(req: &RequestInfo<'_>) -> String {
     let scheme = if req.secure { "https" } else { "http" };
     format!("{scheme}://{}", req.host)
@@ -2007,7 +2260,7 @@ mod tests {
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
             let a = with_secret();
             let mut g = jwt_gate(r#""jwt""#, &format!(r#", "cookie":"heyo_login", "login_endpoint":"{endpoint}""#));
-            let page = a.start(&g, "web", &req("/runs/abc", vec![]), "/runs/abc?before=17");
+            let page = a.start(&g, "web", "default", &req("/runs/abc", vec![]), "/runs/abc?before=17");
             assert_eq!(page.status, 200);
             assert!(page.body.contains("autocomplete=\"current-password\""));
             assert!(page.cookies[0].contains("Secure") && page.cookies[0].contains("HttpOnly"));
@@ -2017,7 +2270,7 @@ mod tests {
             assert!(page.body.contains("name=\"return_to\" value=\"/runs/abc?before=17\""));
             // Another tab refreshes the browser cookie before the original
             // form is submitted. Both its CSRF state and destination survive.
-            let second = a.start(&g, "web", &req("/runs/other", page.cookies), "/runs/other");
+            let second = a.start(&g, "web", "default", &req("/runs/other", page.cookies), "/runs/other");
             let second_raw = cookie_values(&second.cookies, FLOW_COOKIE).remove(0);
             let second_flow = Flow::decode(&a.verify(&second_raw).unwrap()).unwrap();
             assert_eq!(second_flow.nonce, flow.nonce);
@@ -2061,16 +2314,16 @@ mod tests {
                 request.cookies = vec![format!("{FLOW_COOKIE}={}", a.sign(&flow.encode()))];
                 assert_eq!(a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), b"state=a&email=a&password=b").await.status, 403);
                 if deployment != "web" || exp <= now_secs() {
-                    let page = a.start(&g, "web", &request, "/");
+                    let page = a.start(&g, "web", "default", &request, "/");
                     let raw = cookie_values(&page.cookies, FLOW_COOKIE).remove(0);
                     assert_ne!(Flow::decode(&a.verify(&raw).unwrap()).unwrap().nonce, nonce);
                 }
             }
             request.secure = false;
-            assert_eq!(a.start(&g, "web", &request, "/").status, 403);
+            assert_eq!(a.start(&g, "web", "default", &request, "/").status, 403);
             request.secure = true;
             request.wants_html = false;
-            assert_eq!(a.start(&g, "web", &request, "/").status, 401);
+            assert_eq!(a.start(&g, "web", "default", &request, "/").status, 401);
             assert_eq!(a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), &vec![b'x';8193]).await.status, 413);
         }
 
@@ -2157,6 +2410,131 @@ mod tests {
                 bearer: Some(token.to_string()),
                 ..req(path, vec![])
             }
+        }
+
+        /// A gate running scoped sign-in against a stub token endpoint that
+        /// answers with whatever claims `claims` holds at the time.
+        async fn scoped_signin(
+            claims: Arc<std::sync::Mutex<serde_json::Value>>,
+        ) -> (AuthGate, Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let token_url = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = seen.clone();
+            let router = axum::Router::new().route("/oauth/token", axum::routing::post(
+                move |body: String| {
+                    let claims = claims.lock().unwrap().clone();
+                    recorded.lock().unwrap().push(form_urlencoded::parse(body.as_bytes()).into_owned().collect());
+                    async move { axum::Json(json!({"access_token": heyo_token(claims), "token_type": "Bearer"})) }
+                },
+            ));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let g = jwt_gate(r#""jwt""#, &format!(
+                r#", "authorize_url":"https://auth.example.com/oauth/authorize", "token_url":"{token_url}""#
+            ));
+            (g, seen, server)
+        }
+
+        fn callback_req<'a>(path: &'a str, query: &'a str, cookies: Vec<String>) -> RequestInfo<'a> {
+            RequestInfo { query: Some(query), ..req(path, cookies) }
+        }
+
+        #[tokio::test]
+        async fn scoped_signin_asks_for_the_namespace_and_admits_a_host_bound_token() {
+            let claims = Arc::new(std::sync::Mutex::new(json!({"gateHost": "app.example.com", "namespace": "acme"})));
+            let (g, seen, server) = scoped_signin(claims.clone()).await;
+            let a = with_secret();
+
+            // No session: off to the issuer, asking for this deployment's namespace.
+            let Decision::Answered(r) = a.decide(&g, "web", "acme", &req("/runs/7", vec![])).await else {
+                panic!("expected a redirect to the issuer");
+            };
+            assert_eq!(r.status, 302);
+            let location = reqwest::Url::parse(r.location.as_deref().unwrap()).unwrap();
+            assert_eq!(location.as_str().split('?').next(), Some("https://auth.example.com/oauth/authorize"));
+            let q: std::collections::HashMap<_, _> = location.query_pairs().into_owned().collect();
+            assert_eq!(q["scope"], "namespace:acme");
+            assert_eq!(q["redirect_uri"], "https://app.example.com/__applb/auth/callback");
+            assert_eq!(q["code_challenge_method"], "S256");
+            let flow_cookies = r.cookies.clone();
+            let flow = Flow::decode(&a.verify(&cookie_values(&flow_cookies, FLOW_COOKIE)[0]).unwrap()).unwrap();
+            assert_eq!(q["state"], flow.nonce);
+            assert_eq!(q["code_challenge"], pkce_challenge(&flow.verifier));
+
+            // The issuer comes back with a code; the gate redeems it with the verifier.
+            let query = format!("code=c-1&state={}", flow.nonce);
+            let back = callback_req("/__applb/auth/callback", &query, flow_cookies.clone());
+            let Decision::Answered(done) = a.decide(&g, "web", "acme", &back).await else {
+                panic!("the callback answers itself");
+            };
+            assert_eq!(done.status, 302, "{}", done.body);
+            assert_eq!(done.location.as_deref(), Some("https://app.example.com/runs/7"));
+            let sent = seen.lock().unwrap().last().cloned().unwrap();
+            let field = |k: &str| sent.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            assert_eq!(field("grant_type").as_deref(), Some("authorization_code"));
+            assert_eq!(field("code").as_deref(), Some("c-1"));
+            assert_eq!(field("code_verifier"), Some(flow.verifier.clone()));
+            assert_eq!(field("redirect_uri").as_deref(), Some("https://app.example.com/__applb/auth/callback"));
+            // A host-only session of app-lb's own, not the issuer's token.
+            let session = done.cookies.iter().find(|c| c.starts_with("applb_session=")).unwrap();
+            assert!(!session.contains("Domain="));
+            assert!(matches!(
+                a.decide(&g, "web", "acme", &req("/runs/7", done.cookies.clone())).await,
+                Decision::Allow(identity) if identity.as_ref().as_ref().is_some_and(|i| i.subject == "u_1f2e")
+            ));
+            // Bound to the deployment that issued it, like any session.
+            assert!(matches!(
+                a.decide(&g, "other", "acme", &req("/", done.cookies)).await,
+                Decision::Answered(_)
+            ));
+
+            // A token for another host, another namespace, or with no scope at
+            // all is refused, and no session is issued.
+            for bad in [
+                json!({"gateHost": "elsewhere.example.com", "namespace": "acme"}),
+                json!({"gateHost": "app.example.com", "namespace": "other"}),
+                json!({}),
+            ] {
+                *claims.lock().unwrap() = bad.clone();
+                let Decision::Answered(r) = a.decide(&g, "web", "acme", &back).await else {
+                    panic!("the callback answers itself");
+                };
+                assert_eq!(r.status, 403, "{bad}: {}", r.body);
+                assert!(r.cookies.is_empty(), "{bad}");
+            }
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_scoped_signin_gate_tells_a_program_where_to_sign_in() {
+            let (g, _, server) = scoped_signin(Arc::new(std::sync::Mutex::new(json!({})))).await;
+            let a = with_secret();
+            let program = RequestInfo { wants_html: false, ..req("/api", vec![]) };
+            let Decision::Answered(r) = a.decide(&g, "web", "acme", &program).await else {
+                panic!("expected a 401");
+            };
+            assert_eq!(r.status, 401);
+            assert!(r.body.contains("/__applb/auth/login"), "{}", r.body);
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_token_bound_to_another_host_or_namespace_is_refused_as_a_bearer() {
+            let a = with_secret();
+            let g = jwt_gate(r#""jwt""#, "");
+            let elsewhere = heyo_token(json!({"gateHost": "elsewhere.example.com"}));
+            assert!(!matches!(a.decide(&g, "web", "default", &bearing("/", &elsewhere)).await, Decision::Allow(_)));
+            let here = heyo_token(json!({"gateHost": "APP.example.com", "namespace": "default"}));
+            assert!(matches!(a.decide(&g, "web", "default", &bearing("/", &here)).await, Decision::Allow(_)));
+            let other_ns = heyo_token(json!({"namespace": "acme"}));
+            assert!(!matches!(a.decide(&g, "web", "default", &bearing("/", &other_ns)).await, Decision::Allow(_)));
+        }
+
+        #[test]
+        fn bare_host_drops_port_and_case() {
+            assert_eq!(bare_host("App.Example.com:443"), "app.example.com");
+            assert_eq!(bare_host("app.example.com."), "app.example.com");
+            assert_eq!(bare_host("[::1]:8443"), "[::1]");
         }
 
         #[tokio::test]

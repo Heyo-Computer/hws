@@ -17,7 +17,7 @@ import { buildTools } from "./server.js";
 import type { Tool } from "./tools/diagnose.js";
 
 /** `sha256("hello")`, computed outside this codebase so the test is a check. */
-const HELLO_SHA = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+const HELLO_SHA = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 const HELLO_B64 = "aGVsbG8=";
 
 interface Call {

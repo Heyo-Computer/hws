@@ -7,6 +7,7 @@
  */
 
 import { bind, request, ServiceError, type Requester, type ServiceSource } from "../http.js";
+import { checkArtRequest, filterTags, type ArtScope } from "../artscope.js";
 import { cloudUsable, credentialFaults, type Config, type ServiceConfig } from "../config.js";
 
 export interface Clients {
@@ -45,10 +46,24 @@ export function makeClients(config: Config): Clients {
     applb: bind("app-lb", applb, "APPLB_URL or APPLB_TOKEN", config),
     obs: bind("app-obs", config.obs, "APP_OBS_URL", config),
     ci: bind("ci", config.ci, "CI_URL", config),
-    art: bind("artifacts", config.art, "ART_URL (plus ART_API_KEY)", config),
+    art: confineArt(bind("artifacts", config.art, "ART_URL (plus ART_API_KEY)", config), config.artScope),
     remote: bind("git remote", config.remote, "REMOTE_URL", config),
     applbNamespace: async () =>
       typeof applb === "function" ? (await applb()).namespace : applb?.namespace,
+  };
+}
+
+/**
+ * The store requester held to the caller's scope. Every art tool, `art_request`
+ * included, goes through here, so this is the one place the rule is enforced.
+ */
+function confineArt(art: Requester, scope: ArtScope | undefined): Requester {
+  if (!scope) return art;
+  return async (opts) => {
+    const verdict = checkArtRequest(scope, opts.method ?? "GET", opts.path);
+    if (verdict.refused) throw new Error(verdict.refused);
+    const out = await art(opts);
+    return verdict.filterTagsTo === undefined ? out : filterTags(out, verdict.filterTagsTo);
   };
 }
 
