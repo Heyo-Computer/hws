@@ -361,15 +361,21 @@ impl Authenticator {
     /// dashboard sign-in does (`app-lb/src/federated.rs` `login`). The token
     /// is the session: every later request resolves it through
     /// `/api/auth/scopes`, so the namespaces it reaches are exactly the ones
-    /// app-lb would grant it. Returns the token and its lifetime in seconds.
-    pub async fn login(&self, email: &str, password: &str) -> Option<(String, u64)> {
-        let base = self.auth_url.as_ref()?;
-        let url = reqwest::Url::parse(base).ok()?;
+    /// app-lb would grant it. Returns the token and its lifetime in seconds,
+    /// or a sentence for the person saying why not.
+    pub async fn login(&self, email: &str, password: &str) -> Result<(String, u64), String> {
+        let base = self
+            .auth_url
+            .as_ref()
+            .ok_or("Heyo sign-in is not configured here (no REMOTE_AUTH_URL).")?;
+        let url = reqwest::Url::parse(base).map_err(|_| "REMOTE_AUTH_URL is not a URL.")?;
         // Never send a password over plaintext to anything but loopback.
         let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
         if !(url.scheme() == "https" || url.scheme() == "http" && loopback) {
             tracing::warn!("REMOTE_AUTH_URL is not https; refusing to send a password to it");
-            return None;
+            return Err(
+                "Heyo sign-in is misconfigured here (the auth service is not https).".into(),
+            );
         }
         let resp = self
             .http
@@ -377,25 +383,37 @@ impl Authenticator {
             .json(&serde_json::json!({ "email": email, "password": password }))
             .send()
             .await
-            .inspect_err(|e| tracing::warn!(error = %e, "auth service unreachable for sign-in"))
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
+            .map_err(|e| {
+                tracing::warn!(error = %e, "auth service unreachable for sign-in");
+                "The Heyo auth service is unreachable from here. Try again, or sign in with a token."
+                    .to_string()
+            })?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let ok = status.is_success() && body.get("success").and_then(|v| v.as_bool()) == Some(true);
+        if !ok {
+            let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            tracing::info!(status = %status, code, message, "Heyo sign-in refused");
+            return Err(login_refusal(status.as_u16(), code, message));
         }
-        let body: serde_json::Value = resp.json().await.ok()?;
-        if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
-            return None;
-        }
-        let token = body.pointer("/data/tokens/accessToken")?.as_str()?;
-        if !cookie_safe(token) {
-            return None;
-        }
-        let lifetime = body
-            .pointer("/data/tokens/expiresIn")
-            .and_then(|v| v.as_u64())
+        let token = body
+            .pointer("/data/tokens/accessToken")
+            .and_then(|v| v.as_str())
+            .filter(|t| cookie_safe(t))
+            .ok_or_else(|| {
+                tracing::warn!("auth service sign-in answered without a usable accessToken");
+                "The Heyo auth service answered without a usable token.".to_string()
+            })?;
+        // The token's own expiry when it says, so the cookie never outlives it.
+        let lifetime = jwt_remaining(token, crate::sigv4::now_unix())
+            .or_else(|| {
+                body.pointer("/data/tokens/expiresIn")
+                    .and_then(|v| v.as_u64())
+            })
             .unwrap_or(3600)
             .min(86_400);
-        Some((token.to_string(), lifetime))
+        Ok((token.to_string(), lifetime))
     }
 
     async fn repo_token(&self, bearer: &str) -> Option<Principal> {
@@ -572,6 +590,33 @@ impl Authenticator {
     }
 }
 
+/// What to tell a person whose Heyo sign-in was refused. The auth service's
+/// own reason when it gave a specific one; otherwise the likeliest cause.
+///
+/// A Google account has no password, and the auth service reports that as a
+/// bare `500 LOGIN_ERROR`, so that case is named outright: it is the one a
+/// person cannot fix by retyping.
+pub fn login_refusal(status: u16, code: &str, message: &str) -> String {
+    const GOOGLE: &str = "If you sign in to Heyo with Google, there is no password to use here: \
+        open this page from Heyo, or sign in with a Heyo API key or an app-lb token.";
+    match code {
+        "INVALID_CREDENTIALS" => format!("Wrong email or password. {GOOGLE}"),
+        "EMAIL_VERIFICATION_REQUIRED" => "Verify your email address with Heyo first.".into(),
+        "CAPTCHA_REQUIRED" | "CAPTCHA_FAILED" => {
+            "The Heyo auth service wants a captcha, which this page cannot show. \
+             Sign in with a token instead."
+                .into()
+        }
+        _ if status == 429 => "Too many sign-in attempts. Wait a minute and try again.".into(),
+        _ if status >= 500 => format!(
+            "The Heyo auth service could not sign you in ({}). {GOOGLE}",
+            if message.is_empty() { "error" } else { message }
+        ),
+        _ if !message.is_empty() => format!("Sign-in refused: {message}"),
+        _ => format!("Sign-in refused (HTTP {status})."),
+    }
+}
+
 /// Whether a bearer can be a cookie value as-is: the alphabet of JWTs and of
 /// every token shape here.
 pub fn cookie_safe(token: &str) -> bool {
@@ -742,6 +787,20 @@ mod tests {
         assert_eq!(p.account_for("b").as_deref(), Some("acc"));
         assert!(p.allows("b", Some("r"), Tier::Read) && !p.allows("b", Some("r"), Tier::Write));
         assert!(principal_from_scopes(&json!({"success": false})).is_none());
+    }
+
+    #[test]
+    fn sign_in_refusals_say_why() {
+        assert!(
+            login_refusal(401, "INVALID_CREDENTIALS", "Invalid credentials")
+                .starts_with("Wrong email")
+        );
+        // The auth service's answer for a Google account.
+        assert!(login_refusal(500, "LOGIN_ERROR", "Login failed").contains("Google"));
+        assert!(login_refusal(403, "EMAIL_VERIFICATION_REQUIRED", "x").contains("Verify"));
+        assert!(login_refusal(400, "CAPTCHA_REQUIRED", "x").contains("captcha"));
+        assert!(login_refusal(429, "", "").contains("Too many"));
+        assert_eq!(login_refusal(400, "", "nope"), "Sign-in refused: nope");
     }
 
     #[test]

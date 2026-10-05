@@ -354,8 +354,11 @@ async fn upstream_stub() -> String {
             post(|Json(b): Json<Value>| async move {
                 if b["email"] == "ada@example.com" && b["password"] == "pw" {
                     Ok(Json(json!({"success": true, "data": {"tokens": {"accessToken": "ada.jwt.token", "expiresIn": 3600}}})))
+                } else if b["email"] == "google@example.com" {
+                    // What the auth service answers for a Google account.
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"success": false, "message": "Login failed", "code": "LOGIN_ERROR"}))))
                 } else {
-                    Err(StatusCode::UNAUTHORIZED)
+                    Err((StatusCode::UNAUTHORIZED, Json(json!({"success": false, "message": "Invalid credentials", "code": "INVALID_CREDENTIALS"}))))
                 }
             }),
         )
@@ -663,7 +666,7 @@ async fn web_ui_shows_each_session_only_what_app_lb_grants() {
 
     // A Heyo account sees its own grants: team-b, not team-a.
     let mut ada = Browser::new(&srv.url);
-    let (st, _, _) = ada
+    let (st, page, _) = ada
         .post(
             "/-/login",
             &[("email", "ada@example.com"), ("password", "wrong")],
@@ -671,6 +674,16 @@ async fn web_ui_shows_each_session_only_what_app_lb_grants() {
         )
         .await;
     assert_eq!(st, 401);
+    assert!(page.contains("Wrong email or password"), "{page}");
+    let (st, page, _) = ada
+        .post(
+            "/-/login",
+            &[("email", "google@example.com"), ("password", "x")],
+            true,
+        )
+        .await;
+    assert_eq!(st, 401);
+    assert!(page.contains("sign in to Heyo with Google"), "{page}");
     let (st, _, _) = ada
         .post(
             "/-/login",

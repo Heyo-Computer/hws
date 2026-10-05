@@ -604,8 +604,8 @@ async fn login(
             return refuse("Email and password are required.");
         }
         match s.auth.login(f.email.trim(), &f.password).await {
-            Some(x) => x,
-            None => return refuse("Sign-in refused, or the Heyo auth service is unreachable."),
+            Ok(x) => x,
+            Err(why) => return refuse(&why),
         }
     };
     if s.auth.authenticate(&token).await.is_none() {
