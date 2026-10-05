@@ -187,6 +187,45 @@ prefer it.
 deployment still inherits it, naming them: resolution fails closed, so removing
 one out from under a live gate would take those deployments offline.
 
+## Browsers: scoped sign-in (preferred)
+
+The redirect-and-cookie contract further down has one weakness on a shared
+fleet. The issuer's cookie has to sit on a domain the gated host also sees, so
+every host under that domain receives it, other tenants' deployments included.
+Scoped sign-in avoids that. app-lb asks the issuer for access to one namespace,
+and the token comes back to app-lb, not to the browser:
+
+```sh
+curl -X POST …/auth-providers -d '{
+  "name": "heyo", "namespace": "team-a", "preset": "heyo-jwks",
+  "authorize_url": "https://auth.example.com/oauth/authorize",
+  "token_url": "https://auth.example.com/oauth/token"
+}'
+```
+
+A token-less **browser** is sent through an OAuth 2.0 authorization-code flow
+with PKCE (`S256`) and `state`:
+
+1. app-lb redirects it to `authorize_url` with `scope=namespace:<the
+   deployment's namespace>` and `redirect_uri=https://<host><base_path>/callback`.
+2. The issuer signs the person in and decides whether they may reach that
+   namespace. The Heyo auth API checks membership of the owning account and asks
+   "Continue to `<host>`?" once per host. It then returns a single-use code.
+3. app-lb redeems the code at `token_url` server to server, verifies the token
+   against this provider's policy, and requires `gateHost` to equal the request
+   host and `namespace` to equal the deployment's namespace.
+4. app-lb keeps its own host-only session (`applb_session`), which ends when the
+   token would have.
+
+Any JWT carrying `gateHost` or `namespace` is held to those claims on every
+path, the `Authorization` header included. A token issued for one host is
+refused on every other host.
+
+Two rules are enforced at registration. Both endpoints are required, and must
+be `https://` (loopback `http://` aside). Scoped sign-in also can't be combined
+with a `cookie_domain` realm, because a session issued for one namespace's host
+must not be honoured by a sibling gate in another namespace.
+
 ## Browsers, and the sign-in page contract
 
 A `jwt` provider is stateless: it verifies a credential the request already
@@ -316,7 +355,10 @@ stamped with it, and an item route naming another namespace in its path is a
 
 `POST` accepts three request-only fields that are never stored: `preset`, the
 `secret` reference the `heyo` preset needs, and the `jwks_url` that `heyo-jwks`
-takes when app-lb cannot derive one. Everything else is the object itself —
+takes when app-lb cannot derive one. `require`, `cookie`, `login_url`,
+`login_redirect_param`, `authorize_url` and `token_url` may also be sent at the
+top level. They're laid over the resulting `jwt` policy, which is how a preset
+is tuned in the same request. Everything else is the object itself —
 `name`, `namespace`, `description`, `provider`, `client_id`, `client_secret`,
 `allowed_domains`, `allowed_emails`, `jwt`, `cookie_domain`.
 
