@@ -291,7 +291,11 @@ async fn two_real_gateways_scenario() -> Result<()> {
         let base = format!("http://127.0.0.1:{admin}");
         for attempt in 0..100 {
             if client.get(format!("{base}/healthz")).send().await.is_ok() { break; }
-            anyhow::ensure!(attempt < 99, "gateway startup timed out; inspect {}",directory.join("log").display());
+            let exited = proxies.0.last_mut().unwrap().try_wait()?;
+            if exited.is_some() || attempt == 99 {
+                let log = std::fs::read_to_string(directory.join("log"))?;
+                anyhow::bail!("gateway startup failed (exit={exited:?}):\n{log}");
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         for (id, value) in [("peer","peer-test"),("reader","discovery-test")] {

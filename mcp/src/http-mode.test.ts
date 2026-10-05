@@ -91,3 +91,67 @@ test("the server lets a large upload through /art run past Node's 5-minute defau
     server.close();
   }
 });
+
+// us5's shape: app-lb, the git remote and the store, but no ci and no app-obs.
+const HOSTED_US5 = {
+  APPLB_URL: "https://admin.us5.example",
+  REMOTE_URL: "https://git.us5.example",
+  ART_URL: "https://hub.example",
+  HEYO_MCP_HTTP_PORT: "9650",
+};
+
+test("the create-a-repo-and-deploy-it workflow fits a client that keeps only 40 tools", async () => {
+  const { WORKFLOW_FIRST } = await import("./server.js");
+  for (const env of [HOSTED_US5, { ...HOSTED_US5, CI_URL: "https://ci.example", APP_OBS_URL: "https://obs.example" }]) {
+    const names = buildTools(loadConfig(env)).map((t) => t.name);
+    const first40 = new Set(names.slice(0, 40));
+    for (const n of ["repo_create", "repo_write_files", "repo_deploy", "applb_spec_schema", "applb_deploy", "art_publish_files"]) {
+      assert.ok(first40.has(n), `${n} is at ${names.indexOf(n) + 1} of ${names.length}`);
+    }
+    // The leading block is exactly the workflow list, in order, for what exists.
+    const expected = WORKFLOW_FIRST.filter((n) => names.includes(n));
+    assert.deepEqual(names.slice(0, expected.length), expected);
+  }
+});
+
+test("a hosted server lists no tools for services it cannot reach; stdio keeps them", () => {
+  const hosted = buildTools(loadConfig(HOSTED_US5)).map((t) => t.name);
+  for (const n of ["ci_run_status", "ci_request", "diagnose_ci_job", "obs_request", "deployment_logs"]) {
+    assert.ok(!hosted.includes(n), `${n} listed with no ${n.includes("obs") || n === "deployment_logs" ? "app-obs" : "ci"}`);
+  }
+  assert.ok(hosted.includes("repo_create") && hosted.includes("applb_deploy"));
+
+  const withCi = buildTools(loadConfig({ ...HOSTED_US5, CI_URL: "https://ci.example" })).map((t) => t.name);
+  assert.ok(withCi.includes("ci_run_status"));
+
+  const stdio = buildTools(loadConfig({ APPLB_URL: "https://admin.example" })).map((t) => t.name);
+  assert.ok(stdio.includes("ci_run_status"), "stdio keeps the tool that explains what to configure");
+});
+
+test("initialize carries the workflow instructions", async () => {
+  const prev = process.env.HEYO_MCP_REQUIRE_IDENTITY;
+  process.env.HEYO_MCP_REQUIRE_IDENTITY = "0";
+  const server = await serveHttp(loadConfig({ ...HOSTED_US5, HEYO_MCP_HTTP_PORT: "1" }), 0, "127.0.0.1");
+  try {
+    const port = (server.address() as { port: number }).port;
+    const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } },
+      }),
+    });
+    const text = await res.text();
+    const line = text.split("\n").find((l) => l.startsWith("data: ")) ?? text;
+    const instructions = JSON.parse(line.replace(/^data: /, "")).result?.instructions as string;
+    assert.match(instructions, /repo_create/);
+    assert.match(instructions, /Static site/);
+  } finally {
+    if (prev === undefined) delete process.env.HEYO_MCP_REQUIRE_IDENTITY;
+    else process.env.HEYO_MCP_REQUIRE_IDENTITY = prev;
+    server.close();
+  }
+});

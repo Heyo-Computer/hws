@@ -543,9 +543,9 @@ Cross-service, shaped like the question rather than the endpoint.
 | --- | --- | --- |
 | `heyo_status` | read-only | Which of heyo cloud, app-lb, app-obs, ci and the artifact store this server can reach, and what each says about itself. |
 | `heyo_whoami` | read-only | What this server's credential is and what it may do: admin scope, namespace, deployment scope and expiry. |
-| `fleet_overview` | read-only | The whole managed fleet in one call: app-obs's per-deployment rows with host CPU and memory, app-lb's current topology with health and drain state, and app-obs's ingest counters. |
 | `diagnose_deployment` | read-only | Everything about one deployment at once: app-lb's record and its VM pool, app-obs's bucketed series, and the most recent error-level logs. |
 | `deployment_logs` | read-only | Log lines for one deployment, newest first, with the filters app-obs supports: time window or explicit from/to, level, backend, a substring query, and a cursor for paging. |
+| `fleet_overview` | read-only | The whole managed fleet in one call: app-obs's per-deployment rows with host CPU and memory, app-lb's current topology with health and drain state, and app-obs's ingest counters. |
 | `diagnose_empty_pool` | read-only | Why a deployment's VM pool is empty or will not fill. |
 | `diagnose_ci_job` | read-only | Why a ci job is not running. |
 
@@ -626,11 +626,11 @@ Repos on the Heyo git remote: somewhere a generated project can live, and what a
 | Tool | | Does |
 | --- | --- | --- |
 | `repo_create` |  | Create a git repo on the Heyo remote, the place an agent's project lives so app-lb can build it. |
+| `repo_write_files` |  | Commit files to a repo with no git on your side. |
+| `repo_deploy` |  | Deploy a repo from the Heyo remote through app-lb, in one call: mints a read token, stores it as an app-lb secret, registers (or edits) the deployment with `build` pointing at the repo, and starts the build. |
 | `repo_list` | read-only | The repos in a namespace on the Heyo remote, with their clone URLs. |
 | `repo_get` | read-only | One repo: its clone URL, HEAD, every ref and its commit, and whether it is still empty. |
 | `repo_token` |  | Mint a repo token: `read` to clone or let app-lb build, `write` to push. |
-| `repo_write_files` |  | Commit files to a repo with no git on your side. |
-| `repo_deploy` |  | Deploy a repo from the Heyo remote through app-lb, in one call: mints a read token, stores it as an app-lb secret, registers (or edits) the deployment with `build` pointing at the repo, and starts the build. |
 
 ### The artifact store
 
@@ -638,13 +638,13 @@ Where a deployment's bytes come from.
 
 | Tool | | Does |
 | --- | --- | --- |
-| `art_publish` |  | Publish a bundle to the artifact store and point a tag at it. |
 | `art_publish_files` |  | Bundle files into a .tar.gz and publish it under a tag, the format a `site` deployment's `artifact` pull unpacks into its root. |
+| `art_publish` |  | Publish a bundle to the artifact store and point a tag at it. |
 | `art_fetch` |  | Download from the store: a tag or manifest digest (its single entry, or `entry`), or a blob digest. |
+| `art_list_tags` | read-only | Every tag in the store and the digest it points at. |
 | `art_list_manifests` | read-only | Every manifest in the store: digest, kind and entries. |
 | `art_delete_tag` | **destructive** | Remove a tag. |
 | `art_set_public` |  | Make a blob anonymously downloadable (`public: true`) or private again. |
-| `art_list_tags` | read-only | Every tag in the store and the digest it points at. |
 | `art_get_tag` | read-only | What one tag points at. |
 | `art_get_manifest` | read-only | One manifest by digest or by tag: its kind, its entries and their digests and sizes. |
 | `art_list_blobs` | read-only | Every blob with its size, its label and the tags pointing at it. |
