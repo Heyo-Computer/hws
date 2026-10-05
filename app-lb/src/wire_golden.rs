@@ -379,6 +379,8 @@ fn jwt_spec() -> DeploymentSpec {
             // redirected back; the cookie above carries the token on the return.
             login_url: Some("https://auth.example.com/login".into()),
             login_redirect_param: None,
+            authorize_url: None,
+            token_url: None,
         }),
         provider_ref: None,
     });

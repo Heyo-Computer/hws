@@ -1,7 +1,9 @@
 {
   "id": "remote",
   "routes": [
-    { "host": "git.us2.heyo.work" }
+    {
+      "host": "git.us5.heyo.work"
+    }
   ],
   "vm": {
     "driver": "firecracker",
@@ -12,18 +14,30 @@
     "disk_size_gb": 20,
     "env_vars": {
       "REMOTE_LISTEN": "0.0.0.0:9700",
-      "REMOTE_PUBLIC_URL": "https://git.us2.heyo.work",
+      "REMOTE_PUBLIC_URL": "https://git.us5.heyo.work",
       "REMOTE_S3_REGION": "us-east-2",
       "REMOTE_AUTH_URL": "https://auth.us2.heyo.work",
-      "REMOTE_APPLB_URL": "https://admin.us2.heyo.work",
+      "REMOTE_APPLB_URL": "https://admin.us5.heyo.work",
       "REMOTE_CACHE_DIR": "/workspace/cache",
-      "REMOTE_DEFAULT_ACCOUNT": "heyo",
-      "RUST_LOG": "info,remote=info"
+      "RUST_LOG": "info,remote=info",
+      "REMOTE_DEFAULT_ACCOUNT": "heyo"
     },
     "env_from": [
-      { "secret": "remote-s3", "key": "access-key-id", "as": "REMOTE_S3_ACCESS_KEY_ID" },
-      { "secret": "remote-s3", "key": "secret-access-key", "as": "REMOTE_S3_SECRET_ACCESS_KEY" },
-      { "secret": "remote", "key": "admin-token", "as": "REMOTE_ADMIN_TOKEN" }
+      {
+        "secret": "remote-s3",
+        "key": "access-key-id",
+        "as": "REMOTE_S3_ACCESS_KEY_ID"
+      },
+      {
+        "secret": "remote-s3",
+        "key": "secret-access-key",
+        "as": "REMOTE_S3_SECRET_ACCESS_KEY"
+      },
+      {
+        "secret": "remote",
+        "key": "admin-token",
+        "as": "REMOTE_ADMIN_TOKEN"
+      }
     ],
     "ttl_seconds": 0
   },
@@ -33,7 +47,10 @@
     "dockerfile": "remote/Dockerfile",
     "context": ".",
     "image_size_mb": 768,
-    "auth": { "secret": "github", "key": "token" }
+    "auth": {
+      "secret": "github",
+      "key": "token"
+    }
   },
   "scaling": {
     "min_replicas": 1,
@@ -44,5 +61,8 @@
     "cold_start_timeout_secs": 120,
     "drain_timeout_secs": 60
   },
-  "health": { "path": "/healthz", "timeout_secs": 2 }
+  "health": {
+    "path": "/healthz",
+    "timeout_secs": 2
+  }
 }

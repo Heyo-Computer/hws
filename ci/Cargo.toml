@@ -110,3 +110,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # Exercises axum handlers with `ServiceExt::oneshot`, so page tests bind no port.
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Exercise the real global-store protocol with separate disposable caches.
+artifacts = { path = "../artifacts", default-features = false, features = ["daemon"] }

@@ -13,9 +13,9 @@
       "ART_ROOT": "/workspace/store",
       "ART_LISTEN": "0.0.0.0:8080",
       "ART_MIN_FREE_BYTES": "536870912",
-      "ART_S3_BUCKET": "REPLACE_WITH_GLOBAL_ARTIFACTS_BUCKET",
+      "ART_S3_BUCKET": "heyo-artifact-hub",
       "ART_S3_PREFIX": "art/",
-      "ART_S3_REGION": "REPLACE_WITH_BUCKET_REGION",
+      "ART_S3_REGION": "us-east-2",
       "ART_CACHE_MAX_BYTES": "32212254720",
       "ART_HUB": "1",
       "ART_HUB_HOST": "hub.heyo.work"

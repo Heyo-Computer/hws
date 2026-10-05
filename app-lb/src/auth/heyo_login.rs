@@ -113,7 +113,7 @@ input,button {{ font:inherit; padding:.75rem; }} p {{ color:var(--text-muted); }
         let Some(token) = token.filter(|_| value.get("success").and_then(|v| v.as_bool()) == Some(true)) else {
             return Response::text(401, "Sign-in was refused.\n");
         };
-        if token.len() > 3800 || self.verify_jwt(policy, token).await.is_err() {
+        if token.len() > 3800 || self.verify_jwt(policy, token, req.host, None).await.is_err() {
             self.observe_auth(deployment, req, crate::siem::AuthAction::GateJwt, None);
             return Response::text(403, "This account is not permitted to access this application.\n");
         }
