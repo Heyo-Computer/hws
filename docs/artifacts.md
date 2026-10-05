@@ -318,24 +318,26 @@ Turning on `ART_S3_BUCKET` before backfilling is safe: local-only tags keep reso
 Publish (key holders only):
 
 ```sh
-heyctl artifact push postgres.ext4 --tag heyo/postgres:16 --public
+heyctl artifact push postgres.ext4 --tag heyo/postgres:18 --public
 # or, for an existing tag:
 art repo public heyo/postgres
-art repo describe heyo/postgres "PostgreSQL 16 on Debian, for heyvm"
+art repo describe heyo/postgres "PostgreSQL 18 on Debian, for heyvm"
 ```
 
 Pull (anyone):
 
 ```sh
-heyctl artifact pull hub.heyo.work/heyo/postgres:16 --dest ./postgres.ext4
-curl -fsSL https://hub.heyo.work/manifests/heyo/postgres:16
+heyctl artifact pull hub.heyo.work/heyo/postgres:18 --dest ./postgres.ext4
+curl -fsSL https://hub.heyo.work/manifests/heyo/postgres:18
 ```
 
 An app-lb deployment pulls with no `auth`:
 
 ```json
-"artifact": { "store": "https://hub.heyo.work", "ref": "heyo/postgres:16" }
+"artifact": { "store": "https://hub.heyo.work", "ref": "heyo/postgres:18" }
 ```
+
+`heyo/postgres` itself is built from [`images/postgres`](../images/postgres/README.md).
 
 ## Dashboard
 

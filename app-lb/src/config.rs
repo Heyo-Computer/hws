@@ -1882,7 +1882,7 @@ impl ArtifactSpec {
 /// None of them can travel outside the store when pasted into a URL path: the
 /// only separator any of them contains is a `/` between segments that cannot
 /// be dot entries, and the store routes `/tags/{*name}` as one parameter.
-fn is_valid_artifact_ref(r: &str) -> bool {
+pub(crate) fn is_valid_artifact_ref(r: &str) -> bool {
     if r.is_empty() || r.len() > 256 {
         return false;
     }

@@ -2916,6 +2916,8 @@ function renderGetStarted() {
   if (!show || interacting) return;
 
   const fc = info.fastcar;
+  const fromHub = fc.source === "hub" && !!fc.ref;
+  const hubUrl = info.hub && info.hub.url;
   const mcpUrl = info.mcp && info.mcp.url;
   const token = mintedSecret || "applb_…";
   const spec = JSON.stringify(fc.spec, null, 2);
@@ -2968,8 +2970,9 @@ function renderGetStarted() {
              (<code>APP_LB_ONBOARDING_MCP_URL</code>). Use the token with <code>heyctl</code> instead.</div>`}
       </li>
       <li><strong class="gs-step">Deploy fastcar</strong>
-        fastcar is an agent workspace, prebuilt as a public Firecracker image. This spec runs it in
-        mock mode, so it boots without any model keys. ${gateNote}
+        fastcar is an agent workspace, prebuilt as a public Firecracker image${fromHub
+          ? ` on the hub (<code>${esc(fc.ref)}</code>), pulled with no key`
+          : ""}. This spec runs it in mock mode, so it boots without any model keys. ${gateNote}
         ${imageNote}
         <textarea id="gs-spec" class="mono" readonly spellcheck="false">${esc(spec)}</textarea>
         <div class="gs-row">
@@ -2979,9 +2982,14 @@ function renderGetStarted() {
         <input id="gs-prompt" class="mono" readonly value="${claudeDeployPrompt(info)}">
         <div class="gs-row"><button class="btn mini" data-copy="gs-prompt">Copy request</button>
           <span class="note">Or save it as <code>fastcar.json</code> and run
-          <code>heyctl apply -f fastcar.json</code>.</span></div>
+          <code>heyctl apply -f fastcar.json</code>${fromHub
+            ? ` then <code>heyctl pull ${esc(fc.id)} --wait</code> (Claude's <code>applb_deploy</code> starts the pull itself)`
+            : ""}.</span></div>
         ${fc.url ? `<div class="note">It will answer at <a href="${esc(fc.url)}" target="_blank" rel="noopener">${esc(fc.url)}</a>
           — the first request boots the VM, which takes a minute or two.</div>` : ""}
+        ${hubUrl ? `<div class="note">Other public images, and what you publish yourself, are on the hub:
+          <a href="${esc(hubUrl)}" target="_blank" rel="noopener">browse public images</a>.
+          Publish your own under <code>${esc(info.namespace)}/…</code> with the <code>art_*</code> tools.</div>` : ""}
         <div class="note">To run it for real, store your keys as namespace secrets and reference them
           with <code>vm.env_from</code>: <code>INCEPTION_API_KEY</code>, <code>OPENROUTER_API_KEY</code>
           and optionally <code>TAVILY_API_KEY</code>. Then set <code>FASTCAR_MOCK</code> to <code>0</code>.</div>
