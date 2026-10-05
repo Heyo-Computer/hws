@@ -5,15 +5,27 @@ A new Heyo user goes from sign-up to a running app in three places:
 1. **Heyo (retail).** On first sign-in, a user with no namespace is sent to `/welcome` and asked to create one. Cloud creates the namespace and sets it up on app-lb: it declares the namespace and adds a `heyo` sign-in provider to it (see [Authentication](app-lb-auth.md)). Heyo then opens the app-lb dashboard for that namespace (`POST /login/handoff`).
 2. **The app-lb dashboard.** While the namespace is empty, the dashboard shows a **Get started** card, which can be reopened from the top bar. It has three steps:
    - **Mint a token.** This mints an `admin` token confined to the namespace, which expires within `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` (90 days by default). See [Namespace admins mint their own tokens](app-lb-auth.md#namespace-admins-mint-their-own-tokens).
-   - **Install the MCP server.** The card gives the endpoint (`APP_LB_ONBOARDING_MCP_URL`) and the command with the token filled in:
+   - **Add the MCP server to Claude Code.** Until a token is minted, this step tells the user to mint one first. Once it is minted, the step gives the endpoint (`APP_LB_ONBOARDING_MCP_URL`) and the command, with the token and the server name (`APP_LB_ONBOARDING_MCP_NAME`) filled in:
 
      ```sh
      claude mcp add --transport http heyo https://mcp.us2.heyo.work/mcp \
        --header "Authorization: Bearer applb_…"
      ```
 
+     It then says to restart Claude Code and check `/mcp`, or to ask Claude to run `heyo_status` on the server. For other clients that take a URL and headers, it gives the same server as an `mcpServers` JSON entry. The token is the server's only authority. It reaches the app-lb tools, git repos, and artifact-store tags under `<namespace>/` (see `mcp/deploy/vm.md`). Logs and CI tools need a fleet token.
    - **Deploy fastcar.** The card gives a deployment spec, built for this namespace by `GET /onboarding`, and a request to paste into Claude Code. The same spec also works with `heyctl apply -f`.
 3. **Claude Code.** Claude deploys the spec with `applb_deploy`. The first request to the URL boots the VM.
+
+## Configuring the MCP step
+
+An `applb_` token only works with the app-lb that minted it. Each region's MCP server checks tokens with its own app-lb, so each app-lb must point its card at the MCP server in its own region:
+
+| app-lb | `APP_LB_ONBOARDING_MCP_URL` | `APP_LB_ONBOARDING_MCP_NAME` |
+| --- | --- | --- |
+| us2 (`admin.us2.heyo.work`) | `https://mcp.us2.heyo.work/mcp` | `heyo` |
+| us5 (`admin.us5.heyo.work`) | `https://mcp.heyo.work/mcp` | `heyo-us5` |
+
+Without `APP_LB_ONBOARDING_MCP_URL`, the card leaves the MCP step out and points at `heyctl`. The name defaults to `heyo`, and only letters, digits, `-` and `_` are accepted, because it is pasted into a shell command. A distinct name per region lets one person add both servers.
 
 ## The fastcar spec
 
