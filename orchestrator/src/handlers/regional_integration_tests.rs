@@ -281,6 +281,7 @@ async fn two_real_gateways_scenario() -> Result<()> {
         command.current_dir(&directory).stdout(log.try_clone()?).stderr(log)
             .env("APP_LB_PROXY_ADDR",format!("127.0.0.1:{proxy}")).env("APP_LB_ADMIN_ADDR",format!("127.0.0.1:{admin}"))
             .env("APP_LB_PROXY_TLS_ADDR",format!("[::1]:{tls}")).env("APP_LB_TLS_CERT",root.join("cert.pem")).env("APP_LB_TLS_KEY",root.join("key.pem"))
+            .env("APP_LB_INSTANCE_LOCK",directory.join("instance.lock"))
             .env("SSL_CERT_FILE",root.join("ca.pem")).env("APP_LB_SIEM","0").env("APP_LB_DAEMON_URL","http://127.0.0.1:9")
             .env("APP_LB_ADMIN_AUTH","1").env("APP_LB_DASHBOARD_PASSWORD","unused-fixture-password").env("APP_LB_TOKENS_PATH",directory.join("tokens.json"));
         for (key, name) in [("MOUNTS","mounts"),("WORKSPACES","workspaces"),("IMAGES","images"),("BUILD","build")] {
