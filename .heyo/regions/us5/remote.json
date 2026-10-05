@@ -1,0 +1,68 @@
+{
+  "id": "remote",
+  "routes": [
+    {
+      "host": "git.us5.heyo.work"
+    }
+  ],
+  "vm": {
+    "driver": "firecracker",
+    "image": "remote",
+    "port": 9700,
+    "start_command": "setsid nohup /usr/local/bin/remote </dev/null >/var/log/remote.log 2>&1 &",
+    "size_class": "small",
+    "disk_size_gb": 20,
+    "env_vars": {
+      "REMOTE_LISTEN": "0.0.0.0:9700",
+      "REMOTE_PUBLIC_URL": "https://git.us5.heyo.work",
+      "REMOTE_S3_REGION": "us-east-2",
+      "REMOTE_AUTH_URL": "https://auth.us2.heyo.work",
+      "REMOTE_APPLB_URL": "https://admin.us5.heyo.work",
+      "REMOTE_CACHE_DIR": "/workspace/cache",
+      "RUST_LOG": "info,remote=info",
+      "REMOTE_DEFAULT_ACCOUNT": "heyo"
+    },
+    "env_from": [
+      {
+        "secret": "remote-s3",
+        "key": "access-key-id",
+        "as": "REMOTE_S3_ACCESS_KEY_ID"
+      },
+      {
+        "secret": "remote-s3",
+        "key": "secret-access-key",
+        "as": "REMOTE_S3_SECRET_ACCESS_KEY"
+      },
+      {
+        "secret": "remote",
+        "key": "admin-token",
+        "as": "REMOTE_ADMIN_TOKEN"
+      }
+    ],
+    "ttl_seconds": 0
+  },
+  "build": {
+    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
+    "ref": "main",
+    "dockerfile": "remote/Dockerfile",
+    "context": ".",
+    "image_size_mb": 768,
+    "auth": {
+      "secret": "github",
+      "key": "token"
+    }
+  },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "target_concurrency": 32,
+    "scale_to_zero_after_secs": 0,
+    "cold_start_timeout_secs": 120,
+    "drain_timeout_secs": 60
+  },
+  "health": {
+    "path": "/healthz",
+    "timeout_secs": 2
+  }
+}
