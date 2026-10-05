@@ -29,12 +29,14 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     pub auth: Arc<Authenticator>,
     pub git: Arc<GitService>,
+    /// The shared UI's theme cookie (`ui/ui.rs`).
+    pub ui: Arc<crate::heyo_ui::CookieConfig>,
 }
 
 pub fn router(state: AppState) -> Router {
     // Base64 inflates by a third; leave room for the JSON around it.
     let commit_limit = commit::MAX_COMMIT_BYTES * 3 / 2;
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/whoami", get(whoami))
         .route("/api/repos/{ns}", get(list_repos).post(create_repo))
@@ -46,8 +48,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tokens", get(list_tokens).post(mint_token))
         .route("/api/tokens/{id}", delete(revoke_token))
         .route("/{ns}/{repo}/info/refs", get(info_refs))
-        .route("/{ns}/{repo}/{service}", post(git_rpc))
-        .with_state(state)
+        .route("/{ns}/{repo}/{service}", post(git_rpc));
+    let router = if state.cfg.web {
+        router.merge(crate::web::routes())
+    } else {
+        router
+    };
+    router.with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +79,18 @@ impl ApiError {
     fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The error and its hint as one sentence, for a page.
+    pub fn message(&self) -> String {
+        match &self.hint {
+            Some(h) => format!("{} ({h})", self.error),
+            None => self.error.clone(),
+        }
     }
 }
 
@@ -104,7 +123,7 @@ impl From<GitError> for ApiError {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub type ApiResult<T> = Result<T, ApiError>;
 
 // ---------------------------------------------------------------------------
 // Auth helpers
@@ -146,7 +165,7 @@ fn require(p: &Principal, ns: &str, repo: Option<&str>, want: Tier) -> ApiResult
     }))
 }
 
-fn check_names(ns: &str, repo: Option<&str>) -> ApiResult<()> {
+pub fn check_names(ns: &str, repo: Option<&str>) -> ApiResult<()> {
     if !registry::valid_namespace(ns) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -174,7 +193,11 @@ async fn bound(s: &AppState, ns: &str) -> ApiResult<NamespaceBinding> {
     })
 }
 
-async fn existing(s: &AppState, ns: &str, repo: &str) -> ApiResult<(NamespaceBinding, RepoMeta)> {
+pub async fn existing(
+    s: &AppState,
+    ns: &str,
+    repo: &str,
+) -> ApiResult<(NamespaceBinding, RepoMeta)> {
     let b = bound(s, ns).await?;
     let meta = s.registry.repo(&b, ns, repo).await?.ok_or_else(|| {
         ApiError::new(
@@ -188,7 +211,7 @@ async fn existing(s: &AppState, ns: &str, repo: &str) -> ApiResult<(NamespaceBin
     Ok((b, meta))
 }
 
-fn clone_url(s: &AppState, ns: &str, repo: &str) -> String {
+pub fn clone_url(s: &AppState, ns: &str, repo: &str) -> String {
     format!("{}/{ns}/{repo}.git", s.cfg.public_url)
 }
 
@@ -238,12 +261,12 @@ async fn list_repos(
 }
 
 #[derive(Deserialize)]
-struct CreateRepo {
-    name: String,
+pub struct CreateRepo {
+    pub name: String,
     #[serde(default)]
-    description: Option<String>,
+    pub description: Option<String>,
     #[serde(default)]
-    default_branch: Option<String>,
+    pub default_branch: Option<String>,
 }
 
 async fn create_repo(
@@ -252,20 +275,41 @@ async fn create_repo(
     headers: HeaderMap,
     Json(body): Json<CreateRepo>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    check_names(&ns, Some(&body.name))?;
     let p = caller(&s, &headers).await?;
-    require(&p, &ns, None, Tier::Admin)?;
-    let branch = body.default_branch.unwrap_or_else(|| DEFAULT_BRANCH.into());
+    let meta = new_repo(&s, &p, &ns, body).await?;
+    let mut out = repo_json(&s, &meta);
+    out["push"] = json!(format!(
+        "git push {} HEAD:{}  (Basic auth, any username, password = a write token)",
+        clone_url(&s, &ns, &meta.name),
+        meta.default_branch
+    ));
+    Ok((StatusCode::CREATED, Json(out)))
+}
+
+/// Create a repo in `ns` as `p`, binding the namespace to a bucket first if
+/// this is its first repo. Shared by the API and the web UI.
+pub async fn new_repo(
+    s: &AppState,
+    p: &Principal,
+    ns: &str,
+    body: CreateRepo,
+) -> ApiResult<RepoMeta> {
+    check_names(ns, Some(&body.name))?;
+    require(p, ns, None, Tier::Admin)?;
+    let branch = body
+        .default_branch
+        .filter(|b| !b.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BRANCH.into());
     if !commit::valid_branch(&branch) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!("invalid default_branch {branch:?}"),
         ));
     }
-    let binding = match s.registry.binding(&ns).await? {
+    let binding = match s.registry.binding(ns).await? {
         Some(b) => b,
         None => {
-            let account = p.account_for(&ns).or_else(|| s.cfg.default_account.clone()).ok_or_else(|| {
+            let account = p.account_for(ns).or_else(|| s.cfg.default_account.clone()).ok_or_else(|| {
                 ApiError::new(
                     StatusCode::BAD_REQUEST,
                     format!("cannot tell which Heyo account owns namespace {ns}, so there is no bucket to put it in"),
@@ -275,7 +319,7 @@ async fn create_repo(
                      account), or set REMOTE_DEFAULT_ACCOUNT on a self-hosted fleet",
                 )
             })?;
-            s.registry.bind(&ns, &account).await?
+            s.registry.bind(ns, &account).await?
         }
     };
     let meta = s
@@ -284,21 +328,16 @@ async fn create_repo(
             &binding,
             RepoMeta {
                 name: body.name.clone(),
-                namespace: ns.clone(),
-                default_branch: branch.clone(),
+                namespace: ns.to_string(),
+                default_branch: branch,
                 created_at: crate::sigv4::now_unix(),
                 created_by: Some(p.subject.clone()),
-                description: body.description,
+                description: body.description.filter(|d| !d.trim().is_empty()),
             },
         )
         .await?;
     tracing::info!(namespace = %ns, repo = %meta.name, by = %p.subject, "created repo");
-    let mut out = repo_json(&s, &meta);
-    out["push"] = json!(format!(
-        "git push {} HEAD:{branch}  (Basic auth, any username, password = a write token)",
-        clone_url(&s, &ns, &meta.name)
-    ));
-    Ok((StatusCode::CREATED, Json(out)))
+    Ok(meta)
 }
 
 async fn get_repo(
@@ -326,24 +365,30 @@ async fn delete_repo(
     Path((ns, repo)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    check_names(&ns, Some(&repo))?;
     let p = caller(&s, &headers).await?;
-    require(&p, &ns, None, Tier::Admin)?;
-    let (b, _) = existing(&s, &ns, &repo).await?;
-    let r = RepoRef {
-        bucket: b.bucket.clone(),
-        ns: ns.clone(),
-        name: repo.clone(),
-    };
-    // Exclusive, so no push lands half into a deleted repo on this instance.
-    let ex = s.git.exclusive(&r).await?;
-    let objects = s.registry.delete_repo(&b, &ns, &repo).await?;
-    let _ = tokio::fs::remove_dir_all(&ex.path).await;
-    drop(ex);
-    tracing::info!(namespace = %ns, repo = %repo, by = %p.subject, "deleted repo");
+    let objects = remove_repo(&s, &p, &ns, &repo).await?;
     Ok(Json(
         json!({ "deleted": format!("{ns}/{repo}"), "objects": objects }),
     ))
+}
+
+/// Delete `ns/repo` as `p`. Shared by the API and the web UI.
+pub async fn remove_repo(s: &AppState, p: &Principal, ns: &str, repo: &str) -> ApiResult<usize> {
+    check_names(ns, Some(repo))?;
+    require(p, ns, None, Tier::Admin)?;
+    let (b, _) = existing(s, ns, repo).await?;
+    let r = RepoRef {
+        bucket: b.bucket.clone(),
+        ns: ns.to_string(),
+        name: repo.to_string(),
+    };
+    // Exclusive, so no push lands half into a deleted repo on this instance.
+    let ex = s.git.exclusive(&r).await?;
+    let objects = s.registry.delete_repo(&b, ns, repo).await?;
+    let _ = tokio::fs::remove_dir_all(&ex.path).await;
+    drop(ex);
+    tracing::info!(namespace = %ns, repo = %repo, by = %p.subject, "deleted repo");
+    Ok(objects)
 }
 
 async fn create_commit(

@@ -35,6 +35,8 @@ pub struct Config {
     pub git_bin: String,
     pub allow_force_push: bool,
     pub max_token_ttl_secs: u64,
+    /// Serve the web UI (`REMOTE_WEB`, on unless `0`/`false`/`off`).
+    pub web: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +101,8 @@ impl Config {
             allow_force_push: get("REMOTE_ALLOW_FORCE_PUSH")
                 .is_some_and(|v| v == "1" || v == "true"),
             max_token_ttl_secs: num("REMOTE_MAX_TOKEN_TTL_SECS", 30 * 86_400),
+            web: !get("REMOTE_WEB")
+                .is_some_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "no")),
             listen,
         }
     }

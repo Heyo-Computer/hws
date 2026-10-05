@@ -1,7 +1,7 @@
 # ui — one look, one sign-in, one theme
 
-Six apps in this repository serve a web UI: **app-lb**, **app-obs**, **ci**,
-**heyosecret**, **artifacts** and **queue**. They are one product and a person moves
+Seven apps in this repository serve a web UI: **app-lb**, **app-obs**, **ci**,
+**heyosecret**, **artifacts**, **queue** and **remote**. They are one product and a person moves
 between them in one sitting, so they share this directory.
 
 | File | What it is |
@@ -87,6 +87,7 @@ app takes an explicit opt-in before believing them:
 | heyosecret | `HEYOSECRET_DASHBOARD_GATE=1` | its own admin-password login |
 | app-obs | — | identity is displayed, never authorized on; `APP_OBS_API_TOKEN` gates |
 | app-lb | — | it *is* the gate; its own dashboard password still applies |
+| remote | — | not gated (git cannot pass a sign-in page); its own Heyo sign-in resolves namespaces through app-lb and the auth service |
 
 Setting a gate variable *and* a local password is refused at startup rather than
 resolved by precedence: whichever won, half the configuration would be a lie,
