@@ -46,6 +46,7 @@ mod regional_update;
 mod release;
 mod release_build;
 mod release_catalog;
+mod release_environment;
 mod release_git;
 mod release_policy;
 mod repos;
@@ -425,6 +426,7 @@ async fn start_execution(dispatcher: Arc<Dispatcher>) {
     vm_cleanup::spawn(dispatcher.clone());
     debug_report::spawn(dispatcher.clone());
     release_build::spawn(dispatcher.clone());
+    release_environment::spawn(dispatcher.clone());
 
     if let Err(e) = dispatcher.executor.mark_ready().await {
         eprintln!("ci: refusing to announce readiness — {e}");

@@ -173,9 +173,7 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, plan: &JobPlan, step: &st
     ensure!(d.runners.snapshot().locate(&target.runner_hd_id).is_some(), "mapped runner is not served by this controller");
     let run = d.store.get_run(&msg.run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(&target.repository, &run.repo_url), "repository is not authorized for this host");
-    let release = crate::release::get(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?
-        .filter(|r| r.status == "published").ok_or_else(|| anyhow::anyhow!("maintenance requires a confirmed merged release"))?;
-    let sha = release.prepared.release_sha;
+    let (sha, git_ref) = crate::release::deployment_source(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
     let publication = sqlx::query("SELECT a.archive_sha256,a.heyvm_sha256 FROM ci_service_archive a JOIN ci_step s ON s.id=a.step_id JOIN ci_job j ON j.id=a.job_id WHERE a.run_id=$1 AND a.sha=$2 AND a.archive_id=$3 AND a.orchestrator_url=$4 AND a.archive_user_id=$5 AND s.status='success' AND (a.job_id=$6 OR j.status='success')")
         .bind(&msg.run_id).bind(&sha).bind(archive).bind(target.orchestrator_url.trim_end_matches('/'))
         .bind(&target.artifact_user_id).bind(&msg.job_id).fetch_all(d.store.pool()).await?;
@@ -206,7 +204,7 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, plan: &JobPlan, step: &st
     ensure!(!bootstrap_fenced, "runner has an unresolved native heyvm bootstrap");
     let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,$2,$3,$4,$5,$6,'running','releasing',$7,$8 WHERE EXISTS(SELECT 1 FROM ci_job WHERE id=$4 AND status='running')")
         .bind(&id).bind(step).bind(&msg.run_id).bind(&msg.job_id).bind(&request.target.backend_server_id)
-        .bind(hash).bind(&sha).bind(&release.prepared.git_ref).execute(&mut *tx).await?.rows_affected();
+        .bind(hash).bind(&sha).bind(&git_ref).execute(&mut *tx).await?.rows_affected();
     ensure!(inserted == 1, "requesting job is no longer running");
     sqlx::query("INSERT INTO ci_host_maintenance(id,runner_hd_id,request,deadline) VALUES($1,$2,$3,now()+make_interval(secs=>$4))")
         .bind(&id).bind(&request.target.runner_hd_id).bind(value).bind(timeout.min(d.config.max_job_duration).as_secs() as f64).execute(&mut *tx).await?;
@@ -427,9 +425,8 @@ pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<Value> {
     let run = d.store.get_run(run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(&request.target.repository, &run.repo_url), "repository does not own target");
     crate::submission::authorize_publication(&d.store, run_id).await.map_err(anyhow::Error::msg)?;
-    let release = crate::release::get(&d.store, run_id).await.map_err(anyhow::Error::msg)?
-        .ok_or_else(|| anyhow::anyhow!("missing release"))?;
-    ensure!(release.status == "published" && release.prepared.release_sha == request.sha, "release provenance changed");
+    let (sha, _) = crate::release::deployment_source(&d.store, run_id).await.map_err(anyhow::Error::msg)?;
+    ensure!(sha == request.sha, "release provenance changed");
     let job = d.store.get_job(&job_id).await?.ok_or_else(|| anyhow::anyhow!("missing job"))?;
     let plan: JobPlan = serde_json::from_value(job.plan)?;
     let prefix = crate::secrets::Secrets::prefix(&run.workflow_id, plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));

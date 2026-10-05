@@ -80,7 +80,15 @@ fn exclusive(step: &crate::workflow::Step, keys: &[&str]) -> Result<()> {
 }
 
 pub async fn prepare(d: &Dispatcher, repository: &str, policy: &Policy) -> Result<Plan> {
-    let mut plan = submission_plan(policy)?;
+    let plan = submission_plan(policy)?;
+    let plan = prepare_plan(d, repository, policy, plan).await?;
+    crate::submission::validate_release_plan(&plan).map_err(anyhow::Error::msg)?;
+    Ok(plan)
+}
+
+/// Resolve the same operator targets for either submission or promotion jobs.
+/// The caller validates its own lifecycle (merge-first vs retained-bundle).
+pub(crate) async fn prepare_plan(d: &Dispatcher, repository: &str, policy: &Policy, mut plan: Plan) -> Result<Plan> {
     let mut effective = policy.clone();
     effective.placements.retain(|id, _| plan.jobs.iter().any(|job| &job.base_id == id));
     let mut snapshot = Snapshot { digest: String::new(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), token_expressions: Vec::new() };
@@ -193,7 +201,7 @@ fn bind(plan: &mut Plan, repository: &str, policy: &Policy, snapshot: &Snapshot)
             }
         }
     }
-    crate::submission::validate_release_plan(plan).map_err(anyhow::Error::msg)
+    Ok(())
 }
 
 #[cfg(test)]

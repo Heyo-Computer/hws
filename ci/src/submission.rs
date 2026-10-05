@@ -366,6 +366,9 @@ pub async fn artifact(
     store: &Store, release_run_id: &str, workflow: &str, name: &str,
     producer: Option<&str>,
 ) -> Result<crate::artifacts::StoredArtifact, String> {
+    if let Some(bundle) = crate::release_environment::bundle_for_run(store, release_run_id).await.map_err(|e| e.to_string())? {
+        return crate::release_environment::artifact(&bundle["manifest"], workflow, name, producer).map_err(|e| e.to_string());
+    }
     let run = artifact_run(store, release_run_id, workflow).await?;
     let rows = sqlx::query(
         "SELECT a.* FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id

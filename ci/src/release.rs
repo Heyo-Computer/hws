@@ -296,6 +296,18 @@ pub async fn merge(
     Ok(saved)
 }
 
+/// Deployment provenance is either a real Git publication or an admitted
+/// retained-bundle promotion. Never synthesize a publication receipt.
+pub async fn deployment_source(store: &Store, run_id: &str) -> Result<(String, String), String> {
+    if let Some(bundle) = crate::release_environment::bundle_for_run(store, run_id).await.map_err(|e| e.to_string())? {
+        return Ok((bundle["manifest"]["revision"].as_str().ok_or("missing bundle revision")?.into(),
+            bundle["git_ref"].as_str().ok_or("missing bundle branch")?.into()));
+    }
+    let release = get(store, run_id).await?.filter(|r| r.status == "published")
+        .ok_or("deployment requires a confirmed publication or retained release promotion")?;
+    Ok((release.prepared.release_sha, release.prepared.git_ref))
+}
+
 pub async fn get(store: &Store, run: &str) -> Result<Option<ReleaseRow>, String> {
     let row = sqlx::query("SELECT prepared,status,error FROM ci_release WHERE run_id=$1")
         .bind(run)

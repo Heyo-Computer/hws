@@ -328,9 +328,7 @@ pub(crate) async fn published_artifact(store: &Store, run_id: &str, repository: 
     let run = store.get_run(run_id).await.map_err(|e| e.to_string())?.ok_or("missing run")?;
     let repository = repository.ok_or("CI_CONTROLLER_REPOSITORY is not configured")?;
     if !crate::repos::same_repo(repository, &run.repo_url) { return Err("this repository may not replace the CI app".into()); }
-    let release = crate::release::get(store, run_id).await?
-        .filter(|r| r.status == "published").ok_or("CI update requires a confirmed merged release")?;
-    let sha = release.prepared.release_sha;
+    let (sha, _) = crate::release::deployment_source(store, run_id).await?;
     if sha != run.sha { return Err("build must match the exact merged revision; version-bump releases must rebuild first".into()); }
     let stored = if let Some(workflow) = workflow {
         crate::submission::artifact(store, run_id, workflow, artifact, None).await?

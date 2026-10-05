@@ -308,6 +308,8 @@ pub struct Config {
     pub release_policies: Option<String>,
     /// Opt-in build-only release cutoffs and component membership.
     pub release_builds: Option<String>,
+    /// Named environment promotion policies; absent means no automatic promotion.
+    pub release_environments: Option<String>,
     /// Operator-owned runner/backend/archive-database mapping; never workflow supplied.
     pub host_maintenance_targets: Option<String>,
     /// Repository-scoped managed systemd app-lb targets; never workflow supplied.
@@ -603,6 +605,10 @@ impl Config {
         crate::release_build::policies(release_builds.as_deref()).map_err(|error| ConfigError::BadValue {
             var: "CI_RELEASE_BUILDS", value: "<operator policy>".into(), reason: error.to_string(),
         })?;
+        let release_environments = opt("CI_RELEASE_ENVIRONMENTS");
+        crate::release_environment::policies(release_environments.as_deref()).map_err(|error| ConfigError::BadValue {
+            var: "CI_RELEASE_ENVIRONMENTS", value: "<operator policy>".into(), reason: error.to_string(),
+        })?;
 
         Ok(Self {
             name,
@@ -661,6 +667,7 @@ impl Config {
             expected_sha: opt("HEYO_REVISION").or_else(||opt("CI_EXPECTED_SHA")),
             release_policies: opt("CI_RELEASE_POLICIES"),
             release_builds,
+            release_environments,
             host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
             host_app_lb_targets: opt("CI_HOST_APP_LB_TARGETS"),
             host_heyvm_bootstrap_targets: opt("CI_HOST_HEYVM_BOOTSTRAP_TARGETS"),

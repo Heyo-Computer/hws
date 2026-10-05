@@ -2986,9 +2986,8 @@ impl Dispatcher {
                 let user = required("user-id")?;
                 let token = required("token")?;
                 let (sha, bytes) = if action == "ci/promote-service-archive" {
-                    let release = crate::release::get(&self.store, &msg.run_id).await
-                        .map_err(DispatchError::StepFailed)?.filter(|r| r.status == "published")
-                        .ok_or_else(|| DispatchError::StepFailed("artifact promotion requires a confirmed merged release".into()))?;
+                    let (release_sha, _) = crate::release::deployment_source(&self.store, &msg.run_id).await
+                        .map_err(DispatchError::StepFailed)?;
                     let stored = crate::submission::artifact(&self.store, &msg.run_id,
                         &required("workflow")?, &required("artifact")?, with("job").as_deref())
                         .await.map_err(DispatchError::Artifact)?;
@@ -2999,7 +2998,7 @@ impl Dispatcher {
                     }
                     let archive = crate::service_archive::validated_archive(&bytes, &path)
                         .map_err(DispatchError::Artifact)?;
-                    (release.prepared.release_sha, archive)
+                    (release_sha, archive)
                 } else {
                     let sha: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
                         .bind(&msg.job_id).fetch_one(self.store.pool()).await

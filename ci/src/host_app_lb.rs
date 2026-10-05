@@ -67,9 +67,8 @@ pub async fn deploy(d: &Dispatcher, msg: &JobMessage, step: &str, alias: &str, t
     let target = mapping(Some(raw), alias)?;
     let run = d.store.get_run(&msg.run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(&target.repository, &run.repo_url), "repository is not authorized for this host");
-    let release = crate::release::get(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?
-        .filter(|r| r.status == "published").ok_or_else(|| anyhow::anyhow!("host rollout requires confirmed merged release"))?;
-    ensure!(release.prepared.release_sha == run.sha, "artifact must match exact merged revision");
+    let (release_sha, git_ref) = crate::release::deployment_source(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
+    ensure!(release_sha == run.sha, "artifact must match exact merged revision");
     let artifact = crate::submission::artifact(&d.store, &msg.run_id, workflow, artifact, None).await.map_err(anyhow::Error::msg)?;
     ensure!(artifact.sink == "artifacts" && artifact.size_bytes <= bundle::LIMIT, "host rollout requires a bounded HTTP artifact");
     let blob = artifact.digest.as_ref().ok_or_else(|| anyhow::anyhow!("missing artifact digest"))?;
@@ -98,7 +97,7 @@ pub async fn deploy(d: &Dispatcher, msg: &JobMessage, step: &str, alias: &str, t
         eligible(&mut tx, msg).await?;
         sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$2,$3,$4,$5,$6,'submitting',$7,$8) ON CONFLICT(step_id) DO NOTHING")
             .bind(&id).bind(step).bind(&msg.run_id).bind(&msg.job_id).bind(&intent.target.deployment).bind(bundle::sha(&serde_json::to_vec(&value)?))
-            .bind(&run.sha).bind(&release.prepared.git_ref).execute(&mut *tx).await?;
+            .bind(&run.sha).bind(&git_ref).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO ci_host_app_lb(id,intent,deadline) VALUES($1,$2,now()+make_interval(secs=>$3)) ON CONFLICT(id) DO NOTHING")
             .bind(&id).bind(&value).bind(timeout.min(d.config.max_job_duration).as_secs() as f64).execute(&mut *tx).await?;
         let saved: Value = sqlx::query_scalar("SELECT intent FROM ci_host_app_lb WHERE id=$1").bind(&id).fetch_one(&mut *tx).await?;

@@ -214,10 +214,9 @@ pub async fn deploy(d: &Dispatcher, msg: &JobMessage, step: &str, target: Target
     ensure!(!target.deployment.is_empty() && target.deployment.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         "invalid deployment identifier");
     let base = crate::cd::app_lb_endpoint(&target.url).map_err(anyhow::Error::msg)?;
-    let release = crate::release::get(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?
-        .filter(|r| r.status == "published").ok_or_else(|| anyhow::anyhow!("rollout requires confirmed release"))?;
+    let (release_sha, git_ref) = crate::release::deployment_source(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
     let run = d.store.get_run(&msg.run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
-    ensure!(release.prepared.release_sha == run.sha, "validated bundle must match the exact merged revision");
+    ensure!(release_sha == run.sha, "validated bundle must match the exact merged revision");
     let stored = crate::submission::artifact(&d.store, &msg.run_id, workflow, artifact, None).await.map_err(anyhow::Error::msg)?;
     ensure!(stored.sink == "artifacts", "bundle rollout requires the HTTP artifact store");
     let blob = stored.digest.clone().ok_or_else(|| anyhow::anyhow!("missing artifact digest"))?;
@@ -254,7 +253,7 @@ pub async fn deploy(d: &Dispatcher, msg: &JobMessage, step: &str, target: Target
         ensure!(!matches!(status.as_str(), "cancelled" | "failure"), "run stopped before rollout");
         sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) SELECT $1,$2,$3,$4,$5,$6,'submitting',$7,$8 WHERE EXISTS(SELECT 1 FROM ci_job WHERE id=$4 AND status='running') ON CONFLICT(step_id) DO NOTHING")
             .bind(&id).bind(step).bind(&msg.run_id).bind(&msg.job_id).bind(&intent.target.deployment)
-            .bind(digest(&value)).bind(&run.sha).bind(&release.prepared.git_ref).execute(&mut *tx).await?;
+            .bind(digest(&value)).bind(&run.sha).bind(&git_ref).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO ci_service_rollout(id,intent,deadline) VALUES($1,$2,now()+make_interval(secs=>$3)) ON CONFLICT(id) DO NOTHING")
             .bind(&id).bind(&value).bind(timeout.min(d.config.max_job_duration).as_secs() as f64).execute(&mut *tx).await?;
         let saved: Value = sqlx::query_scalar("SELECT intent FROM ci_service_rollout WHERE id=$1").bind(&id).fetch_one(&mut *tx).await?;

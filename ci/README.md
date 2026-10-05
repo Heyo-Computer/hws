@@ -1837,6 +1837,44 @@ version-1 catalog registrations do not acquire these pins automatically and must
 not be treated as retained releases. No shared policies are changed by installing
 this code; activation and environment promotion are separate steps.
 
+### Environment promotion of retained releases
+
+`CI_RELEASE_ENVIRONMENTS` is an optional operator-owned YAML map keyed by named
+environment. Each entry contains `repository`, `workflow_id`, `mode` (`manual`
+by default, or `automatic`), optional `network`, `workflow`, `service_targets`
+and `placements`. Targets and placements use the existing mappings described
+below. Environment names are installation-wide and each belongs to one repository;
+use distinct names such as `hws-stage` and `retail-stage`. This is not an atomic
+multi-repository release.
+
+The embedded workflow uses `on: promotion`, with unconditional non-matrix jobs
+forming one sequential `needs` chain. Supported actions are `ci/rollout-service`,
+`ci/rollout-host-app-lb`, `ci/promote-service-archive`,
+`ci/host-heyvm-maintenance` and `ci/deploy-controller`. Build, merge, shell and
+bootstrap actions are refused. Artifact actions specify literal `workflow` and
+`artifact` inputs from the retained bundle. Region order comes from the operator
+workflow, not hardcoded region names or submitted repository changes.
+
+Admin `POST /release-promotions` accepts
+`{"environment":"hws-stage","bundle_id":"<catalog ID>","request_id":"<unique request>"}`.
+Admission validates the retained version-2 manifest and artifact selection,
+freezes the operator plan, and creates ordinary persisted CI jobs. Repeating the
+request returns the same run; reusing its ID for a different bundle is refused.
+One environment permits one promotion at a time; unrelated environments and CI
+jobs are not locked. `GET /release-environments` shows policy mode, current and
+previous successful bundles, active run, automation hold and recent history.
+These endpoints use the same admin identity and origin checks as release builds.
+
+Automatic mode selects the latest ready build by **build admission time**, not
+completion time. An older slow build cannot displace a newer completed build.
+Manual promotion holds automation, including in automatic environments. Failure
+also holds automation and leaves the last successful bundle unchanged. A failed
+partial rollout may leave mixed service revisions: inspect its deployment records;
+the current bundle is the last complete success, not a live inventory claim.
+Existing managed rollout recovery must settle before the active run is cleared.
+Hold/resume controls and rollback UI are added by the next stacked change; do not
+activate automatic policy before those controls are available.
+
 ### Release target resolution
 
 The operator workflow uses existing actions with logical aliases:
