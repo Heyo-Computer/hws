@@ -1,7 +1,9 @@
 {
-  "id": "artifacts-hub",
+  "id": "artifacts",
   "routes": [
-    { "host": "hub.heyo.work" }
+    {
+      "host": "art.us5.heyo.work"
+    }
   ],
   "vm": {
     "driver": "firecracker",
@@ -18,14 +20,24 @@
       "ART_S3_PREFIX": "art/",
       "ART_S3_REGION": "us-east-2",
       "ART_CACHE_MAX_BYTES": "32212254720",
-      "ART_HUB": "1",
-      "ART_HUB_HOST": "hub.heyo.work",
       "RUST_LOG": "art=info,artifacts=info"
     },
     "env_from": [
-      { "secret": "artifacts", "key": "api-key", "as": "ART_API_KEY" },
-      { "secret": "artifacts-s3", "key": "access-key-id", "as": "ART_S3_ACCESS_KEY_ID" },
-      { "secret": "artifacts-s3", "key": "secret-access-key", "as": "ART_S3_SECRET_ACCESS_KEY" }
+      {
+        "secret": "artifacts",
+        "key": "api-key",
+        "as": "ART_API_KEY"
+      },
+      {
+        "secret": "artifacts-s3",
+        "key": "access-key-id",
+        "as": "ART_S3_ACCESS_KEY_ID"
+      },
+      {
+        "secret": "artifacts-s3",
+        "key": "secret-access-key",
+        "as": "ART_S3_SECRET_ACCESS_KEY"
+      }
     ],
     "ttl_seconds": 0
   },
@@ -35,7 +47,10 @@
     "dockerfile": "artifacts/Dockerfile",
     "context": ".",
     "image_size_mb": 768,
-    "auth": { "secret": "github", "key": "token" }
+    "auth": {
+      "secret": "github",
+      "key": "token"
+    }
   },
   "scaling": {
     "min_replicas": 1,
@@ -46,5 +61,8 @@
     "cold_start_timeout_secs": 120,
     "drain_timeout_secs": 30
   },
-  "health": { "path": "/healthz", "timeout_secs": 2 }
+  "health": {
+    "path": "/healthz",
+    "timeout_secs": 2
+  }
 }

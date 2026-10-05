@@ -59,11 +59,16 @@ Do not restart, rebuild or `apply` the deployment during this step.
 
 ```sh
 SB=sb-XXXXXXXX       # the live replica's sandbox: `heyctl describe artifacts`
+jq .drives /tmp/firecracker-configs/heyo-$SB.json   # the store is the non-root drive
 mkdir -p /root/art-mig && cd /root/art-mig
-cp --sparse=always /var/lib/heyvm/run/$SB/data.ext4 data.ext4      # the copy is what we touch
+cp --sparse=always /var/lib/heyvm/kvm/$SB/mount0.ext4 data.ext4    # the copy is what we touch
 cp --sparse=always data.ext4 work.ext4 && e2fsck -fy work.ext4     # the journal was live
 mkdir tree && debugfs -R "rdump /store $PWD/tree" work.ext4         # ART_ROOT=/workspace/store
 ```
+
+With `vm.workspace` the store is the workspace mount, `kvm/<sb>/mount0.ext4`;
+`run/<sb>/` holds only the root filesystem. `art --root` must be an absolute
+path.
 
 If the extracted blobs come out dense, the backfill uploads their zeros too:
 larger, never wrong — the digest covers the logical bytes either way.
@@ -73,11 +78,12 @@ Check the copy is a whole store and agrees with the live one:
 ```sh
 /root/art-mig/art --root /root/art-mig/tree/store verify --all
 /root/art-mig/art --root /root/art-mig/tree/store ls --tags > tags-copy.txt
-curl -s -H "x-api-key: $KEY" https://art.us2.heyo.work/tags > tags-live.json
+heyctl exec artifacts -- /usr/local/bin/art --root /workspace/store ls --tags > tags-live.txt
 ```
 
-Every tag in `tags-live.json` should be in `tags-copy.txt` with the same
-digest. A tag written in the seconds since the copy is fine — step 4 picks it
+`diff <(sort tags-copy.txt) <(sort tags-live.txt)` should print nothing.
+Listing from inside the VM reads its store directly and keeps the API key out
+of the shell. A tag written in the seconds since the copy is fine — step 4 picks it
 up.
 
 Keep `data.ext4` until step 6 is signed off. It is the rollback.
@@ -86,8 +92,8 @@ Keep `data.ext4` until step 6 is signed off. It is the rollback.
 
 ```sh
 cd /root/art-mig
-./art --root tree/store s3 backfill --dry-run     # blobs, bytes, tags; any conflicts
-nohup ./art --root tree/store s3 backfill > backfill.log 2>&1 &
+./art --root /root/art-mig/tree/store s3 backfill --dry-run     # blobs, bytes, tags; any conflicts
+nohup ./art --root /root/art-mig/tree/store s3 backfill > backfill.log 2>&1 &
 ```
 
 Safe to interrupt and re-run: it skips what the bucket already holds and
@@ -127,7 +133,13 @@ Edit the deployment spec — the image, and only these `vm` fields:
 
 Remove `ART_API_KEY` from `env_vars` when it moves to `env_from`. Leave
 `vm.workspace` as it is for now (step 6). Then build and roll as usual
-(`heyctl set build artifacts --build-context .`, `heyctl build artifacts`).
+(`heyctl build artifacts --wait --logs`).
+
+Make the spec edit first and the build second. The edit rolls the pool onto
+the *old* image, which ignores `ART_S3_*`, so it proves the secrets resolve
+before anything depends on them; the build is the actual switch. Each roll is
+a short outage: a workspace deployment captures the old replica before the
+new one boots.
 
 What the new replica does on its first start, in order:
 
@@ -159,32 +171,31 @@ the workspace store instead of the run directory:
 ```sh
 cd /root/art-mig && mkdir tail
 art --root /var/lib/app-lb/workspace-store cat artifacts-workspace | tar -xz -C tail
-./art --root tail/store s3 backfill
+./art --root /root/art-mig/tail/store s3 backfill
 ```
 
-Then compare against the list from step 1 — every tag in `tags-live.json`
-must resolve:
+Then compare against the list from step 1 — every tag in `tags-live.txt`
+must be in the store with the same digest:
 
 ```sh
-for t in $(jq -r '.[].tag' tags-live.json); do
-  curl -s -o /dev/null -w "%{http_code} $t\n" -H "x-api-key: $KEY" \
-    "https://art.us2.heyo.work/tags/$t"
-done | grep -v '^200'          # prints nothing when all are there
+heyctl artifact ls | tail -n +2 | awk '{print $1"\t"$2}' | sort > tags-now.txt
+comm -23 <(sort tags-live.txt) tags-now.txt    # prints nothing when all are there
 ```
 
 ## 5. Verify with the real clients
 
 - [ ] `heyctl artifact ls` and `heyctl artifact describe <tag>` — same tags,
-      same digests as `tags-live.json`.
+      same digests as `tags-live.txt`.
 - [ ] A push: `heyctl artifact push <file> --tag migration-check`, then
       `./art --root /root/art-mig/empty s3 verify` shows it in the bucket.
 - [ ] Every deployment that pulls from the store (`artifact.ref`,
-      `build.store`, `vm.workspace.store`: on us2 that is bdr-agent, docs,
-      the marketing sites, fastcar's workspace, CI's artifact sink) —
-      `heyctl pull <deployment> --wait` succeeds for one of each kind.
+      `build.store`, `vm.workspace.store`; on us2 the marketing sites,
+      heyo-retail and fastcar's workspace) — `heyctl pull <deployment>
+      --wait` succeeds for one of each kind. A site whose `root` is a plain
+      directory (docs) does not use the store.
 - [ ] `/healthz` and the dashboard.
 - [ ] `art s3 gc --dry-run --min-age 24h` reports what it would remove, and
-      none of it is a tag in `tags-live.json`.
+      none of it is a tag in `tags-live.txt`.
 
 ## 6. Make the store VM disposable
 
@@ -193,7 +204,14 @@ the thing that can hurt: restoring a stale capture only warms the cache, but
 the capture/restore cycle is what has stalled art.us2 twice. Remove
 `vm.workspace` from the spec, so a replaced VM simply starts with an empty
 cache and refills from the bucket — no capture to go stale, no restore to
-block on. Delete `/root/art-mig` (it holds
+block on. In the same edit, raise `disk_size_gb` (it sized the workspace,
+and is now the cache) and `ART_CACHE_MAX_BYTES` to about 80% of it.
+
+Check that the pool rolled: `heyctl describe artifacts` should show a new
+sandbox with the new disk size. If it still shows the old one, and app-lb
+logged `adopting running VMs this deployment was not tracking`, the edit
+was saved but the VM was not replaced. `heyctl restart artifacts` replaces
+it. With no workspace there is nothing to capture. Delete `/root/art-mig` (it holds
 store contents and, in shell history, credentials) once this is signed off.
 
 ## Rollback
