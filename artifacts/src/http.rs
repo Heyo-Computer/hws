@@ -349,12 +349,17 @@ async fn authorize(State(st): State<ServeState>, mut req: Request, next: Next) -
     let Some(expected) = &st.api_key else {
         return next.run(req).await;
     };
-    let presented = bearer(req.headers()).or_else(|| {
-        req.headers()
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-    });
+    // `x-api-key` first: a request carrying both is the gate-plus-store shape,
+    // where `Authorization` holds an app-lb token for the gate in front of this
+    // store and `x-api-key` holds the store's own key (heyo-mcp sends exactly
+    // that). Taking the bearer first compared the gate's token against the key
+    // and refused every such request.
+    let presented = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| bearer(req.headers()));
 
     if presented.is_none()
         && (req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD)
@@ -1257,6 +1262,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "private again");
+    }
+
+    /// A gate in front of the store takes `Authorization`, so a client that
+    /// must pass both sends the gate's token there and the store's key in
+    /// `x-api-key`. The store answers to the key.
+    #[tokio::test]
+    async fn x_api_key_wins_over_a_bearer_meant_for_the_gate() {
+        let d = tmpdir();
+        let (app, _) = app(&d, Some("secret"), false);
+        let both = |key: &str| {
+            HttpRequest::get("/tags")
+                .header("authorization", "Bearer applb_gate_token")
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let r = app.clone().oneshot(both("secret")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        // A wrong key is still wrong, whatever rides beside it.
+        let r = app.clone().oneshot(both("wrong")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
