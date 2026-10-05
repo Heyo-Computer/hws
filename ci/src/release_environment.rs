@@ -373,6 +373,58 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
     Ok(json!({"environments":environments}))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationRequest {
+    pub environment: String,
+    pub held: bool,
+}
+
+pub async fn automation(d: &Dispatcher, request: AutomationRequest) -> Result<Value> {
+    let configured = policies(d.config.release_environments.as_deref())?;
+    let policy = configured
+        .get(&request.environment)
+        .ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
+    set_automation(&d.store, policy, request).await
+}
+
+async fn set_automation(
+    store: &Store,
+    policy: &Policy,
+    request: AutomationRequest,
+) -> Result<Value> {
+    ensure!(
+        request.held || policy.mode == Mode::Automatic,
+        "environment policy is manual"
+    );
+    let mut tx = store.pool().begin().await?;
+    sqlx::query("INSERT INTO ci_release_environment(name,repository) VALUES($1,$2) ON CONFLICT(name) DO NOTHING")
+        .bind(&request.environment).bind(&policy.repository).execute(&mut *tx).await?;
+    let row = sqlx::query(
+        "SELECT repository,active_run FROM ci_release_environment WHERE name=$1 FOR UPDATE",
+    )
+    .bind(&request.environment)
+    .fetch_one(&mut *tx)
+    .await?;
+    ensure!(
+        crate::repos::same_repo(row.get("repository"), &policy.repository),
+        "environment repository changed"
+    );
+    ensure!(
+        request.held || row.get::<Option<String>, _>("active_run").is_none(),
+        "wait for the active promotion before resuming automation"
+    );
+    sqlx::query(
+        "UPDATE ci_release_environment SET automation_held=$2,updated_at=now() WHERE name=$1",
+    )
+    .bind(&request.environment)
+    .bind(request.held)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(json!({"environment":request.environment,"automation_held":request.held}))
+}
+
 async fn finish(store: &Store) -> Result<()> {
     let mut tx = store.pool().begin().await?;
     let rows = sqlx::query("SELECT e.name,p.run_id,p.bundle_id,r.status FROM ci_release_environment e
@@ -382,7 +434,7 @@ async fn finish(store: &Store) -> Result<()> {
         FOR UPDATE OF e SKIP LOCKED").fetch_all(&mut *tx).await?;
     for row in rows {
         let success = row.get::<&str, _>("status") == "success";
-        sqlx::query("UPDATE ci_release_environment SET previous_bundle=CASE WHEN $2 THEN current_bundle ELSE previous_bundle END,
+        sqlx::query("UPDATE ci_release_environment SET previous_bundle=CASE WHEN $2 AND current_bundle IS DISTINCT FROM $3 THEN current_bundle ELSE previous_bundle END,
             current_bundle=CASE WHEN $2 THEN $3 ELSE current_bundle END,active_run=NULL,
             automation_held=automation_held OR NOT $2,updated_at=now() WHERE name=$1")
             .bind(row.get::<&str,_>("name")).bind(success).bind(row.get::<&str,_>("bundle_id")).execute(&mut *tx).await?;
@@ -655,5 +707,55 @@ mod tests {
             .unwrap();
         assert_eq!(state.get::<String, _>("current_bundle"), "new");
         assert_eq!(state.get::<String, _>("previous_bundle"), "old");
+        let toggle = |held| AutomationRequest {
+            environment: "stage".into(),
+            held,
+        };
+        assert!(
+            set_automation(&store, &policy, toggle(false))
+                .await
+                .is_err()
+        );
+        let automatic = Policy {
+            mode: Mode::Automatic,
+            ..policy.clone()
+        };
+        set_automation(&store, &automatic, toggle(false))
+            .await
+            .unwrap();
+        request.request_id = "repeat-current".into();
+        let repeated = persist(
+            &store, &request, &automatic, &bundle, &plan, &source, "policy", true,
+        )
+        .await
+        .unwrap();
+        // Hold may stop future admissions while the admitted rollout finishes.
+        set_automation(&store, &automatic, toggle(true))
+            .await
+            .unwrap();
+        assert!(
+            set_automation(&store, &automatic, toggle(false))
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id=$1")
+            .bind(repeated["run_id"].as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        finish(&store).await.unwrap();
+        let previous: String = sqlx::query_scalar(
+            "SELECT previous_bundle FROM ci_release_environment WHERE name='stage'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            previous, "old",
+            "redeploying current must preserve rollback target"
+        );
+        set_automation(&store, &automatic, toggle(false))
+            .await
+            .unwrap();
     }
 }

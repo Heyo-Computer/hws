@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Releases · Heyo control panel</title>
+  <link rel="stylesheet" href="/__ui/heyo.css"><script src="/__ui/theme.js" defer></script>
+  <style>
+    main { max-width: 1120px; margin: 24px auto; padding: 0 20px; }
+    section { margin: 24px 0; } .card { padding: 20px; margin: 12px 0; }
+    .row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
+    label { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 160px; }
+    input,select { width: 100%; padding: 10px; } button { cursor: pointer; }
+    .muted { opacity: .75; } code,td { overflow-wrap: anywhere; }
+    table { width: 100%; border-collapse: collapse; } th,td { padding: 10px; text-align: left; }
+    .scroll { overflow-x: auto; } #message { white-space: pre-wrap; }
+    h1 { font-size: 26px; } h2 { font-size: 19px; } h3 { font-size: 16px; }
+    @media (max-width: 860px) {
+      .topbar { position: static; height: auto; flex-wrap: wrap; gap: 12px; padding: 12px; }
+      .topbar-nav { display: flex; position: static; flex-direction: row; width: 100%; box-shadow: none; }
+      .topbar-right { width: 100%; flex-wrap: wrap; margin-left: 0; }
+    }
+  </style>
+</head>
+<body><main>
+  <header class="topbar">
+    <a class="topbar-brand" href="/dashboard">heyo · control panel</a>
+    <nav class="topbar-nav"><a href="/dashboard">Dashboard</a><a href="/releases" aria-current="page">Releases</a></nav>
+    <div class="topbar-right"><span>{{WHO}}</span><button class="theme-toggle" data-theme-toggle>Theme</button></div>
+  </header>
+  <h1>Releases</h1>
+  <p class="muted">Build once. Select a retained release for each environment. Manual deployment pauses automation until you resume it.</p>
+  <button id="refresh" class="btn">Refresh status</button>
+  <p id="message" role="status" aria-live="polite">Loading…</p>
+  <section aria-labelledby="build-title" class="card">
+    <h2 id="build-title">Build a release</h2>
+    <form id="build" class="row">
+      <label>Repository<input name="repository" required placeholder="Configured repository URL"></label>
+      <label>Release name<input name="name" required maxlength="128" placeholder="2026-10-05.1"></label>
+      <label>Merged revision (optional)<input name="revision" placeholder="Full SHA; blank uses branch tip"></label>
+      <button class="btn" type="submit">Build</button>
+    </form>
+    <p class="muted">Uses the configured build policy. Building does not deploy in manual environments.</p>
+    <div id="builds" class="scroll"></div>
+  </section>
+  <section aria-labelledby="environments-title"><h2 id="environments-title">Environments</h2><div id="environments"></div></section>
+  <section aria-labelledby="catalog-title"><h2 id="catalog-title">Available releases</h2>
+    <p class="muted">Only retained, complete builds can be deployed. Last complete success is not a live service inventory.</p>
+    <div id="catalog" class="card scroll"></div>
+  </section>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  let releases = [], environments = [], busy = false;
+  const pending = new Map();
+  async function api(resource, data) {
+    const response = await fetch('/api/releases/' + resource, {method: data ? 'POST' : 'GET',
+      headers: {'Content-Type':'application/json'}, body: data ? JSON.stringify(data) : undefined});
+    const value = await response.json();
+    if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
+    return value;
+  }
+  const label = id => { const r = releases.find(r => r.id === id); return r ? `${r.name} · ${r.manifest.revision.slice(0,12)}` : id || 'None'; };
+  async function catalog() {
+    const result = []; let before = '';
+    for (;;) {
+      const page = (await api('releases' + (before ? '?before=' + encodeURIComponent(before) : ''))).releases;
+      result.push(...page);
+      if (page.length < 100) return result;
+      const next = page[page.length - 1].id;
+      if (next === before) throw new Error('Release catalog cursor did not advance');
+      before = next;
+    }
+  }
+  async function refresh() {
+    const [available, env, builds] = await Promise.all([catalog(), api('release-environments'), api('release-builds')]);
+    releases = available; environments = env.environments;
+    $('catalog').innerHTML = releases.length ? `<table><thead><tr><th>Release</th><th>Revision</th><th>Repository</th><th>Retention</th></tr></thead><tbody>${releases.map(r => `<tr><td>${esc(r.name)}</td><td><code>${esc(r.manifest.revision)}</code></td><td>${esc(r.repository)}</td><td>${r.manifest.retained === true ? 'Retained' : 'Not deployable'}</td></tr>`).join('')}</tbody></table>` : 'No releases yet.';
+    $('builds').innerHTML = builds.builds.length ? `<table><thead><tr><th>Build</th><th>Revision</th><th>Status</th></tr></thead><tbody>${builds.builds.map(b => `<tr><td>${esc(b.name)}</td><td><code>${esc(b.revision)}</code></td><td>${esc(b.status)} ${esc(b.error || '')}</td></tr>`).join('')}</tbody></table>` : '<p>No builds yet.</p>';
+    $('environments').innerHTML = environments.map((e,i) => {
+      const s = e.state || {}, choices = releases.filter(r => r.repository === e.repository && r.manifest.retained === true);
+      return `<article class="card" data-env="${i}"><h3>${esc(e.name)}</h3>
+        <p>${esc(e.mode)} policy · automation ${s.automation_held ? 'held' : e.mode === 'automatic' ? 'enabled' : 'off'}</p>
+        <p>Last complete success: <strong>${esc(label(s.current_bundle))}</strong><br>Previous: ${esc(label(s.previous_bundle))}</p>
+        ${s.active_run ? `<p>Deployment in progress: <code>${esc(s.active_run)}</code></p>` : ''}
+        <div class="row"><label>Release<select class="selection" ${!choices.length ? 'disabled' : ''}>${choices.map(r => `<option value="${esc(r.id)}">${esc(label(r.id))}</option>`).join('')}</select></label>
+        <button class="btn" data-action="deploy" ${s.active_run || !choices.length ? 'disabled' : ''}>Deploy selected</button>
+        <button class="btn" data-action="rollback" ${s.active_run || !s.previous_bundle ? 'disabled' : ''}>Roll back</button>
+        <button class="btn" data-action="automation" ${e.mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button></div>
+        <details><summary>Deployment history</summary>${(e.history || []).map(p => `<p><code>${esc(p.run_id)}</code> · ${esc(label(p.bundle_id))} · ${esc(p.status)} ${esc(p.error || '')}<br>${(p.deployments || []).map(d => `${esc(d.service)}: ${esc(d.status)} (${esc(d.revision)})`).join('<br>')}</p>`).join('') || '<p>No deployments.</p>'}</details></article>`;
+    }).join('') || '<p>No environments configured. Set CI_RELEASE_ENVIRONMENTS before deploying.</p>';
+  }
+  async function perform(operation) {
+    if (busy) return;
+    busy = true; $('message').textContent = 'Working…';
+    try { await operation(); await refresh(); $('message').textContent = 'Status updated.'; }
+    catch (error) { $('message').textContent = error.message + '\nRefresh status before retrying an interrupted operation.'; }
+    finally { busy = false; }
+  }
+  $('refresh').onclick = () => perform(async () => {});
+  $('build').onsubmit = event => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(event.target));
+    if (!data.revision.trim()) delete data.revision;
+    perform(() => api('release-builds', data));
+  };
+  $('environments').onclick = event => {
+    const button = event.target.closest('button[data-action]'); if (!button || button.disabled || busy) return;
+    const card = button.closest('[data-env]'), e = environments[Number(card.dataset.env)], s = e.state || {};
+    if (button.dataset.action === 'automation') {
+      if (!s.automation_held || confirm(`Resume automatic deployment of the latest ready release to ${e.name}?`))
+        perform(() => api('release-automation', {environment:e.name,held:!s.automation_held}));
+      return;
+    }
+    const bundle = button.dataset.action === 'rollback' ? s.previous_bundle : card.querySelector('select').value;
+    if (!confirm(`Deploy ${label(bundle)} to ${e.name}? Automation will remain held. Running services will be changed.`)) return;
+    const key = `${e.name}:${bundle}`;
+    if (!pending.has(key)) pending.set(key, crypto.randomUUID());
+    perform(async () => {
+      await api('release-promotions', {environment:e.name,bundle_id:bundle,request_id:pending.get(key)});
+      pending.delete(key);
+    });
+  };
+  perform(async () => {});
+})();
+</script></body></html>

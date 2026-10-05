@@ -89,6 +89,7 @@ pub fn router(
         .route("/release-builds", get(release_builds).post(build_release))
         .route("/release-environments", get(release_environments))
         .route("/release-promotions", post(promote_release))
+        .route("/release-automation", post(release_automation))
         .route("/maintenance", get(maintenance_status))
         .route("/maintenance/{id}/{action}", post(maintenance_action))
         .route("/maintenance/runners/{runner}", get(runner_maintenance_status))
@@ -158,6 +159,15 @@ pub fn router(
         .merge(api::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), instance_http::route))
         .with_state(state)
+}
+
+async fn release_automation(State(state): State<AppState>, headers: HeaderMap,
+    Json(request): Json<crate::release_environment::AutomationRequest>) -> axum::response::Response {
+    if let Err(response) = may_manage(&state, &headers).await { return response; }
+    match crate::release_environment::automation(&state.dispatcher, request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+    }
 }
 
 async fn release_environments(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {

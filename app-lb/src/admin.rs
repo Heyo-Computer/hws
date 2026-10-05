@@ -34,6 +34,9 @@ use tokio::sync::Notify;
 #[path = "admin_login.rs"]
 mod browser_login;
 
+#[path = "release_console.rs"]
+mod release_console;
+
 /// The live dashboard page. Self-contained (no external fetches beyond the
 /// same-origin `/metrics` poll) so it works over an SSH tunnel with no assets.
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
@@ -6303,6 +6306,12 @@ fn router(state: AdminState) -> Router {
         .route("/control-plane/config", get(view_configuration).put(configure_views))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
 
+    let releases = Router::new()
+        .route("/releases", get(release_console::page))
+        .route("/api/releases/:resource", get(release_console::api).post(release_console::api))
+        .layer(axum::extract::DefaultBodyLimit::max(8192))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
+
     // Each plugin's own routes, under `/api/plugins/<id>/…`, on the same two
     // tiers. They carry no state of ours, so the gate goes on them here and
     // they are merged after `with_state` below.
@@ -6328,6 +6337,7 @@ fn router(state: AdminState) -> Router {
         .route("/login/handoff", post(browser_login::handoff)
             .layer(axum::extract::DefaultBodyLimit::max(8192)))
         .route("/logout", post(browser_login::logout))
+        .merge(releases)
         .merge(views)
         .merge(fleet)
         .merge(regional)

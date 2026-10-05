@@ -2523,6 +2523,38 @@ which appear only when there is more than one page.
 
 ### Shared control-plane view
 
+The **Releases** link opens `/releases`, the platform release console. CI remains
+the authority for builds, retained bundles and environment promotion; app-lb
+does not copy that state or run another rollout engine. The console shows release
+versions, recent builds, each environment's last complete success, previous
+version, active run and deployment history. It can build a release, deploy a
+selected version, roll back by promoting the previous version, and hold/resume
+automatic deployment. Refresh status to follow progress.
+
+Set `APP_LB_RELEASE_CI_URL=https://<authenticated-ci-ingress>` on each gateway.
+This is an operator-selected HTTPS origin, not a browser-supplied backend URL.
+CI's ingress must accept the same Heyo bearer identity and forward verified
+identity headers; the operator must also have CI admin access. Never point this
+at CI's ungated backend port. The console requires a federated fleet-admin
+sign-in; local Basic passwords and gateway-local tokens are never forwarded.
+Browser writes retain the existing same-origin session checks. The proxy allows
+only release APIs, does not follow redirects or retry mutations, and bounds
+response size and duration. An interrupted request can have been accepted:
+refresh history before retrying. No live configuration is changed by this code.
+
+Manual deployment holds automation so a newer build cannot immediately replace
+the selected version. Hold stops future promotion admissions, not an active
+rollout. Resume requires automatic policy and no active promotion. Rollback
+uses the same retained artifacts and managed rollout path, without rebuilding;
+repeating deployment of the current version preserves the previous version.
+Database/schema compatibility remains the release author's responsibility.
+
+For fixture-based browser verification, run
+`PLAYWRIGHT_MODULE=<installed-playwright> SCREENSHOT_DIR=<directory> node app-lb/testdata/releases.cjs`.
+It exercises selection, rollback and hold/resume payloads, disabled controls,
+responsive rendering and CI-unavailable errors. These fixtures are not live
+rollout or multi-region availability evidence.
+
 `/dashboard` defaults to the fleet overview on every gateway: shared applications
 and the same explicitly configured regional observations. It does not poll or show
 the entry gateway's local metrics, secrets, tokens, jobs or host inventory.

@@ -1872,8 +1872,14 @@ also holds automation and leaves the last successful bundle unchanged. A failed
 partial rollout may leave mixed service revisions: inspect its deployment records;
 the current bundle is the last complete success, not a live inventory claim.
 Existing managed rollout recovery must settle before the active run is cleared.
-Hold/resume controls and rollback UI are added by the next stacked change; do not
-activate automatic policy before those controls are available.
+Admin `POST /release-automation` takes `{"environment":"hws-stage","held":true}`
+to hold future promotions. `held:false` resumes automatic policy only when no
+promotion is active; it does not convert manual policy into automatic policy.
+An active rollout finishes normally while held. Retrying a failed promotion uses
+a new request ID; automation does not silently repeat an attempted release.
+The app-lb control panel's `/releases` page exposes these controls and rollback
+by promoting the previous retained bundle. Re-deploying the current bundle does
+not erase the previous distinct rollback target. No rebuild occurs on rollback.
 
 ### Release target resolution
 
