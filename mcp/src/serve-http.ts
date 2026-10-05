@@ -33,6 +33,8 @@ const MCP_PATH = "/mcp";
  * not already grant the same caller.
  */
 const ART_PATH = "/art";
+/** How long one request (an upload through `/art`, in practice) may take. */
+export const UPLOAD_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const ART_ROUTES = /^\/(blobs|manifests|tags|labels|public|usage)(\/|$)/;
 const ART_METHODS = new Set(["GET", "HEAD", "PUT", "DELETE"]);
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "content-length", "etag", "last-modified", "cache-control"];
@@ -178,6 +180,13 @@ export async function serveHttp(config: Config, port: number, host: string): Pro
     }
   });
 
+  // Node aborts any request whose body is still arriving after `requestTimeout`
+  // (5 minutes by default). The `/art` gateway exists for blobs too large for a
+  // tool call, and a 2 GB guest image at a home uplink's few MB/s takes longer
+  // than that, so the default reset every such upload partway through. Two
+  // hours fits a multi-GB push; `headersTimeout` stays at its default, so a
+  // client that never finishes its headers is still cut off quickly.
+  http.requestTimeout = UPLOAD_TIMEOUT_MS;
   await new Promise<void>((resolve) => http.listen(port, host, resolve));
   console.error(
     `heyo-mcp on http://${host}:${port}${MCP_PATH} — ${tools.length} tools; ` +
