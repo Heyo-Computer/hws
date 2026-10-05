@@ -1,0 +1,101 @@
+#!/bin/sh
+# Download (first time) and start a vanilla Minecraft: Java Edition server.
+#
+# Run from app-lb's start_command, the only process that receives env_vars:
+#
+#   "start_command": "/usr/local/bin/heyo-minecraft"
+#
+# Environment:
+#   EULA        required: TRUE means you accept https://aka.ms/MinecraftEULA
+#   MC_VERSION  a release id (26.3), or `latest` (default) for the newest release
+#   MC_DIR      server directory (default /workspace/minecraft)
+#   JAVA_OPTS   default -XX:MaxRAMPercentage=75 (75% of the VM's memory)
+#   SERVER_PORT default 25565
+#   MOTD, MAX_PLAYERS, DIFFICULTY, GAMEMODE, ONLINE_MODE, LEVEL_SEED,
+#   VIEW_DISTANCE: written into server.properties on every start when set.
+#   Anything else: edit $MC_DIR/server.properties.
+#
+# The jar comes from Mojang's own manifest and is checked against the SHA-1
+# that manifest gives. It is not in the image: the EULA forbids redistributing
+# it. `latest` is resolved once; the chosen version is pinned in
+# $MC_DIR/.heyo-version so a restart never upgrades a world by surprise. Set
+# MC_VERSION explicitly to move to another version.
+
+set -eu
+
+fg=0
+[ "${1:-}" = --foreground ] && fg=1
+
+MC_DIR="${MC_DIR:-/workspace/minecraft}"
+MANIFEST=https://piston-meta.mojang.com/mc/game/version_manifest_v2.json
+
+case "$(printf '%s' "${EULA:-}" | tr '[:lower:]' '[:upper:]')" in
+    TRUE) ;;
+    *)
+        echo "heyo-minecraft: EULA is not TRUE." >&2
+        echo "  Running a Minecraft server means accepting Mojang's EULA:" >&2
+        echo "  https://aka.ms/MinecraftEULA. Set EULA=TRUE in the deployment's" >&2
+        echo "  env_vars once you have read it." >&2
+        exit 64
+        ;;
+esac
+
+mkdir -p "$MC_DIR"
+cd "$MC_DIR"
+
+want="${MC_VERSION:-}"
+if [ -z "$want" ] || [ "$want" = latest ]; then
+    if [ -s .heyo-version ] && [ -z "${MC_VERSION:-}" ]; then
+        want="$(cat .heyo-version)"
+    else
+        want="$(curl -fsS "$MANIFEST" | jq -r .latest.release)"
+    fi
+fi
+
+jar="server-$want.jar"
+if [ ! -s "$jar" ]; then
+    echo "heyo-minecraft: downloading the $want server from Mojang"
+    vurl="$(curl -fsS "$MANIFEST" | jq -r --arg v "$want" '.versions[] | select(.id == $v) | .url')"
+    [ -n "$vurl" ] || { echo "heyo-minecraft: no version $want in Mojang's manifest" >&2; exit 65; }
+    meta="$(curl -fsS "$vurl")"
+    need="$(printf '%s' "$meta" | jq -r '.javaVersion.majorVersion // 0')"
+    have="$(cat /etc/heyo-java-major)"
+    if [ "$need" -gt "$have" ]; then
+        echo "heyo-minecraft: $want needs Java $need; this image has Java $have" >&2
+        exit 65
+    fi
+    url="$(printf '%s' "$meta" | jq -r .downloads.server.url)"
+    sha1="$(printf '%s' "$meta" | jq -r .downloads.server.sha1)"
+    curl -fsSL -o "$jar.part" "$url"
+    echo "$sha1  $jar.part" | sha1sum -c - >/dev/null
+    mv "$jar.part" "$jar"
+fi
+printf '%s\n' "$want" > .heyo-version
+echo "eula=true" > eula.txt
+
+# server.properties: create on first start, then apply whichever overrides are
+# set. Unset variables leave the file alone, so hand edits survive.
+touch server.properties
+setprop() {
+    [ -n "$2" ] || return 0
+    grep -v "^$1=" server.properties > server.properties.tmp || true
+    printf '%s=%s\n' "$1" "$2" >> server.properties.tmp
+    mv server.properties.tmp server.properties
+}
+setprop server-port "${SERVER_PORT:-25565}"
+setprop motd "${MOTD:-}"
+setprop max-players "${MAX_PLAYERS:-}"
+setprop difficulty "${DIFFICULTY:-}"
+setprop gamemode "${GAMEMODE:-}"
+setprop online-mode "${ONLINE_MODE:-}"
+setprop level-seed "${LEVEL_SEED:-}"
+setprop view-distance "${VIEW_DISTANCE:-}"
+
+chown -R minecraft:minecraft "$MC_DIR"
+set -- java ${JAVA_OPTS:--XX:MaxRAMPercentage=75} -jar "$jar" nogui
+if [ "$fg" = 1 ]; then
+    exec setpriv --reuid=minecraft --regid=minecraft --init-groups "$@"
+fi
+setsid nohup setpriv --reuid=minecraft --regid=minecraft --init-groups "$@" \
+    </dev/null >>"$MC_DIR/console.log" 2>&1 &
+echo "heyo-minecraft: $want starting; log at $MC_DIR/console.log"
