@@ -59,7 +59,7 @@ import { repoTools } from "./tools/repos.js";
 export function buildTools(config: Config): Tool[] {
   const clients = makeClients(config);
   const actions = actionTools(clients, config);
-  return [
+  const all = [
     ...diagnosticTools(clients, config),
     ...(cloudUsable(config) ? sandboxTools(clients) : []),
     ...feedTools(clients),
@@ -68,8 +68,88 @@ export function buildTools(config: Config): Tool[] {
     // `repo_deploy` finishes by handing a spec to `applb_deploy`, so the two
     // cannot disagree about how a deployment is registered and built.
     ...repoTools(clients, config, actions.find((t) => t.name === "applb_deploy")),
-  ].map(validated);
+  ];
+  // A hosted server lists only what it can reach. Over stdio the operator's own
+  // config decides, and a tool that explains what to set is worth keeping.
+  const usable = config.http ? all.filter((t) => reachable(t.name, config)) : all;
+  return workflowFirst(usable).map(validated);
 }
+
+/** Tools that do nothing but call ci, or app-obs. */
+const CI_ONLY = new Set([
+  "diagnose_ci_job",
+  "ci_run_status",
+  "ci_run_logs",
+  "ci_cancel_run",
+  "ci_destroy_vm",
+  "ci_cleanup_failed_vms",
+  "ci_request",
+]);
+const OBS_ONLY = new Set(["deployment_logs", "obs_request"]);
+
+function reachable(name: string, config: Config): boolean {
+  if (CI_ONLY.has(name)) return Boolean(config.ci);
+  if (OBS_ONLY.has(name)) return Boolean(config.obs);
+  return true;
+}
+
+/**
+ * The tools a new user's first task needs, in the order they need them.
+ *
+ * Some MCP clients keep only the first N tools a server lists (Cursor keeps
+ * 40). Registration order put the repo tools last, at 55-60 of 60, so on such
+ * a client an agent could read about `repo_create` in `applb_spec_schema` and
+ * then find no such tool: exactly the create-a-repo-and-deploy-it workflow the
+ * onboarding steers people to. Listing these first keeps that workflow whole
+ * under any cap of at least this many tools.
+ */
+export const WORKFLOW_FIRST = [
+  "heyo_status",
+  "heyo_whoami",
+  "repo_create",
+  "repo_write_files",
+  "repo_deploy",
+  "repo_list",
+  "repo_get",
+  "repo_token",
+  "applb_spec_schema",
+  "applb_deploy",
+  "applb_list_deployments",
+  "applb_get_deployment",
+  "applb_deployment_jobs",
+  "applb_job",
+  "applb_build",
+  "applb_pull",
+  "art_publish_files",
+  "art_publish",
+  "art_fetch",
+  "art_list_tags",
+  "diagnose_deployment",
+  "deployment_logs",
+];
+
+function workflowFirst<T extends { name: string }>(tools: T[]): T[] {
+  const rank = new Map(WORKFLOW_FIRST.map((n, i) => [n, i]));
+  const first = tools.filter((t) => rank.has(t.name)).sort((a, b) => rank.get(a.name)! - rank.get(b.name)!);
+  return [...first, ...tools.filter((t) => !rank.has(t.name))];
+}
+
+/**
+ * Sent to the client at `initialize`; most hosts put it in front of the model.
+ * Short on purpose: the common paths, and where the details live.
+ */
+export const INSTRUCTIONS = `Heyo: deploy apps to app-lb from git repos or published artifacts.
+
+Your token confines you to one namespace. Pass that namespace to repo_* tools; artifact tags you publish must start with "<namespace>/".
+
+Static site (HTML/JS/CSS, already built):
+  1. repo_create  2. repo_write_files with the BUILT files  3. repo_deploy with kind "site" and a host.
+  To update it, repo_write_files again, then repo_deploy again. Nothing in the repo is run.
+  Alternative: art_publish_files (tag "<namespace>/<name>:<version>"), then applb_deploy a site whose artifact is {store, ref}.
+
+App with a Dockerfile: repo_create, repo_write_files including the Dockerfile, then repo_deploy with kind "vm", port and start_command.
+
+applb_spec_schema has the full deployment spec and examples. When something fails, run heyo_status first, then diagnose_deployment.`;
 
 /**
  * Check a tool's arguments against the schema it advertises, before its handler
@@ -268,7 +348,7 @@ export function createServer(config: Config, tools: Tool[]): Server {
     // Resources and prompts alongside tools. Declaring them is what makes a
     // host start issuing `resources/list` and `prompts/list`, so the handlers
     // are registered in the same breath — see `registerResources`.
-    { capabilities: { tools: {}, resources: {}, prompts: {} } },
+    { capabilities: { tools: {}, resources: {}, prompts: {} }, instructions: INSTRUCTIONS },
   );
   registerResources(server);
 
