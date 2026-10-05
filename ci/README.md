@@ -1766,16 +1766,75 @@ references prevent deletion of its artifact provenance. External artifact-store
 retention must also retain catalog-referenced blobs; a database reference alone
 does not prevent S3 lifecycle expiry or operator deletion.
 
-This foundation does **not** schedule daily builds, deploy a bundle, alter an
-environment's current version, implement rollback, or add UI controls. A bundle
-only covers its explicitly selected components. Path-filtered submit builds
-must not be presented as a complete daily platform release. The next layer must
-freeze a main revision at its cutoff, build the configured component set with
-existing CI jobs, verify complete results and artifact availability, and then
-seal the release. Environment promotion must reuse those exact artifacts.
+Registration alone does **not** deploy a bundle, alter an environment's current
+version, implement rollback, or add UI controls. A bundle only covers its
+explicitly selected components. Path-filtered submit builds must not be
+presented as a complete daily platform release. The build-only path below
+freezes the revision and builds the configured component set independently.
+Environment promotion must reuse those exact artifacts.
 Stage automatic policy and production manual policy will be operator-owned;
 manual deployment in an automatic environment needs an explicit hold/resume so
 automation cannot immediately overwrite the operator's selected version.
+
+### Manual and daily release builds
+
+`CI_RELEASE_BUILDS` is an opt-in, operator-owned YAML map keyed by repository.
+It selects the build workflows and their exact artifact producers, not deployment
+targets. It does not change `git submit` or enable environment promotion.
+Example (the workflow scope, network and component names must match the installation):
+
+```yaml
+https://github.com/Heyo-Computer/hws.git:
+  workflow_id: public
+  git_ref: refs/heads/main
+  network: platform
+  daily_utc_minute: 120 # 02:00 UTC; omit for manual builds only
+  components:
+    ci:
+      workflow: .ci/workflows/ci.yml
+      job: release
+      artifact: ci
+```
+
+An admin can `POST /release-builds` with
+`{"repository":"https://github.com/Heyo-Computer/hws.git","name":"2026-10-05.1","revision":"<full merged SHA>"}`.
+Omit `revision` to freeze the configured branch tip observed at admission.
+The SHA must be an ancestor of that branch, not an unmerged PR. Repeating a name
+returns the same build; a name cannot select a different revision. Retry a failed
+build under a new name. `GET /release-builds` returns recent builds, errors and
+the existing CI run IDs. Both routes require dashboard admin identity and origin
+checks, just like `/releases`; they must remain behind app-lb authentication.
+
+The daily scheduler admits at most one `daily-YYYY-MM-DD` build per repository
+after its UTC cutoff. Multiple CI instances use the same unique database row;
+there is no global CI execution lock. After downtime it admits today's build
+using the branch tip at recovery, not a fabricated historical midnight revision.
+It does not backfill missed dates. Configure every instance with the same policy.
+
+Admission atomically stores the exact source descriptor, policy, run membership
+and expanded job plans. Existing CI scheduling and recovery execute those jobs.
+Submit path filters do not reduce the build: every configured workflow runs,
+with `changed()` evaluating against an unknown/full change set. Other job and
+step conditions still apply; a skipped required producer cannot seal a release.
+These workflows may run build/test shell and `ci/upload-artifact`, but not
+deployment/publication builtins. Build admission strips upload aliases and public
+publication flags so it cannot move `latest`. Shell commands are trusted merged
+repository code and must themselves be build-only.
+
+Only complete successful results produce a version-2 catalog bundle. It records
+the exact revision, build ID and every component's digest, size and provenance.
+CI adds dedicated `release-*` artifact-store tags as garbage-collection roots
+before committing the bundle. Pin failures leave the build retryable without
+rebuilding. A failed job or invalid producer fails only that release build.
+The database retains artifact provenance; ordinary build-tag cleanup must not
+delete release tags. Releasing these roots needs an explicit retirement policy,
+not the short-lived build-artifact age limit.
+
+This path currently requires `CI_ARTIFACT_SINK=artifacts`. Disk and S3 sinks fail
+admission because they do not implement verified release retention. Older
+version-1 catalog registrations do not acquire these pins automatically and must
+not be treated as retained releases. No shared policies are changed by installing
+this code; activation and environment promotion are separate steps.
 
 ### Release target resolution
 

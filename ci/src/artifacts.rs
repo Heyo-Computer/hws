@@ -159,6 +159,21 @@ pub trait ArtifactSink: Send + Sync {
     /// Implementations must not treat `uri` as a caller-provided URL/path.
     async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError>;
 
+    /// Give an already-stored artifact a release-owned GC root. Sinks must
+    /// opt in: retaining a path or object without a verifiable pin would let a
+    /// release catalog promise durability the sink does not provide.
+    async fn retain(
+        &self,
+        stored: &StoredArtifact,
+        key: &str,
+    ) -> Result<StoredArtifact, ArtifactError> {
+        let _ = (stored, key);
+        Err(ArtifactError::Misconfigured(format!(
+            "the {} sink does not support release artifact retention",
+            self.kind()
+        )))
+    }
+
     /// How a guest can push a blob into this sink directly, if it can at all.
     /// `None` — the default — means the orchestrator reads the bytes out of the
     /// guest and calls [`Self::put`].
@@ -491,6 +506,61 @@ impl ArtifactSink for ArtifactsSink {
         Ok(bytes)
     }
 
+    async fn retain(
+        &self,
+        stored: &StoredArtifact,
+        key: &str,
+    ) -> Result<StoredArtifact, ArtifactError> {
+        if stored.sink != self.kind() {
+            return Err(ArtifactError::InvalidRecord(format!(
+                "artifact was recorded for the {} sink, not artifacts",
+                stored.sink
+            )));
+        }
+        if key.is_empty() {
+            return Err(ArtifactError::InvalidRecord("release retention key is empty".into()));
+        }
+        let digest = stored.digest.as_deref().ok_or_else(|| {
+            ArtifactError::InvalidRecord("artifacts-store record has no digest".into())
+        })?;
+        validate_digest(digest)?;
+        self.verify_retained_blob(digest, stored.size_bytes).await?;
+
+        // Build this only from immutable recorded content. In particular, do
+        // not resolve `stored.uri`: it may be an alias that has since moved.
+        let manifest = retained_manifest(digest, stored.size_bytes, key);
+        let response = self
+            .auth(self.http.put(format!("{}/manifests", self.config.url)))
+            .json(&manifest)
+            .send()
+            .await
+            .map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        let body: Value = check(response, "storing a release retention manifest")
+            .await?
+            .json()
+            .await
+            .map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        let manifest_digest = body.get("digest").and_then(Value::as_str).ok_or_else(|| {
+            ArtifactError::InvalidRecord("store omitted the retention manifest digest".into())
+        })?;
+        validate_digest(manifest_digest)?;
+
+        let tag = retention_tag(key);
+        let response = self
+            .auth(self.http.put(format!("{}/tags/{tag}", self.config.url)))
+            .header(reqwest::header::CONTENT_TYPE, "text/plain")
+            .body(manifest_digest.to_string())
+            .send()
+            .await
+            .map_err(|e| ArtifactError::Transport(e.to_string()))?;
+        check(response, "setting a release retention tag").await?;
+
+        // Confirm the root still points at bytes with the recorded identity
+        // after pinning; this also catches a store/configuration mismatch.
+        self.verify_retained_blob(digest, stored.size_bytes).await?;
+        Ok(StoredArtifact { uri: tag, ..stored.clone() })
+    }
+
     fn guest_push(&self) -> Option<GuestPush> {
         Some(GuestPush {
             url: self.config.url_for_guest().to_string(),
@@ -553,6 +623,21 @@ impl ArtifactSink for ArtifactsSink {
 }
 
 impl ArtifactsSink {
+    async fn verify_retained_blob(&self, digest: &str, size: u64) -> Result<(), ArtifactError> {
+        match self.stat_blob(digest).await? {
+            None => Err(ArtifactError::InvalidRecord(format!(
+                "retained blob {digest} is missing from the configured artifact store"
+            ))),
+            Some(None) => Err(ArtifactError::InvalidRecord(format!(
+                "HEAD for retained blob {digest} omitted Content-Length"
+            ))),
+            Some(Some(actual)) if actual != size => Err(ArtifactError::InvalidRecord(format!(
+                "retained blob {digest} has size {actual}, expected {size}"
+            ))),
+            Some(Some(_)) => Ok(()),
+        }
+    }
+
     /// `HEAD /blobs/{digest}`: `None` when the store does not have it, else the
     /// size it reports (which a store predating `Content-Length` on HEAD may
     /// omit, hence the inner `Option`).
@@ -774,6 +859,22 @@ fn rootfs_manifest(digest: &str, size: u64, image: &str) -> serde_json::Value {
         "entries": [{"name":"rootfs.ext4", "digest":digest, "size":size}],
         "annotations": {"heyvm.image":image, "heyvm.nominal_size":size.to_string(), "heyvm.primitive":"ext4_raw"}
     })
+}
+
+fn retained_manifest(digest: &str, size: u64, key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "kind": "generic",
+        "entries": [{"name": "artifact", "digest": digest, "size": size}],
+        "annotations": {"ci.release.key": key}
+    })
+}
+
+/// Stable, legal GC-root name. The complete key is hashed rather than
+/// sanitised or truncated; 224 hash bits fit after the release prefix.
+fn retention_tag(key: &str) -> String {
+    let hash = hex::encode(Sha256::digest(key.as_bytes()));
+    format!("release-{}", &hash[..56])
 }
 
 fn validate_digest(digest: &str) -> Result<(), ArtifactError> {
@@ -1287,6 +1388,7 @@ mod tests {
         url: String,
         /// `HEAD /blobs/{digest}` answers: digest → size the store claims.
         blobs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+        head_without_size: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
         manifests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         tags: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
         /// Digests `PUT /public/{digest}` was called for.
@@ -1305,12 +1407,14 @@ mod tests {
             #[derive(Clone)]
             struct St {
                 blobs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+                head_without_size: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
                 manifests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
                 tags: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
                 publics: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
             }
             let st = St {
                 blobs: Default::default(),
+                head_without_size: Default::default(),
                 manifests: Default::default(),
                 tags: Default::default(),
                 publics: Default::default(),
@@ -1331,6 +1435,13 @@ mod tests {
                     "/blobs/{digest}",
                     axum::routing::head(
                         |State(st): State<St>, axum::extract::Path(d): axum::extract::Path<String>| async move {
+                            if st.head_without_size.lock().unwrap().contains(&d) {
+                                return (
+                                    reqwest::StatusCode::OK,
+                                    [(axum::http::header::CONTENT_LENGTH, "unknown")],
+                                )
+                                    .into_response();
+                            }
                             match st.blobs.lock().unwrap().get(&d) {
                                 Some(size) => (
                                     reqwest::StatusCode::OK,
@@ -1347,7 +1458,7 @@ mod tests {
                     put(
                         |State(st): State<St>, axum::Json(m): axum::Json<serde_json::Value>| async move {
                             st.manifests.lock().unwrap().push(m);
-                            axum::Json(serde_json::json!({ "digest": "manifest-digest" }))
+                            axum::Json(serde_json::json!({ "digest": DIGEST }))
                         },
                     ),
                 )
@@ -1369,6 +1480,7 @@ mod tests {
             Self {
                 url: format!("http://{addr}"),
                 blobs: st.blobs,
+                head_without_size: st.head_without_size,
                 manifests: st.manifests,
                 tags: st.tags,
                 publics: st.publics,
@@ -1385,6 +1497,79 @@ mod tests {
     }
 
     const DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    fn stored_artifact() -> StoredArtifact {
+        StoredArtifact {
+            sink: "artifacts",
+            digest: Some(DIGEST.into()),
+            size_bytes: 3,
+            uri: "ci-original-build-tag".into(),
+            public_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_sinks_refuse_retention_by_default() {
+        let sink = DiskSink { root: PathBuf::from("unused") };
+        let err = sink.retain(&stored_artifact(), "release/component").await.unwrap_err();
+        assert!(matches!(err, ArtifactError::Misconfigured(_)), "{err}");
+        assert!(err.to_string().contains("does not support"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn retention_refuses_a_record_from_another_sink() {
+        let store = FakeStore::start().await;
+        let foreign = StoredArtifact { sink: "s3", ..stored_artifact() };
+        let err = store.sink().retain(&foreign, "release/component").await.unwrap_err();
+        assert!(matches!(err, ArtifactError::InvalidRecord(_)), "{err}");
+        assert!(store.manifests.lock().unwrap().is_empty());
+        assert!(store.tags.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retention_is_content_addressed_deterministic_and_preserves_the_build_tag() {
+        let store = FakeStore::start().await;
+        store.blobs.lock().unwrap().insert(DIGEST.into(), 3);
+        let original = stored_artifact();
+        let key = "product/release-with-a-full-identifier/component-linux-arm64";
+        let first = store.sink().retain(&original, key).await.unwrap();
+        let second = store.sink().retain(&original, key).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(original.uri, "ci-original-build-tag");
+        assert_eq!(first.digest, original.digest);
+        assert_eq!(first.size_bytes, original.size_bytes);
+        assert_eq!(first.uri, retention_tag(key));
+        assert_eq!(first.uri.len(), 64);
+        assert!(first.uri.starts_with("release-"));
+        let manifests = store.manifests.lock().unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0], manifests[1], "retry changed immutable content");
+        assert_eq!(manifests[0]["entries"][0]["digest"], DIGEST);
+        assert_eq!(manifests[0]["entries"][0]["size"], 3);
+        assert_eq!(manifests[0]["annotations"]["ci.release.key"], key);
+        let tags = store.tags.lock().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert!(tags.iter().all(|(tag, target)| tag == &first.uri && target == DIGEST));
+        assert!(!tags.iter().any(|(tag, _)| tag == &original.uri));
+    }
+
+    #[tokio::test]
+    async fn retention_requires_a_head_size_matching_the_record() {
+        let store = FakeStore::start().await;
+        store.head_without_size.lock().unwrap().insert(DIGEST.into());
+        let err = store.sink().retain(&stored_artifact(), "release/a").await.unwrap_err();
+        assert!(err.to_string().contains("omitted Content-Length"), "{err}");
+        assert!(store.manifests.lock().unwrap().is_empty());
+        assert!(store.tags.lock().unwrap().is_empty());
+
+        store.head_without_size.lock().unwrap().clear();
+        store.blobs.lock().unwrap().insert(DIGEST.into(), 4);
+        let err = store.sink().retain(&stored_artifact(), "release/a").await.unwrap_err();
+        assert!(err.to_string().contains("size 4, expected 3"), "{err}");
+        assert!(store.manifests.lock().unwrap().is_empty());
+        assert!(store.tags.lock().unwrap().is_empty());
+    }
 
     /// The guest's word is not enough: a blob it says it pushed is looked up
     /// in the store, and a missing one is an error before any manifest or
@@ -1433,8 +1618,8 @@ mod tests {
         assert_eq!(
             tags.as_slice(),
             &[
-                (tag_for(&r), "manifest-digest".to_string()),
-                ("retail-live".to_string(), "manifest-digest".to_string()),
+                (tag_for(&r), DIGEST.to_string()),
+                ("retail-live".to_string(), DIGEST.to_string()),
             ],
             "both tags, and both resolving to the manifest the run stored",
         );
@@ -1481,7 +1666,7 @@ mod tests {
         let tags = store.tags.lock().unwrap();
         assert_eq!(
             tags.as_slice(),
-            &[(tag_for(&aref()), "manifest-digest".to_string())]
+            &[(tag_for(&aref()), DIGEST.to_string())]
         );
         assert!(
             store.publics.lock().unwrap().is_empty(),

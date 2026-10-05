@@ -306,6 +306,8 @@ pub struct Config {
     pub expected_sha: Option<String>,
     /// Operator-owned repository release policies, injected from HeyoSecret.
     pub release_policies: Option<String>,
+    /// Opt-in build-only release cutoffs and component membership.
+    pub release_builds: Option<String>,
     /// Operator-owned runner/backend/archive-database mapping; never workflow supplied.
     pub host_maintenance_targets: Option<String>,
     /// Repository-scoped managed systemd app-lb targets; never workflow supplied.
@@ -597,6 +599,11 @@ impl Config {
             })
             .unwrap_or_default();
 
+        let release_builds = opt("CI_RELEASE_BUILDS");
+        crate::release_build::policies(release_builds.as_deref()).map_err(|error| ConfigError::BadValue {
+            var: "CI_RELEASE_BUILDS", value: "<operator policy>".into(), reason: error.to_string(),
+        })?;
+
         Ok(Self {
             name,
             listen_addr,
@@ -653,6 +660,7 @@ impl Config {
             application_lifecycle_token: opt("CI_APPLICATION_LIFECYCLE_TOKEN"),
             expected_sha: opt("HEYO_REVISION").or_else(||opt("CI_EXPECTED_SHA")),
             release_policies: opt("CI_RELEASE_POLICIES"),
+            release_builds,
             host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
             host_app_lb_targets: opt("CI_HOST_APP_LB_TARGETS"),
             host_heyvm_bootstrap_targets: opt("CI_HOST_HEYVM_BOOTSTRAP_TARGETS"),

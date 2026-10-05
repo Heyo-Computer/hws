@@ -16,6 +16,54 @@ use toml_edit::{DocumentMut, value};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Freeze a merged revision and its build definitions without checking out or
+/// executing repository files. An explicit cutoff must belong to the operator's
+/// branch; an omitted cutoff means the branch tip observed by this fetch.
+pub async fn build_source(
+    repository: &str, git_ref: &str, revision: Option<&str>, paths: &[String],
+    token: &str, max_bytes: usize,
+) -> Result<crate::trigger::GitPatchSource, String> {
+    validate_repository(repository)?;
+    validate_ref(git_ref)?;
+    if let Some(sha) = revision { validate_sha(sha)?; }
+    for path in paths {
+        if path.is_empty() || path.contains(':') || Path::new(path).components().any(|c| !matches!(c, Component::Normal(_))) {
+            return Err("build workflow must be a repository-relative file path".into());
+        }
+    }
+    let dir = TempDir::new().map_err(|e| e.to_string())?;
+    let home = TempDir::new().map_err(|e| e.to_string())?;
+    let home_s = home.path().to_string_lossy();
+    let key = format!("http.{repository}.extraHeader");
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    let auth = format!("Authorization: Basic {basic}");
+    let env = [("HOME", home_s.as_ref()), ("XDG_CONFIG_HOME", home_s.as_ref()),
+        ("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_TERMINAL_PROMPT", "0"), ("GIT_CONFIG_COUNT", "3"),
+        ("GIT_CONFIG_KEY_0", "credential.helper"), ("GIT_CONFIG_VALUE_0", ""),
+        ("GIT_CONFIG_KEY_1", "protocol.ext.allow"), ("GIT_CONFIG_VALUE_1", "never"),
+        ("GIT_CONFIG_KEY_2", key.as_str()), ("GIT_CONFIG_VALUE_2", auth.as_str())];
+    let safe = |e| redact_git_error(e, token);
+    git(dir.path(), &env, &["init", "--quiet"], None).await.map_err(safe)?;
+    git(dir.path(), &env, &["fetch", "--quiet", "--no-tags", repository, git_ref], None).await.map_err(safe)?;
+    let tip = git(dir.path(), &env, &["rev-parse", "FETCH_HEAD^{commit}"], None).await.map_err(safe)?;
+    let sha = revision.unwrap_or(tip.trim()).to_lowercase();
+    git(dir.path(), &env, &["merge-base", "--is-ancestor", &sha, tip.trim()], None).await
+        .map_err(|_| "build cutoff is not a merged ancestor of the configured branch".to_string())?;
+    let tree = git(dir.path(), &env, &["rev-parse", &format!("{sha}^{{tree}}")], None).await.map_err(safe)?;
+    let mut workflows = BTreeMap::new();
+    let mut size = 0;
+    for path in paths {
+        let text = git(dir.path(), &env, &["show", &format!("{sha}:{path}")], None).await.map_err(safe)?;
+        size += text.len();
+        if size > max_bytes { return Err("release build definitions exceed source limit".into()); }
+        workflows.insert(path.clone(), text);
+    }
+    Ok(crate::trigger::GitPatchSource { base_revision: sha, target_tree: tree.trim().into(),
+        patch_base64: String::new(), workflows,
+        changes: crate::paths::Changes::unknown("full release build; path filters do not select components") })
+}
+
 /// Materialize source only for the controller's authorized release operation.
 pub async fn materialize(repository:&str,descriptor:&crate::trigger::GitPatchSource,token:&str)->Result<TempDir,String>{
     validate_repository(repository)?;validate_sha(&descriptor.base_revision)?;
@@ -835,6 +883,32 @@ mod tests {
             ],
         );
         run(repo, &["rev-parse", "HEAD"])
+    }
+
+    #[tokio::test]
+    async fn release_build_freezes_merged_cutoff_not_unmerged_branch_or_new_tip() {
+        let repo = TempDir::new().unwrap();
+        run(repo.path(), &["init", "-b", "main"]);
+        fs::write(repo.path().join("build.yml"), "old definition\n").unwrap();
+        let old = commit(repo.path(), "initial");
+        run(repo.path(), &["checkout", "-b", "unmerged"]);
+        fs::write(repo.path().join("build.yml"), "unmerged definition\n").unwrap();
+        let unmerged = commit(repo.path(), "unmerged");
+        run(repo.path(), &["checkout", "main"]);
+        fs::write(repo.path().join("build.yml"), "new definition\n").unwrap();
+        let new = commit(repo.path(), "new main");
+        let paths = vec!["build.yml".into()];
+        let pinned = build_source(repo.path().to_str().unwrap(), "refs/heads/main", Some(&old), &paths, "", 1000).await.unwrap();
+        assert_eq!(pinned.base_revision, old);
+        assert_eq!(pinned.workflows["build.yml"], "old definition\n");
+        assert_eq!(pinned.target_tree, run(repo.path(), &["rev-parse", &format!("{old}^{{tree}}") ]));
+        assert!(pinned.patch().unwrap().is_empty());
+        let latest = build_source(repo.path().to_str().unwrap(), "refs/heads/main", None, &paths, "", 1000).await.unwrap();
+        assert_eq!(latest.base_revision, new);
+        assert_eq!(latest.workflows["build.yml"], "new definition\n");
+        assert!(build_source(repo.path().to_str().unwrap(), "refs/heads/main", Some(&unmerged), &paths, "", 1000).await.is_err());
+        assert!(build_source(repo.path().to_str().unwrap(), "refs/heads/main", None, &paths, "", 3).await.is_err());
+        assert_eq!(run(repo.path(), &["rev-parse", "HEAD"]), new, "reading must never publish or modify the branch");
     }
 
     #[tokio::test]

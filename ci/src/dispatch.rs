@@ -1184,7 +1184,7 @@ impl Dispatcher {
     /// to a queue nobody consumes, and the answer to "why is my build stuck" is
     /// a row in a table nobody thinks to look at. A submit that cannot run is an
     /// error at the client, naming the network and what is actually served.
-    fn assign_network(
+    pub(crate) fn assign_network(
         &self,
         plan: &mut crate::plan::Plan,
         default_network: Option<&str>,

@@ -44,6 +44,7 @@ mod plan;
 mod pool;
 mod regional_update;
 mod release;
+mod release_build;
 mod release_catalog;
 mod release_git;
 mod release_policy;
@@ -423,6 +424,7 @@ async fn start_execution(dispatcher: Arc<Dispatcher>) {
     host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());
     vm_cleanup::spawn(dispatcher.clone());
     debug_report::spawn(dispatcher.clone());
+    release_build::spawn(dispatcher.clone());
 
     if let Err(e) = dispatcher.executor.mark_ready().await {
         eprintln!("ci: refusing to announce readiness — {e}");
