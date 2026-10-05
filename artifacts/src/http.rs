@@ -182,16 +182,7 @@ pub async fn serve(config: &Config, opts: ServeOptions) -> crate::Result<()> {
         "artifacts daemon listening"
     );
 
-    // The hub claims `/` on its own host; everywhere else `/` is the
-    // dashboard's, when there is one.
-    let app = match &hub {
-        Some(h) if h.host.is_some() || web.is_none() => crate::hub::router(hub.clone())
-            .merge(router(state))
-            .merge(web_router_without_index(web)),
-        _ => router(state)
-            .merge(web_router(web))
-            .merge(crate::hub::router(hub.clone())),
-    };
+    let app = listener_app(state, web, hub);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await
@@ -199,6 +190,34 @@ pub async fn serve(config: &Config, opts: ServeOptions) -> crate::Result<()> {
             context: "http server".into(),
             source: e,
         })
+}
+
+/// Everything one `art serve` listener answers: the API, the dashboard when
+/// configured, and the hub when enabled.
+pub(crate) fn listener_app(
+    state: ServeState,
+    web: Option<crate::web::WebState>,
+    hub: Option<crate::hub::HubState>,
+) -> Router {
+    // The dashboard router carries the shared stylesheet and fonts; a hub
+    // without a dashboard needs them mounted on their own, or every hub page
+    // renders as unstyled HTML.
+    let ui = if hub.is_some() && web.is_none() {
+        ui_router()
+    } else {
+        Router::new()
+    };
+    // The hub claims `/` on its own host; everywhere else `/` is the
+    // dashboard's, when there is one.
+    match &hub {
+        Some(h) if h.host.is_some() || web.is_none() => crate::hub::router(hub.clone())
+            .merge(router(state))
+            .merge(web_router_without_index(web)),
+        _ => router(state)
+            .merge(web_router(web))
+            .merge(crate::hub::router(hub.clone())),
+    }
+    .merge(ui)
 }
 
 pub fn router(state: ServeState) -> Router {
@@ -299,6 +318,12 @@ fn dashboard_router(web: Option<crate::web::WebState>, index: bool) -> Router {
         .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// The shared UI assets alone, for a listener that serves the hub but no
+/// dashboard. Public bytes, so no gate.
+pub fn ui_router() -> Router {
+    Router::new().route("/__ui/{*path}", get(ui_asset))
 }
 
 /// `GET /__ui/{*path}` — the platform stylesheet, theme toggle and fonts.
@@ -1739,6 +1764,52 @@ mod tests {
             "sign-out button on open dashboard"
         );
         assert!(!html.contains("/logout"), "logout form on open dashboard");
+    }
+
+    #[tokio::test]
+    async fn every_listener_with_a_page_serves_the_shared_stylesheet() {
+        // hub.heyo.work runs the hub with no dashboard, and shipped its pages
+        // pointing at a /__ui/heyo.css nothing served.
+        let d = tmpdir();
+        let store = store_at(&d);
+        let state = || ServeState::new(Registry::local(store.clone()), None, false);
+        let hub = |host: Option<&str>| {
+            Some(crate::hub::HubState {
+                registry: Registry::local(store.clone()),
+                host: host.map(str::to_string),
+                ui: Default::default(),
+            })
+        };
+        let web = || {
+            Some(crate::web::WebState {
+                store: store.clone(),
+                auth: None,
+                gate: false,
+                ui: Default::default(),
+            })
+        };
+        for (what, app) in [
+            ("hub alone", listener_app(state(), None, hub(None))),
+            (
+                "hub on its host",
+                listener_app(state(), None, hub(Some("hub.example"))),
+            ),
+            (
+                "hub and dashboard",
+                listener_app(state(), web(), hub(Some("hub.example"))),
+            ),
+            ("dashboard alone", listener_app(state(), web(), None)),
+        ] {
+            let r = app
+                .oneshot(
+                    HttpRequest::get("/__ui/heyo.css")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{what}");
+        }
     }
 
     #[tokio::test]
