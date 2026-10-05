@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 
 import { loadConfig, withForwardedAuth } from "./config.js";
 import { buildTools, toolListing } from "./server.js";
+import { serveHttp, UPLOAD_TIMEOUT_MS } from "./serve-http.js";
 
 const ART = { ART_URL: "http://127.0.0.1:8080", ART_API_KEY: "k" };
 const overHttp = () => buildTools(loadConfig({ ...ART, HEYO_MCP_HTTP_PORT: "9650" }));
@@ -77,5 +78,16 @@ test("over HTTP, a path is never read, and the error says what to send", async (
     assert.equal(stub.calls.length, 0, "a refused publish still went to the store");
   } finally {
     stub.restore();
+  }
+});
+
+test("the server lets a large upload through /art run past Node's 5-minute default", async () => {
+  const server = await serveHttp(loadConfig({ ...ART, HEYO_MCP_HTTP_PORT: "1" }), 0, "127.0.0.1");
+  try {
+    assert.equal(server.requestTimeout, UPLOAD_TIMEOUT_MS);
+    assert.ok(server.requestTimeout >= 60 * 60 * 1000, "a multi-GB push needs at least an hour");
+    assert.ok(server.headersTimeout <= 60_000, "slow headers are still cut off quickly");
+  } finally {
+    server.close();
   }
 });
