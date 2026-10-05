@@ -17,6 +17,7 @@
       "REMOTE_AUTH_URL": "https://auth.us2.heyo.work",
       "REMOTE_APPLB_URL": "https://admin.us2.heyo.work",
       "REMOTE_CACHE_DIR": "/workspace/cache",
+      "REMOTE_DEFAULT_ACCOUNT": "heyo",
       "RUST_LOG": "info,remote=info"
     },
     "env_from": [
