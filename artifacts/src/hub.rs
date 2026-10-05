@@ -357,7 +357,12 @@ h3 { font-size: 12px; margin: var(--gap-3) 0 var(--gap-1); }
 
 fn page(st: &HubState, headers: &header::HeaderMap, title: &str, body: Markup) -> Markup {
     let cookies = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
-    let attrs = st.ui.attrs(cookies);
+    shell(&st.ui.attrs(cookies), title, body)
+}
+
+/// `attrs` empty is an error page: no request in hand, so the toggle script
+/// applies the reader's theme on load (see `web::Shell::default`).
+fn shell(attrs: &str, title: &str, body: Markup) -> Markup {
     let nav: Vec<(&str, &str, bool)> = vec![("Repositories", "/hub", true)];
     html! {
         (DOCTYPE)
@@ -391,13 +396,30 @@ impl From<crate::Error> for HubError {
 impl IntoResponse for HubError {
     fn into_response(self) -> Response {
         match self {
-            HubError::NotFound => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+            HubError::NotFound => {
+                error_page(StatusCode::NOT_FOUND, "No public repository by that name.")
+            }
             HubError::Internal(e) => {
                 tracing::error!(error = %e, "hub page failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "something went wrong\n").into_response()
+                error_page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.")
             }
         }
     }
+}
+
+fn error_page(status: StatusCode, message: &str) -> Response {
+    let body = shell(
+        "",
+        &status.as_u16().to_string(),
+        html! {
+            section {
+                h1 { (status.as_u16()) }
+                p.about { (message) }
+                p { a href="/hub" { "← back to the hub" } }
+            }
+        },
+    );
+    (status, body).into_response()
 }
 
 #[cfg(test)]
@@ -495,6 +517,10 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(get(&app, "/hub/r/../etc").await.0, StatusCode::NOT_FOUND);
+
+        // A 404 is a hub page, not bare text.
+        let (_, body) = get(&app, "/hub/r/acme/nope").await;
+        assert!(body.contains(r#"href="/__ui/heyo.css""#), "{body}");
     }
 
     #[tokio::test]
