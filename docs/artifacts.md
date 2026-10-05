@@ -337,7 +337,7 @@ An app-lb deployment pulls with no `auth`:
 "artifact": { "store": "https://hub.heyo.work", "ref": "heyo/postgres:18" }
 ```
 
-`heyo/postgres` itself is built from [`images/postgres`](../images/postgres/README.md).
+The `heyo/*` images on the hub (alpine, debian, ubuntu, postgres) are built from [`images/`](../images/README.md).
 
 ## Dashboard
 
