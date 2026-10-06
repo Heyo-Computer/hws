@@ -1109,8 +1109,14 @@ impl Puller {
                  manifest nor a blob for {reference:?}"
             ));
         }
+        // The header, not `content_length()`: on a HEAD that reads the (empty)
+        // body's size hint and answers 0, which would then pass every size
+        // check as "smaller than the blob".
         let size = resp
-            .content_length()
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
             .ok_or_else(|| format!("HEAD {url} answered without a Content-Length"))?;
         Ok((digest, size))
     }
@@ -2115,6 +2121,27 @@ mod tests {
         assert_eq!(human(512), "512 B");
         assert_eq!(human(1024), "1.0 KiB");
         assert_eq!(human(21_474_836_480), "20.0 GiB");
+    }
+
+    /// A store with no manifest for the ref falls back to `HEAD /blobs`, and
+    /// the size must come from that response's Content-Length header —
+    /// `content_length()` on a HEAD is the empty body's hint, which is 0.
+    #[tokio::test]
+    async fn a_blob_resolved_by_head_has_its_real_size() {
+        use axum::{Router, routing::get};
+        let app = Router::new()
+            .route("/manifests/:id", get(|| async { axum::http::StatusCode::NOT_FOUND }))
+            .route("/blobs/:id", get(|| async { vec![0u8; 1234] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let puller = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let digest = "3".repeat(64);
+        let (got, size) = puller.resolve_remote(&base, &digest, None, None).await.unwrap();
+        assert_eq!((got.as_str(), size), (digest.as_str(), 1234));
+        server.abort();
     }
 
     #[tokio::test]
