@@ -766,7 +766,10 @@ mod tests {
         let (summary, secret) = s.mint(new("ci", AdminScope::Admin, &["*"]), 100).unwrap();
         let stored = s.get(&summary.id).unwrap();
 
-        let raw = secret.rsplit_once('_').unwrap().1;
+        // Base64url secrets can themselves contain underscores. Remove only
+        // the known public prefix and id, not part of the random secret.
+        let raw = secret.strip_prefix(&format!("applb_{}_", summary.id)).unwrap();
+        assert_eq!(raw.len(), 43);
         assert!(!stored.hash.contains(raw), "the secret is stored in the clear");
 
         // Nor through anything the API can return.
