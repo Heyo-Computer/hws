@@ -16,6 +16,7 @@ Heyo Web Services documentation. These pages are also published at
 - [Authentication](app-lb-auth.md) — admin API credentials, app-tokens and sign-in gates
 - [heyctl](heyctl.md) — the command-line client
 - [HTTP API](http-api.md) — the raw admin API for curl and other languages
+- [API reference](api/overview.md) — every endpoint the `hws` crate calls, one resource per page
 - [Orchestrator](orchestrator.md) — service deployments, discovery and regional rollouts
 
 ## Platform services

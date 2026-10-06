@@ -2,7 +2,7 @@
 
 This page describes app-lb's admin API at the HTTP level, for callers using curl or a language without an SDK. The [`hws`](../app-lb/heyctl) Rust crate (which `heyctl` is built on) and the [`@heyocomputer/hws`](../app-lb/sdk/typescript) TypeScript SDK wrap this API. Both are checked against the response fixtures in [`app-lb/testdata/wire/`](../app-lb/testdata/wire), which also supply the example bodies on this page.
 
-This page sticks to the wire format. For what a deployment field does, see the [deployment spec](app-lb.md#deployment-spec). For how credentials are issued and gates are configured, see [app-lb-auth](app-lb-auth.md).
+For an endpoint-by-endpoint reference of what the `hws` crate calls, with request and response fields and the crate method for each, see the [API reference](api/overview.md). This page sticks to the wire format. For what a deployment field does, see the [deployment spec](app-lb.md#deployment-spec). For how credentials are issued and gates are configured, see [app-lb-auth](app-lb-auth.md).
 
 ## Contents
 
@@ -44,15 +44,17 @@ curl -s -H "Authorization: Bearer $HEYO_API_KEY" $LB/deployments
 
 The [MCP server](../mcp/README.md#managed-mode) and Heyo's cloud SDK address app-lb through this same prefix.
 
-**Only allowlisted routes are reachable through the door.** Cloud forwards an allowlist of routes, and it maintains that list, not app-lb. Any other route answers `404 route not exposed through the namespace proxy`. The [MCP README](../mcp/README.md#managed-mode) lists what the door is known to expose:
+**Only allowlisted routes are reachable through the door.** Cloud forwards an allowlist of routes, and it maintains that list, not app-lb (`lb_route_allowed` in cloud's `handlers/namespaces.rs`). Any other route answers `404 route not exposed through the namespace proxy`. The door exposes:
 
-- the deployment list, get, create, replace, scale and delete routes
-- `build`, `pull`, `mounts/pull` and `update`
-- the job reads
-- VM eviction and `exec`
-- `/metrics` and `/security`
+- `GET`/`POST /deployments`, and `GET`/`PUT`/`DELETE /deployments/:id`
+- `PATCH /deployments/:id/scaling` and `DELETE /deployments/:id/vms/:sandbox_id`
+- `GET /deployments/:id/jobs`, and `POST /deployments/:id/build`, `pull`, `update` and `exec`
+- `GET /metrics` and `GET /ingress`
+- `/secrets` and `/secrets/:id`, pinned to the door's namespace
+- `GET`/`POST /auth-providers`, and `GET`/`DELETE /auth-providers/:namespace/:name` for the door's own namespace
+- `GET /feeds/:namespace` for the door's own namespace
 
-Fleet-wide operator routes (`/disks`, `/certs` and the disk mutations) are not exposed. The obs plugin paths (`/namespaces/{ns}/plugins/obs/...` and `/namespaces/{ns}/plugins`) are reachable only once cloud's allowlist includes them. Until then they 404 at the door. If you need a route that this page documents and the door refuses, the cloud allowlist is what has to change.
+Everything else is refused, including `mounts/pull`, `/jobs/:job_id`, `/security`, the shell, the token routes, and fleet-wide operator routes. The namespace plugin paths (`/namespaces/{ns}/plugins` and `/namespaces/{ns}/plugins/obs/...`) are not exposed either, so telemetry through the door 404s until cloud's allowlist includes them. If you need a route that this page documents and the door refuses, the cloud allowlist is what has to change.
 
 ## Authentication
 
