@@ -27,6 +27,17 @@ use std::time::Duration;
 
 const TICK: Duration = Duration::from_secs(2);
 
+/// How often booting VMs are checked for promotion while any exist.
+///
+/// A Firecracker guest is up in about half a second; promoting it only on the
+/// next [`TICK`] added up to two seconds of nothing to every cold start. While
+/// any pool has a VM booting, the autoscaler lists the daemon and probes just
+/// those VMs at this rate (one listing per fast tick, then one health probe
+/// per booting VM), and drops back to the full reconcile at [`TICK`] once
+/// nothing is booting. Same task as the full reconcile, so the two never run
+/// at once and a VM is never promoted twice.
+const FAST_TICK: Duration = Duration::from_millis(200);
+
 /// How long a still-booting VM may go without a log line. Chosen far above
 /// [`TICK`]: the point is to prove a stuck boot is still stuck, not to narrate
 /// every poll of a VM that will be up in ten seconds.
@@ -584,6 +595,50 @@ impl Autoscaler {
             .await;
     }
 
+    /// Whether any managed pool has a VM booting — the condition for
+    /// [`FAST_TICK`]. A registry walk with no awaits, cheap enough to ask on
+    /// every pass of the loop.
+    fn any_booting(&self) -> bool {
+        self.registry
+            .deployments()
+            .values()
+            .any(|d| d.spec.is_managed() && !d.pending().is_empty())
+    }
+
+    /// The fast path: promote booting VMs that have come up, without the rest
+    /// of a reconcile. One daemon listing, then [`promote_pending`] — which
+    /// probes only pending VMs — for each pool with something booting. Pools a
+    /// rollout reserves are left to the full reconcile, as it leaves them.
+    ///
+    /// [`promote_pending`]: Self::promote_pending
+    pub(crate) async fn promote_booting(&self) {
+        let _retirement = self.registry.retirement_gate.read().await;
+        let _rollout = self.rollout_gate.read().await;
+        let booting: Vec<Arc<Deployment>> = self
+            .registry
+            .deployments()
+            .values()
+            .filter(|d| {
+                d.spec.is_managed()
+                    && !d.pending().is_empty()
+                    && self.is_live(d)
+                    && !crate::rollout::reserved(d)
+            })
+            .cloned()
+            .collect();
+        if booting.is_empty() {
+            return;
+        }
+        let listing = self.runtime.list().await;
+        if listing.total_outage() {
+            return;
+        }
+        let fleet = vm::index_by_id(vm::Listing::from_infos(listing.sandboxes).sandboxes);
+        futures::stream::iter(&booting)
+            .for_each_concurrent(RECONCILE_CONCURRENCY, |d| self.promote_pending(d, &fleet))
+            .await;
+    }
+
     /// Re-admit Ready managed backends after a transient service failure.
     ///
     /// Connect failures mark a backend unhealthy in the proxy. Unlike static
@@ -1058,11 +1113,23 @@ impl Autoscaler {
             };
 
             if let Some(addr) = addr {
+                let now_ms = crate::obs::now_millis().max(0) as u64;
+                let created_ms = p.created_at_ms();
+                // When the daemon says the sandbox turned Running, if it says:
+                // the split between heyvm starting the VM and the guest
+                // answering its health check.
+                let running_ms = (info.status == heyo_sdk::SandboxStatus::Running)
+                    .then(|| chrono::DateTime::parse_from_rfc3339(&info.status_changed_at).ok())
+                    .flatten()
+                    .map(|t| t.timestamp_millis().max(0) as u64)
+                    .filter(|t| *t >= created_ms && *t <= now_ms);
                 tracing::info!(
                     deployment = %d.spec.id,
                     sandbox = %p.sandbox_id,
                     %addr,
-                    boot_secs = age,
+                    create_to_ready_ms = now_ms.saturating_sub(created_ms),
+                    daemon_running_ms = running_ms.map(|t| t - created_ms),
+                    health_after_running_ms = running_ms.map(|t| now_ms - t),
                     "VM ready",
                 );
                 self.metrics.record_cold_start(&d.spec.id, age);
@@ -2336,6 +2403,9 @@ impl BackgroundService for Autoscaler {
 
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Only consulted while something is booting; see `FAST_TICK`.
+        let mut fast = tokio::time::interval(FAST_TICK);
+        fast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Deliberately a separate, much slower ticker: the sweep asks the daemon
         // to walk its persistence directory, which is not something to do every
         // two seconds. See `sweep_suspended`.
@@ -2351,6 +2421,7 @@ impl BackgroundService for Autoscaler {
             tokio::select! {
                 _ = ticker.tick() => self.reconcile().await,
                 _ = nudged => self.reconcile().await,
+                _ = fast.tick(), if self.any_booting() => self.promote_booting().await,
                 _ = sweeper.tick() => self.sweep_suspended().await,
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
@@ -2753,6 +2824,82 @@ mod tests {
         // On the live object itself there is no successor to settle.
         scaler.settle_in_successor(&newer, |attempts| attempts.clear());
         assert_eq!(newer.state().create_attempts.len(), 1, "a live object is left to its own caller");
+    }
+
+    /// A guest is up in about half a second; promoting it only on the next
+    /// 2s tick added up to two seconds to every cold start. With a VM booting,
+    /// the service loop promotes it within a fast tick of the daemon saying
+    /// Running and the probe passing.
+    #[tokio::test]
+    async fn a_booting_vm_is_promoted_well_inside_one_full_tick() {
+        use axum::routing::get;
+        use std::sync::atomic::AtomicBool;
+
+        // The guest's health endpoint.
+        let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = health.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(health, axum::Router::new().route("/", get(|| async { "ok" }))).await.unwrap()
+        });
+
+        // The daemon: the sandbox provisions until `running` flips.
+        let running = Arc::new(AtomicBool::new(false));
+        let flag = running.clone();
+        let daemon = axum::Router::new()
+            .route("/deployed-sandboxes", get(move || {
+                let up = flag.load(Ordering::SeqCst);
+                async move {
+                    axum::Json(serde_json::json!([{
+                        "id": "sb-fast",
+                        // No owner prefix: startup adoption leaves it alone,
+                        // and the pending entry below is what tracks it.
+                        "name": "fast-boot-under-test",
+                        "status": if up { "running" } else { "provisioning" },
+                        "image": "img",
+                        "guest_ip": if up { Some("127.0.0.1") } else { None },
+                        "uptime_secs": 0,
+                        "is_deployed": true,
+                        "status_changed_at": "",
+                        "urls": []
+                    }]))
+                }
+            }))
+            .route("/sandboxes/inactive", get(|| async {
+                axum::Json(serde_json::json!({"sandboxes": [], "next_cursor": null}))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, daemon).await.unwrap() });
+
+        let mut s = spec();
+        s.vm.as_mut().unwrap().port = port;
+        let (scaler, registry) = autoscaler_against(&url, s);
+        let d = registry.get("demo").unwrap();
+        d.set_pending(vec![PendingVm::new("sb-fast".into())]);
+
+        let scaler = Arc::new(scaler);
+        let (stop, watch) = tokio::sync::watch::channel(false);
+        let svc = scaler.clone();
+        let task = tokio::spawn(async move { svc.start(watch).await });
+
+        // Let the immediate first full tick pass with the VM still
+        // provisioning; the next full tick is ~2s away.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(registry.get("demo").unwrap().backends().is_empty());
+        running.store(true, Ordering::SeqCst);
+        let flipped = std::time::Instant::now();
+        while registry.get("demo").unwrap().backends().is_empty() {
+            assert!(flipped.elapsed() < Duration::from_secs(3), "never promoted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let took = flipped.elapsed();
+        assert!(
+            took < Duration::from_millis(1000),
+            "promoted {took:?} after the daemon said Running; a full tick alone would be ~1.7s"
+        );
+        assert!(registry.get("demo").unwrap().pending().is_empty());
+        let _ = stop.send(true);
+        let _ = task.await;
     }
 
     mod correlated_allocations {
