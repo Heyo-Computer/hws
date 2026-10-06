@@ -371,8 +371,8 @@ table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
       <a href="/dashboard" aria-current="page">Dashboard</a>
       <a href="/releases" data-fleet-only>Releases</a>
       <a href="/siem" data-local-nav>Security</a>
-      <a href="/storage" data-local-nav>Disks</a>
-      <a href="/plugins" data-local-nav>Plugins</a>
+      <a href="/storage" data-local-nav data-fleet-only>Disks</a>
+      <a href="/plugins" data-local-nav data-fleet-only>Plugins</a>
       <a href="/network" id="network-nav">Network</a>
       <a href="/metrics" data-local-nav>Metrics</a>
       <a href="#get-started" id="gs-open" hidden>Get started</a>
@@ -562,22 +562,48 @@ const pageParams = new URLSearchParams(location.search);
 // — which a namespace user cannot read — are not shown at all.
 // The same alphabet `is_valid_namespace` admits server-side.
 const NS_RE = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
-const pinnedNamespace = NS_RE.test(pageParams.get("namespace") || "") ? pageParams.get("namespace") : "";
+// What the server knows and the URL may not say. It stamps these when it
+// renders the page: whether this app-lb has a gateway fleet at all (no fleet,
+// no cross-server sections), and whether the credential is confined to
+// namespaces, with its namespace when there is exactly one. So a namespace user
+// who navigates back to plain /dashboard still gets their namespace's view.
+const MULTI_SERVER = "{{MULTI_SERVER}}" === "true";
+const CALLER_CONFINED = "{{CONFINED}}" === "true";
+const CALLER_NAMESPACE = NS_RE.test("{{SCOPE_NAMESPACE}}") ? "{{SCOPE_NAMESPACE}}" : "";
+const pinnedNamespace = NS_RE.test(pageParams.get("namespace") || "") ? pageParams.get("namespace") : CALLER_NAMESPACE;
 const HOME_URL = "{{HOME_URL}}";
-const localView = pageParams.get("view") === "local" || !!pinnedNamespace;
-if (pinnedNamespace) {
+// A namespace's view: no fleet sections, no servers, no host.
+const namespaceView = !!pinnedNamespace || CALLER_CONFINED;
+const localView = pageParams.get("view") === "local" || namespaceView || !MULTI_SERVER;
+// The tokens table's "servers" column only means something across a fleet.
+const SHOW_SERVERS = MULTI_SERVER && !namespaceView;
+if (namespaceView) {
   document.querySelectorAll("[data-fleet-only]").forEach(el => el.hidden = true);
+}
+// Keep the namespace on links that lead back into narrowing pages, so a click
+// away and back does not drop it from the URL.
+if (pinnedNamespace) {
+  document.querySelectorAll('.topbar-nav a[href^="/"], .topbar-brand').forEach(a => {
+    const u = new URL(a.getAttribute("href"), location.origin);
+    if (!u.searchParams.has("namespace")) u.searchParams.set("namespace", pinnedNamespace);
+    a.setAttribute("href", u.pathname + u.search + u.hash);
+  });
 }
 // One server's page never shows the cross-server sections, and never polls them.
 document.querySelectorAll("[data-control-plane]").forEach(el => el.hidden = localView);
 document.getElementById("local-view").hidden = !localView;
 document.querySelectorAll("[data-local-nav]").forEach(el => el.hidden = !localView);
-document.querySelector(".topbar-brand").href = "/dashboard";
+document.querySelector(".topbar-brand").href = pinnedNamespace
+  ? "/dashboard?namespace=" + encodeURIComponent(pinnedNamespace) : "/dashboard";
 document.querySelector(".topbar-app").textContent = pinnedNamespace
-  ? "Namespace " + pinnedNamespace : localView ? location.host : "Control plane";
-document.title = localView ? location.host + " · Heyo" : "Heyo control plane";
-document.getElementById("local-title").textContent = "Selected gateway: " + location.host + " · host & pools";
-document.getElementById("uptime").hidden = !localView;
+  ? "Namespace " + pinnedNamespace : namespaceView ? "Your namespaces" : localView ? location.host : "Control plane";
+document.title = pinnedNamespace ? "Namespace " + pinnedNamespace + " · Heyo"
+  : localView ? location.host + " · Heyo" : "Heyo control plane";
+document.getElementById("local-title").textContent = namespaceView
+  ? "Deployments & traffic"
+  : MULTI_SERVER ? "Selected gateway: " + location.host + " · host & pools" : location.host + " · host & pools";
+document.getElementById("local-view").setAttribute("aria-label", namespaceView ? "Namespace overview" : "Server details");
+document.getElementById("uptime").hidden = !localView || namespaceView;
 // The global topology is the default away from a local view; a local page
 // keeps its own gateway's picture.
 document.getElementById("network-nav").href = localView ? "/network?view=local" : "/network";
@@ -830,16 +856,20 @@ function render(data) {
   const avgLat = intervalAvgLatency(s => s.latSum, s => s.latCount);
   const errTotal = g.requests.c5xx + g.requests.errors;
   const errRate = g.requests.total ? (errTotal / g.requests.total) * 100 : 0;
-  $("fleet-tiles").innerHTML = [
+  // A namespace's view shows its own pools, not the machine they run on.
+  const hostTiles = namespaceView ? [] : [
     tile("Host CPU", h.available ? fmt(h.cpu_percent, 1) : "—", h.available ? "%" : "",
          h.available ? `${fmt(h.cpu_count)} cores` : "usage unavailable"),
     tile("Host memory", h.available ? fmt(memPct, 0) + "%" : "—", "",
          h.available ? `${fmtBytes(h.memory_used_bytes)} / ${fmtBytes(h.memory_total_bytes)}` : ""),
+  ];
+  $("fleet-tiles").innerHTML = [
+    ...hostTiles,
     tile("Deployments", fmt(data.fleet.deployments)),
     tile("Ready VMs", fmt(data.fleet.ready), "", `${fmt(data.fleet.pending)} pending · ${fmt(data.fleet.draining)} draining`),
     // What else is on the machine. An older app-lb does not send the list at
     // all, and "0" would then claim a knowledge it does not have.
-    ...(Array.isArray(data.host_sandboxes) ? [tile("Host sandboxes", fmt(data.host_sandboxes.length), "",
+    ...(!namespaceView && Array.isArray(data.host_sandboxes) ? [tile("Host sandboxes", fmt(data.host_sandboxes.length), "",
          data.host_sandboxes.length ? "not managed by app-lb" : "none outside the pools")] : []),
     tile("In-flight", fmt(data.fleet.total_in_flight), "", "requests being served"),
     tile("Requests / sec", rps == null ? "—" : fmt(rps, rps < 10 ? 1 : 0)),
@@ -1591,7 +1621,7 @@ function renderTokens(tokens, target = "tokens", count = "tokens-count", fleetOn
       <td>${esc(t.name)}</td>
       <td class="mono">${esc(t.id)}</td>
       <td>${tokenScope(t)}</td>
-      ${fleetOnly ? "" : `<td>${tokenServers(t)}</td>`}
+      ${fleetOnly || !SHOW_SERVERS ? "" : `<td>${tokenServers(t)}</td>`}
       <td>${fmtDur(Math.max(0, now - t.created_at))} ago</td>
       <td>${used}</td>
       <td>${expires}</td>
@@ -1600,7 +1630,7 @@ function renderTokens(tokens, target = "tokens", count = "tokens-count", fleetOn
   }).join("");
 
   $(target).innerHTML = `<div style="overflow-x:auto"><table class="vms">
-      <thead><tr><th>name</th><th>id</th><th>scope</th>${fleetOnly ? "" : "<th>servers</th>"}<th>created</th>
+      <thead><tr><th>name</th><th>id</th><th>scope</th>${fleetOnly || !SHOW_SERVERS ? "" : "<th>servers</th>"}<th>created</th>
         <th>last used${fleetOnly ? " here" : ""}</th><th>expires</th><th>actions</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
