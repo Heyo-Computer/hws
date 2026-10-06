@@ -1200,6 +1200,24 @@ impl Jobs {
         let image = spec.image_for(deployment_id, &prepared.version);
         self.update_record(job_id, |r| r.image = Some(image.clone()));
 
+        // An application image rarely brings the PID 1 a Firecracker guest
+        // boots (`init=/init.sh`); without one every VM panics and the pool
+        // never fills. Supply the standard one when the Dockerfile has none.
+        let mut prepared = prepared;
+        match guest_init::supply(&prepared.dockerfile, &prepared.context) {
+            Ok(Some(derived)) => {
+                self.log(
+                    job_id,
+                    "the Dockerfile never mentions /init.sh, so app-lb adds its standard guest init \
+                     (it starts nothing; the deployment's start_command starts the app)"
+                        .to_string(),
+                );
+                prepared.dockerfile = derived;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("cannot add the standard guest init: {e}")),
+        }
+
         let mut cmd = tokio::process::Command::new(&self.cfg.heyvm_bin);
         cmd.arg("mvm")
             .arg("build")
@@ -3192,5 +3210,96 @@ mod tests {
         let json = serde_json::to_string(&rootfs).unwrap();
         assert!(!json.contains("site_root"), "no site fields on a rootfs pull: {json}");
         assert!(!json.contains("files"), "{json}");
+    }
+}
+
+/// The standard PID 1 for a guest image that brings none.
+///
+/// heyvm boots every Firecracker guest with `init=/init.sh` and adds nothing of
+/// its own, so a Dockerfile written for Docker (an app, a `CMD`) produces an
+/// image whose kernel panics on boot: the deployment registers, builds, and
+/// then cold-starts forever with `ready: 0`. Images that bring an init (every
+/// one in this repository) mention `/init.sh` in their Dockerfile and are left
+/// alone; the rest get `src/guest_init.sh` copied in as the final step.
+///
+/// A `COPY` rather than a `RUN`, so it needs no shell or base64 in the image:
+/// the script is written into the build context and the derived Dockerfile is
+/// written beside the original, both under the job's own checkout.
+pub(crate) mod guest_init {
+    use std::path::{Path, PathBuf};
+
+    pub const SCRIPT: &str = include_str!("guest_init.sh");
+    pub const CONTEXT_NAME: &str = "heyo-guest-init.sh";
+
+    /// Whether a Dockerfile already provides its own init.
+    pub fn provides_init(dockerfile: &str) -> bool {
+        dockerfile.lines().any(|l| {
+            let l = l.trim_start();
+            !l.starts_with('#') && l.contains("/init.sh")
+        })
+    }
+
+    /// The Dockerfile to build: `None` to use `dockerfile` as it is, or a
+    /// derived one that also installs the standard init.
+    pub fn supply(dockerfile: &Path, context: &Path) -> std::io::Result<Option<PathBuf>> {
+        let text = std::fs::read_to_string(dockerfile)?;
+        if provides_init(&text) {
+            return Ok(None);
+        }
+        let script = context.join(CONTEXT_NAME);
+        std::fs::write(&script, SCRIPT)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let mut derived = text;
+        if !derived.ends_with('\n') {
+            derived.push('\n');
+        }
+        derived.push_str(&format!(
+            "\n# Added by app-lb: this image brings no PID 1 for the Firecracker guest.\nCOPY {CONTEXT_NAME} /init.sh\n"
+        ));
+        let mut name = dockerfile.as_os_str().to_owned();
+        name.push(".app-lb");
+        let out = PathBuf::from(name);
+        std::fs::write(&out, derived)?;
+        Ok(Some(out))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn an_app_dockerfile_gets_the_standard_init_and_one_with_its_own_does_not() {
+            let dir = tempfile::tempdir().unwrap();
+            let df = dir.path().join("Dockerfile");
+            std::fs::write(&df, "FROM node:20-slim\nWORKDIR /app\nCOPY . .\nCMD [\"node\", \"server.js\"]").unwrap();
+            let derived = supply(&df, dir.path()).unwrap().expect("an app image gets an init");
+            let text = std::fs::read_to_string(&derived).unwrap();
+            assert!(text.starts_with("FROM node:20-slim"), "the original is kept: {text}");
+            assert!(text.trim_end().ends_with("COPY heyo-guest-init.sh /init.sh"), "{text}");
+            let script = dir.path().join(CONTEXT_NAME);
+            assert_eq!(std::fs::read_to_string(&script).unwrap(), SCRIPT);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755);
+            }
+
+            std::fs::write(&df, "FROM ubuntu:24.04\nCOPY remote/init.sh /init.sh\nCMD [\"/init.sh\"]\n").unwrap();
+            assert!(supply(&df, dir.path()).unwrap().is_none(), "an image with its own init is left alone");
+            // A commented mention is not an init.
+            assert!(!provides_init("FROM x\n# TODO: /init.sh\n"));
+        }
+
+        #[test]
+        fn the_script_is_a_pid_1_that_signals_ready_and_never_exits() {
+            assert!(SCRIPT.starts_with("#!/bin/sh"));
+            assert!(SCRIPT.contains("echo \"HEYVM_READY\""));
+            assert!(SCRIPT.contains("while :; do"));
+            assert!(!SCRIPT.contains("bash"), "base images may have no bash");
+        }
     }
 }
