@@ -154,7 +154,7 @@ turn `apply` or `restart` into a coordinated release.
 For a reusable app-token across servers, mint it at the configured token authority:
 
 ```sh
-heyctl token mint fleet-reader --admin view --all-deployments --all-servers
+heyctl token mint fleet-operator --admin admin --all-deployments --all-servers
 heyctl login --server https://admin.us3.heyo.work --token-stdin
 heyctl get deployments --fleet
 ```
