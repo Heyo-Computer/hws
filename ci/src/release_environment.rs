@@ -678,12 +678,16 @@ mod tests {
         let valid = policy();
         assert_eq!(plan("any-region", &valid).unwrap().jobs.len(), 2);
         let daemon = Policy {
-            workflow: valid.workflow.replace("ci/rollout-service", "ci/rollout-host-heyvmd"),
+            workflow: valid.workflow.replace("uses: ci/rollout-service", "uses: ci/rollout-host-heyvmd, with: {target: daemon, token: '${{ secrets.HOST_TOKEN }}', workflow: .ci/workflows/mvm-ctrl.yml, artifact: heyvm}"),
             ..valid.clone()
         };
         assert_eq!(plan("stage", &daemon).unwrap().jobs.len(), 2);
+        let bootstrap = Policy {
+            workflow: daemon.workflow.replace("ci/rollout-host-heyvmd", "ci/bootstrap-host-heyvm"),
+            ..valid.clone()
+        };
+        assert!(plan("stage", &bootstrap).unwrap_err().to_string().contains("merge, build and bootstrap are not allowed"));
         for workflow in [
-            valid.workflow.replace("ci/rollout-service", "ci/bootstrap-host-heyvm"),
             valid.workflow.replace("    needs: [first]\n", ""),
             valid
                 .workflow
