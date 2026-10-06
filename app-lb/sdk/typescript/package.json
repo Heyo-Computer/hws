@@ -1,7 +1,7 @@
 {
-  "name": "heyctl",
-  "version": "0.1.0",
-  "description": "Client for the app-lb admin API \u2014 deployments, autoscaling, exec and interactive shells for heyvm microVMs",
+  "name": "@heyocomputer/hws",
+  "version": "0.2.0",
+  "description": "The app-lb SDK for TypeScript — deployments, autoscaling, exec and shells, rollouts, namespace plugins and telemetry for heyvm microVMs. Twin of the hws crate.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,7 +13,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=18"
@@ -38,7 +39,21 @@
     "firecracker",
     "microvm",
     "sandbox",
-    "load-balancer"
+    "load-balancer",
+    "hws",
+    "heyo"
   ],
-  "license": "MIT"
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Heyo-Computer/hws.git",
+    "directory": "app-lb/sdk/typescript"
+  },
+  "homepage": "https://github.com/Heyo-Computer/hws/tree/main/app-lb/sdk/typescript#readme",
+  "bugs": {
+    "url": "https://github.com/Heyo-Computer/hws/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

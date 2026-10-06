@@ -16,8 +16,8 @@ own first consumer, which is the point: a field the client stops understanding
 becomes a compile error rather than a silently blank column at somebody's
 terminal.
 
-There is a [TypeScript client](../sdk/typescript) with the same name, the same
-surface and the same wire contract.
+There is a [TypeScript client](../sdk/typescript), `@heyocomputer/hws` on npm,
+with the same version, the same surface and the same wire contract.
 
 The verbs are kubectl's because the mental model is the same: declarative specs you `apply`,
 imperative helpers (`create`, `scale`, `set`) that write those specs for you, and read commands

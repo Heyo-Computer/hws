@@ -1,19 +1,23 @@
-# heyctl (TypeScript)
+# @heyocomputer/hws
 
-A client for the [app-lb](../../README.md) admin API: register deployments,
-scale pools, run commands inside a microVM, and attach an interactive shell.
+The TypeScript twin of [`hws`](https://crates.io/crates/hws), the app-lb SDK:
+register deployments, scale pools, run commands inside a microVM, attach an
+interactive shell, roll out new specs, and — through a namespace's installed
+plugins — read its telemetry.
 
-Same name and same wire contract as the [Rust crate](../../heyctl) and the
-`heyctl` CLI.
+Same wire contract and the same version as the [Rust crate](../../heyctl)
+(source in this repo, published as `hws` on crates.io), which also ships the
+`heyctl` CLI. Both are checked against the golden fixtures app-lb's own tests
+write.
 
 ```sh
-npm install heyctl
+npm install @heyocomputer/hws
 ```
 
 ```ts
-import { Heyctl } from "heyctl";
+import { Hws } from "@heyocomputer/hws";
 
-const lb = new Heyctl({
+const lb = new Hws({
   server: "127.0.0.1:9090",
   token: process.env.APP_LB_TOKEN,
 });
@@ -32,7 +36,7 @@ restarting app-lb, optionally expiring. Basic auth also works and is unscoped �
 it is the operator credential, and the one that mints tokens.
 
 ```ts
-const admin = new Heyctl({ server, user: "admin", password: process.env.PW! });
+const admin = new Hws({ server, user: "admin", password: process.env.PW! });
 
 const minted = await admin.mintToken({
   name: "agent-runner",
@@ -124,7 +128,7 @@ and `isAuth`:
 | `ForbiddenError` | 403 — the credential was good, the scope was not. Re-presenting it will not help. |
 | `NotFoundError` | 404, carrying `kind` and the name |
 | `NoRunningVmError` | 409 from `exec`/`shell` with `wake: false` |
-| `ConflictError` | 409 — a job is already running, a secret is still referenced |
+| `ConflictError` | 409 — a job is already running, a secret is still referenced, a rollout's revision moved. `code` carries app-lb's reason when it gives one, e.g. `plugin_not_installed` / `plugin_disabled` |
 | `ColdStartTimeoutError` | 503 — no VM appeared in time. `retryable`. |
 | `UpstreamError` | 502 — the daemon failed. `retryable`. |
 | `MalformedResponseError` | a response that could not be interpreted |
@@ -163,6 +167,46 @@ well-defined answer into an unexplained transport error.
 **Registering a deployment does not mean it has a certificate.** ACME issuance
 is asynchronous; poll `certs()`.
 
+## Rollouts
+
+`replaceDeployment` recycles the pool in place. To roll a new spec beside the
+old pool, verify it, and only then drain the old one:
+
+```ts
+const { rollout_revision, spec } = await lb.deployment("api");
+spec.vm!.image = "api-v2";
+const op = await lb.startRollout("api", {
+  operationId: crypto.randomUUID(),     // retry a lost reply with the same id
+  expectedRevision: rollout_revision!,  // 409 if anything changed it since
+  spec,
+});
+let now = op;
+while (now.status === "running") now = await lb.rollout("api", op.operation_id);
+```
+
+## Namespace plugins and telemetry
+
+Some plugins install per namespace. The operator enables one for the fleet; a
+namespace administrator installs it. Installing `obs` makes app-obs collect
+every deployment in the namespace, readable with the namespace's own token:
+
+```ts
+await lb.installPlugin("team-a", "obs");
+const obs = lb.obs("team-a");
+const fleet = await obs.fleet({ window: "1h" });
+let page = await obs.logs("web", { level: "error", limit: 100 });
+while (page.next_before_ms !== null) {
+  page = await obs.logs("web", { level: "error", limit: 100, before: page.next_before_ms });
+}
+```
+
+Before it is installed every `obs` call rejects with a `ConflictError` whose
+`code` is `plugin_not_installed` (or `plugin_disabled` while the operator has it
+off).
+
+`whoami()` says what the server makes of the credential: its tier, whether it is
+confined, and to which namespace.
+
 ## Building deployments
 
 Writes take the spec as an object and send it verbatim. Read with
@@ -190,3 +234,6 @@ client without a test failing. A field app-lb starts sending now fails this test
 instead of going silently unread.
 
 `examples/e2e.mjs` runs the whole surface against a live app-lb.
+
+`Heyctl` is still exported as an alias of `Hws`, so code written against the
+pre-0.2 package name keeps compiling after changing its import.

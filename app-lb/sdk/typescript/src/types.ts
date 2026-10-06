@@ -1128,4 +1128,267 @@ export interface PluginView {
   last_error?: string;
   /** Whatever the plugin reports about itself; the shape is per plugin. */
   status: unknown;
+  /** Whether namespaces install this plugin themselves. */
+  per_namespace?: boolean;
+  /** The namespaces that have, for a per-namespace plugin. */
+  installed_in?: string[];
+}
+
+// -- whoami ------------------------------------------------------------------
+
+/**
+ * `GET /whoami` — what the server makes of the credential presented. Needs no
+ * tier, so it answers even for a token every other route refuses.
+ */
+export interface WhoAmI {
+  /** `ungated`, `operator`, `app-token` or `federated`. */
+  caller: string;
+  /** `none`, `view`, `admin` — or `unchecked` on an ungated listener. */
+  admin_scope: string;
+  /** Whether this credential may use the fleet-wide routes. */
+  fleet: boolean;
+  /** Whether it is behind a namespace wall. */
+  confined: boolean;
+  may: { read_view_routes: boolean; use_admin_routes: boolean; [extra: string]: unknown };
+  token?: { id: string; name: string; [extra: string]: unknown };
+  /** An app-token's namespace, when it is confined to one. */
+  namespace?: string;
+  /** `["*"]` is every deployment; empty on a namespace token is all of it. */
+  deployments?: string[];
+  expires_at?: number;
+  expires_in_secs?: number;
+  /** A federated caller's identity, as the auth service reported it. */
+  subject?: unknown;
+  /** A federated caller's namespaces and its tier in each. */
+  namespaces?: Record<string, string>;
+  detail?: string;
+  note?: string;
+  [extra: string]: unknown;
+}
+
+// -- rollouts ----------------------------------------------------------------
+
+/** `POST /deployments/:id/rollouts` and `GET …/rollouts/:operation`. */
+export interface RolloutOperation {
+  operation_id: string;
+  deployment: string;
+  /** The `rollout_revision` the operation was admitted against. */
+  source_revision: string;
+  target_spec_sha256: string;
+  /** `running`, `succeeded`, `failed` or `reconciliation_required`. */
+  status: string;
+  phase: string;
+  readiness_verified: boolean;
+  previous_stopped: boolean;
+  error?: string | null;
+  preparation_stage?: string | null;
+  /** Present once a failed rollout's candidates have been reclaimed. */
+  failure_settlement?: unknown;
+  [extra: string]: unknown;
+}
+
+// -- discovery ---------------------------------------------------------------
+
+/** `GET /deployments/:id/discovery-status`. camelCase on the wire. */
+export interface DiscoveryStatus {
+  serviceId: string;
+  sourceUrl?: string | null;
+  version?: number | null;
+  /** The regional discovery state; its shape belongs to the regional protocol. */
+  regional?: unknown;
+  upstreams: { peer: string; draining: boolean; inFlight: number; [extra: string]: unknown }[];
+  [extra: string]: unknown;
+}
+
+// -- namespaces, auth providers ----------------------------------------------
+
+/** `GET /namespaces` — one namespace the credential can see. */
+export interface NamespaceEntry {
+  namespace: string;
+  /** How many of its deployments this credential may view. */
+  deployments: number;
+  /** Whether it was declared, rather than only named by a deployment. */
+  declared: boolean;
+  description?: string;
+  created_at?: number;
+  [extra: string]: unknown;
+}
+
+/** `GET /auth-providers` — a declared identity provider. */
+export interface AuthProviderView {
+  name: string;
+  namespace: string;
+  description?: string;
+  created_at: number;
+  provider: AuthProvider | AuthProvider[];
+  client_id?: string;
+  client_secret?: SecretRef;
+  allowed_domains?: string[];
+  allowed_emails?: string[];
+  jwt?: JwtSpec;
+  cookie_domain?: string;
+  [extra: string]: unknown;
+}
+
+// -- namespace plugins -------------------------------------------------------
+
+/**
+ * `GET /namespaces/:ns/plugins` — a plugin as one namespace sees it. `enabled`
+ * is the operator's fleet switch; `installed` is this namespace's. A plugin
+ * does nothing for a namespace unless both are true.
+ */
+export interface NamespacePlugin {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  installed: boolean;
+  installed_at?: number;
+  /** `token:<id>` or `user:<id>`; absent for the operator. */
+  installed_by?: string;
+  config?: unknown;
+  [extra: string]: unknown;
+}
+
+export interface NamespaceInstall {
+  installed_at: number;
+  installed_by?: string | null;
+  config: unknown;
+  [extra: string]: unknown;
+}
+
+/** `GET /api/plugins/:id/installs` — fleet scope only. */
+export interface PluginInstalls {
+  plugin: string;
+  enabled: boolean;
+  namespaces: string[];
+  installs: Record<string, NamespaceInstall>;
+  [extra: string]: unknown;
+}
+
+// -- telemetry (the obs plugin) ----------------------------------------------
+
+/** Whether recently ingested telemetry is queryable yet. */
+export interface ObsFreshness {
+  buffered_rows: number;
+  flush_secs: number;
+  dropped: number;
+  [extra: string]: unknown;
+}
+
+/** One time bucket. A `null` measure means nothing was sampled, not zero. */
+export interface ObsMetricBucket {
+  /** Bucket start, epoch milliseconds UTC. */
+  t: number;
+  requests_per_sec?: number | null;
+  errors_per_sec?: number | null;
+  mean_latency_ms?: number | null;
+  p50_ms?: number | null;
+  p90_ms?: number | null;
+  p99_ms?: number | null;
+  cpu_percent?: number | null;
+  memory_bytes?: number | null;
+  in_flight?: number | null;
+  ready?: number | null;
+  pending?: number | null;
+  draining?: number | null;
+  [extra: string]: unknown;
+}
+
+export interface ObsLogBucket {
+  t: number;
+  lines: number;
+  errors: number;
+  [extra: string]: unknown;
+}
+
+export interface ObsFleetRow {
+  id: string;
+  buckets: ObsMetricBucket[];
+  log_buckets: ObsLogBucket[];
+  latest: ObsMetricBucket;
+  log_lines: number;
+  error_logs: number;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/obs/api/fleet` — a namespace's telemetry overview. */
+export interface ObsFleet {
+  generated_at_ms: number;
+  from_ms: number;
+  to_ms: number;
+  step_secs: number;
+  window: string;
+  windows: string[];
+  retain_days: number;
+  freshness: ObsFreshness;
+  /** Operator view only; absent in a namespace's. */
+  host?: ObsMetricBucket[];
+  deployments: ObsFleetRow[];
+  /** Operator view only. */
+  host_sandboxes?: unknown;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/obs/api/deployments/:id`. */
+export interface ObsDeployment {
+  id: string;
+  generated_at_ms: number;
+  from_ms: number;
+  to_ms: number;
+  step_secs: number;
+  window: string;
+  windows: string[];
+  retain_days: number;
+  freshness: ObsFreshness;
+  buckets: ObsMetricBucket[];
+  log_buckets: ObsLogBucket[];
+  latest: ObsMetricBucket;
+  log_lines: number;
+  error_logs: number;
+  /** Backends that logged in the window. */
+  backends: string[];
+  [extra: string]: unknown;
+}
+
+/** One stored log line. */
+export interface ObsLogRow {
+  /** Epoch milliseconds UTC. */
+  ts: number;
+  level?: string | null;
+  /** `stdout`, `stderr`, `console`, `access`, `security`, … */
+  source: string;
+  message: string;
+  backend?: string | null;
+  host?: string | null;
+  /** The structured payload, still a JSON string. */
+  fields?: string | null;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/obs/api/deployments/:id/logs` — one page, newest first. */
+export interface ObsLogs {
+  id: string;
+  from_ms: number;
+  to_ms: number;
+  rows: ObsLogRow[];
+  /**
+   * Pass back as `before` for the next page; `null` at the end. Inclusive, so
+   * the next page may repeat lines from the same millisecond.
+   */
+  next_before_ms: number | null;
+  limit: number;
+  [extra: string]: unknown;
+}
+
+/** An alert rule, from `…/plugins/obs/api/alerts`. */
+export interface ObsAlert {
+  id: string;
+  deployment: string;
+  namespace?: string | null;
+  /** `errors` — errors over the trailing minute. */
+  metric: string;
+  threshold: number;
+  webhook_url: string;
+  [extra: string]: unknown;
 }

@@ -1,14 +1,15 @@
 /**
- * A client for the app-lb admin API.
+ * `@heyocomputer/hws` — the TypeScript twin of the `hws` crate: a client for
+ * the app-lb admin API.
  *
  * app-lb is a load balancer for heyvm Firecracker/KVM microVMs. This package
  * drives it: register deployments, scale pools, run commands inside a VM, and
  * attach an interactive shell.
  *
  * ```ts
- * import { Heyctl } from "heyctl";
+ * import { Hws } from "@heyocomputer/hws";
  *
- * const lb = new Heyctl({ server: "127.0.0.1:9090", token: process.env.APP_LB_TOKEN });
+ * const lb = new Hws({ server: "127.0.0.1:9090", token: process.env.APP_LB_TOKEN });
  * const { stdout } = await lb.exec("sb-7f3a9c", "uname -a");
  * ```
  *
@@ -37,6 +38,11 @@
  */
 
 export { Heyctl, normalizeServer, ASSUMED_COLD_START_MS } from "./client.js";
+/**
+ * The client under the package's name. `Heyctl` stays exported for code
+ * written against the earlier name; they are the same class.
+ */
+export { Heyctl as Hws } from "./client.js";
 export type {
   Auth,
   ExecOptions,
@@ -44,7 +50,11 @@ export type {
   MetricsQuery,
   NewToken,
   HeyctlOptions,
+  HeyctlOptions as HwsOptions,
 } from "./client.js";
+
+export { ObsClient, OBS_PLUGIN, logQueryString } from "./obs.js";
+export type { LogQuery, NewAlert } from "./obs.js";
 
 export { Shell, PING_INTERVAL_MS } from "./shell.js";
 export type { ShellExit, ShellOptions } from "./shell.js";
