@@ -1337,7 +1337,7 @@
           ]
         },
         "start_command": {
-          "description": "Shell command that starts the workload, run once per replica after boot.\n\nIt must *return*: the daemon runs it and waits, so a command that blocks\nin the foreground is a VM that never finishes booting. Daemonize\nexplicitly — every example here spells it\n`setsid nohup <program> </dev/null >/var/log/<name>.log 2>&1 &`. Its\noutput goes to `/var/log/heyvm-start.log` *inside the guest*, so it lives\nand dies with the boot; read it with `applb_exec`, not app-obs.",
+          "description": "Shell command that starts the workload, run once per replica after boot.\n\nRequired to run anything: a VM never runs its image's `CMD` or\n`ENTRYPOINT` (the rootfs is a `docker export`, which drops the image\nconfig), so without this the guest boots, nothing listens, and every\nreplica times out. Put what `CMD` did here, `WORKDIR` and `ENV`\nincluded, e.g. `cd /app && setsid nohup node server.js </dev/null &`.\n\nIt must *return*: the daemon runs it and waits, so a command that blocks\nin the foreground is a VM that never finishes booting. Daemonize\nexplicitly with `setsid nohup <program> </dev/null &`. Its stdout and\nstderr go to `/var/log/heyvm-start.log` and `.err.log` inside the guest,\nand on to app-obs when the image has `socat`; don't redirect them to a\nfile of your own, or they never leave the guest.",
           "type": [
             "string",
             "null"

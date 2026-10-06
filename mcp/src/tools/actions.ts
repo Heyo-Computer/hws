@@ -14,6 +14,7 @@
  */
 
 import { lintVmSpec } from "./vmboot.js";
+import { dockerfileCandidates, remoteStartInfo, startCommand } from "./dockerfile.js";
 import { z } from "zod";
 import { telemetry, telemetryRoute } from "../telemetry.js";
 import { bool, num , DESTRUCTIVE_PREFIX } from "./schema.js";
@@ -79,8 +80,70 @@ export function notVisible(e: ServiceError): boolean {
   return e.status === 404 || (e.status === 403 && /not scoped to deployment/.test(e.body));
 }
 
+/**
+ * Make sure a VM spec says how to start its app. Mutates `spec.vm` and pushes
+ * a section when it fills `start_command` in; returns why it refuses, if it
+ * does.
+ */
+type StartSettler = (
+  spec: Record<string, unknown>,
+  previousVm: unknown,
+  acknowledged: boolean,
+  sections: Section[],
+) => Promise<string | undefined>;
+
 export function actionTools(clients: Clients, config: Config): Tool[] {
   const enc = encodeURIComponent;
+
+  const settleStartCommand: StartSettler = async (spec, previousVm, acknowledged, sections) => {
+    const vm = spec.vm as Record<string, unknown> | undefined;
+    if (!vm || spec.site || spec.upstreams) return undefined;
+    if (typeof vm.start_command === "string" && vm.start_command.trim()) return undefined;
+    const prev = (previousVm as { start_command?: unknown } | undefined)?.start_command;
+    if (typeof prev === "string" && prev.trim()) {
+      vm.start_command = prev;
+      sections.push({
+        title: "start_command (kept)",
+        body: `The spec left vm.start_command out; the deployment's current one is kept:\n${prev}`,
+      });
+      return undefined;
+    }
+    const build = spec.build as Record<string, unknown> | undefined;
+    const onRemote = build ? remoteRepoOf(config, build.repo) : undefined;
+    if (build && onRemote) {
+      const derived = await remoteStartInfo(
+        clients.remote,
+        onRemote.namespace,
+        onRemote.repo,
+        typeof build.ref === "string" && build.ref ? build.ref : "main",
+        dockerfileCandidates(build.dockerfile, build.context),
+      );
+      const cmd = derived && startCommand(derived);
+      if (cmd) {
+        vm.start_command = cmd;
+        if (vm.port === undefined && derived?.port) vm.port = derived.port;
+        sections.push({
+          title: "start_command (from the Dockerfile)",
+          body: `${cmd}\nA VM does not run the image's CMD/ENTRYPOINT, so this does it. Set vm.start_command to override.`,
+        });
+        return undefined;
+      }
+      if (derived?.ownsInit) return undefined;
+    }
+    if (acknowledged) {
+      sections.push({ title: "No start_command", body: "Deployed without one, as asked (no_start_command)." });
+      return undefined;
+    }
+    return (
+      "This is a VM deployment with no `vm.start_command`. A VM never runs its image's CMD or " +
+      "ENTRYPOINT, so nothing would start the app: it would build, boot, and time out every " +
+      "boot without ever becoming ready. Set `vm.start_command` to what CMD does, backgrounded, " +
+      "e.g. `cd /app && setsid nohup node server.js </dev/null &` (no redirect, so its output " +
+      "reaches deployment_logs). For a Dockerfile in a Heyo-remote repo this tool derives it " +
+      "itself; repo_deploy does too. If the image starts its app from its own /init.sh, pass " +
+      "no_start_command: true."
+    );
+  };
 
   return [
     // ---- app-lb reads -------------------------------------------------
@@ -286,6 +349,9 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "If your token is confined to a namespace, set `namespace` in the spec to it: " +
         "registering does not fill it in, and the default is `default`, which such a token " +
         "cannot reach.\n\n" +
+        "A VM never runs the image's CMD/ENTRYPOINT: give `vm.start_command`. For a build from a " +
+        "Heyo-remote repo it is derived from the Dockerfile when omitted; a VM spec with neither " +
+        "is refused.\n\n" +
         "`wait_seconds` bounds the poll only; the job continues regardless and applb_job " +
         "reports it.",
       // The one tool carrying the spec schema. A second copy would be ~12 KB on
@@ -298,12 +364,18 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
             type: "number",
             description: "how long to poll the job before returning; default 120, 0 to skip",
           },
+          no_start_command: {
+            type: "boolean",
+            description:
+              "deploy a VM with no vm.start_command on purpose (its image starts the app from its own /init.sh); otherwise refused",
+          },
         },
         required: ["spec"],
       },
       schema: {
         spec: z.record(z.unknown()).describe("the deployment spec; see inputSchema"),
         wait_seconds: num().optional().describe("poll the job for this long; default 120"),
+        no_start_command: bool().optional(),
       },
       handler: async (a) => {
         const spec = a.spec as Record<string, unknown>;
@@ -406,6 +478,18 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           previousVm = current?.spec?.vm ?? current?.vm;
         } catch (e) {
           if (!(e instanceof ServiceError && notVisible(e))) throw e;
+        }
+
+        // A VM never runs its image's CMD/ENTRYPOINT, so a VM spec with no
+        // start_command registers, builds, and then never becomes ready — the
+        // pool times out every boot with nothing to say why (us5 newsfeed-api,
+        // 2026-10-06). Fill it in where it can be known, refuse where it can't.
+        const startProblem = await settleStartCommand(spec, previousVm, a.no_start_command === true, sections);
+        if (startProblem) {
+          return report(`${id}: not sent — no start_command`, [
+            ...sections,
+            { title: "Why", body: startProblem },
+          ]);
         }
 
         const registered = await clients.applb({
