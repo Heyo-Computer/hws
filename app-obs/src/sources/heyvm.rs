@@ -92,6 +92,7 @@ impl WireEntry {
             message: self.message,
             fields: None,
             host: None,
+            namespace: None,
         })
     }
 

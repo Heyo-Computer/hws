@@ -174,8 +174,7 @@ impl Writer {
     /// and rejection is exactly the kind of thing that drifts and then lies on a
     /// status page.
     fn publish(&self) {
-        self.buffered
-            .store(self.buffered_rows(), Ordering::Relaxed);
+        self.buffered.store(self.buffered_rows(), Ordering::Relaxed);
     }
 
     fn flush_partition(&mut self, key: &PartitionKey) -> Result<(), WriteError> {
@@ -250,6 +249,7 @@ fn build_logs_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
     let mut message = StringBuilder::new();
     let mut fields = StringBuilder::new();
     let mut host = StringBuilder::new();
+    let mut namespace = StringBuilder::new();
 
     for record in records {
         let Record::Log(r) = record else {
@@ -264,6 +264,7 @@ fn build_logs_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
         message.append_value(&r.message);
         fields.append_option(r.fields.as_deref());
         host.append_option(r.host.as_deref());
+        namespace.append_option(r.namespace.as_deref());
     }
 
     let schema = Table::Logs.schema();
@@ -275,6 +276,7 @@ fn build_logs_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
         std::sync::Arc::new(message.finish()),
         std::sync::Arc::new(fields.finish()),
         std::sync::Arc::new(host.finish()),
+        std::sync::Arc::new(namespace.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
@@ -296,6 +298,7 @@ fn build_metrics_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
     let mut p99 = Float64Builder::with_capacity(n);
     let mut latency_count = UInt64Builder::with_capacity(n);
     let mut latency_sum = UInt64Builder::with_capacity(n);
+    let mut namespace = StringBuilder::new();
 
     for record in records {
         let Record::Metric(r) = record else {
@@ -316,6 +319,7 @@ fn build_metrics_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
         p99.append_option(r.p99_ms);
         latency_count.append_option(r.latency_count);
         latency_sum.append_option(r.latency_sum);
+        namespace.append_option(r.namespace.as_deref());
     }
 
     let schema = Table::Metrics.schema();
@@ -335,6 +339,7 @@ fn build_metrics_batch(records: &[Record]) -> Result<RecordBatch, WriteError> {
         std::sync::Arc::new(p99.finish()),
         std::sync::Arc::new(latency_count.finish()),
         std::sync::Arc::new(latency_sum.finish()),
+        std::sync::Arc::new(namespace.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
@@ -378,8 +383,7 @@ mod tests {
     const TS: i64 = 1_785_260_096_000; // 2026-07-28T17:34:56Z
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("app-obs-writer-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("app-obs-writer-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -394,6 +398,7 @@ mod tests {
             message: message.into(),
             fields: None,
             host: None,
+            namespace: None,
         })
     }
 
@@ -433,7 +438,9 @@ mod tests {
         writer.push(log("demo", TS, "second")).unwrap();
         // Two rows hit flush_rows, so the partition is already on disk.
 
-        let partition = PartitionKey::new(Table::Logs, "demo", TS).unwrap().dir(&dir);
+        let partition = PartitionKey::new(Table::Logs, "demo", TS)
+            .unwrap()
+            .dir(&dir);
         assert_eq!(read_rows(&partition), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -445,7 +452,9 @@ mod tests {
         let mut writer = Writer::new(&dir, 1, Duration::from_secs(3600));
         writer.push(log("demo", TS, "hello world")).unwrap();
 
-        let partition = PartitionKey::new(Table::Logs, "demo", TS).unwrap().dir(&dir);
+        let partition = PartitionKey::new(Table::Logs, "demo", TS)
+            .unwrap()
+            .dir(&dir);
         let path = &parquet_files(&partition)[0];
         let file = std::fs::File::open(path).unwrap();
         let batch = ParquetRecordBatchReaderBuilder::try_new(file)

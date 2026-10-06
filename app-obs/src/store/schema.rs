@@ -34,6 +34,11 @@ pub struct LogRecord {
     /// functions when a query needs to.
     pub fields: Option<String>,
     pub host: Option<String>,
+    /// The app-lb namespace the deployment belonged to when the row was
+    /// written, stamped by [`crate::ingest::Sink`] from the poller's
+    /// directory — never by the sender. [`UNATTRIBUTED`] for platform rows and
+    /// deployments app-lb has not reported; `None` only before stamping.
+    pub namespace: Option<String>,
 }
 
 /// One sample of a deployment's or VM's resource and traffic state.
@@ -74,7 +79,20 @@ pub struct MetricRecord {
     pub latency_count: Option<u64>,
     /// Milliseconds, matching `p50_ms` and friends.
     pub latency_sum: Option<u64>,
+    /// See [`LogRecord::namespace`].
+    pub namespace: Option<String>,
 }
+
+/// The `namespace` written for rows no tenant namespace owns: the platform's
+/// reserved partitions (`_host`, `_lb`, `_unmanaged`, `syslog`) and any
+/// deployment app-lb has not reported. Not a legal app-lb namespace (the
+/// underscore), so no namespace route can ever be asked for it.
+pub const UNATTRIBUTED: &str = "_";
+
+/// The namespace a row written before the column existed belongs to. Every
+/// deployment predating namespaces lived in app-lb's `default`, and that is
+/// where app-lb still files a spec that names none.
+pub const LEGACY_NAMESPACE: &str = "default";
 
 /// Either kind of row. The writer is generic over this so ingest and polling
 /// share one buffering, flushing, and partitioning path.
@@ -96,6 +114,13 @@ impl Record {
         match self {
             Self::Log(r) => &r.deployment,
             Self::Metric(r) => &r.deployment,
+        }
+    }
+
+    pub fn set_namespace(&mut self, namespace: String) {
+        match self {
+            Self::Log(r) => r.namespace = Some(namespace),
+            Self::Metric(r) => r.namespace = Some(namespace),
         }
     }
 
@@ -159,6 +184,10 @@ pub fn logs_schema() -> Arc<Schema> {
         Field::new("message", DataType::Utf8, false),
         Field::new("fields", DataType::Utf8, true),
         Field::new("host", DataType::Utf8, true),
+        // Appended and nullable, like `latency_count` below: parquet written
+        // before namespaces still reads, with a null the query layer takes as
+        // [`LEGACY_NAMESPACE`].
+        Field::new("namespace", DataType::Utf8, true),
     ]))
 }
 
@@ -182,6 +211,7 @@ pub fn metrics_schema() -> Arc<Schema> {
         // missing from a file with nulls rather than failing the scan.
         Field::new("latency_count", DataType::UInt64, true),
         Field::new("latency_sum", DataType::UInt64, true),
+        Field::new("namespace", DataType::Utf8, true),
     ]))
 }
 

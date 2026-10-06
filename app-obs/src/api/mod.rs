@@ -9,9 +9,27 @@
 //! The endpoints are typed rather than a SQL passthrough. Each one is a query
 //! this module built, so partition pruning and a row cap are always applied —
 //! neither is something a caller can forget.
+//!
+//! # Namespace routes
+//!
+//! `/ns/{ns}/…` is the same dashboard and API narrowed to one app-lb namespace,
+//! for app-lb's obs plugin to put behind its own gate: a tenant reaches it as
+//! `/namespaces/{ns}/plugins/obs/…`, app-lb checks the tenant may read `{ns}`
+//! and forwards with this service's token. Nothing here trusts the caller to
+//! name its own namespace — the token is the operator's — so the narrowing is
+//! all in what these handlers will return:
+//!
+//! - every query filters on the stored `namespace` column, so history follows
+//!   the namespace a row was written under, not today's deployment list;
+//! - a deployment in another namespace, or one of the platform partitions,
+//!   answers 404 exactly as one that never existed;
+//! - the fleet view carries no host usage and no host sandboxes;
+//! - alerts are the namespace's own, and their webhooks may only leave for a
+//!   public `https` address.
 
 use crate::alerts::{Alert, AlertMetric, new_id};
 use crate::ingest::{Sink, token_matches};
+use crate::namespaces::{Directory, is_platform_id, is_valid_namespace};
 use crate::query::{
     Engine, HOST_DEPLOYMENT, LogBucket, LogFilter, MAX_LOG_LIMIT, MetricBucket, QueryError, Window,
 };
@@ -24,6 +42,7 @@ use axum::routing::{delete, get};
 use axum::{Json, Router};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -79,6 +98,8 @@ pub struct ApiState {
     pub alerts: Arc<tokio::sync::RwLock<Vec<Alert>>>,
     /// Where alert rules are persisted on every create/delete.
     pub alerts_file: String,
+    /// Which namespace each deployment is in, for the `/ns/{ns}` routes.
+    pub directory: Arc<Directory>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -94,6 +115,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/alerts", get(list_alerts).post(create_alert))
         .route("/api/alerts/{id}", delete(delete_alert))
         .route("/stats", get(stats))
+        // One namespace's view, for app-lb's obs plugin. See the module docs.
+        .route("/ns/{ns}", get(ns_redirect))
+        .route("/ns/{ns}/", get(ns_dashboard))
+        .route("/ns/{ns}/api/fleet", get(ns_fleet))
+        .route("/ns/{ns}/api/deployments/{id}", get(ns_detail))
+        .route("/ns/{ns}/api/deployments/{id}/logs", get(ns_logs))
+        .route(
+            "/ns/{ns}/api/alerts",
+            get(ns_list_alerts).post(ns_create_alert),
+        )
+        .route("/ns/{ns}/api/alerts/{id}", delete(ns_delete_alert))
         .route_layer(middleware::from_fn_with_state(
             state.api_token.clone(),
             require_api_token,
@@ -158,10 +190,27 @@ fn api_request_authorized(expected: Option<&str>, presented: Option<&str>) -> bo
 /// `str::replace` rather than a template engine, matching app-lb's dashboards,
 /// with a test standing in for the compile-time check maud would have given.
 async fn dashboard(State(st): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
-    Html(render_dashboard(&st, &headers))
+    Html(render_dashboard(&st, &headers, None))
 }
 
-fn render_dashboard(st: &ApiState, headers: &HeaderMap) -> String {
+/// `GET /ns/{ns}` — the page's URLs are relative, so it must be served from a
+/// path ending in `/` or every fetch resolves one level too high.
+async fn ns_redirect(Path(ns): Path<String>) -> Result<Redirect, ApiError> {
+    let ns = namespace_param(&ns)?;
+    Ok(Redirect::permanent(&format!("/ns/{ns}/")))
+}
+
+/// `GET /ns/{ns}/` — the dashboard in namespace mode.
+async fn ns_dashboard(
+    State(st): State<ApiState>,
+    Path(ns): Path<String>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ApiError> {
+    let ns = namespace_param(&ns)?;
+    Ok(Html(render_dashboard(&st, &headers, Some(ns))))
+}
+
+fn render_dashboard(st: &ApiState, headers: &HeaderMap, namespace: Option<&str>) -> String {
     let cookies = headers
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok());
@@ -172,9 +221,13 @@ fn render_dashboard(st: &ApiState, headers: &HeaderMap) -> String {
     let who = crate::heyo_ui::identity_from(|n| headers.get(n).and_then(|v| v.to_str().ok()))
         .map(|i| crate::heyo_ui::escape(i.display()))
         .unwrap_or_default();
+    // Validated before it gets here, and escaped anyway: it lands in an
+    // attribute.
+    let namespace = namespace.map(crate::heyo_ui::escape).unwrap_or_default();
     DASHBOARD_HTML
         .replace("{{HTML_ATTRS}}", &st.ui_cookies.attrs(cookies))
         .replace("{{WHO}}", &who)
+        .replace("{{NAMESPACE}}", &namespace)
 }
 
 /// `GET /__ui/{*path}` — the platform stylesheet, theme script and fonts,
@@ -201,6 +254,16 @@ async fn stats(State(state): State<ApiState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "accepted": state.sink.accepted(),
         "dropped": state.sink.dropped(),
+        "gated": state.sink.gated(),
+        // Which namespaces are being collected: "open" (all of them),
+        // "unknown" (app-lb has not answered yet), or the installed list.
+        "collecting": match state.directory.gate() {
+            crate::namespaces::Gate::Open => serde_json::json!("open"),
+            crate::namespaces::Gate::Unknown => serde_json::json!("unknown"),
+            crate::namespaces::Gate::Installed(set) => {
+                serde_json::json!(set.into_iter().collect::<BTreeSet<_>>())
+            }
+        },
         "buffered_rows": state.buffered.load(Ordering::Relaxed),
         "flush_secs": state.flush_secs,
         "retain_days": state.retain_days,
@@ -408,17 +471,55 @@ async fn fleet(
     State(state): State<ApiState>,
     Query(params): Query<WindowParams>,
 ) -> Result<Json<FleetResponse>, ApiError> {
+    fleet_view(&state, params, None).await
+}
+
+/// `GET /ns/{ns}/api/fleet`
+async fn ns_fleet(
+    State(state): State<ApiState>,
+    Path(ns): Path<String>,
+    Query(params): Query<WindowParams>,
+) -> Result<Json<FleetResponse>, ApiError> {
+    let ns = namespace_param(&ns)?;
+    fleet_view(&state, params, Some(ns)).await
+}
+
+async fn fleet_view(
+    state: &ApiState,
+    params: WindowParams,
+    namespace: Option<&str>,
+) -> Result<Json<FleetResponse>, ApiError> {
     let (label, window) = resolve_window(params.window.as_deref());
     let step = window.step_secs(FLEET_POINTS);
 
     // One scan for the whole fleet rather than one per row: `deployment` is a
     // partition column, so the engine still only opens the directories the
     // window touches.
-    let metrics = state.engine.metrics(window, step, None).await?;
-    let volume = state.engine.log_volume(window, step, None).await?;
+    let metrics = state.engine.metrics(window, step, None, namespace).await?;
+    let volume = state
+        .engine
+        .log_volume(window, step, None, namespace)
+        .await?;
+
+    // The operator's list is what is on disk. A namespace's is what app-lb
+    // says is in it now — so a deployment quiet for the whole window still
+    // gets a row — plus whatever left rows under it in the window, which is
+    // how a deleted deployment's last hours stay readable.
+    let ids: Vec<String> = match namespace {
+        None => state.engine.deployments(),
+        Some(ns) => {
+            let mut ids: BTreeSet<String> =
+                state.directory.deployments_in(ns).into_iter().collect();
+            ids.extend(metrics.keys().cloned());
+            ids.extend(volume.keys().cloned());
+            ids.into_iter()
+                .filter(|id| visible_in(state, ns, id))
+                .collect()
+        }
+    };
 
     let mut deployments = Vec::new();
-    for id in state.engine.deployments() {
+    for id in ids {
         let buckets = metrics.get(&id).cloned().unwrap_or_default();
         let log_buckets = volume.get(&id).cloned().unwrap_or_default();
         deployments.push(FleetRow {
@@ -439,21 +540,53 @@ async fn fleet(
         window: label,
         windows: window_labels(),
         retain_days: state.retain_days,
-        freshness: freshness(&state),
+        freshness: freshness(state),
         // An empty vec and `None` mean different things: the first is "host
         // samples exist, none in this window", the second is "the daemon has
-        // never reported host usage at all".
-        host: metrics
-            .get(HOST_DEPLOYMENT)
-            .cloned()
-            .or_else(|| state.engine.has_host_data().then(Vec::new)),
+        // never reported host usage at all". A namespace gets neither: the
+        // host is shared, and how loaded it is says something about every
+        // other tenant on it.
+        host: match namespace {
+            Some(_) => None,
+            None => metrics
+                .get(HOST_DEPLOYMENT)
+                .cloned()
+                .or_else(|| state.engine.has_host_data().then(Vec::new)),
+        },
         deployments,
-        host_sandboxes: state
-            .live
-            .borrow()
-            .as_ref()
-            .map(|live| live.host_sandboxes.clone()),
+        host_sandboxes: match namespace {
+            Some(_) => None,
+            None => state
+                .live
+                .borrow()
+                .as_ref()
+                .map(|live| live.host_sandboxes.clone()),
+        },
     }))
+}
+
+/// Whether deployment `id` may be shown to namespace `ns` at all.
+///
+/// app-lb's word decides when it has one: in `ns`, yes; in another namespace,
+/// no — even if older rows say otherwise, an id re-registered elsewhere must
+/// not carry its history across. When app-lb no longer reports the id (it was
+/// deleted), the stored rows decide, because every query below filters on
+/// the namespace they were written under. The platform partitions are never
+/// a tenant's.
+fn visible_in(state: &ApiState, ns: &str, id: &str) -> bool {
+    match state.directory.namespace_of(id) {
+        Some(owner) => owner == ns,
+        None => !is_platform_id(id),
+    }
+}
+
+/// A namespace path segment, or the 404 an unknown one gets.
+fn namespace_param(ns: &str) -> Result<&str, ApiError> {
+    if is_valid_namespace(ns) {
+        Ok(ns)
+    } else {
+        Err(ApiError::NotFound)
+    }
 }
 
 async fn detail(
@@ -461,15 +594,54 @@ async fn detail(
     Path(id): Path<String>,
     Query(params): Query<WindowParams>,
 ) -> Result<Json<DetailResponse>, ApiError> {
+    detail_view(&state, id, params, None).await
+}
+
+/// `GET /ns/{ns}/api/deployments/{id}`
+async fn ns_detail(
+    State(state): State<ApiState>,
+    Path((ns, id)): Path<(String, String)>,
+    Query(params): Query<WindowParams>,
+) -> Result<Json<DetailResponse>, ApiError> {
+    let ns = namespace_param(&ns)?;
+    if !visible_in(&state, ns, &id) {
+        return Err(ApiError::NotFound);
+    }
+    detail_view(&state, id, params, Some(ns)).await
+}
+
+async fn detail_view(
+    state: &ApiState,
+    id: String,
+    params: WindowParams,
+    namespace: Option<&str>,
+) -> Result<Json<DetailResponse>, ApiError> {
     let (label, window) = resolve_window(params.window.as_deref());
     let step = window.step_secs(DETAIL_POINTS);
 
-    let metrics = state.engine.metrics(window, step, Some(&id)).await?;
-    let volume = state.engine.log_volume(window, step, Some(&id)).await?;
-    let backends = state.engine.backends(window, &id).await?;
+    let metrics = state
+        .engine
+        .metrics(window, step, Some(&id), namespace)
+        .await?;
+    let volume = state
+        .engine
+        .log_volume(window, step, Some(&id), namespace)
+        .await?;
+    let backends = state.engine.backends(window, &id, namespace).await?;
 
     let buckets = metrics.get(&id).cloned().unwrap_or_default();
     let log_buckets = volume.get(&id).cloned().unwrap_or_default();
+
+    // A deployment app-lb no longer reports, with nothing under this
+    // namespace in the window, is one this namespace cannot be shown to have
+    // had — the same 404 as an id that never existed.
+    if let Some(ns) = namespace
+        && buckets.is_empty()
+        && log_buckets.is_empty()
+        && state.directory.namespace_of(&id).as_deref() != Some(ns)
+    {
+        return Err(ApiError::NotFound);
+    }
 
     Ok(Json(DetailResponse {
         generated_at_ms: Utc::now().timestamp_millis(),
@@ -479,7 +651,7 @@ async fn detail(
         window: label,
         windows: window_labels(),
         retain_days: state.retain_days,
-        freshness: freshness(&state),
+        freshness: freshness(state),
         latest: latest_of(&buckets),
         log_lines: log_buckets.iter().map(|b| b.lines).sum(),
         error_logs: log_buckets.iter().map(|b| b.errors).sum(),
@@ -495,12 +667,42 @@ async fn logs(
     Path(id): Path<String>,
     Query(params): Query<LogParams>,
 ) -> Result<Json<LogsResponse>, ApiError> {
+    logs_view(&state, id, params, None).await
+}
+
+/// `GET /ns/{ns}/api/deployments/{id}/logs`
+async fn ns_logs(
+    State(state): State<ApiState>,
+    Path((ns, id)): Path<(String, String)>,
+    Query(params): Query<LogParams>,
+) -> Result<Json<LogsResponse>, ApiError> {
+    let ns = namespace_param(&ns)?;
+    if !visible_in(&state, ns, &id) {
+        return Err(ApiError::NotFound);
+    }
+    let gone = state.directory.namespace_of(&id).is_none();
+    let response = logs_view(&state, id, params, Some(ns)).await?;
+    // As for the detail view: a deleted deployment with nothing under this
+    // namespace is indistinguishable from one that never existed.
+    if gone && response.rows.is_empty() && response.next_before_ms.is_none() {
+        return Err(ApiError::NotFound);
+    }
+    Ok(response)
+}
+
+async fn logs_view(
+    state: &ApiState,
+    id: String,
+    params: LogParams,
+    namespace: Option<&str>,
+) -> Result<Json<LogsResponse>, ApiError> {
     let (_, window) = resolve_window(params.window.as_deref());
     let window = resolve_range(window, params.from, params.to);
     let limit = params.limit.unwrap_or(200).clamp(1, MAX_LOG_LIMIT);
 
     let filter = LogFilter {
         deployment: id.clone(),
+        namespace: namespace.map(str::to_string),
         // An empty query string is what a cleared form field sends. Treating it
         // as a filter would match everything or nothing depending on the
         // operator, and either way it isn't what was meant.
@@ -547,6 +749,57 @@ async fn list_alerts(State(state): State<ApiState>) -> Json<Vec<Alert>> {
     Json(state.alerts.read().await.clone())
 }
 
+/// `GET /ns/{ns}/api/alerts` — the rules this namespace created, and no others.
+/// An operator's rule on one of its deployments is the operator's.
+async fn ns_list_alerts(
+    State(state): State<ApiState>,
+    Path(ns): Path<String>,
+) -> Result<Json<Vec<Alert>>, ApiError> {
+    let ns = namespace_param(&ns)?;
+    Ok(Json(
+        state
+            .alerts
+            .read()
+            .await
+            .iter()
+            .filter(|a| a.namespace.as_deref() == Some(ns))
+            .cloned()
+            .collect(),
+    ))
+}
+
+/// `POST /ns/{ns}/api/alerts` — a rule on one of this namespace's deployments.
+///
+/// Stricter than the operator's route in two ways. The deployment must be one
+/// app-lb reports in this namespace now: a rule fires on the metric series by
+/// id, and that series is not filtered by namespace. And the webhook must be a
+/// public `https` address, because the request comes from this host and a
+/// tenant must not be able to aim it at the host's own listeners.
+async fn ns_create_alert(
+    State(state): State<ApiState>,
+    Path(ns): Path<String>,
+    Json(req): Json<CreateAlertRequest>,
+) -> Result<(StatusCode, Json<Alert>), AlertsApiError> {
+    let ns = namespace_param(&ns).map_err(|_| AlertsApiError::UnknownDeployment)?;
+    if state.directory.namespace_of(&req.deployment).as_deref() != Some(ns) {
+        return Err(AlertsApiError::UnknownDeployment);
+    }
+    if !public_https_url(&req.webhook_url) {
+        return Err(AlertsApiError::PrivateWebhook);
+    }
+    store_alert(&state, req, Some(ns.to_string())).await
+}
+
+/// `DELETE /ns/{ns}/api/alerts/{id}` — idempotent like the operator's route,
+/// and never reaches a rule this namespace did not create.
+async fn ns_delete_alert(
+    State(state): State<ApiState>,
+    Path((ns, id)): Path<(String, String)>,
+) -> Result<StatusCode, AlertsApiError> {
+    let ns = namespace_param(&ns).map_err(|_| AlertsApiError::UnknownDeployment)?;
+    remove_alert(&state, |a| a.id == id && a.namespace.as_deref() == Some(ns)).await
+}
+
 /// `POST /api/alerts` — create a rule.
 ///
 /// The deployment must be one the engine knows about, so a typo cannot leave a
@@ -567,13 +820,21 @@ async fn create_alert(
     if !valid_webhook_url(&req.webhook_url) {
         return Err(AlertsApiError::BadWebhook);
     }
+    store_alert(&state, req, None).await
+}
 
+async fn store_alert(
+    state: &ApiState,
+    req: CreateAlertRequest,
+    namespace: Option<String>,
+) -> Result<(StatusCode, Json<Alert>), AlertsApiError> {
     let alert = Alert {
         id: new_id(),
         deployment: req.deployment,
         metric: req.metric.unwrap_or(AlertMetric::Errors),
         threshold: req.threshold,
         webhook_url: req.webhook_url,
+        namespace,
     };
 
     let path = state.alerts_file.clone();
@@ -593,16 +854,22 @@ async fn delete_alert(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AlertsApiError> {
+    remove_alert(&state, |a| a.id == id).await
+}
+
+async fn remove_alert(
+    state: &ApiState,
+    matches: impl Fn(&Alert) -> bool,
+) -> Result<StatusCode, AlertsApiError> {
     let path = state.alerts_file.clone();
     let mut alerts = state.alerts.write().await;
     let before = alerts.len();
-    alerts.retain(|a| a.id != id);
+    alerts.retain(|a| !matches(a));
     if alerts.len() == before {
         // Nothing changed on disk, so no rewrite — and no error either.
         return Ok(StatusCode::NO_CONTENT);
     }
-    crate::alerts::save(std::path::Path::new(&path), &alerts)
-        .map_err(AlertsApiError::Persist)?;
+    crate::alerts::save(std::path::Path::new(&path), &alerts).map_err(AlertsApiError::Persist)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -617,26 +884,83 @@ fn valid_webhook_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A webhook a namespace may point the collector at: `https`, and a host that
+/// is not loopback, link-local, private or otherwise this side of the
+/// internet when written as an address. A name is resolved later by the
+/// sender; this stops the obvious aims at the host's own listeners rather
+/// than every DNS trick, which is what the `https` requirement is for.
+fn public_https_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // `host_str` keeps an IPv6 literal's brackets.
+    match host
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let [a, b, ..] = ip.octets();
+            !(ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                // 100.64.0.0/10, carrier-grade NAT and tailnets.
+                || (a == 100 && (b & 0xc0) == 64))
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || ip.to_ipv4_mapped().is_some())
+        }
+        Err(_) => {
+            let d = host.trim_end_matches('.').to_ascii_lowercase();
+            !d.is_empty()
+                && d != "localhost"
+                && !d.ends_with(".localhost")
+                && !d.ends_with(".internal")
+        }
+    }
+}
+
 /// Failures from the alert routes, mapped to status codes a caller can act on.
 enum AlertsApiError {
     UnknownDeployment,
     BadWebhook,
+    PrivateWebhook,
     Persist(std::io::Error),
 }
 
 impl IntoResponse for AlertsApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            Self::UnknownDeployment => {
-                (StatusCode::BAD_REQUEST, "deployment is not known to this collector")
-            }
+            Self::UnknownDeployment => (
+                StatusCode::BAD_REQUEST,
+                "deployment is not known to this collector",
+            ),
             Self::BadWebhook => (
                 StatusCode::BAD_REQUEST,
                 "webhook_url must be an absolute http or https URL with a host",
             ),
+            Self::PrivateWebhook => (
+                StatusCode::BAD_REQUEST,
+                "webhook_url must be an https URL on a public host",
+            ),
             Self::Persist(e) => {
                 tracing::error!(error = %e, "could not persist alerts file");
-                (StatusCode::INTERNAL_SERVER_ERROR, "could not persist the alert")
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not persist the alert",
+                )
             }
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
@@ -802,17 +1126,32 @@ fn latest_of(buckets: &[MetricBucket]) -> MetricBucket {
 }
 
 /// A query failure, as a status the dashboard can act on.
-struct ApiError(QueryError);
+enum ApiError {
+    Query(QueryError),
+    /// A namespace route asked about something outside its namespace — or
+    /// about nothing at all; the two answer alike.
+    NotFound,
+}
 
 impl From<QueryError> for ApiError {
     fn from(e: QueryError) -> Self {
-        Self(e)
+        Self::Query(e)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let status = match &self.0 {
+        let error = match self {
+            Self::Query(e) => e,
+            Self::NotFound => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "no such deployment" })),
+                )
+                    .into_response();
+            }
+        };
+        let status = match &error {
             // Not an error in the deployment, so not a 500: the caller should
             // come back, and app-lb should not conclude anything is wrong.
             QueryError::Busy => StatusCode::SERVICE_UNAVAILABLE,
@@ -820,12 +1159,12 @@ impl IntoResponse for ApiError {
             QueryError::BadDeployment(_) => StatusCode::BAD_REQUEST,
             QueryError::Engine(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        if let QueryError::Engine(e) = &self.0 {
+        if let QueryError::Engine(e) = &error {
             tracing::error!(error = %e, "query failed");
         }
         // The message goes back as well as to the log: this is an operator's
         // tool, and "something went wrong" would just mean two places to look.
-        let body = Json(serde_json::json!({ "error": self.0.to_string() }));
+        let body = Json(serde_json::json!({ "error": error.to_string() }));
         (status, body).into_response()
     }
 }
@@ -839,12 +1178,16 @@ mod shell_tests {
     /// pays it. A survivor is rendered literally into somebody's browser.
     #[test]
     fn every_placeholder_is_filled_and_none_are_invented() {
-        for token in ["{{HTML_ATTRS}}", "{{WHO}}"] {
-            assert!(DASHBOARD_HTML.contains(token), "{token} is gone from the page");
+        for token in ["{{HTML_ATTRS}}", "{{WHO}}", "{{NAMESPACE}}"] {
+            assert!(
+                DASHBOARD_HTML.contains(token),
+                "{token} is gone from the page"
+            );
         }
         let rendered = DASHBOARD_HTML
             .replace("{{HTML_ATTRS}}", r#"data-theme="dark""#)
-            .replace("{{WHO}}", "ops@example.com");
+            .replace("{{WHO}}", "ops@example.com")
+            .replace("{{NAMESPACE}}", "team-a");
         assert!(!rendered.contains("{{"), "a placeholder survived rendering");
     }
 
@@ -855,7 +1198,10 @@ mod shell_tests {
         assert!(DASHBOARD_HTML.contains(r#"href="/__ui/heyo.css""#));
         assert!(DASHBOARD_HTML.contains(r#"src="/__ui/theme.js""#));
         for external in ["src=\"http", "href=\"http", "src=\"//", "href=\"//"] {
-            assert!(!DASHBOARD_HTML.contains(external), "external asset: {external}");
+            assert!(
+                !DASHBOARD_HTML.contains(external),
+                "external asset: {external}"
+            );
         }
     }
 
@@ -925,6 +1271,7 @@ mod tests {
             host_sandboxes: Vec::new(),
             deployments: vec![DeploymentView {
                 id: "stage".into(),
+                namespace: None,
                 kind: Some("static".into()),
                 upstreams: vec!["eu1:80".into(), "us1:80".into()],
                 routed: Some(true),
@@ -1055,6 +1402,7 @@ mod tests {
         let mut status = static_status(vec![backend("eu1:80", true, false)]);
         status.deployments.push(DeploymentView {
             id: "agent-sandbox".into(),
+            namespace: None,
             kind: Some("vm".into()),
             upstreams: Vec::new(),
             routed: Some(false),
@@ -1154,7 +1502,11 @@ mod tests {
 
         // Unit words, spaces and case all mean the same thing.
         for spelling in ["1 day", "24 hours", "24H", " 1440 minutes "] {
-            assert_eq!(resolve_window(Some(spelling)).1.seconds(), 86_400, "{spelling}");
+            assert_eq!(
+                resolve_window(Some(spelling)).1.seconds(),
+                86_400,
+                "{spelling}"
+            );
         }
         assert_eq!(resolve_window(Some("45m")).1.seconds(), 2_700);
         assert_eq!(resolve_window(Some("2w")).1.seconds(), 1_209_600);
@@ -1261,5 +1613,240 @@ mod tests {
         assert_eq!(non_empty(Some("".into())), None);
         assert_eq!(non_empty(Some("   ".into())), None);
         assert_eq!(non_empty(None), None);
+    }
+}
+
+#[cfg(test)]
+mod ns_tests {
+    use super::*;
+    use crate::namespaces::Gate;
+    use crate::store::schema::{LogRecord, MetricRecord, Record};
+    use crate::store::writer::Writer;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+
+    const TOKEN: &str = "svc-token";
+
+    /// A collector over two namespaces' worth of stored rows, served on a
+    /// loopback port, with the directory saying where each deployment lives.
+    async fn serve(tag: &str) -> (String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("app-obs-ns-api-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = Utc::now().timestamp_millis();
+        let mut writer = Writer::new(&dir, 10_000, Duration::from_secs(3600));
+        for (dep, ns) in [("web", "team-a"), ("api", "team-b"), ("_lb", "_")] {
+            writer
+                .push(Record::Log(LogRecord {
+                    ts_millis: now - 1_000,
+                    deployment: dep.into(),
+                    backend: None,
+                    source: "stdout".into(),
+                    level: Some("error".into()),
+                    message: format!("{dep} says hi"),
+                    fields: None,
+                    host: None,
+                    namespace: Some(ns.into()),
+                }))
+                .unwrap();
+            writer
+                .push(Record::Metric(MetricRecord {
+                    ts_millis: now - 1_000,
+                    deployment: dep.into(),
+                    ready: Some(1),
+                    namespace: Some(ns.into()),
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        writer.flush_all().unwrap();
+
+        let directory = Arc::new(Directory::new(true));
+        directory.set_namespaces(HashMap::from([
+            ("web".to_string(), "team-a".to_string()),
+            ("api".to_string(), "team-b".to_string()),
+            ("quiet".to_string(), "team-a".to_string()),
+        ]));
+        directory.set_gate(Gate::Installed(HashSet::from(["team-a".to_string()])));
+        let engine = Arc::new(Engine::new(&dir, 2, Duration::from_secs(30)).await.unwrap());
+        let (sink, _rx) = Sink::new(16);
+        let (_live_tx, live) = tokio::sync::watch::channel(None);
+        let state = ApiState {
+            engine,
+            sink,
+            api_token: Some(Arc::new(TOKEN.into())),
+            buffered: Arc::new(AtomicUsize::new(0)),
+            flush_secs: 60,
+            retain_days: 30,
+            live,
+            stale_after_secs: 30,
+            ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::default()),
+            alerts: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            alerts_file: dir.join("alerts.json").display().to_string(),
+            directory,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        (format!("http://{addr}"), dir)
+    }
+
+    async fn get(base: &str, path: &str) -> (u16, serde_json::Value) {
+        let r = reqwest::Client::new()
+            .get(format!("{base}{path}"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_namespace_route_sees_its_own_deployments_and_nothing_else() {
+        let (base, dir) = serve("fleet").await;
+
+        let (code, fleet) = get(&base, "/ns/team-a/api/fleet?window=1h").await;
+        assert_eq!(code, 200);
+        let ids: Vec<&str> = fleet["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["quiet", "web"],
+            "a quiet deployment still gets a row"
+        );
+        assert!(fleet["host"].is_null() && fleet["host_sandboxes"].is_null());
+
+        let (code, logs) = get(&base, "/ns/team-a/api/deployments/web/logs?window=1h").await;
+        assert_eq!(code, 200);
+        assert_eq!(logs["rows"][0]["message"], "web says hi");
+
+        // Another namespace's deployment, a platform partition and an id that
+        // never existed all answer alike.
+        for path in [
+            "/ns/team-a/api/deployments/api",
+            "/ns/team-a/api/deployments/api/logs",
+            "/ns/team-a/api/deployments/_lb",
+            "/ns/team-a/api/deployments/_lb/logs",
+            "/ns/team-a/api/deployments/ghost",
+            "/ns/team-a/api/deployments/ghost/logs",
+            "/ns/_/api/fleet",
+        ] {
+            let (code, body) = get(&base, path).await;
+            assert_eq!(code, 404, "{path}");
+            assert!(!body.to_string().contains("says hi"), "{path}");
+        }
+
+        // The operator's routes are unchanged.
+        let (code, fleet) = get(&base, "/api/fleet?window=1h").await;
+        assert_eq!(code, 200);
+        assert_eq!(fleet["deployments"].as_array().unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn namespace_alerts_are_private_and_aim_only_outward() {
+        let (base, dir) = serve("alerts").await;
+        let client = reqwest::Client::new();
+        let post = |ns: &str, body: serde_json::Value| {
+            client
+                .post(format!("{base}/ns/{ns}/api/alerts"))
+                .bearer_auth(TOKEN)
+                .json(&body)
+                .send()
+        };
+
+        let r = post(
+            "team-a",
+            serde_json::json!({"deployment": "web", "threshold": 1, "webhook_url": "https://hooks.example.com/x"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 201);
+        let created: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(created["namespace"], "team-a");
+
+        for (ns, dep, url) in [
+            ("team-a", "api", "https://hooks.example.com/x"), // not team-a's
+            ("team-a", "web", "http://hooks.example.com/x"),  // not https
+            ("team-a", "web", "https://127.0.0.1:9600/x"),
+            ("team-a", "web", "https://10.0.0.1/x"),
+            ("team-a", "web", "https://[::1]/x"),
+            ("team-a", "web", "https://localhost/x"),
+        ] {
+            let r = post(
+                ns,
+                serde_json::json!({"deployment": dep, "threshold": 1, "webhook_url": url}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r.status().as_u16(), 400, "{dep} {url}");
+        }
+
+        let (_, mine) = get(&base, "/ns/team-a/api/alerts").await;
+        assert_eq!(mine.as_array().unwrap().len(), 1);
+        let (_, theirs) = get(&base, "/ns/team-b/api/alerts").await;
+        assert!(theirs.as_array().unwrap().is_empty());
+
+        // team-b cannot delete team-a's rule, even by id.
+        let id = created["id"].as_str().unwrap();
+        let r = client
+            .delete(format!("{base}/ns/team-b/api/alerts/{id}"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 204);
+        let (_, mine) = get(&base, "/ns/team-a/api/alerts").await;
+        assert_eq!(mine.as_array().unwrap().len(), 1, "still there");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_namespace_page_is_served_with_its_namespace_and_needs_the_token() {
+        let (base, dir) = serve("page").await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let r = client
+            .get(format!("{base}/ns/team-a/"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let html = r.text().await.unwrap();
+        assert!(html.contains(r#"<meta name="obs-namespace" content="team-a">"#));
+
+        let r = client
+            .get(format!("{base}/ns/team-a"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 308);
+        assert_eq!(r.headers()["location"], "/ns/team-a/");
+
+        let r = client
+            .get(format!("{base}/ns/team-a/api/fleet"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401, "the service token still gates it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Absolute `/api/...` paths would break the page behind app-lb's
+    /// `/namespaces/<ns>/plugins/obs/` prefix.
+    #[test]
+    fn the_page_fetches_only_relative_api_paths() {
+        for absolute in ["(`/api/", "(\"/api/", "('/api/"] {
+            assert!(!DASHBOARD_HTML.contains(absolute), "{absolute}");
+        }
+        assert!(DASHBOARD_HTML.contains("api(`api/fleet"));
     }
 }

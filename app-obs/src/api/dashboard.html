@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>app-obs</title>
+<!-- Set when this page is one namespace's view (`/ns/<ns>/`, or app-lb's
+     `/namespaces/<ns>/plugins/obs/`); empty for the operator's. -->
+<meta name="obs-namespace" content="{{NAMESPACE}}">
 <link rel="stylesheet" href="/__ui/heyo.css">
 <script defer src="/__ui/theme.js"></script>
 <style>
@@ -330,6 +333,12 @@ const REFRESH_MS = 10_000;   // matches the metrics poll interval; finer just re
 const LOG_PAGE = 200;
 
 const $ = (id) => document.getElementById(id);
+
+// One namespace's view, or "" for the operator's. Every API path below is
+// relative for the same reason: this page is served at `/dashboard`, at
+// `/ns/<ns>/` and behind app-lb's `/namespaces/<ns>/plugins/obs/`, and a
+// relative `api/...` resolves to the right one of each.
+const NS = document.querySelector('meta[name="obs-namespace"]').content;
 
 let state = {
   window: "24h",
@@ -777,11 +786,14 @@ function freshnessNote(f) {
 
 function renderFleet(data) {
   state.data = data;
-  $("subtitle").textContent = `${data.deployments.length} deployment${data.deployments.length === 1 ? "" : "s"} · ${data.retain_days}d retention`;
+  $("subtitle").textContent = `${NS ? NS + " · " : ""}${data.deployments.length} deployment${data.deployments.length === 1 ? "" : "s"} · ${data.retain_days}d retention`;
 
-  // Whole-host usage, which belongs to no deployment.
+  // Whole-host usage, which belongs to no deployment — and to no namespace,
+  // so a namespace's view has no host section at all.
   const host = $("host-wrap");
-  if (data.host == null) {
+  if (NS) {
+    host.innerHTML = "";
+  } else if (data.host == null) {
     host.innerHTML = `<div class="section-title">Host</div>
       <div class="card"><div class="sub" style="color:var(--muted);font-size:13px">
       app-lb has not reported host usage — the daemon supplies it only once it has sampled the host.</div></div>`;
@@ -806,7 +818,10 @@ function renderFleet(data) {
 
   const fleet = $("fleet");
   if (!data.deployments.length) {
-    fleet.innerHTML = `<div class="card"><span style="color:var(--muted)">Nothing collected yet.
+    fleet.innerHTML = NS
+      ? `<div class="card"><span style="color:var(--muted)">Nothing collected for ${esc(NS)} yet.
+      Metrics arrive within a poll of a deployment starting; logs as its sandboxes write them.</span></div>`
+      : `<div class="card"><span style="color:var(--muted)">Nothing collected yet.
       Logs arrive on the ingest port; metrics are polled from app-lb.</span></div>`;
   } else {
     fleet.innerHTML = data.deployments.map((d) => {
@@ -1069,7 +1084,7 @@ async function loadLogs(append) {
   try {
     const before = append ? state.logNext : null;
     if (!append) { state.logRows = []; state.logSeen = new Set(); }
-    const data = await api(`/api/deployments/${encodeURIComponent(state.route.id)}/logs?${logQuery(before)}`);
+    const data = await api(`api/deployments/${encodeURIComponent(state.route.id)}/logs?${logQuery(before)}`);
 
     // `before` is inclusive, so the boundary millisecond comes back twice. The
     // server cannot drop it without risking losing lines from a burst that
@@ -1253,9 +1268,9 @@ async function refresh() {
   view.classList.add("busy");
   try {
     if (route.view === "detail") {
-      renderDetail(await api(`/api/deployments/${encodeURIComponent(route.id)}?window=${state.window}`));
+      renderDetail(await api(`api/deployments/${encodeURIComponent(route.id)}?window=${state.window}`));
     } else {
-      renderFleet(await api(`/api/fleet?window=${state.window}`));
+      renderFleet(await api(`api/fleet?window=${state.window}`));
     }
     banner(null);
   } catch (e) {

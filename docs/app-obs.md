@@ -106,11 +106,13 @@ All ingest paths feed one bounded queue (`APP_OBS_QUEUE_CAPACITY`). When it is f
 
 ### Log columns
 
-`ts`, `backend`, `source`, `level`, `message`, `fields`, `host` (plus the `deployment`/`date`/`hour` partition keys).
+`ts`, `backend`, `source`, `level`, `message`, `fields`, `host`, `namespace` (plus the `deployment`/`date`/`hour` partition keys).
 
 ### Metric columns
 
-`ts`, `backend`, `cpu_percent`, `memory_bytes`, `in_flight`, `ready`, `pending`, `draining`, `requests_total`, `errors_total`, `p50_ms`, `p90_ms`, `p99_ms`, `latency_count`, `latency_sum`.
+`ts`, `backend`, `cpu_percent`, `memory_bytes`, `in_flight`, `ready`, `pending`, `draining`, `requests_total`, `errors_total`, `p50_ms`, `p90_ms`, `p99_ms`, `latency_count`, `latency_sum`, `namespace`.
+
+`namespace` is the app-lb namespace the deployment was in when the row was written, stamped by the collector (never by the sender). Platform rows (`_host`, `_lb`, `_unmanaged`, `syslog`) and rows for deployments app-lb has not reported yet carry `_`, which no namespace route can ask for. Files written before the column existed read it as null, which is treated as `default`; compaction fills the column with nulls when it merges old and new files.
 
 Things to know when reading metrics:
 
@@ -132,7 +134,8 @@ The API listener (default `127.0.0.1:9600`) serves a single self-contained HTML 
 | `GET /api/alerts` | token | All alert rules |
 | `POST /api/alerts` | token | Create an alert rule |
 | `DELETE /api/alerts/{id}` | token | Delete an alert rule (`204` even if already gone) |
-| `GET /stats` | token | Ingest counters (`accepted`, `dropped`) and `buffered_rows` |
+| `GET /stats` | token | Ingest counters (`accepted`, `dropped`, `gated`), `buffered_rows`, and the install gate as `collecting` |
+| `GET /ns/{ns}/…` | token | One namespace's dashboard, API and alerts; see [Per-namespace plugin](#per-namespace-plugin) |
 | `GET /healthz` | open | `ok`. Never waits on a query slot |
 | `GET /__ui/{path}` | open | Shared stylesheet, theme script, and fonts |
 
@@ -158,6 +161,48 @@ The API listener (default `127.0.0.1:9600`) serves a single self-contained HTML 
 
 There is no SQL passthrough. Every query is built by the server, so partition pruning and row caps always apply. Queries run in a bounded pool (`APP_OBS_QUERY_CONCURRENCY`) with a deadline (`APP_OBS_QUERY_TIMEOUT_SECS`); a query that arrives while the pool is full gets `503`, and one that runs past its deadline gets `504`.
 
+## Per-namespace plugin
+
+app-obs is one collector per region, shared by every tenant. Tenants reach it through app-lb's **obs plugin**, which is installed one namespace at a time:
+
+1. The operator enables the fleet plugin on app-lb, giving it this collector's API URL and a secret reference to `APP_OBS_API_TOKEN`.
+2. A namespace admin installs it in their namespace: `heyctl plugins install obs -n <ns>`.
+3. Anyone who can read that namespace opens `/namespaces/<ns>/plugins/obs/` on app-lb. It is this dashboard, narrowed to the namespace. The hosted MCP server's telemetry tools use the same API.
+
+app-lb checks the caller's namespace access and forwards to app-obs's `/ns/<ns>/…` routes with the service token. The tenant's own credential never reaches app-obs.
+
+### What gets collected
+
+Each poll, app-obs reads each deployment's namespace from app-lb's `/metrics`, and the installed namespaces from `GET /api/plugins/obs/installs` using the same `APP_LB_USER`/`APP_LB_PASSWORD`. Every record from every source passes the same gate: the poll, the daemon tail, `/ingest` and syslog.
+
+- **Tenant deployments** are collected only when their namespace has installed the plugin. Records for other namespaces are dropped before they are written (counted as `gated` in `/stats`), and their sandboxes are not tailed.
+- **Platform rows and deployments app-lb has not reported** are always collected, stamped `_`.
+- **The gate is open** (every namespace is collected, as before namespaces existed) when `APP_OBS_REQUIRE_INSTALL=0`, when app-lb answers `404` (it predates the endpoint), or when the fleet obs plugin is disabled.
+- **Until app-lb first answers**, tenant deployments are not collected. Later failures keep the last answer.
+- `/stats` reports the gate as `collecting`: `"open"`, `"unknown"`, or the installed namespaces.
+
+Uninstalling stops collection. It does not delete what was already stored; retention ages it out.
+
+### Namespace routes
+
+The same `APP_OBS_API_TOKEN` guards these as every other protected route. They exist for app-lb's plugin and must not be exposed to tenants directly.
+
+| Route | Returns |
+| --- | --- |
+| `GET /ns/{ns}/` | The dashboard in namespace mode: no host or host-sandbox sections. `/ns/{ns}` redirects here |
+| `GET /ns/{ns}/api/fleet?window=` | As `/api/fleet`, for the namespace's deployments; `host` and `host_sandboxes` are always null |
+| `GET /ns/{ns}/api/deployments/{id}?window=` | As `/api/deployments/{id}`, from rows written under `ns` |
+| `GET /ns/{ns}/api/deployments/{id}/logs` | As `/api/deployments/{id}/logs`, from rows written under `ns` |
+| `GET /ns/{ns}/api/alerts` | Only the alert rules this namespace created |
+| `POST /ns/{ns}/api/alerts` | Create a rule. The deployment must be in `ns` now, and `webhook_url` must be `https` on a public host |
+| `DELETE /ns/{ns}/api/alerts/{id}` | Delete one of this namespace's rules (`204` either way) |
+
+**Which deployments a namespace sees.** Every query filters on the stored `namespace` column, so history follows the namespace a row was written under, not the current deployment list. The following all return the same `404` as an id that never existed:
+
+- a deployment app-lb reports in another namespace;
+- a platform partition;
+- a deleted deployment with no rows under the namespace in the window.
+
 ## Alerts
 
 An alert watches one deployment's error count over the trailing minute. A checker runs every 60 seconds and, when the count is greater than the threshold, POSTs to the webhook:
@@ -176,9 +221,9 @@ curl -XPOST localhost:9600/api/alerts \
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `deployment` | yes | Must be a deployment app-obs already has data for, or the request is rejected |
+| `deployment` | yes | Must be a deployment app-obs already has data for, or the request is rejected. On the namespace route, it must be in that namespace |
 | `threshold` | yes | Fires when errors in the last minute exceed this. `0` fires on any error |
-| `webhook_url` | yes | `http` or `https` URL |
+| `webhook_url` | yes | `http` or `https` URL. On the namespace route, `https` on a public host only: no loopback, private, link-local or CGNAT addresses, no `localhost` or `.internal` names |
 | `metric` | no | `errors` (the only metric today) |
 
 Rules are stored in `APP_OBS_ALERTS_FILE` (default `<APP_OBS_DATA_DIR>/alerts.json`) and rewritten atomically on every change. A corrupt file stops app-obs from starting rather than silently dropping every rule. Webhook delivery has a 10-second timeout and is not retried; a failed query never fires an alert.
@@ -199,6 +244,7 @@ Configuration is environment-only; there is no config file and no CLI flags.
 | `APP_LB_USER` | `admin` | Basic-auth user for app-lb; only used when `APP_LB_PASSWORD` is set |
 | `APP_LB_PASSWORD` | unset | Set when app-lb requires admin auth |
 | `APP_OBS_SOURCE` | `app-lb` | Collector name carried in platform-status snapshots |
+| `APP_OBS_REQUIRE_INSTALL` | `1` | Collect a tenant namespace only once the obs plugin is installed in it on app-lb. `0` collects every namespace. See [What gets collected](#what-gets-collected) |
 | `HEYVM_URL` | unset | heyvm daemon to tail native logs from, e.g. `http://127.0.0.1:34099`. Unset disables native tailing |
 | `HEYVM_TOKEN` | unset | Bearer token for the daemon, when it runs with `JWT_SECRET` |
 | `APP_OBS_POLL_SECS` | `10` | Metrics poll interval |
