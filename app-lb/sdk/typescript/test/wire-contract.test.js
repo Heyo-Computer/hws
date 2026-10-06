@@ -24,7 +24,8 @@ const WIRE = join(here, "..", "..", "..", "testdata", "wire");
  */
 const KNOWN = {
   common: {
-    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms"],
+    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "workspace", "site"],
+    SiteRootStatus: ["root", "status", "index_present", "hint"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
     DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed"],
     DiscoverySpec: ["service_id"],
@@ -41,9 +42,10 @@ const KNOWN = {
     UpdateSpec: ["working_dir", "commands", "env", "env_from", "auth", "timeout_secs", "verify_timeout_secs"],
     SecretEnv: ["secret", "key", "as", "namespace"],
     SecretRef: ["secret", "key", "username", "namespace"],
-    AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "session_scope", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity", "jwt"],
+    AuthGate: ["provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "public_paths", "session_scope", "base_path", "session_ttl_secs", "cookie_name", "cookie_domain", "redirect_url", "forward_identity", "jwt", "provider_ref"],
+    AuthProviderView: ["name", "namespace", "description", "created_at", "provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "jwt", "cookie_domain"],
     PublicPath: ["path", "scope"],
-    JwtSpec: ["secret", "public_key", "jwks_url", "algorithms", "issuer", "audience", "require", "subject_claim", "email_claim", "name_claim", "leeway_secs", "cookie"],
+    JwtSpec: ["secret", "public_key", "jwks_url", "algorithms", "issuer", "audience", "require", "subject_claim", "email_claim", "name_claim", "leeway_secs", "cookie", "login_endpoint", "login_url", "login_redirect_param", "authorize_url", "token_url"],
     DeploymentView: ["id", "namespace", "account_id", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
     UpstreamTrafficStatus: ["deployment_id", "upstream", "state", "healthy", "in_flight", "reason", "started_at"],
     PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs"],
@@ -93,7 +95,10 @@ const KNOWN = {
     FeedSpec: ["announce", "issues", "expose"],
     FeedIndexEntry: ["namespace", "events"],
     FeedEvent: ["id", "ts", "last_ts", "count", "namespace", "deployment", "kind", "title", "detail"],
-    PluginView: ["id", "name", "description", "config_schema", "enabled", "config", "updated_at", "last_error", "status"],
+    PluginView: ["id", "name", "description", "config_schema", "enabled", "config", "updated_at", "last_error", "status", "per_namespace", "installed_in"],
+    NamespacePlugin: ["id", "name", "description", "enabled", "installed", "installed_at", "installed_by", "config"],
+    PluginInstalls: ["plugin", "enabled", "namespaces", "installs"],
+    NamespaceInstall: ["installed_at", "installed_by", "config"],
   },
 };
 
@@ -132,6 +137,19 @@ const FIXTURES = {
   "feed-event": "FeedEvent",
   "feed-index": "FeedIndexEntry",
   "plugins": "PluginView",
+  "namespace-plugins": "NamespacePlugin",
+  "plugin-installs": "PluginInstalls",
+  "auth-provider-google": "AuthProviderView",
+  "auth-provider-heyo": "AuthProviderView",
+  "deployment-inherited-gate": "DeploymentSpec",
+};
+
+/**
+ * Keys holding a map whose *keys* are data (a namespace name, say) and whose
+ * values are all one declaration.
+ */
+const MAPS = {
+  installs: "NamespaceInstall",
 };
 
 /** Which declaration governs a nested object, by the key that holds it. */
@@ -182,7 +200,11 @@ function check(value, declName, path, unknown) {
       unknown.push(`${path}.${key}`);
       continue;
     }
-    if (child && typeof child === "object" && !Array.isArray(child)) {
+    if (child && typeof child === "object" && !Array.isArray(child) && MAPS[key]) {
+      for (const [k, v] of Object.entries(child)) {
+        if (v && typeof v === "object") check(v, MAPS[key], `${path}.${key}.${k}`, unknown);
+      }
+    } else if (child && typeof child === "object" && !Array.isArray(child)) {
       // Two keys mean different things depending on where they sit, so the
       // declaration we are inside disambiguates them: `vms` is VmStatus under a
       // DeploymentStatus and VmView under a DeploymentView, and `auth` is the
@@ -195,6 +217,10 @@ function check(value, declName, path, unknown) {
       if (key === "auth") nested = declName === "DeploymentSpec" ? "AuthGate" : "SecretRef";
       if (key === "secret") nested = "SecretRef";
       if (key === "totals" && declName === "DiskInventory") nested = "DiskTotals";
+      // A spec's `site` is how to serve it; a status's is whether it can.
+      if (key === "site") nested = declName === "DeploymentStatus" ? "SiteRootStatus" : "SiteSpec";
+      // A plugin's `config` and `status` are its own business.
+      if ((key === "config" || key === "status") && /Plugin|Install/.test(declName)) nested = undefined;
       // A free-form claim map: the keys are whatever the issuer sends.
       if (key === "require") nested = undefined;
       if (nested) check(child, nested, `${path}.${key}`, unknown);

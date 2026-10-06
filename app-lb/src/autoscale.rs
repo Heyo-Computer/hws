@@ -1306,17 +1306,24 @@ impl Autoscaler {
             });
         });
         self.registry.persist_one(&d.spec.id).map_err(|_| vm::VmError::Runtime("cannot persist allocation intent".into()))?;
+        let attempt_name = name.clone();
         let result = match prepared {
             Some(prepared) => self.vms().submit_allocation(&prepared).await.map(|r| (r.sandbox_id.clone(), Some(r))),
             None => self.runtime.create(d.spec.vm_spec(), name, seed, owner, secret_env).await.map(|id| (id,None)),
         };
         match result {
             Ok((id, receipt)) => {
-                d.mutate_state(|s| { s.create_attempts[attempt].sandbox_id=Some(id.clone()); s.create_attempts[attempt].receipt=receipt; });
+                d.mutate_state(|s| { s.create_attempts[attempt].sandbox_id=Some(id.clone()); s.create_attempts[attempt].receipt=receipt.clone(); });
                 if self.registry.persist_one(&d.spec.id).is_err() {
                     d.mutate_state(|s| { s.create_attempts[attempt].sandbox_id=None; s.create_attempts[attempt].receipt=None; });
                     return Err(vm::VmError::Runtime("cannot persist allocation receipt".into()));
                 }
+                self.settle_in_successor(d, |attempts| {
+                    if let Some(a) = attempts.iter_mut().find(|a| a.name == attempt_name && a.sandbox_id.is_none()) {
+                        a.sandbox_id = Some(id.clone());
+                        a.receipt = receipt.clone();
+                    }
+                });
                 Ok(id)
             }
             Err(error) => {
@@ -1324,9 +1331,38 @@ impl Autoscaler {
                     | vm::VmError::WrongRuntime {..} | vm::VmError::RuntimeUnavailable {..}) {
                     d.mutate_state(|s| { s.create_attempts.remove(attempt); s.allocation_history_complete=history_was_complete; });
                     let _ = self.registry.persist_one(&d.spec.id);
+                    self.settle_in_successor(d, |attempts| {
+                        attempts.retain(|a| !(a.name == attempt_name && a.sandbox_id.is_none()));
+                    });
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// Apply a create's outcome to the deployment's successor, if it has one.
+    ///
+    /// A rollover — an image pull or build landing, a spec edit — replaces the
+    /// deployment object through `Registry::upsert`, which copies
+    /// `create_attempts` into the new object while this create is still
+    /// awaiting the daemon. The outcome is recorded on the object that started
+    /// the create; unless it also lands in the successor, the successor keeps
+    /// an attempt with no sandbox id, and `scale_up` refuses to create while
+    /// one exists — so the pool stays empty, silently, until a restart. Only
+    /// known outcomes are carried over: an attempt whose result is genuinely
+    /// unknown still blocks until `recover_allocations` resolves it.
+    fn settle_in_successor(
+        &self,
+        d: &Arc<Deployment>,
+        settle: impl FnOnce(&mut Vec<crate::retirement::CreateAttempt>),
+    ) {
+        let Some(live) = self.registry.get(&d.spec.id) else { return };
+        if Arc::ptr_eq(&live, d) {
+            return;
+        }
+        live.mutate_state(|s| settle(&mut s.create_attempts));
+        if let Err(e) = self.registry.persist_one(&d.spec.id) {
+            tracing::warn!(deployment = %d.spec.id, error = %e, "could not persist a create outcome carried to the replacement deployment");
         }
     }
 
@@ -2656,6 +2692,50 @@ mod tests {
             ),
             registry,
         )
+    }
+
+    /// Live on us5 (2026-10-06): a pull landed while the pool's first create
+    /// was awaiting the daemon. The rollover copied that unresolved attempt
+    /// into the new deployment object, the outcome was recorded only on the
+    /// old one, and the new pool never scaled up — `scale_up` refuses while
+    /// any attempt lacks a sandbox id. The outcome must reach the successor.
+    #[test]
+    fn a_create_that_lands_after_a_rollover_does_not_freeze_the_new_pool() {
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", spec());
+        let old = registry.get("demo").unwrap();
+        old.mutate_state(|s| s.create_attempts.push(crate::retirement::CreateAttempt {
+            name: "applb-demo-r1-0".into(),
+            ..Default::default()
+        }));
+        let new = registry.upsert(old.spec.clone());
+        assert!(!Arc::ptr_eq(&old, &new));
+        let blocked = |d: &Deployment| d.state().create_attempts.iter().any(|a| a.sandbox_id.is_none());
+        assert!(blocked(&new), "the rollover carries the in-flight attempt over");
+
+        // The create's outcome, as allocate_replica records it.
+        scaler.settle_in_successor(&old, |attempts| {
+            if let Some(a) = attempts.iter_mut().find(|a| a.name == "applb-demo-r1-0" && a.sandbox_id.is_none()) {
+                a.sandbox_id = Some("sb-landed".into());
+            }
+        });
+        assert!(!blocked(&new), "the new pool may scale up again");
+        assert_eq!(new.state().create_attempts[0].sandbox_id.as_deref(), Some("sb-landed"));
+
+        // A known failure removes it from the successor instead.
+        let failing = registry.get("demo").unwrap();
+        failing.mutate_state(|s| s.create_attempts.push(crate::retirement::CreateAttempt {
+            name: "applb-demo-r1-1".into(),
+            ..Default::default()
+        }));
+        let newer = registry.upsert(failing.spec.clone());
+        scaler.settle_in_successor(&failing, |attempts| {
+            attempts.retain(|a| !(a.name == "applb-demo-r1-1" && a.sandbox_id.is_none()));
+        });
+        assert!(!blocked(&newer));
+
+        // On the live object itself there is no successor to settle.
+        scaler.settle_in_successor(&newer, |attempts| attempts.clear());
+        assert_eq!(newer.state().create_attempts.len(), 1, "a live object is left to its own caller");
     }
 
     mod correlated_allocations {

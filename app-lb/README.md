@@ -3202,7 +3202,7 @@ work.
 | | |
 |---|---|
 | [`heyctl`](heyctl/README.md) | Rust — a client library *and* the kubectl-shaped CLI. `cargo install hws` for the CLI (crate `hws`), `default-features = false` for the library. |
-| [`heyctl` (npm)](sdk/typescript/README.md) | TypeScript — Node, Bun, Deno and browsers. |
+| [`@heyocomputer/hws` (npm)](sdk/typescript/README.md) | TypeScript — Node, Bun, Deno and browsers. |
 
 Both speak the same wire contract, and both are checked against it: the fixtures
 in `testdata/wire/` are written by app-lb's own response types, and each client

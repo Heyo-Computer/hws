@@ -895,6 +895,11 @@ fn decide_access(
             // A namespace administrator mints and revokes that namespace's
             // tokens; the handlers keep every token they touch inside it.
             None if is_token_route(matched) && caller.confined() => {}
+            // A job a namespace caller started (a pull, a build) is one it must
+            // be able to watch. The handler answers 404 for a job whose
+            // deployment the caller cannot touch, exactly as for one that
+            // never existed; the job list stays fleet-wide.
+            None if matched == "/jobs/:job_id" && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -6098,8 +6103,16 @@ async fn deployment_jobs(
 async fn get_job(
     State(state): State<AdminState>,
     Path(job_id): Path<String>,
+    caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
-    match state.jobs.record(&job_id) {
+    let visible = |deployment: &str| match confined(caller.as_deref()) {
+        None => true,
+        Some(c) => {
+            let ns = state.registry.get(deployment).map(|d| d.spec.namespace.clone());
+            c.may_touch(deployment, ns.as_deref())
+        }
+    };
+    match state.jobs.record(&job_id).filter(|r| visible(&r.deployment)) {
         Some(r) => Json(r).into_response(),
         // History is in memory and bounded, so an id can be forgotten rather
         // than never having existed. Say so.
@@ -7844,6 +7857,59 @@ mod tests {
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             (status, (), serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        }
+
+        /// A namespace token watches the jobs of its own deployments — the pull
+        /// it just started — and a job elsewhere answers like one that never
+        /// existed.
+        #[tokio::test]
+        async fn a_namespace_token_reads_its_own_jobs_and_nobody_elses() {
+            let f = fixture(true).await;
+            let mut mine = (*empty()).spec.clone();
+            mine.id = "mine".into();
+            mine.namespace = "team-a".into();
+            f.registry.upsert(mine);
+            let job = |id: &str, deployment: &str| -> crate::jobs::JobRecord {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "deployment": deployment, "kind": "artifact-pull",
+                    "status": "succeeded", "started_at": 1, "finished_at": 2, "log": []
+                }))
+                .unwrap()
+            };
+            f.state.jobs.remember_for_test(job("job-mine", "mine"));
+            f.state.jobs.remember_for_test(job("job-theirs", "obsolete"));
+
+            let (summary, _) = f
+                .state
+                .tokens
+                .mint(
+                    crate::tokens::NewToken {
+                        name: "ns".into(),
+                        admin: crate::tokens::AdminScope::Admin,
+                        namespace: Some("team-a".into()),
+                        deployments: vec![],
+                        expires_in_secs: None,
+                    },
+                    now_secs(),
+                )
+                .unwrap();
+            let caller = Caller::Token(f.state.tokens.get(&summary.id).unwrap());
+            let get = |id: &str, c: Option<Caller>| {
+                get_job(State(f.state.clone()), Path(id.to_string()), c.map(axum::Extension))
+            };
+            assert_eq!(get("job-mine", Some(caller.clone())).await.into_response().status(), StatusCode::OK);
+            let theirs = get("job-theirs", Some(caller.clone())).await.into_response();
+            let never = get("job-never", Some(caller)).await.into_response();
+            assert_eq!(theirs.status(), StatusCode::NOT_FOUND);
+            assert_eq!(never.status(), StatusCode::NOT_FOUND);
+            let body = |r: Response| async { axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap() };
+            assert_eq!(
+                String::from_utf8_lossy(&body(theirs).await).replace("job-theirs", "X"),
+                String::from_utf8_lossy(&body(never).await).replace("job-never", "X"),
+                "another namespace's job is indistinguishable from none"
+            );
+            // The operator reads every job.
+            assert_eq!(get("job-theirs", Some(Caller::Operator)).await.into_response().status(), StatusCode::OK);
         }
 
         /// The namespace plugin routes, through the real router: install and
@@ -9868,6 +9934,15 @@ mod tests {
                 ),
                 Verdict::Allow(_)
             ));
+        }
+
+        #[test]
+        fn a_namespace_token_reaches_single_jobs_but_not_the_job_list() {
+            let t = store();
+            let hdr = format!("Bearer {}", mint_in_namespace(&t, AdminScope::Admin, "team-a"));
+            let at = |matched: &str, path: &str| on(Some(&basic()), &t, Some(&hdr), matched, path, AdminScope::Admin);
+            assert!(matches!(at("/jobs/:job_id", "/jobs/job-1"), Verdict::Allow(_)));
+            assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
         }
 
         /// A namespace token narrowed to some of the namespace's deployments
