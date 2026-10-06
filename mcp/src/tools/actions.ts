@@ -17,6 +17,7 @@ import { z } from "zod";
 import { bool, num , DESTRUCTIVE_PREFIX } from "./schema.js";
 import type { Clients } from "../clients/index.js";
 import { json, report, type Section } from "../format.js";
+import { remoteRepoOf, storeBuildCredential } from "./remote-auth.js";
 import { ServiceError } from "../http.js";
 import type { Tool } from "./diagnose.js";
 import { cloudUsable, type Config } from "../config.js";
@@ -284,6 +285,26 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           ]);
         }
         if (!id) return "The spec has no `id`, so there is nothing to register.";
+
+        // A repo on this server's git remote is private: without
+        // `build.auth`, app-lb clones it anonymously and the build dies at
+        // "could not read Username". Add the credential `repo_deploy` would.
+        const build = spec.build as Record<string, unknown> | undefined;
+        const onRemote = build && !build.auth ? remoteRepoOf(config, build.repo) : undefined;
+        if (build && onRemote) {
+          const ns =
+            (typeof spec.namespace === "string" && spec.namespace) ||
+            (await clients.applbNamespace().catch(() => undefined));
+          const cred = await storeBuildCredential(clients, onRemote, id, ns || undefined);
+          build.auth = cred.auth;
+          sections.push({
+            title: "Build credential",
+            body:
+              `build.repo is on the Heyo git remote, so a read token (${cred.tokenId}) for ` +
+              `${onRemote.namespace}/${onRemote.repo} was stored as app-lb secret ${cred.secretId} ` +
+              "and set as build.auth.",
+          });
+        }
 
         // Exists or not decides POST vs PUT, and that decides whether the pool
         // survives. A 404 here is the normal create path, not an error.

@@ -350,7 +350,8 @@ export function artifactTools(clients: Clients, config: Config): Tool[] {
         "deployment's `artifact` pull unpacks into its root. For an agent holding a built " +
         "site with no tar at hand. " +
         (http
-          ? "Give `files` inline (utf8 or base64). "
+          ? "Give `files` inline (utf8 or base64): this server is remote, so a local path " +
+            "would name its disk, not yours. "
           : "Give `files` inline, or `directory`: a folder on this machine (e.g. `dist`), " +
             "bundled with paths relative to it. ") +
         "Up to 64 MiB. Set `deployment` to also start applb_pull on it.",
