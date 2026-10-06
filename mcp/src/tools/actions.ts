@@ -36,33 +36,42 @@ const DESTRUCTIVE = DESTRUCTIVE_PREFIX;
  * another namespace, the POST is what refuses it.
  */
 /**
- * The generated spec schema, with a note on the four fields whose app-lb
- * description invites what a namespace credential may not do. The schema
- * itself stays generated (`applb/spec.schema.ts`); these are prepended only
- * where it is advertised, so the first thing a hand-writer reads is the safe
- * route.
+ * The spec as `applb_deploy` advertises it: every top-level field and its
+ * one-line description, without the nested block definitions.
+ *
+ * The full generated schema (`applb/spec.schema.ts`) was ~4,000 tokens of a
+ * ~18,000-token tools/list, re-sent on every request, for the minority of
+ * sessions that hand-write a spec (repo_deploy and heyo_guide cover the common
+ * paths). applb_spec_schema returns any block in full, one call away. The
+ * notes below are prepended where a field's own description invites what a
+ * namespace credential may not do.
  */
-export const TENANT_NOTES: readonly (readonly [string[], string])[] = [
-  [["properties", "site"], "Omit `root`; fill via `build` or `artifact`."],
-  [["properties", "update"], "Operators only: a namespace credential is refused."],
-  [["$defs", "BuildSpec", "properties", "repo"], "Namespace credentials: https:// only."],
-  [["$defs", "VmSpec", "properties", "start_command"], "Must return (setsid nohup … &)."],
-];
+export const TENANT_NOTES: Record<string, string> = {
+  site: "Omit `root`; fill via `build` or `artifact`.",
+  update: "Operators only: a namespace credential is refused.",
+  build: "Namespace credentials: https:// repos and stores only.",
+  vm: "`start_command` must return (setsid nohup … &).",
+};
 
-function withTenantNotes<T>(schema: T): T {
-  const copy = JSON.parse(JSON.stringify(schema)) as Record<string, unknown>;
-  for (const [path, note] of TENANT_NOTES) {
-    let node: unknown = copy;
-    for (const k of path) node = (node as Record<string, unknown> | undefined)?.[k];
-    if (node && typeof node === "object") {
-      const n = node as { description?: string };
-      n.description = n.description ? `${note} ${n.description}` : note;
-    }
-  }
-  return copy as T;
+function topLevelSpec(full: typeof DEPLOYMENT_SPEC_SCHEMA): Record<string, unknown> {
+  const props = full.properties as Record<string, { description?: string }>;
+  const firstSentence = (d?: string) => (d ?? "").split(/(?<=\.)\s/)[0]?.replace(/\s+/g, " ").trim() ?? "";
+  return {
+    type: "object",
+    description:
+      "A deployment spec. Fields only; applb_spec_schema returns any block (e.g. VmSpec, SiteSpec) in full.",
+    properties: Object.fromEntries(
+      Object.entries(props).map(([k, v]) => {
+        const d = firstSentence(v.description);
+        const note = TENANT_NOTES[k];
+        return [k, { description: note ? `${note} ${d}` : d }];
+      }),
+    ),
+    required: (full as { required?: string[] }).required ?? [],
+  };
 }
 
-const ADVERTISED_SPEC = withTenantNotes(DEPLOYMENT_SPEC_SCHEMA);
+const ADVERTISED_SPEC = topLevelSpec(DEPLOYMENT_SPEC_SCHEMA);
 
 export function notVisible(e: ServiceError): boolean {
   return e.status === 404 || (e.status === 403 && /not scoped to deployment/.test(e.body));
@@ -331,6 +340,25 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           });
         }
         const problems = checkSpec(spec, { confined: Boolean(ownNs) });
+        // An artifact store this server does not know is almost always a
+        // guessed URL (a region with no store of its own); the pull fails
+        // with nothing to retry.
+        const artStore = (spec?.artifact as { store?: unknown } | undefined)?.store;
+        if (typeof artStore === "string" && config.art && /^https?:\/\//.test(artStore)) {
+          const want = new URL(config.art.baseUrl).host;
+          let got = "";
+          try {
+            got = new URL(artStore).host;
+          } catch {
+            /* checkSpec reports a malformed URL */
+          }
+          if (got && got !== want) {
+            problems.push(
+              `\`artifact.store\` is ${artStore}, but this region's store is ${config.art.baseUrl}. ` +
+                "Use that URL (art_publish_files' result gives the exact block).",
+            );
+          }
+        }
         if (problems.length > 0) {
           return report(`${id || "spec"}: not sent — ${problems.length} rule(s) broken`, [
             { title: "Rules this spec breaks", body: problems },
@@ -478,6 +506,20 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
                     "puts a repo's files there, or art_publish_files with `deployment` puts a bundle there."),
             });
           }
+        }
+
+        // A VM whose image comes from a build or a pull runs nothing unless
+        // start_command says so: the rootfs drops the image's CMD.
+        const vmBlock = spec.vm as Record<string, unknown> | undefined;
+        if (vmBlock && (spec.build || spec.artifact) && !vmBlock.start_command) {
+          sections.push({
+            title: "No start_command",
+            body:
+              "A VM does not run the image's CMD or ENTRYPOINT, so with no `vm.start_command` the app " +
+              "never starts and the pool never becomes ready. Add one that returns " +
+              "(`cd /app && setsid nohup node server.js </dev/null >/var/log/app.log 2>&1 &`); " +
+              "repo_deploy derives it from the Dockerfile.",
+          });
         }
 
         // TLS, which nothing else on the surface would have told them.

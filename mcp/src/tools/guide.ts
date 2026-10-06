@@ -139,8 +139,10 @@ export const GUIDES: readonly Guide[] = [
     title: "VM deployment never becomes ready / pool stays empty",
     keywords: ["ready", "pool", "boot", "start", "start_command", "crash", "timeout", "unhealthy", "replicas", "port"],
     steps: [
+      "applb_get_deployment {id}: is there a `vm.start_command`? A VM does not run the image's CMD/ENTRYPOINT. repo_deploy (kind vm) derives one from the Dockerfile when you give none.",
       DAEMONIZE,
       "Check the port: the spec's `vm.port` (repo_deploy `port`) must be the one the app listens on, on 0.0.0.0.",
+      "An `artifact` image: `artifact.store` must be this region's store (art_publish_files' result gives it); a guessed URL fails the pull and leaves no image.",
       "diagnose_deployment {id} and applb_deployment_jobs {id} — did the image build succeed? A failed build leaves the old image (or none).",
       "Then redeploy (repo_deploy again, or applb_deploy with the corrected spec).",
     ],

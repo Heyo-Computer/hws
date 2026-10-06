@@ -32,6 +32,7 @@ import type { Tool } from "./diagnose.js";
 import { notVisible } from "./actions.js";
 import { num, bool } from "./schema.js";
 import { storeBuildCredential } from "./remote-auth.js";
+import { readStartInfo, startCommand, type StartInfo } from "./dockerfile.js";
 
 interface RepoInfo {
   name?: string;
@@ -349,6 +350,46 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           delete spec.update;
         } else {
           if (a.dockerfile) build.dockerfile = a.dockerfile;
+          // A VM's rootfs drops the image's CMD, ENV and WORKDIR, so with no
+          // start_command nothing would ever run. Read them from the
+          // Dockerfile instead (and its EXPOSE for the port).
+          const prevVm = existing?.vm as Record<string, unknown> | undefined;
+          if (!a.start_command && !prevVm?.start_command) {
+            const ref = String(a.ref ?? info.default_branch ?? "main");
+            const candidates = [
+              a.dockerfile,
+              a.context ? `${String(a.context).replace(/\/$/, "")}/Dockerfile` : undefined,
+              "Dockerfile",
+            ].filter((p): p is string => typeof p === "string" && p.length > 0);
+            let derived: StartInfo | undefined;
+            for (const path of candidates) {
+              const text = (await clients
+                .remote({ path: `/${enc(ns)}/${enc(repo)}/raw/${enc(ref)}/${path.split("/").map(enc).join("/")}`, expectText: true })
+                .catch(() => undefined)) as string | undefined;
+              if (typeof text === "string" && /^\s*FROM\s/im.test(text)) {
+                derived = readStartInfo(text);
+                break;
+              }
+            }
+            const cmd = derived && startCommand(derived);
+            if (cmd) {
+              a.start_command = cmd;
+              if (a.port === undefined && !prevVm?.port && derived?.port) a.port = derived.port;
+              sections.push({
+                title: "start_command (from the Dockerfile)",
+                body:
+                  `${cmd}\nA VM does not run the image's CMD/ENTRYPOINT, so this does it. Pass start_command to override.`,
+              });
+            } else {
+              sections.push({
+                title: "No start_command",
+                body:
+                  "Nothing tells the VM what to run: no start_command was given and the Dockerfile has no " +
+                  "CMD or ENTRYPOINT. The pool will never become ready. Call again with start_command " +
+                  "(background it: setsid nohup … &).",
+              });
+            }
+          }
           spec = {
             ...(existing ?? {}),
             id,

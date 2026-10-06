@@ -118,7 +118,14 @@ test("a tool that advertises its own schema still agrees with the one that valid
 });
 
 test("the listing stays within its size budget", () => {
-  // Measured 2026-10-03: 75,796 bytes across 76 tools, up from 66,069 across 65.
+  // Measured 2026-10-06: 65,628 bytes across 77 tools, down from 76,926.
+  //
+  // applb_deploy stopped embedding the nested spec tree (~11 KB): it now
+  // advertises each top-level field with its first sentence, and
+  // applb_spec_schema returns any block in full. heyo_guide (~900 bytes) and
+  // the tenant notes are inside that figure.
+  //
+  // Earlier, 2026-10-03: 75,796 bytes across 76 tools, up from 66,069 across 65.
   //
   // The +9,727 is eleven new tools and one schema doc paragraph. Six are the
   // `repo_*` tools (~5.9 KB) for the Heyo git remote, which is how a generated
@@ -140,10 +147,10 @@ test("the listing stays within its size budget", () => {
   // verbatim, which is the cheapest correct description of them.
   //
   // The headroom below is for ordinary description edits. It is deliberately
-  // NOT enough for a second full spec schema: a tool that wants one shares this
-  // one by pointing at it, because two copies of a 12 KB tree is a cost every
-  // client pays on every connect.
-  const BUDGET = 77_000;
+  // NOT enough to bring the nested spec tree back: applb_deploy advertises
+  // top-level fields only (measured 65,628 bytes after that cut, from 76,926),
+  // and applb_spec_schema serves any block on demand.
+  const BUDGET = 67_000;
   const bytes = JSON.stringify(toolListing(everything())).length;
   assert.ok(
     bytes <= BUDGET,
