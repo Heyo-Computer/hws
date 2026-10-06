@@ -69,7 +69,7 @@ function tool(name: string): Tool {
 const VM_SPEC = {
   id: "web",
   routes: [{ host: "web.example.com" }],
-  vm: { driver: "firecracker", port: 8080 },
+  vm: { driver: "firecracker", port: 8080, start_command: "setsid nohup app </dev/null &" },
   artifact: { store: "http://127.0.0.1:8080", ref: "web" },
 };
 
@@ -77,7 +77,7 @@ test("a spec that breaks a rule is never sent, and the rule is named", async () 
   const stub = stubApplb();
   try {
     const out = await tool("applb_deploy").handler({
-      spec: { id: "web", routes: [], vm: { driver: "firecracker", port: 8080 }, upstreams: ["a:1"] },
+      spec: { id: "web", routes: [], vm: { driver: "firecracker", port: 8080, start_command: "setsid nohup app </dev/null &" }, upstreams: ["a:1"] },
     });
     assert.match(out, /Two backends/, `did not name the rule: ${out.slice(0, 200)}`);
     assert.equal(stub.calls.length, 0, "a spec known to be invalid still went to app-lb");
@@ -112,7 +112,7 @@ test("an edit says whether the pool survives it", async () => {
     assert.match(same, /preserved/);
 
     const changed = await tool("applb_deploy").handler({
-      spec: { ...VM_SPEC, vm: { driver: "firecracker", port: 9090 } },
+      spec: { ...VM_SPEC, vm: { driver: "firecracker", port: 9090, start_command: "setsid nohup app </dev/null &" } },
       wait_seconds: 0,
     });
     assert.match(changed, /REBUILDING/);
@@ -128,7 +128,7 @@ test("the job started follows from the backend, so the wrong one cannot be picke
       {
         id: "web",
         routes: [{ host: "w.example.com" }],
-        vm: { driver: "firecracker", port: 8080 },
+        vm: { driver: "firecracker", port: 8080, start_command: "setsid nohup app </dev/null &" },
         build: { repo: "https://example.com/x.git" },
       },
       "/build",
@@ -179,7 +179,7 @@ test("a host_suffix route is warned about, because it never gets its own certifi
       spec: {
         id: "web",
         routes: [{ host_suffix: "apps.example.com" }],
-        vm: { driver: "firecracker", port: 8080 },
+        vm: { driver: "firecracker", port: 8080, start_command: "setsid nohup app </dev/null &" },
       },
       wait_seconds: 0,
     });
@@ -315,7 +315,7 @@ test("a build.repo on the Heyo git remote gets a build credential; other repos d
           id: "newsfeed-app",
           namespace: "us5",
           routes: [{ host: "newsfeed.example.com" }],
-          vm: { driver: "firecracker", port: 8080 },
+          vm: { driver: "firecracker", port: 8080, start_command: "setsid nohup app </dev/null &" },
           build: { repo, dockerfile: "Dockerfile" },
         },
         wait_seconds: 0,

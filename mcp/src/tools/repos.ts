@@ -32,7 +32,7 @@ import type { Tool } from "./diagnose.js";
 import { notVisible } from "./actions.js";
 import { num, bool } from "./schema.js";
 import { storeBuildCredential } from "./remote-auth.js";
-import { readStartInfo, startCommand, type StartInfo } from "./dockerfile.js";
+import { dockerfileCandidates, remoteStartInfo, startCommand } from "./dockerfile.js";
 
 interface RepoInfo {
   name?: string;
@@ -354,25 +354,31 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           // start_command nothing would ever run. Read them from the
           // Dockerfile instead (and its EXPOSE for the port).
           const prevVm = existing?.vm as Record<string, unknown> | undefined;
-          if (!a.start_command && !prevVm?.start_command) {
+          if (!a.start_command) {
             const ref = String(a.ref ?? info.default_branch ?? "main");
-            const candidates = [
-              a.dockerfile,
-              a.context ? `${String(a.context).replace(/\/$/, "")}/Dockerfile` : undefined,
-              "Dockerfile",
-            ].filter((p): p is string => typeof p === "string" && p.length > 0);
-            let derived: StartInfo | undefined;
-            for (const path of candidates) {
-              const text = (await clients
-                .remote({ path: `/${enc(ns)}/${enc(repo)}/raw/${enc(ref)}/${path.split("/").map(enc).join("/")}`, expectText: true })
-                .catch(() => undefined)) as string | undefined;
-              if (typeof text === "string" && /^\s*FROM\s/im.test(text)) {
-                derived = readStartInfo(text);
-                break;
-              }
-            }
+            const derived = await remoteStartInfo(
+              clients.remote,
+              ns,
+              repo,
+              ref,
+              dockerfileCandidates(a.dockerfile, a.context),
+            );
             const cmd = derived && startCommand(derived);
-            if (cmd) {
+            const kept = typeof prevVm?.start_command === "string" ? prevVm.start_command : undefined;
+            if (kept) {
+              // Keeping it is right — it may have been set by hand — but a
+              // changed CMD silently not applying is how a fix "does nothing".
+              if (cmd && cmd !== kept) {
+                sections.push({
+                  title: "start_command kept (differs from the Dockerfile)",
+                  body:
+                    `The deployment keeps its start_command:\n${kept}\n` +
+                    `The Dockerfile's CMD/ENTRYPOINT now amounts to:\n${cmd}\n` +
+                    "A VM never runs CMD, so editing it changes nothing on its own. Call again with " +
+                    "start_command set to the line you want.",
+                });
+              }
+            } else if (cmd) {
               a.start_command = cmd;
               if (a.port === undefined && !prevVm?.port && derived?.port) a.port = derived.port;
               sections.push({
@@ -380,7 +386,7 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
                 body:
                   `${cmd}\nA VM does not run the image's CMD/ENTRYPOINT, so this does it. Pass start_command to override.`,
               });
-            } else {
+            } else if (!derived?.ownsInit) {
               sections.push({
                 title: "No start_command",
                 body:

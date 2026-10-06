@@ -14,6 +14,11 @@ export interface StartInfo {
   /** The process, as a shell command line, or undefined if none is declared. */
   command?: string;
   port?: number;
+  /**
+   * The Dockerfile installs its own `/init.sh`, the guest's PID 1, so the
+   * image may start its workload itself and need no `start_command`.
+   */
+  ownsInit: boolean;
 }
 
 /** Joined instruction lines of the final stage, with continuations folded. */
@@ -52,7 +57,7 @@ function execForm(arg: string): string[] | undefined {
 const quote = (s: string) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
 
 export function readStartInfo(dockerfile: string): StartInfo {
-  const info: StartInfo = { env: [] };
+  const info: StartInfo = { env: [], ownsInit: /\/init\.sh\b/.test(dockerfile) };
   let entrypoint: { exec?: string[]; shell?: string } | undefined;
   let cmd: { exec?: string[]; shell?: string } | undefined;
   for (const line of finalStage(dockerfile)) {
@@ -110,4 +115,39 @@ export function startCommand(info: StartInfo): string | undefined {
   // The trailing `&` backgrounds the whole list, so it returns at once and
   // the `cd` and exports apply to the app.
   return parts.join(" && ");
+}
+
+
+/** Something that fetches a file from the Heyo git remote as text. */
+type RemoteFetch = (req: { path: string; expectText: true }) => Promise<unknown>;
+
+/**
+ * Read the Dockerfile for `namespace/repo` at `ref` from the Heyo git remote,
+ * trying each candidate path in turn. `undefined` when none is a Dockerfile.
+ */
+export async function remoteStartInfo(
+  remote: RemoteFetch,
+  namespace: string,
+  repo: string,
+  ref: string,
+  candidates: string[],
+): Promise<StartInfo | undefined> {
+  const enc = encodeURIComponent;
+  for (const path of candidates) {
+    const text = (await remote({
+      path: `/${enc(namespace)}/${enc(repo)}/raw/${enc(ref)}/${path.split("/").map(enc).join("/")}`,
+      expectText: true,
+    }).catch(() => undefined)) as string | undefined;
+    if (typeof text === "string" && /^\s*FROM\s/im.test(text)) return readStartInfo(text);
+  }
+  return undefined;
+}
+
+/** Where a build's Dockerfile can be, most specific first. */
+export function dockerfileCandidates(dockerfile?: unknown, context?: unknown): string[] {
+  return [
+    typeof dockerfile === "string" ? dockerfile : undefined,
+    typeof context === "string" && context ? `${context.replace(/\/$/, "")}/Dockerfile` : undefined,
+    "Dockerfile",
+  ].filter((p): p is string => typeof p === "string" && p.length > 0);
 }

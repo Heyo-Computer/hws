@@ -836,12 +836,18 @@ pub struct VmSpec {
     pub port: u16,
     /// Shell command that starts the workload, run once per replica after boot.
     ///
+    /// Required to run anything: a VM never runs its image's `CMD` or
+    /// `ENTRYPOINT` (the rootfs is a `docker export`, which drops the image
+    /// config), so without this the guest boots, nothing listens, and every
+    /// replica times out. Put what `CMD` did here, `WORKDIR` and `ENV`
+    /// included, e.g. `cd /app && setsid nohup node server.js </dev/null &`.
+    ///
     /// It must *return*: the daemon runs it and waits, so a command that blocks
     /// in the foreground is a VM that never finishes booting. Daemonize
-    /// explicitly — every example here spells it
-    /// `setsid nohup <program> </dev/null >/var/log/<name>.log 2>&1 &`. Its
-    /// output goes to `/var/log/heyvm-start.log` *inside the guest*, so it lives
-    /// and dies with the boot; read it with `applb_exec`, not app-obs.
+    /// explicitly with `setsid nohup <program> </dev/null &`. Its stdout and
+    /// stderr go to `/var/log/heyvm-start.log` and `.err.log` inside the guest,
+    /// and on to app-obs when the image has `socat`; don't redirect them to a
+    /// file of your own, or they never leave the guest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_command: Option<String>,
     /// CPU and memory, as one of the daemon's named classes.

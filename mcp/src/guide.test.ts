@@ -205,9 +205,12 @@ test("repo_deploy kind vm with no start_command derives it from the Dockerfile",
   assert.equal(spec.vm.port, 3001, "EXPOSE supplies the port when none is given");
   assert.match(out, /start_command \(from the Dockerfile\)/);
 
+  // With nothing to derive and none given, the VM would never start its app,
+  // so it is refused rather than registered.
   const none = await repoDeploy({ repo: "app", kind: "vm" }, undefined, "FROM alpine\nRUN true\n");
-  assert.equal(none.spec.vm.start_command, undefined);
+  assert.equal(none.spec, undefined, "not registered");
   assert.match(none.out, /No start_command/);
+  assert.match(none.out, /not sent — no start_command/);
 });
 
 test("applb_deploy refuses an artifact store that is not this region's", async () => {
