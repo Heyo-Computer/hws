@@ -3148,6 +3148,13 @@ impl Dispatcher {
                     .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
             }
             "ci/deploy-controller" => {
+                if let Some(expected) = plan.release_policy.as_ref().and_then(|p| p.ci_application.as_ref()) {
+                    let current = crate::release_policy::CiApplicationTarget::current(self)
+                        .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                    if &current != expected {
+                        return Err(DispatchError::StepFailed("CI application mapping changed since release admission".into()));
+                    }
+                }
                 if self.config.managed_deployment.is_some() {
                     crate::managed_update::request(self,msg,sid,&required("archive-id")?).await
                         .map(|note|(note,json!({}))).map_err(|e|DispatchError::StepFailed(e.to_string()))

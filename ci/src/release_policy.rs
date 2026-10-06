@@ -42,8 +42,24 @@ pub struct Snapshot {
     pub hosts: BTreeMap<String, host_heyvm_bootstrap_coordinator::Target>,
     #[serde(default)]
     pub app_lbs: BTreeMap<String, crate::host_app_lb::Target>,
+    #[serde(default)]
+    pub ci_application: Option<CiApplicationTarget>,
     /// Expressions only; credential values are never persisted here.
     pub token_expressions: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct CiApplicationTarget {
+    pub application: String,
+    pub authority: String,
+}
+
+impl CiApplicationTarget {
+    pub fn current(d: &Dispatcher) -> Result<Self> {
+        let (application, authority, _) = crate::controller_rollout::application_target(d)
+            .map_err(anyhow::Error::msg)?;
+        Ok(Self { application: application.into(), authority: authority.trim_end_matches('/').into() })
+    }
 }
 
 pub fn select(raw: Option<&str>, repository: &str) -> Result<Option<Policy>> {
@@ -99,7 +115,7 @@ pub async fn prepare(d: &Dispatcher, repository: &str, policy: &Policy) -> Resul
 pub(crate) async fn prepare_plan(d: &Dispatcher, repository: &str, policy: &Policy, mut plan: Plan) -> Result<Plan> {
     let mut effective = policy.clone();
     effective.placements.retain(|id, _| plan.jobs.iter().any(|job| &job.base_id == id));
-    let mut snapshot = Snapshot { digest: String::new(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), token_expressions: Vec::new() };
+    let mut snapshot = Snapshot { digest: String::new(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, token_expressions: Vec::new() };
     let mut aliases: Vec<String> = effective.placements.values().cloned().collect();
     for job in &plan.jobs {
         for step in &job.steps {
@@ -108,6 +124,11 @@ pub(crate) async fn prepare_plan(d: &Dispatcher, repository: &str, policy: &Poli
                 if !snapshot.token_expressions.contains(token) { snapshot.token_expressions.push(token.clone()); }
             }
             match step.uses.as_deref() {
+                Some("ci/deploy-controller") if d.config.application_id.is_some() => {
+                    ensure!(d.config.controller_repository.as_deref().is_some_and(|allowed| crate::repos::same_repo(repository, allowed)),
+                        "CI application is not authorized for this repository");
+                    snapshot.ci_application = Some(CiApplicationTarget::current(d)?);
+                }
                 Some("ci/rollout-host-app-lb") => {
                     let alias = input(step, "target")?;
                     let target = crate::host_app_lb::trusted(d, &alias).await?;
@@ -154,6 +175,10 @@ fn submission_plan(policy: &Policy) -> Result<Plan> {
 }
 
 pub async fn check_targets(d: &Dispatcher, snapshot: &Snapshot) -> Result<()> {
+    if let Some(expected) = &snapshot.ci_application {
+        ensure!(&CiApplicationTarget::current(d)? == expected,
+            "CI application mapping changed since admission; resubmit before merging");
+    }
     for (alias, expected) in &snapshot.app_lbs {
         ensure!(&crate::host_app_lb::trusted(d, alias).await? == expected,
             "app-lb mapping changed since admission; resubmit before merging");
@@ -285,7 +310,7 @@ mod tests {
     }
 
     fn snapshot() -> Snapshot {
-        Snapshot { digest: "frozen-policy".into(), token_expressions: Vec::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), maintenance: BTreeMap::from([
+        Snapshot { digest: "frozen-policy".into(), token_expressions: Vec::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, maintenance: BTreeMap::from([
             ("us3".into(), host_maintenance::Target { repository: REPO.into(), runner_hd_id: "us-runner".into(),
                 backend_server_id: "us-backend".into(), cloud_url: "https://cloud.eu.example".into(),
                 orchestrator_url: "https://archive.eu.example".into(), artifact_user_id: "archive-owner".into(),
@@ -346,6 +371,9 @@ mod tests {
             deployment: "host-ingress".into(), namespace: "default".into(),
             health_url: "https://admin.first.example/healthz".into(),
         });
+        frozen.ci_application = Some(CiApplicationTarget {
+            application: "build-ci".into(), authority: "https://platform.example".into(),
+        });
         job.release_policy = Some(frozen);
         let stored = serde_json::to_vec(&job).unwrap();
         let restored: crate::plan::JobPlan = serde_json::from_slice(&stored).unwrap();
@@ -353,9 +381,14 @@ mod tests {
         let frozen = restored.release_policy.unwrap();
         assert_eq!(frozen.maintenance["us3"].cloud_url, "https://cloud.eu.example");
         assert_eq!(frozen.app_lbs["ingress"].url, "https://admin.first.example");
+        assert_eq!(frozen.ci_application.as_ref().unwrap().application, "build-ci");
+        assert_eq!(frozen.ci_application.as_ref().unwrap().authority, "https://platform.example");
         let mut old = serde_json::to_value(frozen).unwrap();
         old.as_object_mut().unwrap().remove("app_lbs");
-        assert!(serde_json::from_value::<Snapshot>(old).unwrap().app_lbs.is_empty());
+        old.as_object_mut().unwrap().remove("ci_application");
+        let old: Snapshot = serde_json::from_value(old).unwrap();
+        assert!(old.app_lbs.is_empty());
+        assert!(old.ci_application.is_none());
     }
 
     #[test]
