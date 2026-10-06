@@ -67,7 +67,9 @@ function spec(id) {
     // The image runs only sshd; a TCP connect to it is readiness.
     health: { path: null, port: 22 },
     scaling: {
-      min_replicas: 1,
+      // Zero until the image is pulled: a pool asked for a VM before then
+      // boots the default image instead, fails, and backs off.
+      min_replicas: 0,
       max_replicas: 1,
       warm_pool: 0,
       boot_timeout_secs: 180,
@@ -88,6 +90,7 @@ async function create(lb, id) {
   assert.equal(done.status, "succeeded", `${id}: pull ${done.status}: ${done.error}`);
   const pulled = ms(t0);
 
+  await lb.patchScaling(id, { min_replicas: 1 });
   const status = await lb.waitForReady(id, { timeoutMs: 240_000 });
   const total_ms = ms(t0);
   return {

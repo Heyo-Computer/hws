@@ -21,10 +21,10 @@
 //!
 //! What it does, timing each step:
 //!
-//! 1. Registers five deployments of one VM each from the public alpine image,
-//!    concurrently, and pulls the image into each. Creation latency is
-//!    register → pull done → first healthy VM. The image runs only sshd, so
-//!    readiness is a TCP check on port 22.
+//! 1. Registers five deployments from the public alpine image at zero
+//!    replicas, concurrently, pulls the image into each, then scales each to
+//!    one VM. Creation latency is register → pull done → first healthy VM.
+//!    The image runs only sshd, so readiness is a TCP check on port 22.
 //! 2. Runs the same exec commands in every VM, timing each call.
 //! 3. In the last VM, writes a "Heyo World" page and serves it on port 8080
 //!    with busybox `nc -lk -e`, then adds a public route to the deployment and
@@ -91,7 +91,9 @@ fn spec(env: &Env, id: &str) -> Value {
         "artifact": { "store": env.store, "ref": env.image },
         "health": { "path": null, "port": 22 },
         "scaling": {
-            "min_replicas": 1, "max_replicas": 1, "warm_pool": 0,
+            // Zero until the image is pulled: a pool asked for a VM before
+            // then boots the default image instead, fails, and backs off.
+            "min_replicas": 0, "max_replicas": 1, "warm_pool": 0,
             "boot_timeout_secs": 180, "scale_to_zero_after_secs": 900
         }
     })
@@ -136,6 +138,9 @@ async fn create(lb: &Client, env: &Env, id: &str) -> Result<Creation, String> {
     }
     let pulled = t0.elapsed();
 
+    lb.patch_scaling(id, &json!({ "min_replicas": 1 }))
+        .await
+        .map_err(|e| format!("{id}: scale to 1: {e}"))?;
     let status = lb
         .wait_for_ready(id)
         .timeout(Duration::from_secs(240))
