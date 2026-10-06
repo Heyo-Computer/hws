@@ -19,6 +19,12 @@ import type { DeploymentStatus, JobRecord } from "./types.js";
 
 export const JOB_POLL_MS = 3_000;
 export const POOL_POLL_MS = 2_000;
+/**
+ * Where polling starts unless `pollMs` fixes it. It doubles from here up to
+ * {@link JOB_POLL_MS} / {@link POOL_POLL_MS}, so a VM that is ready in half a
+ * second is seen in about that, and a long build is still asked about politely.
+ */
+export const FIRST_POLL_MS = 100;
 
 export interface JobProgress {
   job: JobRecord;
@@ -80,7 +86,8 @@ export async function waitForJob(
   jobId: string,
   opts: WaitForJobOptions = {},
 ): Promise<JobRecord> {
-  const pollMs = opts.pollMs ?? JOB_POLL_MS;
+  const capMs = opts.pollMs ?? JOB_POLL_MS;
+  let pollMs = opts.pollMs ?? Math.min(FIRST_POLL_MS, capMs);
   const timeoutMs = opts.timeoutMs ?? 1_800_000;
   const deadline = Date.now() + timeoutMs;
   let seen = 0;
@@ -102,6 +109,7 @@ export async function waitForJob(
     if (job.status !== "running") return job;
     if (Date.now() >= deadline) throw new TimeoutError(`job ${jobId}`, timeoutMs);
     await sleep(pollMs, opts.signal);
+    pollMs = Math.min(pollMs * 2, capMs);
   }
 }
 
@@ -116,7 +124,8 @@ export async function waitForReady(
   id: string,
   opts: WaitForReadyOptions = {},
 ): Promise<DeploymentStatus> {
-  const pollMs = opts.pollMs ?? POOL_POLL_MS;
+  const capMs = opts.pollMs ?? POOL_POLL_MS;
+  let pollMs = opts.pollMs ?? Math.min(FIRST_POLL_MS, capMs);
   const timeoutMs = opts.timeoutMs ?? 300_000;
   const deadline = Date.now() + timeoutMs;
 
@@ -139,5 +148,6 @@ export async function waitForReady(
     if (progress.converged) return status;
     if (Date.now() >= deadline) throw new TimeoutError(`deployment ${id}`, timeoutMs);
     await sleep(pollMs, opts.signal);
+    pollMs = Math.min(pollMs * 2, capMs);
   }
 }

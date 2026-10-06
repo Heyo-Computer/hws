@@ -59,7 +59,7 @@ export type { LogQuery, NewAlert } from "./obs.js";
 export { Shell, PING_INTERVAL_MS } from "./shell.js";
 export type { ShellExit, ShellOptions } from "./shell.js";
 
-export { waitForJob, waitForReady, JOB_POLL_MS, POOL_POLL_MS } from "./wait.js";
+export { waitForJob, waitForReady, JOB_POLL_MS, POOL_POLL_MS, FIRST_POLL_MS } from "./wait.js";
 export type {
   JobProgress,
   PoolProgress,

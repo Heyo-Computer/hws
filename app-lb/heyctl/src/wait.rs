@@ -24,6 +24,11 @@ use std::time::{Duration, Instant};
 
 /// How often to ask about a job. Builds and host updates run for minutes.
 pub const JOB_POLL: Duration = Duration::from_secs(3);
+/// Where a waiter's polling starts unless `poll_every` fixes it. It doubles
+/// from here up to [`JOB_POLL`] / [`POOL_POLL`], so a firecracker boot that
+/// is ready in half a second is seen in about that, and a long build is still
+/// asked about politely.
+pub const FIRST_POLL: Duration = Duration::from_millis(100);
 /// How often to ask about a pool. A boot is tens of seconds.
 pub const POOL_POLL: Duration = Duration::from_secs(2);
 
@@ -78,6 +83,7 @@ impl Client {
             job_id,
             deployment: None,
             poll: JOB_POLL,
+            fixed: false,
             timeout: Duration::from_secs(1800),
             on_progress: None,
         }
@@ -92,6 +98,7 @@ impl Client {
             client: self,
             id,
             poll: POOL_POLL,
+            fixed: false,
             timeout: Duration::from_secs(300),
             on_progress: None,
         }
@@ -104,6 +111,8 @@ pub struct JobWaiter<'a> {
     job_id: &'a str,
     deployment: Option<&'a str>,
     poll: Duration,
+    /// `poll_every` was called: poll at exactly that interval.
+    fixed: bool,
     timeout: Duration,
     #[allow(clippy::type_complexity)]
     on_progress: Option<Box<dyn FnMut(JobProgress<'_>) + Send + 'a>>,
@@ -124,6 +133,7 @@ impl<'a> JobWaiter<'a> {
 
     pub fn poll_every(mut self, d: Duration) -> Self {
         self.poll = d;
+        self.fixed = true;
         self
     }
 
@@ -140,6 +150,7 @@ impl<'a> JobWaiter<'a> {
 
     pub async fn await_done(mut self) -> Result<JobRecord> {
         let started = Instant::now();
+        let mut interval = if self.fixed { self.poll } else { FIRST_POLL.min(self.poll) };
         let mut seen = 0usize;
         loop {
             let job = match self.deployment {
@@ -177,7 +188,8 @@ impl<'a> JobWaiter<'a> {
                     after: self.timeout,
                 });
             }
-            tokio::time::sleep(self.poll).await;
+            tokio::time::sleep(interval).await;
+            interval = (interval * 2).min(self.poll);
         }
     }
 }
@@ -196,6 +208,8 @@ pub struct PoolWaiter<'a> {
     client: &'a Client,
     id: &'a str,
     poll: Duration,
+    /// `poll_every` was called: poll at exactly that interval.
+    fixed: bool,
     timeout: Duration,
     #[allow(clippy::type_complexity)]
     on_progress: Option<Box<dyn FnMut(PoolProgress) + Send + 'a>>,
@@ -204,6 +218,7 @@ pub struct PoolWaiter<'a> {
 impl<'a> PoolWaiter<'a> {
     pub fn poll_every(mut self, d: Duration) -> Self {
         self.poll = d;
+        self.fixed = true;
         self
     }
 
@@ -219,6 +234,7 @@ impl<'a> PoolWaiter<'a> {
 
     pub async fn await_ready(mut self) -> Result<DeploymentStatus> {
         let started = Instant::now();
+        let mut interval = if self.fixed { self.poll } else { FIRST_POLL.min(self.poll) };
         loop {
             let status = self.client.deployment(self.id).await?;
 
@@ -247,7 +263,8 @@ impl<'a> PoolWaiter<'a> {
                     after: self.timeout,
                 });
             }
-            tokio::time::sleep(self.poll).await;
+            tokio::time::sleep(interval).await;
+            interval = (interval * 2).min(self.poll);
         }
     }
 }
