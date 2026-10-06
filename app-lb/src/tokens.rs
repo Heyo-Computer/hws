@@ -46,6 +46,23 @@
 //! creating deployments, reading the secret store, listing every job — because
 //! those are not about a deployment it was given. The narrow token an agent
 //! carries to reach its own sandbox is then genuinely narrow.
+//!
+//! # Fleet tokens
+//!
+//! A token is a row in one server's store, so by itself it works on that server
+//! only. A control-plane app-lb — one with gateways configured — can mint a
+//! token with `fleet: true`, and every server that names that control plane as
+//! its `token_authority` pulls the control plane's fleet tokens into a *mirror*
+//! and verifies them locally, the same lookup-and-hash as its own.
+//!
+//! What crosses the wire is the stored record — scope and `sha256(secret)` —
+//! never the secret, which still exists only in the response to the mint. A
+//! mirror is replaced wholesale on each pull, so a revoke or re-scope at the
+//! control plane reaches every server on its next pull. A failed pull keeps the
+//! last mirror: a control-plane outage must not log every client out of every
+//! server. The mirror is persisted beside the token file for the same reason
+//! across a restart. Mirrored tokens are read-only where they are mirrored;
+//! they are changed and revoked at the control plane that minted them.
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -131,7 +148,12 @@ pub struct AppToken {
     /// mints its own credentials, so the record says which of its people did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minted_by: Option<String>,
-    /// Hex `sha256(secret)`. Never leaves this module.
+    /// Minted at a control plane for every server that mirrors it. See the
+    /// module docs on fleet tokens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fleet: bool,
+    /// Hex `sha256(secret)`. Leaves this module only in the control plane's
+    /// fleet export, to servers that verify the token themselves.
     #[serde(rename = "secret_sha256")]
     hash: String,
     /// Last time the token authenticated something, for deciding whether a
@@ -217,6 +239,8 @@ impl AppToken {
                 0 => None,
                 n => Some(n),
             },
+            fleet: self.fleet,
+            mirrored_from: None,
         }
     }
 }
@@ -240,6 +264,13 @@ pub struct TokenSummary {
     /// since the last time the store was written. See [`AppToken::last_used_at`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<u64>,
+    /// Valid on every server that mirrors this control plane's fleet tokens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fleet: bool,
+    /// Set on a server that holds this token only as a mirror: the id of the
+    /// control plane it came from, which is where it is changed or revoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirrored_from: Option<String>,
 }
 
 /// A mint request.
@@ -263,6 +294,10 @@ pub struct NewToken {
     /// and worth making deliberately.
     #[serde(default)]
     pub expires_in_secs: Option<u64>,
+    /// Valid on every server of the fleet, not only this one. Only a control
+    /// plane mints these; the admin API refuses the flag anywhere else.
+    #[serde(default)]
+    pub fleet: bool,
 }
 
 /// The fields of a token that can be changed after minting. The secret cannot:
@@ -307,6 +342,8 @@ pub enum TokenError {
     Io(std::io::Error),
     Json(serde_json::Error),
     UnknownFormat(String),
+    /// A record in a control plane's fleet export that is not a token.
+    BadFleetRecord(String),
 }
 
 impl std::fmt::Display for TokenError {
@@ -326,6 +363,7 @@ impl std::fmt::Display for TokenError {
             Self::Io(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "{e}"),
             Self::UnknownFormat(m) => write!(f, "{m}"),
+            Self::BadFleetRecord(m) => write!(f, "invalid fleet token record: {m}"),
         }
     }
 }
@@ -338,12 +376,34 @@ struct TokenFile {
     tokens: Vec<AppToken>,
 }
 
+/// The mirror file: the last fleet export pulled, and where it came from.
+#[derive(Serialize, Deserialize)]
+struct MirrorFile {
+    version: u32,
+    authority: String,
+    tokens: Vec<AppToken>,
+}
+
+/// What a control plane serves at `GET /fleet/tokens`, and what a server pulls.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FleetExport {
+    pub tokens: Vec<AppToken>,
+}
+
+/// Another control plane's fleet tokens, as last pulled.
+#[derive(Default)]
+struct Mirror {
+    authority: String,
+    tokens: HashMap<String, Arc<AppToken>>,
+}
+
 /// Token id -> token, behind the same copy-on-write swap the registry and the
 /// secret store use: verification happens on every gated request, and must not
 /// contend with the rare mint.
 pub struct TokenStore {
     tokens: ArcSwap<HashMap<String, Arc<AppToken>>>,
     path: PathBuf,
+    mirror: ArcSwap<Mirror>,
 }
 
 impl std::fmt::Debug for TokenStore {
@@ -351,6 +411,7 @@ impl std::fmt::Debug for TokenStore {
         f.debug_struct("TokenStore")
             .field("path", &self.path)
             .field("count", &self.tokens.load().len())
+            .field("mirrored", &self.mirror.load().tokens.len())
             .finish()
     }
 }
@@ -360,7 +421,13 @@ impl TokenStore {
         Self {
             tokens: ArcSwap::from_pointee(HashMap::new()),
             path: path.into(),
+            mirror: ArcSwap::from_pointee(Mirror::default()),
         }
+    }
+
+    /// Beside the token file: `tokens.json` mirrors into `tokens.fleet.json`.
+    fn mirror_path(&self) -> PathBuf {
+        self.path.with_extension("fleet.json")
     }
 
     pub fn path(&self) -> &Path {
@@ -402,6 +469,7 @@ impl TokenStore {
             created_at: now,
             expires_at: req.expires_in_secs.map(|s| now.saturating_add(s)),
             minted_by,
+            fleet: req.fleet,
             hash: hash_secret(&secret),
             last_used_at: 0,
             live_last_used: Arc::new(AtomicU64::new(0)),
@@ -415,8 +483,32 @@ impl TokenStore {
         Ok((summary, format!("{PREFIX}{id}_{secret}")))
     }
 
+    /// This server's own token. Mirrored fleet tokens are not in here — see
+    /// [`summary`](Self::summary) and [`mirrored_from`](Self::mirrored_from).
     pub fn get(&self, id: &str) -> Option<Arc<AppToken>> {
         self.tokens.load().get(id).cloned()
+    }
+
+    /// The summary of a token this server knows, its own or mirrored.
+    pub fn summary(&self, id: &str) -> Option<TokenSummary> {
+        if let Some(t) = self.get(id) {
+            return Some(t.summary());
+        }
+        let mirror = self.mirror.load();
+        mirror.tokens.get(id).map(|t| TokenSummary {
+            mirrored_from: Some(mirror.authority.clone()),
+            ..t.summary()
+        })
+    }
+
+    /// The control plane a token was mirrored from, when this server holds it
+    /// only as a mirror and so cannot change or revoke it.
+    pub fn mirrored_from(&self, id: &str) -> Option<String> {
+        if self.tokens.load().contains_key(id) {
+            return None;
+        }
+        let mirror = self.mirror.load();
+        mirror.tokens.contains_key(id).then(|| mirror.authority.clone())
     }
 
     /// Put a token back exactly as it was.
@@ -431,8 +523,24 @@ impl TokenStore {
         });
     }
 
+    /// Every token this server accepts: its own, then mirrored fleet tokens it
+    /// does not also hold itself. Expired mirrored ones are left out, since the
+    /// sweep that drops expired tokens only touches this server's own.
     pub fn list(&self) -> Vec<TokenSummary> {
-        let mut out: Vec<_> = self.tokens.load().values().map(|t| t.summary()).collect();
+        let own = self.tokens.load();
+        let mut out: Vec<_> = own.values().map(|t| t.summary()).collect();
+        let mirror = self.mirror.load();
+        let now = crate::deployment::now_secs();
+        out.extend(
+            mirror
+                .tokens
+                .values()
+                .filter(|t| !own.contains_key(&t.id) && !t.expired_at(now))
+                .map(|t| TokenSummary {
+                    mirrored_from: Some(mirror.authority.clone()),
+                    ..t.summary()
+                }),
+        );
         out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         out
     }
@@ -503,7 +611,11 @@ impl TokenStore {
     /// "wrong secret" could enumerate ids.
     pub fn verify(&self, presented: &str, now: u64) -> Option<Arc<AppToken>> {
         let (id, secret) = split(presented)?;
-        let token = self.tokens.load().get(id).cloned()?;
+        // This server's own first, so a mirrored record can never shadow it.
+        let token = match self.tokens.load().get(id).cloned() {
+            Some(t) => t,
+            None => self.mirror.load().tokens.get(id).cloned()?,
+        };
 
         // Hash before the expiry check, and compare in constant time, so neither
         // an expired token nor a wrong secret is distinguishable by timing.
@@ -539,14 +651,7 @@ impl TokenStore {
 
         let json = serde_json::to_vec_pretty(&TokenFile { version: 1, tokens })
             .map_err(TokenError::Json)?;
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(TokenError::Io)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, b"").map_err(TokenError::Io)?;
-        restrict(&tmp).map_err(TokenError::Io)?;
-        std::fs::write(&tmp, json).map_err(TokenError::Io)?;
-        std::fs::rename(&tmp, &self.path).map_err(TokenError::Io)
+        write_restricted(&self.path, &json)
     }
 
     /// Load the file. A missing one is a normal first run.
@@ -583,6 +688,143 @@ impl TokenStore {
             })
             .collect();
         self.tokens.store(Arc::new(map));
+        Ok(n)
+    }
+
+    /// This store's live fleet tokens, as a control plane exports them for the
+    /// servers that mirror it. Usage stamps are local and are not exported.
+    pub fn fleet_export(&self, now: u64) -> FleetExport {
+        let mut tokens: Vec<AppToken> = self
+            .tokens
+            .load()
+            .values()
+            .filter(|t| t.fleet && !t.expired_at(now))
+            .map(|t| AppToken {
+                last_used_at: 0,
+                live_last_used: Arc::new(AtomicU64::new(0)),
+                ..(**t).clone()
+            })
+            .collect();
+        tokens.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        FleetExport { tokens }
+    }
+
+    /// How many fleet tokens are mirrored here, and from where.
+    pub fn mirror_status(&self) -> (Option<String>, usize) {
+        let mirror = self.mirror.load();
+        let authority = (!mirror.authority.is_empty()).then(|| mirror.authority.clone());
+        (authority, mirror.tokens.len())
+    }
+
+    /// Replace the mirror with a control plane's export.
+    ///
+    /// All or nothing: one malformed record rejects the whole export and keeps
+    /// the previous mirror, rather than serving a partial set that silently
+    /// drops somebody's credential. Persisted before it is published, so what
+    /// is served is never ahead of what a restart would restore. Returns
+    /// whether anything changed.
+    pub fn replace_mirror(&self, authority: &str, export: FleetExport) -> Result<bool, TokenError> {
+        let previous = self.mirror.load_full();
+        let mut tokens = HashMap::with_capacity(export.tokens.len());
+        for t in export.tokens {
+            if t.id.len() != ID_LEN || !t.id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(TokenError::BadFleetRecord(format!("id {:?}", t.id)));
+            }
+            if t.hash.len() != 64 || !t.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(TokenError::BadFleetRecord(format!("verifier of {}", t.id)));
+            }
+            if !t.fleet {
+                return Err(TokenError::BadFleetRecord(format!("{} is not a fleet token", t.id)));
+            }
+            validate_scope(&t.deployments)?;
+            validate_namespace(t.namespace.as_deref())?;
+            // Keep this server's usage stamp across pulls.
+            let live = previous
+                .tokens
+                .get(&t.id)
+                .map(|p| Arc::new(AtomicU64::new(p.last_used())))
+                .unwrap_or_default();
+            let id = t.id.clone();
+            if tokens
+                .insert(id.clone(), Arc::new(AppToken { last_used_at: 0, live_last_used: live, ..t }))
+                .is_some()
+            {
+                return Err(TokenError::BadFleetRecord(format!("duplicate id {id}")));
+            }
+        }
+        let same = previous.authority == authority
+            && previous.tokens.len() == tokens.len()
+            && tokens.iter().all(|(id, t)| {
+                previous.tokens.get(id).is_some_and(|p| {
+                    p.hash == t.hash
+                        && p.name == t.name
+                        && p.admin == t.admin
+                        && p.namespace == t.namespace
+                        && p.deployments == t.deployments
+                        && p.expires_at == t.expires_at
+                })
+            });
+        if same {
+            return Ok(false);
+        }
+        let next = Mirror { authority: authority.to_string(), tokens };
+        self.persist_mirror(&next)?;
+        self.mirror.store(Arc::new(next));
+        Ok(true)
+    }
+
+    /// Forget the mirror, for a server whose token authority was unconfigured.
+    /// Unlike a failed pull, that is a decision to stop trusting it.
+    pub fn clear_mirror(&self) -> Result<bool, TokenError> {
+        if self.mirror.load().authority.is_empty() {
+            return Ok(false);
+        }
+        match std::fs::remove_file(self.mirror_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(TokenError::Io(e)),
+        }
+        self.mirror.store(Arc::new(Mirror::default()));
+        Ok(true)
+    }
+
+    fn persist_mirror(&self, mirror: &Mirror) -> Result<(), TokenError> {
+        let mut tokens: Vec<AppToken> = mirror.tokens.values().map(|t| (**t).clone()).collect();
+        tokens.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        let json = serde_json::to_vec_pretty(&MirrorFile {
+            version: 1,
+            authority: mirror.authority.clone(),
+            tokens,
+        })
+        .map_err(TokenError::Json)?;
+        write_restricted(&self.mirror_path(), &json)
+    }
+
+    /// Load the mirror file. Missing is normal; unreadable is an error, for the
+    /// same reason as [`load`](Self::load).
+    pub fn load_mirror(&self) -> Result<usize, TokenError> {
+        let bytes = match std::fs::read(self.mirror_path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(TokenError::Io(e)),
+        };
+        let file: MirrorFile = serde_json::from_slice(&bytes).map_err(TokenError::Json)?;
+        if file.version != 1 {
+            return Err(TokenError::UnknownFormat(format!(
+                "fleet token mirror version {} was written by a newer app-lb",
+                file.version
+            )));
+        }
+        let n = file.tokens.len();
+        let tokens = file
+            .tokens
+            .into_iter()
+            .map(|t| {
+                let live = Arc::new(AtomicU64::new(t.last_used_at));
+                (t.id.clone(), Arc::new(AppToken { live_last_used: live, ..t }))
+            })
+            .collect();
+        self.mirror.store(Arc::new(Mirror { authority: file.authority, tokens }));
         Ok(n)
     }
 
@@ -682,6 +924,18 @@ fn random_b64(bytes: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
+/// Write `path` via a temp file that is restricted *before* it has any content.
+fn write_restricted(path: &Path, json: &[u8]) -> Result<(), TokenError> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(TokenError::Io)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, b"").map_err(TokenError::Io)?;
+    restrict(&tmp).map_err(TokenError::Io)?;
+    std::fs::write(&tmp, json).map_err(TokenError::Io)?;
+    std::fs::rename(&tmp, path).map_err(TokenError::Io)
+}
+
 /// 0600. Unix-only, like the rest of app-lb's on-disk credential handling.
 fn restrict(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -735,6 +989,7 @@ mod tests {
 
     fn new(name: &str, admin: AdminScope, deployments: &[&str]) -> NewToken {
         NewToken {
+            fleet: false,
             name: name.into(),
             admin,
             namespace: None,
@@ -1093,5 +1348,122 @@ mod tests {
             assert!(secrets.insert(secret), "duplicate token secret");
         }
         assert_eq!(s.list().len(), 200);
+    }
+
+    /// The control plane's side of a fleet token, then a member server's.
+    fn fleet_pair() -> ((TokenStore, tempdir::Guard), (TokenStore, tempdir::Guard)) {
+        (store(), store())
+    }
+
+    #[test]
+    fn a_fleet_token_verifies_on_a_server_that_mirrors_it() {
+        let ((cp, _a), (member, _b)) = fleet_pair();
+        let (fleet, secret) = cp.mint(NewToken { fleet: true, ..new("deploy", AdminScope::Admin, &["*"]) }, 100).unwrap();
+        let (_, local_only) = cp.mint(new("local", AdminScope::Admin, &["*"]), 100).unwrap();
+
+        let export = cp.fleet_export(100);
+        assert_eq!(export.tokens.len(), 1, "only fleet tokens leave the control plane");
+        assert!(member.verify(&secret, 100).is_none(), "nothing is accepted before a pull");
+
+        assert!(member.replace_mirror("us2", export).unwrap());
+        let t = member.verify(&secret, 100).expect("the mirrored token verifies");
+        assert_eq!(t.id, fleet.id);
+        assert!(member.verify(&local_only, 100).is_none(), "a control plane's own tokens stay its own");
+        assert!(member.get(&fleet.id).is_none(), "a mirror is not this server's own token");
+        assert_eq!(member.mirrored_from(&fleet.id).as_deref(), Some("us2"));
+
+        let listed = member.list();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].fleet);
+        assert_eq!(listed[0].mirrored_from.as_deref(), Some("us2"));
+
+        // The same export again changes nothing and writes nothing new.
+        assert!(!member.replace_mirror("us2", cp.fleet_export(100)).unwrap());
+    }
+
+    #[test]
+    fn a_revoke_or_rescope_at_the_control_plane_reaches_the_member_on_its_next_pull() {
+        let ((cp, _a), (member, _b)) = fleet_pair();
+        let (t, secret) = cp.mint(NewToken { fleet: true, ..new("deploy", AdminScope::Admin, &["*"]) }, 100).unwrap();
+        member.replace_mirror("us2", cp.fleet_export(100)).unwrap();
+
+        cp.patch(&t.id, TokenPatch { admin: Some(AdminScope::View), ..Default::default() }).unwrap();
+        assert!(member.replace_mirror("us2", cp.fleet_export(100)).unwrap());
+        assert_eq!(member.verify(&secret, 100).unwrap().admin, AdminScope::View);
+
+        cp.revoke(&t.id);
+        assert!(member.replace_mirror("us2", cp.fleet_export(100)).unwrap());
+        assert!(member.verify(&secret, 100).is_none());
+        assert!(member.list().is_empty());
+    }
+
+    #[test]
+    fn the_mirror_survives_a_restart_and_is_dropped_when_the_authority_is_unbound() {
+        let ((cp, _a), (member, g)) = fleet_pair();
+        let (_, secret) = cp.mint(NewToken { fleet: true, ..new("deploy", AdminScope::Admin, &["*"]) }, 100).unwrap();
+        member.replace_mirror("us2", cp.fleet_export(100)).unwrap();
+
+        let restarted = TokenStore::new(g.path.join("tokens.json"));
+        assert_eq!(restarted.load_mirror().unwrap(), 1);
+        assert!(restarted.verify(&secret, 100).is_some(), "a restart while the control plane is down keeps the mirror");
+        assert_eq!(restarted.mirror_status(), (Some("us2".to_string()), 1));
+
+        assert!(restarted.clear_mirror().unwrap());
+        assert!(restarted.verify(&secret, 100).is_none());
+        let again = TokenStore::new(g.path.join("tokens.json"));
+        assert_eq!(again.load_mirror().unwrap(), 0, "an unbound authority is forgotten on disk too");
+    }
+
+    #[test]
+    fn a_malformed_export_is_rejected_whole_and_keeps_the_last_mirror() {
+        let ((cp, _a), (member, _b)) = fleet_pair();
+        let (_, secret) = cp.mint(NewToken { fleet: true, ..new("deploy", AdminScope::Admin, &["*"]) }, 100).unwrap();
+        member.replace_mirror("us2", cp.fleet_export(100)).unwrap();
+
+        let mut bad = cp.fleet_export(100);
+        let mut not_fleet = bad.tokens[0].clone();
+        not_fleet.id = "0123456789ab".into();
+        not_fleet.fleet = false;
+        bad.tokens.push(not_fleet);
+        assert!(member.replace_mirror("us2", bad).is_err());
+
+        let mut short = cp.fleet_export(100);
+        short.tokens[0].hash = "abc".into();
+        assert!(member.replace_mirror("us2", short).is_err());
+
+        let mut dup = cp.fleet_export(100);
+        dup.tokens.push(dup.tokens[0].clone());
+        assert!(member.replace_mirror("us2", dup).is_err());
+
+        assert!(member.verify(&secret, 100).is_some(), "the previous mirror is still served");
+    }
+
+    #[test]
+    fn a_servers_own_token_is_never_shadowed_by_a_mirrored_one() {
+        let ((cp, _a), (member, _b)) = fleet_pair();
+        let (own, own_secret) = member.mint(new("own", AdminScope::Admin, &["*"]), 100).unwrap();
+        // A hostile or confused authority exporting a record with the same id.
+        let mut export = FleetExport { tokens: vec![] };
+        cp.mint(NewToken { fleet: true, ..new("x", AdminScope::View, &["*"]) }, 100).unwrap();
+        let mut forged = cp.fleet_export(100).tokens.remove(0);
+        forged.id = own.id.clone();
+        export.tokens.push(forged);
+        member.replace_mirror("us2", export).unwrap();
+
+        assert_eq!(member.verify(&own_secret, 100).unwrap().admin, AdminScope::Admin);
+        assert!(member.mirrored_from(&own.id).is_none());
+        assert_eq!(member.list().len(), 1, "listed once, as this server's own");
+    }
+
+    #[test]
+    fn expired_fleet_tokens_are_not_exported_and_mirrored_ones_stop_verifying() {
+        let ((cp, _a), (member, _b)) = fleet_pair();
+        let (_, secret) = cp
+            .mint(NewToken { fleet: true, expires_in_secs: Some(10), ..new("brief", AdminScope::View, &["*"]) }, 100)
+            .unwrap();
+        member.replace_mirror("us2", cp.fleet_export(100)).unwrap();
+        assert!(member.verify(&secret, 105).is_some());
+        assert!(member.verify(&secret, 110).is_none(), "expiry holds without a pull");
+        assert!(cp.fleet_export(110).tokens.is_empty());
     }
 }

@@ -274,8 +274,34 @@ fn create_request(
         image_sha256: spec.image_download_url.as_ref().and(spec.image_sha256.clone()),
         sandbox_path: archive_key.as_ref().map(|_| crate::config::DEFAULT_WORKSPACE_PATH.to_string()),
         s3_archive_key: archive_key,
+        extra: rootfs_extra(spec),
         ..DaemonCreateRequest::default()
     }
+}
+
+/// Fields heyo-sdk 0.1.11's typed create body has no slot for yet, carried in
+/// its flattened `extra` map. `rootfs_mode` is absent for the default, so a
+/// copy-mode body is unchanged; a heyvm without per-sandbox rootfs modes
+/// ignores the field and copies, which is the behaviour it already had.
+fn rootfs_extra(spec: &VmSpec) -> serde_json::Map<String, serde_json::Value> {
+    let mut extra = serde_json::Map::new();
+    if let Some(mode) = spec.rootfs.daemon_mode() {
+        extra.insert("rootfs_mode".into(), serde_json::Value::from(mode));
+    }
+    extra
+}
+
+/// What `DELETE /images/:name` answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageDelete {
+    /// Gone from the catalog (or never there).
+    Deleted,
+    /// The daemon had no such image.
+    Missing,
+    /// Still referenced by these sandboxes, live or inactive.
+    InUse(Vec<String>),
+    /// This heyvm has no image-delete route (`404`/`405` on the route itself).
+    Unsupported,
 }
 
 /// A guest mount, resolved: the tree on this host, the id it is known to
@@ -762,6 +788,52 @@ impl VmManager {
         Ok(self.daemon.image(name).await?)
     }
 
+    /// `GET /images`: every image in the daemon's catalog.
+    pub async fn list_images(&self) -> Result<Vec<ImageInfo>, VmError> {
+        Ok(self.daemon.list_images().await?)
+    }
+
+    /// `DELETE /images/:name`.
+    ///
+    /// Not in heyo-sdk 0.1.11, so sent raw. heyvm answers `204` once the file
+    /// is gone, `404` with no such image, and `409 {error, sandboxes}` while a
+    /// sandbox still references it. A heyvm that predates the route also
+    /// answers `404` (or `405`), indistinguishable from "no such image" by
+    /// status alone — so the caller asks only about an image it has just seen
+    /// in the catalog, and a `404` for one is read as the route missing.
+    pub async fn delete_image(&self, name: &str, known_present: bool) -> Result<ImageDelete, VmError> {
+        if !crate::images::is_catalog_name(name) {
+            return Err(VmError::Runtime(format!("{name:?} is not an image name heyvm would hold")));
+        }
+        let resp = self
+            .client
+            .raw_request(
+                reqwest::Method::DELETE,
+                &format!("/images/{name}"),
+                None::<&()>,
+                heyo_sdk::RequestOptions::default(),
+            )
+            .await?;
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        Ok(match status {
+            200..=299 => ImageDelete::Deleted,
+            404 if known_present => ImageDelete::Unsupported,
+            404 => ImageDelete::Missing,
+            405 | 501 => ImageDelete::Unsupported,
+            409 => ImageDelete::InUse(
+                body.get("sandboxes")
+                    .and_then(|s| s.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default(),
+            ),
+            other => {
+                let detail = body.get("error").and_then(|e| e.as_str()).unwrap_or("").to_string();
+                return Err(VmError::Runtime(format!("DELETE /images/{name} answered {other}: {detail}")));
+            }
+        })
+    }
+
     /// Put an ext4 rootfs on this host into the daemon's catalog as `name`.
     pub async fn upload_image(&self, name: &str, path: &Path, opts: &ImageUploadOptions) -> Result<ImageInfo, VmError> {
         let stream = heyo_sdk::file_stream(path).await?;
@@ -1165,6 +1237,7 @@ mod tests {
             image_sha256: None,
             driver: Driver::Firecracker,
             image: None,
+            rootfs: Default::default(),
             port: 8080,
             start_command: None,
             size_class: None,
@@ -1447,6 +1520,65 @@ mod tests {
 
     fn template() -> VmSpec {
         spec_with(vec![])
+    }
+
+    /// `vm.rootfs: shared` reaches heyvm as `rootfs_mode`; the default adds
+    /// nothing, so a copy-mode body is what it always was.
+    #[test]
+    fn a_shared_rootfs_is_asked_for_and_the_default_says_nothing() {
+        let plain = serde_json::to_value(create_request(
+            &template(), "web-1".into(), vec![8080], None, vec![], &VmOwner::default(),
+        ))
+        .unwrap();
+        assert!(plain.get("rootfs_mode").is_none(), "{plain}");
+        let mut shared = template();
+        shared.rootfs = crate::config::RootfsMode::Shared;
+        let body = serde_json::to_value(create_request(
+            &shared, "web-1".into(), vec![8080], None, vec![], &VmOwner::default(),
+        ))
+        .unwrap();
+        assert_eq!(body["rootfs_mode"], "shared");
+    }
+
+    /// `DELETE /images/:name`, each answer heyvm can give, read the way the
+    /// image inventory needs it — including a heyvm with no such route.
+    #[tokio::test]
+    async fn image_delete_answers_are_told_apart() {
+        use axum::extract::Path as AxPath;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/images/:name",
+            axum::routing::delete(|AxPath(name): AxPath<String>| async move {
+                match name.as_str() {
+                    "gone" => StatusCode::NO_CONTENT.into_response(),
+                    "busy" => (StatusCode::CONFLICT, axum::Json(json!({"error": "in use", "sandboxes": ["sb-1", "sb-2"]}))).into_response(),
+                    "old" => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                    "boom" => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "disk"}))).into_response(),
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(Some(url), None, test_mounts()).unwrap();
+
+        assert_eq!(m.delete_image("gone", true).await.unwrap(), ImageDelete::Deleted);
+        assert_eq!(
+            m.delete_image("busy", true).await.unwrap(),
+            ImageDelete::InUse(vec!["sb-1".into(), "sb-2".into()])
+        );
+        assert_eq!(m.delete_image("old", true).await.unwrap(), ImageDelete::Unsupported);
+        assert_eq!(m.delete_image("absent", false).await.unwrap(), ImageDelete::Missing);
+        assert_eq!(
+            m.delete_image("absent", true).await.unwrap(),
+            ImageDelete::Unsupported,
+            "a 404 for an image just seen in the catalog means the route is missing"
+        );
+        assert!(m.delete_image("boom", true).await.is_err());
+        assert!(m.delete_image("../etc", true).await.is_err(), "never sent");
+        assert!(m.delete_image("vmlinux.bin", true).await.is_err(), "kernels are never deleted");
     }
 
     /// The daemon's own field names, in a body the SDK types: the owner,

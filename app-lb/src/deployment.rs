@@ -278,6 +278,9 @@ pub enum BootOrigin {
 pub struct PendingVm {
     pub sandbox_id: String,
     pub created_at: u64,
+    /// The same instant in milliseconds, for the boot timings in the
+    /// "VM ready" line; `0` when unknown (a VM adopted after a restart).
+    pub created_ms: u64,
     /// The daemon's last reported status, `None` before the first observation.
     /// Kept so a *transition* (Provisioning → Running, or → Stopped) can be
     /// logged the moment it happens instead of at the next heartbeat.
@@ -308,6 +311,7 @@ impl PendingVm {
         Self {
             sandbox_id,
             created_at: now_secs(),
+            created_ms: crate::obs::now_millis().max(0) as u64,
             status: None,
             reported_at_secs: 0,
             origin: BootOrigin::Created,
@@ -321,6 +325,18 @@ impl PendingVm {
         Self {
             origin: BootOrigin::Resumed,
             ..Self::new(sandbox_id)
+        }
+    }
+
+    /// When this VM was created, in milliseconds. `created_ms` only when it
+    /// agrees with `created_at`: a VM adopted after a restart has its
+    /// `created_at` dated from the daemon's uptime, and its `created_ms` is
+    /// then just when the record was made.
+    pub fn created_at_ms(&self) -> u64 {
+        if self.created_ms != 0 && self.created_ms / 1000 == self.created_at {
+            self.created_ms
+        } else {
+            self.created_at.saturating_mul(1000)
         }
     }
 
@@ -742,6 +758,7 @@ mod tests {
                 image_sha256: None,
                 driver: Driver::Firecracker,
                 image: None,
+                rootfs: Default::default(),
                 port: 8080,
                 start_command: None,
                 size_class: None,

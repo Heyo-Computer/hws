@@ -936,6 +936,21 @@
         "auth"
       ]
     },
+    "RootfsMode": {
+      "description": "See [`VmSpec::rootfs`].",
+      "oneOf": [
+        {
+          "description": "A private, writable copy of the image per boot.",
+          "type": "string",
+          "const": "copy"
+        },
+        {
+          "description": "The image itself, attached read-only; no copy.",
+          "type": "string",
+          "const": "shared"
+        }
+      ]
+    },
     "RouteRule": {
       "description": "How a request is matched to a deployment.\n\nA rule matches when *every* populated field matches. An empty rule matches\nnothing (rejected at registration) rather than everything, so a typo can't\nsilently swallow all traffic.",
       "type": "object",
@@ -1296,6 +1311,10 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "rootfs": {
+          "description": "How the VM's root filesystem relates to its image.\n\n`copy` (the default) boots from a private copy of the image that heyvm\nmakes on every cold boot — a reflink where the filesystem can, a full\ncopy where it cannot (ext4). `shared` attaches the image itself\nread-only, so no copy is made at all: the image must bring its own\nwritable layer (the hub's base images mount tmpfs over the paths that\nneed writing), and anything that must persist lives on the data disk or\nthe workspace mount. The reuse a `/workspace` VM wants.\n\nheyvm versions without per-sandbox `rootfs_mode` ignore it and copy.",
+          "$ref": "#/$defs/RootfsMode"
         },
         "setup_hooks": {
           "type": [

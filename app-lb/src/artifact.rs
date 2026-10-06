@@ -299,8 +299,40 @@ impl Puller {
             .await
             .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
 
+        self.pull_into(dir, deployment_id, None, spec, api_key, force, log).await
+    }
+
+    /// [`pull`](Self::pull), into the catalog name `image` rather than the
+    /// one [`ArtifactSpec::image_for`] would choose. A thaw needs this: an
+    /// offloaded image comes back under the name a deployment's `vm.image`
+    /// already says, whatever shape that name has.
+    pub async fn pull_as(
+        &self,
+        image: &str,
+        spec: &ArtifactSpec,
+        api_key: Option<&str>,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<Pulled, String> {
+        let dir = self.scratch.as_path();
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        self.pull_into(dir, image, Some(image), spec, api_key, false, log).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pull_into(
+        &self,
+        dir: &Path,
+        deployment_id: &str,
+        name: Option<&str>,
+        spec: &ArtifactSpec,
+        api_key: Option<&str>,
+        force: bool,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<Pulled, String> {
         if spec.is_remote() {
-            self.pull_remote(dir, deployment_id, spec, api_key, force, log).await
+            self.pull_remote(dir, deployment_id, name, spec, api_key, force, log).await
         } else {
             if api_key.is_some() {
                 // Said rather than ignored: a key configured here is a
@@ -309,7 +341,111 @@ impl Puller {
                      file permissions, not by an API key, and the secret is unused"
                     .to_string());
             }
-            self.pull_local(dir, deployment_id, spec, force, log).await
+            self.pull_local(dir, deployment_id, name, spec, force, log).await
+        }
+    }
+
+    /// Whether `store` still serves the blob `digest`, and at `size` bytes
+    /// when a size is known. The check an offload makes before it deletes the
+    /// only local copy: the store is the copy that remains.
+    pub async fn verify_blob(
+        &self,
+        store: &str,
+        digest: &str,
+        api_key: Option<&str>,
+        size: Option<u64>,
+    ) -> Result<(), String> {
+        if !is_digest(digest) {
+            return Err(format!("{digest:?} is not a blob digest"));
+        }
+        if is_remote_store(store) {
+            let base = store.trim().trim_end_matches('/');
+            let url = format!("{base}/blobs/{digest}");
+            let resp = self.head(&url, api_key).await.map_err(|e| format!("HEAD {url} failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("HEAD {url} answered {}", resp.status()));
+            }
+            // The header, not `content_length()`: on a HEAD that reads the
+            // (empty) body's size hint and answers 0.
+            let got = resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            if let (Some(want), Some(got)) = (size, got)
+                && want != got
+            {
+                return Err(format!("{url} is {got} bytes, expected {want}"));
+            }
+            Ok(())
+        } else {
+            let (got, len) = self.stat_local(store.trim(), digest).await?;
+            if got != digest {
+                return Err(format!("{store} resolves {digest} to {got}"));
+            }
+            if let Some(want) = size
+                && want != len
+            {
+                return Err(format!("{store} holds {digest} at {len} bytes, expected {want}"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Put the file at `path` into `store` and point `tag` at it, returning
+    /// the digest the store recorded — the offload of an image that came from
+    /// a build and so exists nowhere else.
+    ///
+    /// The digest is computed here first and the store must agree with it:
+    /// `PUT /blobs/{digest}` refuses bytes that hash to anything else, and a
+    /// local `art put` reports the digest it stored. The tag is what keeps the
+    /// blob out of the store's garbage collection.
+    pub async fn push_image(
+        &self,
+        store: &str,
+        path: &Path,
+        tag: &str,
+        api_key: Option<&str>,
+    ) -> Result<(String, u64), String> {
+        if is_remote_store(store) {
+            let (digest, size) = sha256_file(path).await?;
+            let base = store.trim().trim_end_matches('/');
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+            let body = reqwest::Body::from(file);
+            let url = format!("{base}/blobs/{digest}");
+            let mut req = self.http.put(&url).body(body);
+            if let Some(k) = api_key {
+                req = req.header("x-api-key", k);
+            }
+            let resp = req.send().await.map_err(|e| format!("PUT {url} failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("PUT {url} answered {}", resp.status()));
+            }
+            let url = format!("{base}/tags/{tag}");
+            let mut req = self.http.put(&url).body(digest.clone());
+            if let Some(k) = api_key {
+                req = req.header("x-api-key", k);
+            }
+            let resp = req.send().await.map_err(|e| format!("PUT {url} failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("PUT {url} answered {}", resp.status()));
+            }
+            Ok((digest, size))
+        } else {
+            let mut cmd = self.art(store.trim());
+            cmd.arg("--json").arg("put").arg(path).arg("--squash").arg("--tag").arg(tag);
+            let out = self.run(cmd).await?;
+            let v: serde_json::Value = serde_json::from_str(&out)
+                .map_err(|e| format!("`art put` produced output that is not JSON: {e}"))?;
+            let digest = v
+                .get("digest")
+                .and_then(|d| d.as_str())
+                .ok_or("`art put` reported no digest")?
+                .to_string();
+            let size = v.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            Ok((digest, size))
         }
     }
 
@@ -849,10 +985,12 @@ impl Puller {
 
     // -- remote: art serve over HTTP ---------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     async fn pull_remote(
         &self,
         dir: &Path,
         deployment_id: &str,
+        name: Option<&str>,
         spec: &ArtifactSpec,
         api_key: Option<&str>,
         force: bool,
@@ -868,7 +1006,7 @@ impl Puller {
             human(expected_size),
         ));
 
-        let image = spec.image_for(deployment_id, &digest);
+        let image = name.map(str::to_string).unwrap_or_else(|| spec.image_for(deployment_id, &digest));
 
         if !force
             && let Some((path, size)) = self.usable_on_daemon(&image, expected_size, spec.grow_gb).await?
@@ -971,8 +1109,14 @@ impl Puller {
                  manifest nor a blob for {reference:?}"
             ));
         }
+        // The header, not `content_length()`: on a HEAD that reads the (empty)
+        // body's size hint and answers 0, which would then pass every size
+        // check as "smaller than the blob".
         let size = resp
-            .content_length()
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
             .ok_or_else(|| format!("HEAD {url} answered without a Content-Length"))?;
         Ok((digest, size))
     }
@@ -1114,6 +1258,7 @@ impl Puller {
         &self,
         dir: &Path,
         deployment_id: &str,
+        name: Option<&str>,
         spec: &ArtifactSpec,
         force: bool,
         log: &mut (dyn FnMut(String) + Send),
@@ -1130,7 +1275,7 @@ impl Puller {
                     spec.artifact_ref,
                     human(size)
                 ));
-                let image = spec.image_for(deployment_id, &digest);
+                let image = name.map(str::to_string).unwrap_or_else(|| spec.image_for(deployment_id, &digest));
                 if !force
                     && let Some((path, size)) = self.usable_on_daemon(&image, size, spec.grow_gb).await?
                 {
@@ -1160,7 +1305,7 @@ impl Puller {
 
         let tmp = TempImage::new(dir, &format!("pull-{}", sanitize(deployment_id)));
         let out = self.materialize(root, spec, tmp.path()).await?;
-        let image = spec.image_for(deployment_id, &out.digest);
+        let image = name.map(str::to_string).unwrap_or_else(|| spec.image_for(deployment_id, &out.digest));
         log(format!(
             "materialized {} ({} written, {})",
             out.digest,
@@ -1717,6 +1862,29 @@ pub fn human(n: u64) -> String {
     }
 }
 
+/// The SHA-256 and length of a file, read once in 1 MiB chunks.
+async fn sha256_file(path: &Path) -> Result<(String, u64), String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut len = 0u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        len += n as u64;
+    }
+    Ok((format!("{:x}", hasher.finalize()), len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1953,6 +2121,27 @@ mod tests {
         assert_eq!(human(512), "512 B");
         assert_eq!(human(1024), "1.0 KiB");
         assert_eq!(human(21_474_836_480), "20.0 GiB");
+    }
+
+    /// A store with no manifest for the ref falls back to `HEAD /blobs`, and
+    /// the size must come from that response's Content-Length header —
+    /// `content_length()` on a HEAD is the empty body's hint, which is 0.
+    #[tokio::test]
+    async fn a_blob_resolved_by_head_has_its_real_size() {
+        use axum::{Router, routing::get};
+        let app = Router::new()
+            .route("/manifests/:id", get(|| async { axum::http::StatusCode::NOT_FOUND }))
+            .route("/blobs/:id", get(|| async { vec![0u8; 1234] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let puller = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let digest = "3".repeat(64);
+        let (got, size) = puller.resolve_remote(&base, &digest, None, None).await.unwrap();
+        assert_eq!((got.as_str(), size), (digest.as_str(), 1234));
+        server.abort();
     }
 
     #[tokio::test]

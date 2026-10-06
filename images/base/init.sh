@@ -30,6 +30,30 @@ fi
 mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
 
 dmesg -n 1 2>/dev/null
+
+# A read-only root: heyvm attaches the catalog image itself, shared by every VM
+# booted from it (`vm.rootfs: "shared"` in app-lb, or HEYO_FC_SHARED_ROOTFS on
+# the host), instead of copying it per boot. Everything this script and a
+# normal system write to goes on tmpfs: /run and /tmp fresh, and writable
+# copies of /etc, /root, /home and /var (small in these images) bound over the
+# originals, so hostname, resolv.conf, sshd's host keys and package caches work
+# as before. Nothing written there survives a stop, exactly as with a copied
+# rootfs; what must persist belongs on the data disk at /workspace.
+if ! touch /.heyo-rw-probe 2>/dev/null; then
+    echo "init: root is read-only (shared image); using tmpfs for writable paths"
+    mount -t tmpfs -o mode=0755 tmpfs /run
+    mount -t tmpfs -o mode=1777 tmpfs /tmp
+    for d in etc root home var; do
+        [ -d "/$d" ] || continue
+        mkdir -p "/run/heyo-rw/$d"
+        cp -a "/$d/." "/run/heyo-rw/$d/"
+        mount --bind "/run/heyo-rw/$d" "/$d"
+    done
+    mkdir -p /var/tmp && chmod 1777 /var/tmp
+else
+    rm -f /.heyo-rw-probe
+fi
+
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 hostname "$(cat /etc/heyo-hostname 2>/dev/null || echo heyo)"
 
@@ -74,13 +98,15 @@ if [ -b /dev/vdb ]; then
                 echo "init: formatting blank data disk /dev/vdb"
                 mkfs.ext4 -q -L workspace /dev/vdb
             fi
-            mkdir -p /workspace
+            mkdir -p /workspace 2>/dev/null
             mount /dev/vdb /workspace 2>/dev/null
             ;;
     esac
 fi
 # Without /dev/vdb, /workspace is on the rootfs and does not survive a cold boot.
-mkdir -p /workspace
+# The images ship /workspace as a directory, so this is a no-op on a read-only
+# root rather than an error.
+mkdir -p /workspace 2>/dev/null
 
 # sshd for `heyvm exec` / `heyvm sh`. Log to a file, never to the serial
 # console, which carries the marker-delimited command protocol.

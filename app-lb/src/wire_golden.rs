@@ -102,6 +102,7 @@ fn vm_spec() -> DeploymentSpec {
             image_sha256: None,
             driver: crate::config::Driver::Firecracker,
             image: Some("agent-base".into()),
+            rootfs: Default::default(),
             port: 8080,
             start_command: Some("/usr/local/bin/agent serve".into()),
             size_class: Some(heyo_sdk::SandboxSize::Medium),
@@ -927,8 +928,29 @@ fn token_responses_are_stable() {
         expires_at: None,
         minted_by: None,
         last_used_at: Some(1_722_403_600),
+        fleet: false,
+        mirrored_from: None,
     };
     golden("token-summary", &fleet);
+
+    // A fleet token as a member server lists it: minted at the control plane
+    // `us2`, mirrored here, and changed or revoked only there.
+    golden(
+        "token-summary-mirrored",
+        &TokenSummary {
+            id: "c3d4e5f6a1b2".into(),
+            name: "deploy bot".into(),
+            admin: AdminScope::Admin,
+            namespace: None,
+            deployments: vec!["*".into()],
+            created_at: 1_722_400_000,
+            expires_at: None,
+            minted_by: None,
+            last_used_at: None,
+            fleet: true,
+            mirrored_from: Some("us2".into()),
+        },
+    );
 
     // The narrow shape: an agent's own sandbox, no admin API access, expiring.
     golden(
@@ -943,6 +965,8 @@ fn token_responses_are_stable() {
             expires_at: Some(1_722_486_400),
             minted_by: None,
             last_used_at: None,
+            fleet: false,
+            mirrored_from: None,
         },
     );
 
@@ -961,6 +985,8 @@ fn token_responses_are_stable() {
             expires_at: None,
             minted_by: None,
             last_used_at: None,
+            fleet: false,
+            mirrored_from: None,
         },
     );
 
@@ -1480,6 +1506,90 @@ fn plugin_installs_are_stable() {
                 ("team-b".to_string(), install(None)),
             ]
             .into(),
+        },
+    );
+}
+
+/// `GET /images` — heyvm's image catalog with references, and
+/// `POST /images/sweep`.
+#[test]
+fn image_inventory_is_stable() {
+    use crate::images::{ImageRecord, ImageSource, ImageView, InventoryView, Reference, SweepReport, Tier};
+    let pulled = ImageRecord {
+        name: "img-c74abee2ce8409f1".into(),
+        source: ImageSource::Pull,
+        tier: Tier::Local,
+        digest: Some("c74abee2ce8409f1aa00bb11cc22dd33ee44ff5566778899aabbccddeeff0011".into()),
+        store: Some("https://hub.heyo.work".into()),
+        artifact_ref: Some("heyo/alpine:3.24".into()),
+        bytes: 536_870_912,
+        first_seen: 1_760_000_000,
+        last_used: 1_760_086_400,
+        ..Default::default()
+    };
+    let offloaded = ImageRecord {
+        name: "web-0123456789ab".into(),
+        source: ImageSource::Build,
+        tier: Tier::Offloaded,
+        digest: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
+        store: Some("https://art.example".into()),
+        bytes: 1_073_741_824,
+        first_seen: 1_750_000_000,
+        last_used: 1_750_000_000,
+        offloaded_to: Some("https://art.example#0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef (app-lb-offload:web-0123456789ab)".into()),
+        offloaded_at: Some(1_760_000_000),
+        ..Default::default()
+    };
+    let unknown = ImageRecord {
+        name: "ubuntu-24.04".into(),
+        bytes: 2_147_483_648,
+        first_seen: 1_760_000_000,
+        last_used: 1_760_000_000,
+        pinned: true,
+        failures: 1,
+        next_attempt_at: 1_760_001_800,
+        last_error: Some("HEAD https://art.example/blobs/… answered 404 Not Found".into()),
+        ..Default::default()
+    };
+    golden(
+        "images",
+        &InventoryView {
+            generated_at: 1_760_090_000,
+            complete: true,
+            error: None,
+            delete_supported: Some(true),
+            offload: true,
+            disk_used_pct: Some(41.3),
+            pressure_pct: 85,
+            local_bytes: 2_684_354_560,
+            images: vec![
+                ImageView {
+                    record: unknown,
+                    present: true,
+                    references: vec![Reference::Pinned, Reference::Sandbox { id: "sb-1a2b3c4d".into() }],
+                    kept_because: Some("in use by 2 reference(s)".into()),
+                },
+                ImageView {
+                    record: pulled,
+                    present: true,
+                    references: vec![
+                        Reference::Deployment { id: "web".into() },
+                        Reference::Rollout { deployment: "web".into(), operation: "op-1".into() },
+                        Reference::Job { deployment: "api".into(), job: "job-1".into() },
+                    ],
+                    kept_because: Some("in use by 3 reference(s)".into()),
+                },
+                ImageView { record: offloaded, present: false, references: vec![], kept_because: Some("not in heyvm's catalog".into()) },
+            ],
+        },
+    );
+    golden(
+        "images-sweep",
+        &SweepReport {
+            skipped: None,
+            pressure: false,
+            offloaded: vec!["img-0000000000000000".into()],
+            failed: vec![("img-1111111111111111".into(), "image \"img-1111111111111111\" was kept: its remote copy did not verify (HEAD … answered 404)".into())],
         },
     );
 }

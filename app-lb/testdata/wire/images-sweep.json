@@ -1,0 +1,12 @@
+{
+  "pressure": false,
+  "offloaded": [
+    "img-0000000000000000"
+  ],
+  "failed": [
+    [
+      "img-1111111111111111",
+      "image \"img-1111111111111111\" was kept: its remote copy did not verify (HEAD … answered 404)"
+    ]
+  ]
+}

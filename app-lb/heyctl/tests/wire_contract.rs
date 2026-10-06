@@ -486,8 +486,66 @@ fn plugin_installs_understands_every_field() {
 /// The request half of the contract for the workload routes: what this crate
 /// *sends*, checked against a scripted transport. Needs `test-util`.
 #[cfg(feature = "test-util")]
+/// `GET /images` and `POST /images/sweep`, as app-lb writes them.
+#[test]
+fn the_image_inventory_reads_every_field() {
+    use hws::{ImageInventory, ImageSweep};
+    let inv: ImageInventory = serde_json::from_str(&fixture("images")).expect("fixture parses");
+    assert!(inv.extra.is_empty(), "unmodelled: {:?}", inv.extra.keys().collect::<Vec<_>>());
+    assert!(inv.complete);
+    assert_eq!(inv.delete_supported, Some(true));
+    for i in &inv.images {
+        assert!(i.extra.is_empty(), "{}: unmodelled {:?}", i.name, i.extra.keys().collect::<Vec<_>>());
+    }
+    let pulled = inv.images.iter().find(|i| i.name == "img-c74abee2ce8409f1").unwrap();
+    assert_eq!(pulled.source, "pull");
+    assert_eq!(pulled.artifact_ref.as_deref(), Some("heyo/alpine:3.24"));
+    assert_eq!(
+        pulled.references.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["deployment/web", "rollout of web", "job job-1 of api"]
+    );
+    let gone = inv.images.iter().find(|i| i.tier == "offloaded").unwrap();
+    assert!(!gone.present);
+    assert!(gone.offloaded_to.as_deref().unwrap().contains("app-lb-offload:"));
+
+    let sweep: ImageSweep = serde_json::from_str(&fixture("images-sweep")).expect("fixture parses");
+    assert_eq!(sweep.offloaded, vec!["img-0000000000000000"]);
+    assert_eq!(sweep.failed[0].0, "img-1111111111111111");
+}
+
 mod requests {
     use hws::Client;
+
+    /// The image routes send what app-lb's routes take.
+    #[tokio::test]
+    async fn image_requests_have_the_routes_shapes() {
+        let (c, stub) = client(
+            Stub::new()
+                .json(200, json!({"images": []}))
+                .json(200, json!({"offloaded": [], "failed": []}))
+                .json(200, json!({"name": "img-a"}))
+                .json(200, json!({"name": "img-a", "pinned": true}))
+                .reply(204, ""),
+        );
+        c.images().await.unwrap();
+        c.sweep_images().await.unwrap();
+        c.offload_image("img-a").await.unwrap();
+        assert!(c.pin_image("img-a", true).await.unwrap().pinned);
+        c.delete_image("img-a").await.unwrap();
+        let calls = stub.calls();
+        let seen: Vec<_> = calls.iter().map(|c| (c.method, c.path.as_str())).collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Method::Get, "/images"),
+                (Method::Post, "/images/sweep"),
+                (Method::Post, "/images/img-a/offload"),
+                (Method::Patch, "/images/img-a"),
+                (Method::Delete, "/images/img-a"),
+            ]
+        );
+        assert_eq!(calls[3].body, Some(json!({"pinned": true})));
+    }
     use hws::transport::Method;
     use hws::transport::stub::Stub;
     use serde_json::json;
@@ -591,4 +649,20 @@ mod requests {
         assert_eq!(s.upstreams[0].in_flight, 2);
         assert_eq!(stub.calls()[0].path, "/deployments/web/discovery-status?staged=true");
     }
+}
+
+/// A fleet token as a member server lists it. `fleet` and `mirrored_from` are
+/// what tell an operator where a token works and where it can be revoked.
+#[test]
+fn mirrored_token_summary_understands_every_field() {
+    let t: hws::types::TokenSummary =
+        serde_json::from_str(&fixture("token-summary-mirrored")).expect("fixture parses");
+    assert!(
+        t.extra.is_empty(),
+        "heyctl does not understand these fields app-lb sends: {:?}\n\
+         Add them to TokenSummary in src/types.rs.",
+        t.extra.keys().collect::<Vec<_>>()
+    );
+    assert!(t.fleet);
+    assert_eq!(t.mirrored_from.as_deref(), Some("us2"));
 }

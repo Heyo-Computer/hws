@@ -163,6 +163,10 @@ fn html_escape(s: &str) -> String {
 #[derive(Clone)]
 struct AdminState {
     views: Option<Arc<crate::fleet::ViewStore>>,
+    /// The last pull of the token authority's fleet tokens, if one is bound.
+    token_sync: Arc<std::sync::Mutex<TokenSyncStatus>>,
+    /// heyvm's image catalog as app-lb manages it; `None` in tests.
+    images: Option<Arc<crate::images::ImageCatalog>>,
     rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
@@ -369,6 +373,8 @@ impl AdminApi {
             addr,
             state: AdminState {
                 views: None,
+                token_sync: Default::default(),
+                images: None,
                 rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
@@ -415,6 +421,11 @@ impl AdminApi {
 
     pub fn with_views(mut self, views: Arc<crate::fleet::ViewStore>) -> Self {
         self.state.views = Some(views);
+        self
+    }
+
+    pub fn with_images(mut self, images: Arc<crate::images::ImageCatalog>) -> Self {
+        self.state.images = Some(images);
         self
     }
 }
@@ -2160,6 +2171,113 @@ async fn storage_console(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     Html(render_page(&state, &state.disks_html, &headers))
+}
+
+// ---- images ---------------------------------------------------------------
+
+#[allow(clippy::result_large_err)]
+fn images_of(state: &AdminState) -> Result<&Arc<crate::images::ImageCatalog>, Response> {
+    state.images.as_ref().ok_or_else(|| {
+        err(StatusCode::SERVICE_UNAVAILABLE, "the image inventory is not running").into_response()
+    })
+}
+
+fn image_error(e: crate::images::ImageError) -> Response {
+    use crate::images::ImageError as E;
+    let status = match &e {
+        E::NotFound(_) => StatusCode::NOT_FOUND,
+        E::InUse(..) | E::NotEligible(..) => StatusCode::CONFLICT,
+        E::Unclassifiable(_) | E::Unsupported => StatusCode::SERVICE_UNAVAILABLE,
+        E::Unverified(..) | E::Failed(_) => StatusCode::BAD_GATEWAY,
+    };
+    let mut body = serde_json::json!({ "error": e.to_string() });
+    if let E::InUse(_, refs, sandboxes) = &e {
+        body["references"] = serde_json::to_value(refs).unwrap_or_default();
+        if !sandboxes.is_empty() {
+            body["sandboxes"] = serde_json::to_value(sandboxes).unwrap_or_default();
+        }
+    }
+    (status, Json(body)).into_response()
+}
+
+fn bad_image_name(name: &str) -> Option<Response> {
+    (!crate::images::is_catalog_name(name)).then(|| {
+        err(StatusCode::BAD_REQUEST, format!("{name:?} is not an image name")).into_response()
+    })
+}
+
+/// `GET /images` — heyvm's catalog, what references each image, and what the
+/// offload pacer would do with it. Fleet-wide: images are shared across
+/// namespaces now that they are named by content.
+async fn list_images(State(state): State<AdminState>) -> Response {
+    match images_of(&state) {
+        Ok(images) => Json(images.inventory().await).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `POST /images/sweep` — one offload pass now.
+async fn sweep_images(State(state): State<AdminState>) -> Response {
+    match images_of(&state) {
+        Ok(images) => Json(images.sweep().await).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `POST /images/:name/offload` — verify the remote copy, then delete it from
+/// heyvm. Skips the idle age, and nothing else.
+async fn offload_image(State(state): State<AdminState>, Path(name): Path<String>) -> Response {
+    if let Some(r) = bad_image_name(&name) {
+        return r;
+    }
+    let images = match images_of(&state) {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
+    match images.offload(&name, true).await {
+        Ok(()) => Json(images.store().get(&name)).into_response(),
+        Err(e) => image_error(e),
+    }
+}
+
+/// `DELETE /images/:name` — remove an unreferenced image outright.
+async fn delete_image(State(state): State<AdminState>, Path(name): Path<String>) -> Response {
+    if let Some(r) = bad_image_name(&name) {
+        return r;
+    }
+    let images = match images_of(&state) {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
+    match images.delete(&name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => image_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchImage {
+    pinned: bool,
+}
+
+/// `PATCH /images/:name` — `{pinned}`. A pin is a reference: a pinned image
+/// is never offloaded or deleted.
+async fn patch_image(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(body): Json<PatchImage>,
+) -> Response {
+    if let Some(r) = bad_image_name(&name) {
+        return r;
+    }
+    let images = match images_of(&state) {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
+    match images.set_pinned(&name, body.pinned) {
+        Ok(record) => Json(record).into_response(),
+        Err(e) => image_error(e),
+    }
 }
 
 // ---- plugins --------------------------------------------------------------
@@ -6311,7 +6429,81 @@ async fn services_snapshot(State(state): State<AdminState>, axum::Extension(call
 async fn view_configuration(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>) -> Response {
     if matches!(caller, Caller::Ungated) || !caller.covers_fleet() { return forbidden("authenticated fleet admin required"); }
     let Some(views) = &state.views else { return err(StatusCode::SERVICE_UNAVAILABLE, "view store unavailable").into_response(); };
-    ([(header::CACHE_CONTROL, "no-store")], Json(views.snapshot())).into_response()
+    let mut body = serde_json::to_value(&*views.snapshot()).unwrap_or_default();
+    let sync = state.token_sync.lock().map(|s| s.clone()).unwrap_or_default();
+    if let Some(body) = body.as_object_mut() {
+        body.insert("token_sync".into(), serde_json::to_value(sync).unwrap_or_default());
+    }
+    ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
+
+/// Seconds between pulls of the token authority's fleet tokens: how long a
+/// fleet token minted or revoked at the control plane takes to reach a server.
+const TOKEN_SYNC_SECS: u64 = 10;
+
+/// The last pull, for `GET /control-plane/config`. A server keeps serving its
+/// last mirror while pulls fail, so how stale it is has to be visible somewhere.
+#[derive(Clone, Default, Serialize)]
+struct TokenSyncStatus {
+    /// The bound authority's id, or `None` when this server mirrors nothing.
+    authority: Option<String>,
+    /// Fleet tokens currently mirrored.
+    tokens: usize,
+    last_attempt_at: Option<u64>,
+    last_success_at: Option<u64>,
+    error: Option<String>,
+}
+
+/// `GET /fleet/tokens` — this control plane's fleet tokens, verifiers included,
+/// for the servers that name it as their token authority. Never secrets.
+async fn fleet_tokens_export(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>) -> Response {
+    if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
+        return forbidden("authenticated fleet view required");
+    }
+    if !state.views.as_ref().is_some_and(|v| v.snapshot().fleet.is_some()) {
+        return err(StatusCode::CONFLICT, "this app-lb has no gateways configured, so it is not a token authority").into_response();
+    }
+    ([(header::CACHE_CONTROL, "no-store")], Json(state.tokens.fleet_export(now_secs()))).into_response()
+}
+
+/// One pull from the token authority. A failure keeps the last mirror; an
+/// unbound authority drops it.
+async fn sync_fleet_tokens(state: &AdminState) {
+    let authority = state.views.as_ref().and_then(|v| v.snapshot().token_authority.clone());
+    let now = now_secs();
+    let Some(authority) = authority else {
+        match state.tokens.clear_mirror() {
+            Ok(true) => tracing::info!("token authority unconfigured; fleet tokens no longer accepted"),
+            Ok(false) => {}
+            Err(e) => tracing::error!(error = %e, "cannot remove the fleet token mirror"),
+        }
+        if let Ok(mut status) = state.token_sync.lock() { *status = TokenSyncStatus::default(); }
+        return;
+    };
+    let result = match authority.fleet_tokens().await {
+        Ok((id, export)) => state.tokens.replace_mirror(&id, export).map(|changed| (id, changed)).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let (mirrored_from, count) = state.tokens.mirror_status();
+    let Ok(mut status) = state.token_sync.lock() else { return };
+    status.last_attempt_at = Some(now);
+    status.tokens = count;
+    match result {
+        Ok((id, changed)) => {
+            if changed { tracing::info!(authority = %id, tokens = count, "fleet tokens updated"); }
+            status.authority = Some(id);
+            status.last_success_at = Some(now);
+            status.error = None;
+        }
+        Err(e) => {
+            // Only log a change of state, not every failed pull.
+            if status.error.as_deref() != Some(e.as_str()) {
+                tracing::warn!(error = %e, mirrored = count, "fleet token pull failed; keeping the last mirror");
+            }
+            status.authority = mirrored_from.or(status.authority.take());
+            status.error = Some(e);
+        }
+    }
 }
 
 async fn configure_views(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
@@ -6372,6 +6564,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/:id", get(get_plugin))
         .route("/api/plugins/:id/installs", get(plugin_installs))
+        // heyvm's image catalog. Fleet-wide, like the disk inventory beside it.
+        .route("/images", get(list_images))
         // A namespace's plugins: what it has installed, and the installed
         // plugins' own pages. Walled by the namespace in the path (see
         // `decide_access`), so a namespace token reaches these for its own
@@ -6480,6 +6674,9 @@ fn router(state: AdminState) -> Router {
         .route("/api/plugins/:id", put(put_plugin))
         .route("/api/plugins/:id/enable", post(enable_plugin))
         .route("/api/plugins/:id/disable", post(disable_plugin))
+        .route("/images/sweep", post(sweep_images))
+        .route("/images/:name/offload", post(offload_image))
+        .route("/images/:name", axum::routing::delete(delete_image).patch(patch_image))
         .route(
             "/namespaces/:name/plugins/:id",
             put(install_namespace_plugin).delete(uninstall_namespace_plugin),
@@ -6553,6 +6750,7 @@ fn router(state: AdminState) -> Router {
         .route("/fleet/deployments", get(fleet_deployments))
         .route("/fleet/gateways/:id/metrics", get(fleet_gateway_metrics))
         .route("/fleet/network", get(fleet_network))
+        .route("/fleet/tokens", get(fleet_tokens_export))
         .route("/services", get(services_snapshot))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_fleet_view));
 
@@ -6616,6 +6814,15 @@ impl BackgroundService for AdminApi {
             }
         };
         tracing::info!(addr = %self.addr, "admin API listening");
+        let sync_state = self.state.clone();
+        let mut sync_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(TOKEN_SYNC_SECS));
+            loop { tokio::select! {
+                _ = tick.tick() => sync_fleet_tokens(&sync_state).await,
+                _ = sync_shutdown.changed() => break,
+            } }
+        });
         let rollouts = self.state.rollouts.clone();
         let mut rollout_shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -6934,6 +7141,20 @@ fn token_visible(caller: Option<&Caller>, token: &crate::tokens::TokenSummary) -
     })
 }
 
+/// The refusal to change a fleet token where it is only mirrored. Asked only
+/// once the caller is known to see the token.
+fn mirrored_token(state: &AdminState, caller: Option<&Caller>, id: &str) -> Option<Response> {
+    let authority = state.tokens.mirrored_from(id)?;
+    if !state.tokens.summary(id).is_some_and(|t| token_visible(caller, &t)) {
+        return Some(no_token(id));
+    }
+    Some(err(
+        StatusCode::CONFLICT,
+        format!("{id} is a fleet token mirrored from {authority}; change or revoke it there"),
+    )
+    .into_response())
+}
+
 /// The one refusal for a token id a caller cannot see, worded as the one for an
 /// id that does not exist so the two cannot be told apart.
 fn no_token(id: &str) -> Response {
@@ -6954,6 +7175,13 @@ async fn mint_token(
             return refused;
         }
         minted_by = c.principal();
+    }
+    if req.fleet && !state.views.as_ref().is_some_and(|v| v.snapshot().fleet.is_some()) {
+        return err(
+            StatusCode::CONFLICT,
+            "fleet tokens are minted on a control plane: this app-lb has no gateways configured",
+        )
+        .into_response();
     }
     let name = req.name.clone();
     let (summary, token) = match state.tokens.mint_by(req, now_secs(), minted_by) {
@@ -7002,7 +7230,7 @@ async fn get_token(
     caller: Option<axum::Extension<Caller>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.tokens.get(&id).map(|t| t.summary()) {
+    match state.tokens.summary(&id) {
         Some(t) if token_visible(caller.as_deref(), &t) => Json(t).into_response(),
         _ => no_token(&id),
     }
@@ -7015,6 +7243,9 @@ async fn patch_token(
     Json(patch): Json<crate::tokens::TokenPatch>,
 ) -> Response {
     let caller = caller.as_deref();
+    if let Some(refused) = mirrored_token(&state, caller, &id) {
+        return refused;
+    }
     let before = state.tokens.get(&id);
     if !before.as_ref().is_some_and(|t| token_visible(caller, &t.summary())) {
         return no_token(&id);
@@ -7044,6 +7275,9 @@ async fn revoke_token(
     caller: Option<axum::Extension<Caller>>,
     Path(id): Path<String>,
 ) -> Response {
+    if let Some(refused) = mirrored_token(&state, caller.as_deref(), &id) {
+        return refused;
+    }
     let before = state.tokens.get(&id);
     if !before.as_ref().is_some_and(|t| token_visible(caller.as_deref(), &t.summary())) {
         return no_token(&id);
@@ -7403,6 +7637,116 @@ mod tests {
             Fixture { state: api.state, registry, root, mutations, inactive }
         }
 
+        /// Fleet tokens: minted only where gateways are configured, exported
+        /// only to fleet-wide callers, and read-only where they are mirrored.
+        mod fleet_tokens {
+            use super::*;
+            use crate::tokens::{AdminScope, NewToken};
+
+            fn new(name: &str, fleet: bool) -> NewToken {
+                NewToken { fleet, name: name.into(), admin: AdminScope::Admin, namespace: None,
+                    deployments: vec!["*".into()], expires_in_secs: None }
+            }
+
+            /// Make the fixture a control plane with one configured gateway.
+            fn control_plane(f: &mut Fixture) {
+                let path = f.root.join("views.json");
+                std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"revision":1,"config":{
+                    "gateways":[{"id":"us4","region":"US4","url":"https://admin.us4.example",
+                        "auth":{"secret":"fleet-observer-us4","key":"token"}}],
+                    "control_plane":[]}})).unwrap()).unwrap();
+                let views = crate::fleet::ViewStore::open(path, f.state.secrets.clone(), [None, None]).unwrap();
+                f.state.views = Some(Arc::new(views));
+            }
+
+            async fn body(r: Response) -> (StatusCode, serde_json::Value) {
+                let status = r.status();
+                let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+            }
+
+            fn operator(f: &Fixture) -> Caller {
+                let (summary, _) = f.state.tokens.mint(new("operator", false), now_secs()).unwrap();
+                Caller::Token(f.state.tokens.get(&summary.id).unwrap())
+            }
+
+            #[tokio::test]
+            async fn only_a_control_plane_mints_fleet_tokens() {
+                let mut f = fixture(true).await;
+                let (status, v) = body(mint_token(State(f.state.clone()), None, Json(new("deploy", true))).await).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{v}");
+                assert!(f.state.tokens.list().is_empty(), "a refused mint leaves nothing behind");
+
+                control_plane(&mut f);
+                let (status, v) = body(mint_token(State(f.state.clone()), None, Json(new("deploy", true))).await).await;
+                assert_eq!(status, StatusCode::CREATED, "{v}");
+                assert_eq!(v["fleet"], true);
+            }
+
+            #[tokio::test]
+            async fn the_export_carries_only_fleet_tokens_to_fleet_wide_callers() {
+                let mut f = fixture(true).await;
+                control_plane(&mut f);
+                let op = operator(&f);
+                f.state.tokens.mint(new("deploy", true), now_secs()).unwrap();
+
+                let (status, v) = body(fleet_tokens_export(State(f.state.clone()), axum::Extension(op)).await).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let tokens = v["tokens"].as_array().unwrap();
+                assert_eq!(tokens.len(), 1, "the operator's own token is not exported");
+                assert_eq!(tokens[0]["name"], "deploy");
+                assert_eq!(tokens[0]["secret_sha256"].as_str().unwrap().len(), 64);
+                assert!(!v.to_string().contains("applb_"), "never a secret");
+
+                let (summary, _) = f.state.tokens.mint(NewToken { namespace: Some("team-a".into()), ..new("ns", false) }, now_secs()).unwrap();
+                let confined = Caller::Token(f.state.tokens.get(&summary.id).unwrap());
+                let (status, _) = body(fleet_tokens_export(State(f.state.clone()), axum::Extension(confined)).await).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                let (status, _) = body(fleet_tokens_export(State(f.state.clone()), axum::Extension(Caller::Ungated)).await).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+
+            #[tokio::test]
+            async fn a_server_that_is_not_a_control_plane_exports_nothing() {
+                let f = fixture(true).await;
+                let op = operator(&f);
+                let (status, _) = body(fleet_tokens_export(State(f.state.clone()), axum::Extension(op)).await).await;
+                assert_eq!(status, StatusCode::CONFLICT);
+            }
+
+            #[tokio::test]
+            async fn a_mirrored_token_is_listed_but_changed_and_revoked_only_at_its_control_plane() {
+                let f = fixture(true).await;
+                let cp = crate::tokens::TokenStore::new(f.root.join("cp-tokens.json"));
+                let (t, secret) = cp.mint(new("deploy", true), now_secs()).unwrap();
+                f.state.tokens.replace_mirror("us2", cp.fleet_export(now_secs())).unwrap();
+
+                let (status, v) = body(get_token(State(f.state.clone()), None, Path(t.id.clone())).await).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                assert_eq!(v["mirrored_from"], "us2");
+
+                let (status, v) = body(revoke_token(State(f.state.clone()), None, Path(t.id.clone())).await).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{v}");
+                assert!(v.to_string().contains("us2"), "the refusal names where to go: {v}");
+                let patch: crate::tokens::TokenPatch = serde_json::from_value(serde_json::json!({"name":"renamed"})).unwrap();
+                let (status, _) = body(patch_token(State(f.state.clone()), None, Path(t.id.clone()), Json(patch)).await).await;
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(f.state.tokens.verify(&secret, now_secs()).is_some(), "still accepted after the refusals");
+            }
+
+            #[tokio::test]
+            async fn unbinding_the_authority_stops_accepting_its_tokens() {
+                let f = fixture(true).await;
+                let cp = crate::tokens::TokenStore::new(f.root.join("cp-tokens.json"));
+                let (_, secret) = cp.mint(new("deploy", true), now_secs()).unwrap();
+                f.state.tokens.replace_mirror("us2", cp.fleet_export(now_secs())).unwrap();
+                // No views at all: nothing names a token authority.
+                sync_fleet_tokens(&f.state).await;
+                assert!(f.state.tokens.verify(&secret, now_secs()).is_none());
+                assert_eq!(f.state.token_sync.lock().unwrap().authority, None);
+            }
+        }
+
         /// The token routes for a namespace-confined caller, end to end through
         /// the handlers: what it may mint, see, re-scope and revoke.
         mod tenant_tokens {
@@ -7411,6 +7755,7 @@ mod tests {
 
             fn new(name: &str, ns: Option<&str>, admin: AdminScope, ttl: Option<u64>) -> NewToken {
                 NewToken {
+                    fleet: false,
                     name: name.into(),
                     admin,
                     namespace: ns.map(str::to_string),
@@ -7889,6 +8234,7 @@ mod tests {
                         namespace: Some("team-a".into()),
                         deployments: vec![],
                         expires_in_secs: None,
+                        fleet: false,
                     },
                     now_secs(),
                 )
@@ -9073,6 +9419,7 @@ mod tests {
         fn mint(s: &TokenStore, admin: AdminScope, deployments: &[&str]) -> String {
             s.mint(
                 NewToken {
+                    fleet: false,
                     name: "test".into(),
                     admin,
                     namespace: None,
@@ -9131,6 +9478,7 @@ mod tests {
         fn mint_in_namespace(s: &TokenStore, admin: AdminScope, ns: &str) -> String {
             s.mint(
                 NewToken {
+                    fleet: false,
                     name: "ns test".into(),
                     admin,
                     namespace: Some(ns.into()),
@@ -9654,6 +10002,7 @@ mod tests {
                 let secret = s
                     .mint(
                         NewToken {
+                            fleet: false,
                             name: "test".into(),
                             admin: AdminScope::Admin,
                             namespace: namespace.map(str::to_string),
@@ -9811,6 +10160,31 @@ mod tests {
             assert!(matches!(verdict, Verdict::Allow(Caller::Ungated)));
         }
 
+        /// heyvm's image catalog is shared by every namespace now that images
+        /// are named by content, so its routes are fleet-only: a namespace
+        /// token reads none of it and changes none of it.
+        #[test]
+        fn image_routes_are_fleet_only_and_mutations_need_admin() {
+            let t = store();
+            let ns = format!("Bearer {}", mint_in_namespace(&t, AdminScope::Admin, "team-a"));
+            let view = format!("Bearer {}", mint(&t, AdminScope::View, &["*"]));
+            let admin = format!("Bearer {}", mint(&t, AdminScope::Admin, &["*"]));
+            let at = |hdr: &str, matched: &str, path: &str, want: AdminScope| {
+                on(Some(&basic()), &t, Some(hdr), matched, path, want)
+            };
+            for (m, p, want) in [
+                ("/images", "/images", AdminScope::View),
+                ("/images/sweep", "/images/sweep", AdminScope::Admin),
+                ("/images/:name/offload", "/images/img-a/offload", AdminScope::Admin),
+                ("/images/:name", "/images/img-a", AdminScope::Admin),
+            ] {
+                assert!(matches!(at(&ns, m, p, want), Verdict::Forbidden(_)), "{m} for a namespace token");
+                assert!(matches!(at(&admin, m, p, want), Verdict::Allow(_)), "{m} for a fleet admin");
+            }
+            assert!(matches!(at(&view, "/images", "/images", AdminScope::View), Verdict::Allow(_)));
+            assert!(matches!(at(&view, "/images/:name", "/images/img-a", AdminScope::Admin), Verdict::Forbidden(_)));
+        }
+
         #[test]
         fn the_feed_route_is_walled_by_namespace() {
             let t = store();
@@ -9953,6 +10327,7 @@ mod tests {
             let narrow = t
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "narrow".into(),
                         admin: AdminScope::Admin,
                         namespace: Some("team-a".into()),
@@ -10203,6 +10578,7 @@ mod tests {
             let secret = t
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "sam".into(),
                         admin: AdminScope::Admin,
                         namespace: Some("sam".into()),
@@ -10249,6 +10625,7 @@ mod tests {
             let secret = t
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "sam".into(),
                         admin: AdminScope::Admin,
                         namespace: Some("sam".into()),
@@ -10438,6 +10815,7 @@ mod tests {
             let secret = t
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "short".into(),
                         admin: AdminScope::Admin,
                         namespace: None,

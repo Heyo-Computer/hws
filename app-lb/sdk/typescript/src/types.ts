@@ -1077,6 +1077,13 @@ export interface TokenSummary {
    * stamp is flushed opportunistically, not per request.
    */
   last_used_at?: number;
+  /** Minted at a control plane and valid on every server that mirrors it. */
+  fleet?: boolean;
+  /**
+   * Set when this server holds the token only as a mirror: the control plane
+   * it came from, which is where it is changed or revoked.
+   */
+  mirrored_from?: string;
 }
 
 // -- the event feed --------------------------------------------------------

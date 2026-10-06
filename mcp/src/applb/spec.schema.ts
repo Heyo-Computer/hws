@@ -577,7 +577,7 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "description": "How a *static* (proxy_pass) deployment's backend is updated: a working directory on the app-lb host, and commands to run in it. (Call applb_spec_schema with block \"UpdateSpec\" for the full shape; everything it accepted is still accepted.)"
     },
     "VmSpec": {
-      "description": "The VM template. (9 more fields — correlated_creates, env_from, image_download_url, image_sha256, image_size_bytes, mounts, setup_hooks, workspace, workspace_archive — omitted here for size. Call applb_spec_schema with block \"VmSpec\" for the full shape; everything it accepted is still accepted.)",
+      "description": "The VM template. (10 more fields — correlated_creates, env_from, image_download_url, image_sha256, image_size_bytes, mounts, rootfs, setup_hooks, workspace, workspace_archive — omitted here for size. Call applb_spec_schema with block \"VmSpec\" for the full shape; everything it accepted is still accepted.)",
       "type": "object",
       "properties": {
         "disk_size_gb": {
@@ -1614,6 +1614,21 @@ export const DEPLOYMENT_SPEC_FULL = {
         "auth"
       ]
     },
+    "RootfsMode": {
+      "description": "See [`VmSpec::rootfs`].",
+      "oneOf": [
+        {
+          "description": "A private, writable copy of the image per boot.",
+          "type": "string",
+          "const": "copy"
+        },
+        {
+          "description": "The image itself, attached read-only; no copy.",
+          "type": "string",
+          "const": "shared"
+        }
+      ]
+    },
     "RouteRule": {
       "description": "How a request is matched to a deployment.\n\nA rule matches when *every* populated field matches. An empty rule matches\nnothing (rejected at registration) rather than everything, so a typo can't\nsilently swallow all traffic.",
       "type": "object",
@@ -1974,6 +1989,10 @@ export const DEPLOYMENT_SPEC_FULL = {
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "rootfs": {
+          "description": "How the VM's root filesystem relates to its image.\n\n`copy` (the default) boots from a private copy of the image that heyvm\nmakes on every cold boot — a reflink where the filesystem can, a full\ncopy where it cannot (ext4). `shared` attaches the image itself\nread-only, so no copy is made at all: the image must bring its own\nwritable layer (the hub's base images mount tmpfs over the paths that\nneed writing), and anything that must persist lives on the data disk or\nthe workspace mount. The reuse a `/workspace` VM wants.\n\nheyvm versions without per-sandbox `rootfs_mode` ignore it and copy.",
+          "$ref": "#/$defs/RootfsMode"
         },
         "setup_hooks": {
           "type": [

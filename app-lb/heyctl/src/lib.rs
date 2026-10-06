@@ -75,6 +75,7 @@
 
 pub mod api;
 pub mod error;
+pub mod images;
 pub mod obs;
 pub mod shell;
 pub mod transport;

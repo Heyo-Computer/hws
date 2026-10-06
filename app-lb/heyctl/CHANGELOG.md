@@ -4,6 +4,22 @@ All notable changes to the `hws` crate (the Heyo Web Services SDK and the
 `heyctl` CLI). The crate follows [semantic versioning](https://semver.org/);
 while it is `0.x`, a minor bump may break the API.
 
+## Unreleased
+
+### Added
+
+- **Tokens for every server.** `NewToken::on_all_servers()` (and
+  `heyctl token mint … --all-servers`) mints at a control-plane app-lb a token
+  that every server mirroring it accepts. `TokenSummary` gains `fleet` and
+  `mirrored_from`; `heyctl token list` has a SERVERS column and `heyctl token
+  describe` says where a token works and where to revoke it.
+
+### Changed
+
+- `NewToken` and `TokenSummary` have new public fields, which breaks code that
+  builds either one with a struct literal. Use `NewToken::new(…)` and its builder
+  methods instead.
+
 ## 0.2.0 — unreleased
 
 The crate is now the SDK for creating and managing workloads on Heyo, including

@@ -276,6 +276,19 @@ A token scoped to specific deployments is refused the fleet-wide routes,
 *including minting* — so it cannot widen itself. See the
 [app-tokens section](../README.md#app-tokens) of app-lb's README.
 
+A context is one server. To use one token across servers, mint it with
+`--all-servers` at the control-plane app-lb. It then works on every server that
+names that control plane as its `token_authority`, so you can point a context at
+any of them with the same token:
+
+```sh
+heyctl --server https://admin.us2.example token mint deploy-bot --admin admin --all-deployments --all-servers -q
+```
+
+The other servers list it with the control plane's id under SERVERS. Change or
+revoke it at the control plane; the other servers refuse those changes. See
+[tokens for every server](../README.md#tokens-for-every-server).
+
 ## Quick start
 
 ```sh
