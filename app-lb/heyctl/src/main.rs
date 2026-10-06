@@ -69,6 +69,11 @@ enum Command {
     #[command(subcommand, visible_alias = "plugin")]
     Plugins(cmd::plugins::PluginsCmd),
 
+    /// heyvm's image catalog: what is on the host, what holds each image, and
+    /// offloading what nothing uses. Fleet scope.
+    #[command(subcommand, visible_alias = "image")]
+    Images(cmd::images::ImagesCmd),
+
     /// Manage stored contexts.
     Config {
         #[command(subcommand)]
@@ -319,6 +324,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Token(cmd) => cmd::token::run(&Ctx::new(g)?, cmd),
         Command::Feed(args) => cmd::feed::run(&Ctx::new(g)?, args),
         Command::Plugins(cmd) => cmd::plugins::run(&Ctx::new(g)?, cmd),
+        Command::Images(cmd) => cmd::images::run(&Ctx::new(g)?, cmd),
         Command::Completion { shell } => {
             let mut command = Cli::command();
             let name = command.get_name().to_string();
