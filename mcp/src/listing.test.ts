@@ -118,6 +118,11 @@ test("a tool that advertises its own schema still agrees with the one that valid
 });
 
 test("the listing stays within its size budget", () => {
+  // Measured 2026-10-06 (latest): 68,259 bytes across 79 tools, up from 67,096.
+  // The +1,163 is `diagnose_vm_boot`, the in-guest probe for a VM that boots
+  // and never answers its health check — the us5 farm-backend case, which no
+  // other tool could see into.
+  //
   // Measured 2026-10-06 (later): 67,096 bytes across 78 tools, up from 65,628.
   //
   // The +1,468 is `namespace_telemetry` (~1 KB), the telemetry read for a
@@ -157,7 +162,7 @@ test("the listing stays within its size budget", () => {
   // NOT enough to bring the nested spec tree back: applb_deploy advertises
   // top-level fields only (measured 65,628 bytes after that cut, from 76,926),
   // and applb_spec_schema serves any block on demand.
-  const BUDGET = 68_000;
+  const BUDGET = 69_000;
   const bytes = JSON.stringify(toolListing(everything())).length;
   assert.ok(
     bytes <= BUDGET,
