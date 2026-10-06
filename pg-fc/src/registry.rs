@@ -2059,6 +2059,14 @@ impl SchemaRegistry {
                     // The bring-up resolved: the id is durably bound, so the
                     // pending ledger's claim on it is settled.
                     crate::pending::clear(schema).await;
+                    // Whatever the offload sweeps last concluded about this
+                    // schema described the data before it came back up; a
+                    // client can write to it now. Forget it, so a schema
+                    // settled as empty (backed off for the full cap) is
+                    // compacted and archived on the normal schedule again.
+                    if restore.is_some() {
+                        self.offload_backoff.clear(schema);
+                    }
                     // A thawed schema's local offload artifact is now dead
                     // weight: the row is durably live, the data lives on the
                     // VM's disk, and the next freeze/compact rewrites the file
@@ -3047,6 +3055,9 @@ impl SchemaRegistry {
             if e.downcast_ref::<AlreadyOffloading>().is_some() {
                 // Benign: another worker / the dashboard claimed it first.
                 debug!("offload: {} schema {schema} skipped — already in flight", kind.as_str());
+            } else if e.downcast_ref::<crate::imgarchive::EmptyCluster>().is_some() {
+                // Not a failure — `archive_schema` journals it as "kept local".
+                debug!("offload: {} schema {schema} kept local — no user data", kind.as_str());
             } else {
                 warn!(
                     "offload: {} schema {schema} failed (backing off): {e:#}",
@@ -3881,6 +3892,7 @@ impl SchemaRegistry {
         let mut compact_candidates: Vec<String> = Vec::new();
         let mut total = 0usize;
         let mut backing_off = 0usize;
+        let mut empty = 0usize;
         let (mut refreshed, mut keepalive, mut already, mut not_idle) = (0usize, 0usize, 0usize, 0usize);
         for (schema, rec) in self.store_records() {
             total += 1;
@@ -3889,6 +3901,8 @@ impl SchemaRegistry {
                 if !ka && now.saturating_sub(rec.last_active) >= threshold_secs {
                     if rec.tier == Tier::Frozen {
                         frozen_candidates.push(schema);
+                    } else if self.compacted_empty(&schema) {
+                        empty += 1;
                     } else {
                         compact_candidates.push(schema);
                     }
@@ -3935,11 +3949,12 @@ impl SchemaRegistry {
             "S3 eviction sweep: evaluated {total} schema(s) — {} live candidate(s) + \
              {} frozen + {} compacted promotion(s), {refreshed} refreshed (warm), \
              {backing_off} in failure backoff, skipped {} ({keepalive} keepalive, \
-             {already} already archived, {not_idle} idle < {threshold_secs}s)",
+             {already} already archived, {empty} compacted with no user data, \
+             {not_idle} idle < {threshold_secs}s)",
             candidates.len(),
             frozen_candidates.len(),
             compact_candidates.len(),
-            keepalive + already + not_idle,
+            keepalive + already + empty + not_idle,
         );
 
         // Promote local files first: cheap (a file upload, no VM), and every
@@ -4045,14 +4060,15 @@ impl SchemaRegistry {
                 crate::events::record(crate::events::Event::OffloadDone);
             }
             // Not a failure: the schema has nothing worth uploading, and the
-            // pooler can rebuild an empty database for free. Backed off all
-            // the same, so sweeps stop re-asking a question whose answer only
-            // changes when a client writes to it.
+            // pooler can rebuild an empty database for free. Backed off for
+            // the full cap straight away: the answer only changes when a
+            // client writes to it, and the restore that allows that clears
+            // the backoff.
             Err(e)
                 if e.downcast_ref::<crate::imgarchive::EmptyCluster>()
                     .is_some() =>
             {
-                let (_, delay) = self.offload_backoff.record_failure(schema, Instant::now());
+                let delay = self.offload_backoff.record_settled(schema, Instant::now());
                 crate::events::journal_info(
                     "archive",
                     format!(
@@ -5440,6 +5456,20 @@ impl SchemaRegistry {
         self.archiving.lock().unwrap().contains(schema)
     }
 
+    /// Is `schema`'s compacted image marked as holding no user relations?
+    /// Promotion refuses such an image (see `imgarchive::promote_compact`),
+    /// and the answer can't change while it sits there: only a restore, which
+    /// deletes the image and its marker together, gives the schema new data.
+    /// The S3 eviction sweep (no backoff of its own) skips it outright; the
+    /// offload pacer instead backs it off for the full cap — see
+    /// `OffloadBackoff::record_settled`.
+    fn compacted_empty(&self, schema: &str) -> bool {
+        self.cfg
+            .compact
+            .as_ref()
+            .is_some_and(|c| crate::imgarchive::empty_marker(&c.compact_path(schema)).exists())
+    }
+
     /// Warm-spare pool depth `(ready, target)`; `None` when the pool is
     /// disabled. Zero ready is the single biggest cold-start signal: the next
     /// new-schema connect pays a full create + boot instead of a spare claim.
@@ -5511,6 +5541,18 @@ impl OffloadBackoff {
         entry.0 = entry.0.saturating_add(1);
         entry.1 = now;
         (entry.0, offload_backoff_delay(entry.0))
+    }
+
+    /// Skip `schema` for the full cap from `now`: for an outcome that isn't a
+    /// failure and won't change on its own (an empty cluster), so doubling
+    /// up from 30m would only re-ask the same question all day. A restore
+    /// clears it like any other backoff.
+    fn record_settled(&self, schema: &str, now: Instant) -> Duration {
+        self.map
+            .lock()
+            .unwrap()
+            .insert(schema.to_string(), (u32::MAX, now));
+        offload_backoff_delay(u32::MAX)
     }
 
     /// A success (or a completed restore) forgets the schema's failures.
@@ -7507,6 +7549,17 @@ mod tests {
         assert!(b.active("s", t0).is_none());
         let (n, _) = b.record_failure("s", t0);
         assert_eq!(n, 1, "counter restarts after a clear");
+
+        // A settled outcome skips for the whole cap at once, and a clear
+        // (a restore) still forgets it.
+        assert_eq!(b.record_settled("e", t0), OFFLOAD_BACKOFF_CAP);
+        assert!(
+            b.active("e", t0 + OFFLOAD_BACKOFF_CAP - Duration::from_secs(1))
+                .is_some()
+        );
+        assert!(b.active("e", t0 + OFFLOAD_BACKOFF_CAP).is_none());
+        b.clear("e");
+        assert!(b.active("e", t0).is_none());
 
         assert_eq!(fmt_backoff(Duration::from_secs(30 * 60)), "30m");
         assert_eq!(fmt_backoff(Duration::from_secs(2 * 3600)), "2h");
