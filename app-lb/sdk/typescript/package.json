@@ -22,7 +22,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test test/*.test.js",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "e2e": "npm run build && node --test --test-reporter=spec e2e/*.e2e.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
