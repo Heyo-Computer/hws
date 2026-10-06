@@ -49,10 +49,32 @@ provision the referenced secrets using existing operator configuration.
 The example releases **orchestrator only**. A bundle covers exactly its declared
 components; it is not automatically a complete platform release. Before adopting
 this for every service, map each component to a supported managed rollout action.
-Legacy arbitrary shell deployments (including the pooler shell workflow) are not
-accepted as promotion actions by this implementation. Do not silently omit them
-while describing a release as platform-wide. S3/disk artifact sinks likewise do
-not implement this release-retention contract.
+Do not silently omit components while describing a release as platform-wide.
+S3/disk artifact sinks do not implement this release-retention contract.
+
+The supported actions have different lifecycle contracts:
+
+| Target | Action | Required operator configuration |
+| --- | --- | --- |
+| Stateless managed service | `ci/rollout-service` | `service_targets`: existing release mount, start command and revision marker |
+| Persistent singleton service | `ci/rollout-stateful-service` | `stateful_targets`: existing Firecracker workspace, singleton scaling, release mount and revision-identifying health URL |
+| Static site | `ci/rollout-site` | `site_targets`: existing site deployment and configuration fingerprint |
+| PostgreSQL pooler | `ci/rollout-pooler` | `pooler_targets`: executable, process manager, config/state paths and SQL credential references |
+| Host app-lb | `ci/rollout-host-app-lb` | Existing trusted host mapping, frozen at admission |
+| Host heyvm/heyvmd | `ci/host-heyvm-maintenance` / `ci/rollout-host-heyvmd` | Existing trusted host mappings and a coordinator on the other host |
+| CI application | `ci/deploy-controller` | Existing application membership, lifecycle authority and regional deployment configuration |
+
+The singleton action preserves the existing workspace and changes only the
+release mount and revision marker. It is stop–replace–start, not a zero-downtime
+handoff; the other region must serve traffic. It verifies the new revision and
+attempts to restore the prior release if replacement fails. It does not migrate
+a standalone artifact store into the global store or create missing workspaces.
+
+The pooler action embeds the existing replacement recipe; promotion workflows
+cannot supply arbitrary shell commands. CI application promotion uses the same
+regional update protocol as ordinary CI updates, but its provenance comes from
+the retained bundle rather than a new Git merge. Running build jobs are not
+replaced with the CI application.
 
 ## Local and disposable verification
 
