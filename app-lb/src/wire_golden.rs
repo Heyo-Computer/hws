@@ -1406,6 +1406,8 @@ fn plugin_list_is_stable() {
                 "properties": {"url": {"type": "string"}},
             }),
         },
+        per_namespace: true,
+        installed_in: vec!["team-a".into()],
         enabled: true,
         config: serde_json::json!({"url": "http://127.0.0.1:34199"}),
         updated_at: 1_760_000_000,
@@ -1419,6 +1421,8 @@ fn plugin_list_is_stable() {
             description: "A plugin nobody switched on.",
             config_schema: serde_json::json!({"type": "object"}),
         },
+        per_namespace: false,
+        installed_in: Vec::new(),
         enabled: false,
         config: serde_json::Value::Null,
         updated_at: 0,
@@ -1426,4 +1430,56 @@ fn plugin_list_is_stable() {
         status: serde_json::json!({}),
     };
     golden("plugins", &vec![enabled, disabled]);
+}
+
+/// `GET /namespaces/:name/plugins` and the item the install/uninstall routes
+/// answer with.
+#[test]
+fn namespace_plugin_list_is_stable() {
+    use crate::plugins::NamespacePluginView;
+    let installed = NamespacePluginView {
+        id: "obs",
+        name: "Observability",
+        description: "Logs, metrics and alerts for every app in a namespace.",
+        enabled: true,
+        installed: true,
+        installed_at: Some(1_760_000_000),
+        installed_by: Some("token:0123456789ab".into()),
+        config: Some(serde_json::json!({})),
+    };
+    let available = NamespacePluginView {
+        id: "other",
+        name: "Other",
+        description: "Installable, not installed, and off on this host.",
+        enabled: false,
+        installed: false,
+        installed_at: None,
+        installed_by: None,
+        config: None,
+    };
+    golden("namespace-plugins", &vec![installed, available]);
+}
+
+/// `GET /api/plugins/:id/installs` — what app-obs polls.
+#[test]
+fn plugin_installs_are_stable() {
+    use crate::plugins::{InstallsView, NamespaceInstall};
+    let install = |by: Option<&str>| NamespaceInstall {
+        installed_at: 1_760_000_000,
+        installed_by: by.map(str::to_owned),
+        config: serde_json::json!({}),
+    };
+    golden(
+        "plugin-installs",
+        &InstallsView {
+            plugin: "obs",
+            enabled: true,
+            namespaces: vec!["team-a".into(), "team-b".into()],
+            installs: [
+                ("team-a".to_string(), install(Some("user:u_123"))),
+                ("team-b".to_string(), install(None)),
+            ]
+            .into(),
+        },
+    );
 }

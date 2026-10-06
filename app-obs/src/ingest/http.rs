@@ -139,6 +139,7 @@ async fn ingest(
             // every other deployment sharing the table.
             fields: incoming.fields.as_ref().map(|f| f.to_string()),
             host: incoming.host.or_else(|| batch.host.clone()),
+            namespace: None,
         });
 
         if state.sink.send(record) {

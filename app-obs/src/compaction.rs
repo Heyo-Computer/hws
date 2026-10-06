@@ -265,7 +265,7 @@ fn prepare(dir: &Path, sequence: u64) -> Result<Option<PendingSwap>, CompactErro
     let tmp = dir.join(format!(".{stem}.compact.tmp"));
     let final_path = dir.join(format!("{stem}.parquet"));
 
-    match merge(&inputs, &tmp) {
+    match merge(&inputs, &tmp, table_of(dir)) {
         Ok(rows) => Ok(Some(PendingSwap {
             dir: dir.to_path_buf(),
             tmp,
@@ -282,10 +282,16 @@ fn prepare(dir: &Path, sequence: u64) -> Result<Option<PendingSwap>, CompactErro
 
 /// Stream every input's batches into one file at `tmp`.
 ///
-/// The output schema is the first input's own, and `ArrowWriter` rejects any
-/// later batch that disagrees — a mismatch aborts the merge with the partition
-/// untouched rather than writing a file that mixes two shapes.
-fn merge(inputs: &[PathBuf], tmp: &Path) -> Result<usize, CompactError> {
+/// For a partition under a known table the output schema is that table's
+/// current one, and each batch is brought up to it: a column the schema has
+/// gained since a file was written (`namespace`, `latency_count`) is filled
+/// with nulls, exactly as the query layer reads it. Without that, the first
+/// day after a column is appended holds files of two shapes and could never
+/// be compacted. Anything else — a column the schema does not have, one
+/// whose type changed — still aborts the merge with the partition untouched
+/// rather than writing a file that mixes two shapes.
+fn merge(inputs: &[PathBuf], tmp: &Path, table: Option<Table>) -> Result<usize, CompactError> {
+    let target = table.map(|t| t.schema());
     // Same zstd choice as the writer, for the same reason: scanned far less
     // often than it is written, and smaller is the point.
     let props = WriterProperties::builder()
@@ -300,12 +306,15 @@ fn merge(inputs: &[PathBuf], tmp: &Path) -> Result<usize, CompactError> {
             let out = std::fs::File::create(tmp)?;
             writer = Some(ArrowWriter::try_new(
                 out,
-                reader.schema().clone(),
+                target.clone().unwrap_or_else(|| reader.schema().clone()),
                 Some(props.clone()),
             )?);
         }
         for batch in reader.build()? {
-            let batch = batch?;
+            let mut batch = batch?;
+            if let Some(schema) = &target {
+                batch = conform(batch, schema)?;
+            }
             rows += batch.num_rows();
             writer
                 .as_mut()
@@ -317,6 +326,66 @@ fn merge(inputs: &[PathBuf], tmp: &Path) -> Result<usize, CompactError> {
     // file is still under its temporary name — the writer's own bargain.
     writer.expect("inputs is never empty").close()?;
     Ok(rows)
+}
+
+/// `batch` in exactly `schema`'s shape, with nulls for the nullable columns it
+/// predates.
+fn conform(
+    batch: datafusion::arrow::record_batch::RecordBatch,
+    schema: &Arc<datafusion::arrow::datatypes::Schema>,
+) -> Result<datafusion::arrow::record_batch::RecordBatch, CompactError> {
+    use datafusion::arrow::array::new_null_array;
+    use datafusion::arrow::error::ArrowError;
+
+    if batch.schema() == *schema {
+        return Ok(batch);
+    }
+    for field in batch.schema().fields() {
+        if schema.field_with_name(field.name()).is_err() {
+            return Err(CompactError::Arrow(ArrowError::SchemaError(format!(
+                "column {:?} is not in the current schema",
+                field.name()
+            ))));
+        }
+    }
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match batch.column_by_name(field.name()) {
+            Some(column) if column.data_type() == field.data_type() => Ok(column.clone()),
+            Some(column) => Err(ArrowError::SchemaError(format!(
+                "column {:?} is {} on disk but {} in the schema",
+                field.name(),
+                column.data_type(),
+                field.data_type()
+            ))),
+            None if field.is_nullable() => Ok(new_null_array(field.data_type(), batch.num_rows())),
+            None => Err(ArrowError::SchemaError(format!(
+                "required column {:?} is missing",
+                field.name()
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(datafusion::arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        columns,
+    )?)
+}
+
+/// Which table a partition directory belongs to: the parent of its
+/// `deployment=` ancestor. `None` for anything not shaped like the writer's
+/// layout, which then merges in its own first file's schema as before.
+fn table_of(dir: &Path) -> Option<Table> {
+    let deployment = dir.ancestors().find(|a| {
+        a.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("deployment="))
+    })?;
+    match deployment.parent()?.file_name()?.to_str()? {
+        "logs" => Some(Table::Logs),
+        "metrics" => Some(Table::Metrics),
+        _ => None,
+    }
 }
 
 /// Put a partition directory right after a crash, from names alone.
@@ -455,6 +524,7 @@ mod tests {
             message: message.into(),
             fields: None,
             host: None,
+            namespace: None,
         })
     }
 
@@ -510,6 +580,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A partition holding files written before `namespace` existed and files
+    /// written after must still compact, the old rows reading as null.
+    #[test]
+    fn files_from_before_a_column_was_appended_merge_with_newer_ones() {
+        use datafusion::arrow::array::{Array, StringArray, TimestampMillisecondArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        let (dir, partition) = seeded("legacy-merge", 2);
+        // A legacy file: the logs schema as it was, without `namespace`.
+        let legacy_schema = Arc::new(Schema::new(
+            crate::store::schema::logs_schema()
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "namespace")
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        assert_eq!(
+            legacy_schema.field(0),
+            &Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false
+            )
+        );
+        let n = 1;
+        let utf8 = |v: Option<&str>| Arc::new(StringArray::from(vec![v; n])) as _;
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+            legacy_schema.clone(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![TS]).with_timezone("UTC")) as _,
+                utf8(Some("sb-old")),
+                utf8(Some("stdout")),
+                utf8(None),
+                utf8(Some("from before namespaces")),
+                utf8(None),
+                utf8(None),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(partition.join("0000000000000-000000.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(file, legacy_schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let swap = prepare(&partition, 7)
+            .unwrap()
+            .expect("mixed shapes still merge");
+        swap.commit().unwrap();
+        let files = parquet_files(&partition);
+        assert_eq!(files.len(), 1);
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&files[0]).unwrap())
+                .unwrap();
+        assert!(reader.schema().field_with_name("namespace").is_ok());
+        let mut rows = 0;
+        let mut nulls = 0;
+        for b in reader.build().unwrap() {
+            let b = b.unwrap();
+            rows += b.num_rows();
+            nulls += b.column_by_name("namespace").unwrap().null_count();
+        }
+        assert_eq!(rows, 3);
+        assert_eq!(nulls, 3, "neither seeded nor legacy rows were stamped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_lone_file_is_left_untouched() {
         // A partition already at one file has nothing to gain; rewriting it
@@ -528,7 +665,9 @@ mod tests {
         let swap = prepare(&partition, 1).unwrap().unwrap();
 
         let mut writer = Writer::new(&dir, 1, Duration::from_secs(3600));
-        writer.push(log("demo", TS + 60_000, "late arrival")).unwrap();
+        writer
+            .push(log("demo", TS + 60_000, "late arrival"))
+            .unwrap();
 
         swap.commit().unwrap();
         assert_eq!(parquet_files(&partition).len(), 2, "merged + the late file");
@@ -549,7 +688,11 @@ mod tests {
 
         recover_dir(&partition).unwrap();
 
-        assert_eq!(parquet_files(&partition).len(), 3, "all inputs visible again");
+        assert_eq!(
+            parquet_files(&partition).len(),
+            3,
+            "all inputs visible again"
+        );
         assert_eq!(read_rows(&partition), 3);
         assert!(
             !partition.join(".0-c.compact.tmp").exists(),
@@ -613,18 +756,17 @@ mod tests {
     async fn queries_see_the_same_rows_before_and_after_a_pass() {
         // The whole point: compaction changes the file layout and nothing else.
         let (dir, partition) = seeded("engine", 6);
-        let engine = Arc::new(
-            Engine::new(&dir, 2, Duration::from_secs(30))
-                .await
-                .unwrap(),
-        );
+        let engine = Arc::new(Engine::new(&dir, 2, Duration::from_secs(30)).await.unwrap());
 
         let window = crate::query::Window {
             from: Utc.timestamp_millis_opt(TS - 60_000).single().unwrap(),
             to: Utc.timestamp_millis_opt(TS + 600_000).single().unwrap(),
         };
         let count = |engine: Arc<Engine>| async move {
-            let volume = engine.log_volume(window, 3600, Some("demo")).await.unwrap();
+            let volume = engine
+                .log_volume(window, 3600, Some("demo"), None)
+                .await
+                .unwrap();
             volume["demo"].iter().map(|b| b.lines).sum::<u64>()
         };
         assert_eq!(count(engine.clone()).await, 6);

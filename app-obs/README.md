@@ -233,6 +233,7 @@ Configuration is environment-only:
 | `APP_LB_USER` | `admin` | Only used when a password is set |
 | `APP_LB_PASSWORD` | *(unset)* | Set when app-lb has `APP_LB_ADMIN_AUTH=1` |
 | `APP_OBS_SOURCE` | `app-lb` | Stable collector/edge name carried in status snapshots |
+| `APP_OBS_REQUIRE_INSTALL` | `1` | Collect a tenant namespace only once app-lb's obs plugin is installed in it; `0` collects every namespace |
 | `HEYVM_URL` | *(unset)* | Sandbox daemon whose native log streams to tail (e.g. `http://127.0.0.1:34099`); **unset disables native tailing** |
 | `HEYVM_TOKEN` | *(unset)* | Bearer token for the daemon, needed when it runs with `JWT_SECRET` |
 | `APP_OBS_POLL_SECS` | `10` | Metrics poll interval |
@@ -249,6 +250,17 @@ Configuration is environment-only:
 days, and the eighth-oldest day is removed. Future-dated partitions are never
 deleted — a sender with a skewed clock shouldn't have its data destroyed before
 anyone notices the skew.
+
+## Per-namespace access
+
+Tenants do not reach this service directly. app-lb's `obs` plugin is installed
+per namespace (`heyctl plugins install obs -n <ns>`) and serves
+`/namespaces/<ns>/plugins/obs/` by forwarding to this service's
+`/ns/<ns>/…` routes with `APP_OBS_API_TOKEN`, after checking the caller may read
+that namespace. Every stored row carries the namespace it was written under,
+and a namespace that has not installed the plugin is not collected at all. See
+[docs/app-obs.md](../docs/app-obs.md#per-namespace-plugin) for the gate and the
+route table.
 
 ## Registering with app-lb
 

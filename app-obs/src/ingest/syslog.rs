@@ -98,6 +98,7 @@ fn ingest_line(sink: &Sink, default_deployment: &str, line: &str, peer: Option<S
         message: parsed.message.to_string(),
         fields: None,
         host: peer.map(|p| p.ip().to_string()),
+        namespace: None,
     });
     sink.send(record);
 }

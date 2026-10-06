@@ -87,11 +87,17 @@ const CI_ONLY = new Set([
   "ci_cleanup_failed_vms",
   "ci_request",
 ]);
-const OBS_ONLY = new Set(["deployment_logs", "obs_request"]);
+const OBS_ONLY = new Set(["deployment_logs", "namespace_telemetry", "obs_request"]);
 
+/**
+ * app-obs is reachable two ways: directly at APP_OBS_URL, or through app-lb's
+ * per-namespace obs plugin with the caller's own credential (`telemetry.ts`).
+ * The second needs nothing but app-lb, which is how a hosted instance with no
+ * app-obs of its own still serves a namespace its telemetry.
+ */
 function reachable(name: string, config: Config): boolean {
   if (CI_ONLY.has(name)) return Boolean(config.ci);
-  if (OBS_ONLY.has(name)) return Boolean(config.obs);
+  if (OBS_ONLY.has(name)) return Boolean(config.obs || config.applb);
   return true;
 }
 
@@ -129,6 +135,8 @@ export const WORKFLOW_FIRST = [
   "art_list_tags",
   "diagnose_deployment",
   "deployment_logs",
+  "namespace_telemetry",
+  "diagnose_vm_boot",
 ];
 
 function workflowFirst<T extends { name: string }>(tools: T[]): T[] {
@@ -170,7 +178,9 @@ App with a Dockerfile: repo_create, repo_write_files including the Dockerfile, t
 
 Never set site.root or an update block: app-lb assigns the root, and update is operator-only.
 
-applb_spec_schema has the full deployment spec. On a 401 or 403 run heyo_whoami; on any other failure, heyo_guide with the error, then diagnose_deployment.`;
+applb_spec_schema has the full deployment spec. On a 401 or 403 run heyo_whoami; on any other failure, heyo_guide with the error, then diagnose_deployment.
+
+Telemetry for your namespace (requests, errors, latency, logs): namespace_telemetry, then deployment_logs. It needs the obs plugin installed in the namespace; the error says how when it is not.`;
 
 /**
  * Check a tool's arguments against the schema it advertises, before its handler
@@ -291,6 +301,7 @@ const READ_ONLY = new Set([
   "diagnose_empty_pool",
   "diagnose_ci_job",
   "deployment_logs",
+  "namespace_telemetry",
   "applb_feeds",
   "applb_feed",
   "applb_list_deployments",

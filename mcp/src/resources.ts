@@ -106,7 +106,9 @@ re-registering.
 \`heyo_status\` first: it distinguishes "not configured" from "configured and
 refusing", and reports a credential that cannot work before you spend a call
 finding out. Then \`diagnose_deployment\`, and \`deployment_logs\` for what the
-application itself said.`;
+application itself said. \`namespace_telemetry\` is every deployment in your
+namespace at once; it needs the obs plugin installed there
+(\`heyctl plugins install obs -n <ns>\`).`;
 
 /** The TLS answer, which is a trap rather than a sequence. */
 const TLS_NOTES = `# TLS on a new deployment

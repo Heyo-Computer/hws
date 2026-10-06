@@ -852,6 +852,17 @@ fn decide_access(
             Some(id) if !caller.may_touch(id, req.target_namespace) => {
                 return Verdict::Forbidden(out_of_scope(id));
             }
+            None if namespace_plugin_target(matched, req.path).is_some() => {
+                // Walled by the namespace in the path, like the feed below: a
+                // namespace token reaches its own namespace's plugins and no
+                // other, and a deployment-list token reaches none.
+                let ns = namespace_plugin_target(matched, req.path).unwrap_or_default();
+                if !caller.reaches_namespace(ns) {
+                    return Verdict::Forbidden(format!(
+                        "this token cannot reach the \"{ns}\" namespace's plugins"
+                    ));
+                }
+            }
             None if matched == "/feeds/:namespace" => {
                 // Namespace-scoped rather than fleet-scoped: the handler knows
                 // which namespace from the path, and the check lives here so a
@@ -948,7 +959,16 @@ async fn authorize(
         .as_deref()
         .and_then(|m| deployment_of(m, &path))
         .and_then(|id| state.registry.get(id))
-        .map(|d| d.spec.namespace.clone());
+        .map(|d| d.spec.namespace.clone())
+        // A namespace's plugin routes act on the namespace in their path, so
+        // a federated grant's tier is measured there — view in one namespace
+        // must not post alerts in it because it is admin in another.
+        .or_else(|| {
+            matched
+                .as_deref()
+                .and_then(|m| namespace_plugin_target(m, &path))
+                .map(str::to_owned)
+        });
 
     // A foreign bearer is asked about only when federation is on, the gate is
     // on, and the local store does not already know the token — so a local
@@ -2197,15 +2217,172 @@ async fn set_plugin(
     enabled: bool,
     config: Option<serde_json::Value>,
 ) -> Response {
-    use crate::plugins::SetError;
     match state.plugins.set(id, enabled, config).await {
         Ok(view) => Json(view).into_response(),
-        Err(e @ SetError::NotFound) => err(StatusCode::NOT_FOUND, e.to_string()).into_response(),
-        Err(e @ SetError::Invalid(_)) => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-        Err(e @ SetError::Io(_)) => {
+        Err(e) => plugin_set_error(e),
+    }
+}
+
+fn plugin_set_error(e: crate::plugins::SetError) -> Response {
+    use crate::plugins::SetError;
+    match e {
+        e @ SetError::NotFound => err(StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        e @ SetError::Invalid(_) => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        e @ SetError::Io(_) => {
             err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
+        e @ SetError::Disabled(_) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string(), "code": "plugin_disabled" })),
+        )
+            .into_response(),
     }
+}
+
+/// `GET /api/plugins/:id/installs` — the namespaces that installed a
+/// per-namespace plugin. Fleet-wide: it is what app-obs reads, with the
+/// operator credential, to learn what to collect.
+async fn plugin_installs(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    match state.plugins.installs(&id) {
+        Some(view) => Json(view).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            format!("no plugin named {id:?} can be installed in a namespace"),
+        )
+        .into_response(),
+    }
+}
+
+/// The namespace a `/namespaces/:name/plugins…` route acts on, read
+/// positionally off the real path the way [`deployment_of`] reads an id.
+fn namespace_plugin_target<'a>(matched: &str, path: &'a str) -> Option<&'a str> {
+    if !matched.starts_with("/namespaces/:name/plugins") {
+        return None;
+    }
+    path.split('/').nth(2).filter(|s| !s.is_empty())
+}
+
+fn bad_namespace(ns: &str) -> Option<Response> {
+    (!crate::config::is_valid_namespace(ns)).then(|| {
+        err(StatusCode::BAD_REQUEST, format!("{ns:?} is not a valid namespace name")).into_response()
+    })
+}
+
+/// `GET /namespaces/:name/plugins` — what this namespace may install and
+/// whether it has. The gate has checked the caller reaches the namespace.
+async fn namespace_plugins(State(state): State<AdminState>, Path(ns): Path<String>) -> Response {
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    Json(state.plugins.namespace_plugins(&ns)).into_response()
+}
+
+/// `GET /namespaces/:name/plugins/:id`
+async fn namespace_plugin(
+    State(state): State<AdminState>,
+    Path((ns, id)): Path<(String, String)>,
+) -> Response {
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    match state.plugins.namespace_plugins(&ns).into_iter().find(|p| p.id == id) {
+        Some(view) => Json(view).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            format!("no plugin named {id:?} can be installed in a namespace"),
+        )
+        .into_response(),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InstallPlugin {
+    #[serde(default)]
+    config: Option<serde_json::Value>,
+}
+
+/// Installing changes what the namespace's apps send to a shared collector,
+/// so it is the namespace administrator's call: a token narrowed to a few of
+/// the namespace's deployments does not get to decide it for the rest.
+fn refuse_unless_administers(caller: Option<&Caller>, ns: &str) -> Option<Response> {
+    match caller {
+        Some(c) if !c.administers_namespace(ns) => Some(
+            err(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "installing a plugin needs an admin credential for all of namespace \"{ns}\""
+                ),
+            )
+            .into_response(),
+        ),
+        _ => None,
+    }
+}
+
+/// `PUT /namespaces/:name/plugins/:id` — `{config?}`.
+async fn install_namespace_plugin(
+    State(state): State<AdminState>,
+    Path((ns, id)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+    body: Option<Json<InstallPlugin>>,
+) -> Response {
+    let caller = caller.as_deref();
+    if let Some(r) = bad_namespace(&ns).or_else(|| refuse_unless_administers(caller, &ns)) {
+        return r;
+    }
+    let config = body
+        .and_then(|Json(b)| b.config)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let by = caller.and_then(Caller::principal);
+    match state.plugins.install(&id, &ns, config, by).await {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => plugin_set_error(e),
+    }
+}
+
+/// `DELETE /namespaces/:name/plugins/:id`
+async fn uninstall_namespace_plugin(
+    State(state): State<AdminState>,
+    Path((ns, id)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    if let Some(r) = bad_namespace(&ns).or_else(|| refuse_unless_administers(caller.as_deref(), &ns)) {
+        return r;
+    }
+    match state.plugins.uninstall(&id, &ns).await {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => plugin_set_error(e),
+    }
+}
+
+/// `/namespaces/:name/plugins/:id/*rest` — a plugin's namespace surface. A
+/// `GET` arrives here through the view tier and anything else through the
+/// CRUD tier; the plugin sees the request relative to its own prefix.
+async fn namespace_plugin_surface(
+    State(state): State<AdminState>,
+    Path((ns, id, _rest)): Path<(String, String, String)>,
+    mut req: Request,
+) -> Response {
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    let prefix = format!("/namespaces/{ns}/plugins/{id}");
+    let rest = req
+        .uri()
+        .path()
+        .strip_prefix(&prefix)
+        .unwrap_or("/")
+        .to_string();
+    let rest = if rest.is_empty() { "/".to_string() } else { rest };
+    let rewritten = match req.uri().query() {
+        Some(q) => format!("{rest}?{q}"),
+        None => rest,
+    };
+    match rewritten.parse() {
+        Ok(uri) => *req.uri_mut() = uri,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "unparseable plugin path").into_response(),
+    }
+    state.plugins.dispatch_namespace(&id, &ns, req).await
 }
 
 /// `GET /network` — the network topology console.
@@ -6181,6 +6358,15 @@ fn router(state: AdminState) -> Router {
         .route("/plugins", get(plugins_console))
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/:id", get(get_plugin))
+        .route("/api/plugins/:id/installs", get(plugin_installs))
+        // A namespace's plugins: what it has installed, and the installed
+        // plugins' own pages. Walled by the namespace in the path (see
+        // `decide_access`), so a namespace token reaches these for its own
+        // namespace. Every `GET` is view tier; the methods that change
+        // something are on the CRUD side below.
+        .route("/namespaces/:name/plugins", get(namespace_plugins))
+        .route("/namespaces/:name/plugins/:id", get(namespace_plugin))
+        .route("/namespaces/:name/plugins/:id/*rest", get(namespace_plugin_surface))
         // The network topology console. View tier, like the dashboard it sits
         // beside: it renders `/metrics` and `/ingress`, so it must work with
         // the browser's cached view credentials.
@@ -6281,6 +6467,17 @@ fn router(state: AdminState) -> Router {
         .route("/api/plugins/:id", put(put_plugin))
         .route("/api/plugins/:id/enable", post(enable_plugin))
         .route("/api/plugins/:id/disable", post(disable_plugin))
+        .route(
+            "/namespaces/:name/plugins/:id",
+            put(install_namespace_plugin).delete(uninstall_namespace_plugin),
+        )
+        .route(
+            "/namespaces/:name/plugins/:id/*rest",
+            post(namespace_plugin_surface)
+                .put(namespace_plugin_surface)
+                .patch(namespace_plugin_surface)
+                .delete(namespace_plugin_surface),
+        )
         .route("/tokens", post(mint_token).get(list_tokens))
         .route(
             "/tokens/:id",
@@ -7173,6 +7370,7 @@ mod tests {
                 archive_on_expire: false, archive_timeout: std::time::Duration::from_secs(60),
                 orphan_ttl_secs: 0,
             }, vms, registry.clone()));
+            let plugin_secrets = secrets.clone();
             let api = AdminApi::new(
                 "127.0.0.1:0".into(), registry.clone(), autoscaler, metrics, "test".into(),
                 None, None, false, false, None,
@@ -7185,7 +7383,7 @@ mod tests {
                 Some(disks), PublicUrl::from_config(false, "127.0.0.1:80", "127.0.0.1:443"),
                 feed, &[], None,
                 Arc::new(crate::plugins::PluginHost::new(
-                    Vec::new(),
+                    vec![crate::plugins::obs::ObsPlugin::new(plugin_secrets)],
                     crate::plugins::PluginStore::new(root.join("plugins")),
                 )),
             );
@@ -7635,6 +7833,73 @@ mod tests {
         }
 
         fn persisted(root: &FsPath) -> bool { root.join("obsolete.json").exists() }
+
+        async fn send(f: &Fixture, method: &str, uri: &str, body: &str) -> (StatusCode, (), serde_json::Value) {
+            let mut app = router(f.state.clone());
+            std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+            let request = Request::builder().method(method).uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())).unwrap();
+            let response = app.call(request).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, (), serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        }
+
+        /// The namespace plugin routes, through the real router: install and
+        /// the surface's path rewrite onto app-obs's `/ns/<ns>/…`.
+        #[tokio::test]
+        async fn a_namespace_installs_obs_and_reads_through_the_router() {
+            let obs = Router::new().fallback(|request: Request<Body>| async move {
+                Json(serde_json::json!({
+                    "method": request.method().as_str(),
+                    "path": request.uri().path(),
+                    "query": request.uri().query(),
+                }))
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let obs_url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, obs).await.unwrap() });
+            let f = fixture(true).await;
+
+            let (status, _, list) = send(&f, "GET", "/namespaces/team-a/plugins", "").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(list[0]["id"], "obs");
+            assert_eq!(list[0]["installed"], false);
+            let (status, _, v) = send(&f, "PUT", "/namespaces/team-a/plugins/obs", "{}").await;
+            assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("plugin_disabled")));
+
+            f.state.plugins.set("obs", true, Some(serde_json::json!({"url": obs_url}))).await.unwrap();
+            let (status, _, v) = send(&f, "GET", "/namespaces/team-a/plugins/obs/api/fleet", "").await;
+            assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("plugin_not_installed")));
+
+            let (status, _, v) = send(&f, "PUT", "/namespaces/team-a/plugins/obs", "").await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["installed"], true);
+            let (status, _, v) = send(&f, "GET", "/namespaces/team-a/plugins/obs", "").await;
+            assert_eq!((status, &v["installed"]), (StatusCode::OK, &serde_json::json!(true)));
+            let (status, _, v) = send(&f, "GET", "/api/plugins/obs/installs", "").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v["namespaces"], serde_json::json!(["team-a"]));
+
+            let (status, _, v) = send(&f, "GET", "/namespaces/team-a/plugins/obs/api/deployments/web/logs?level=error", "").await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["path"], "/ns/team-a/api/deployments/web/logs");
+            assert_eq!(v["query"], "level=error");
+            let (status, _, v) = send(&f, "DELETE", "/namespaces/team-a/plugins/obs/api/alerts/a1", "").await;
+            assert_eq!((status, v["method"].as_str()), (StatusCode::OK, Some("DELETE")));
+            assert_eq!(v["path"], "/ns/team-a/api/alerts/a1");
+            let (status, _, v) = send(&f, "GET", "/namespaces/team-a/plugins/obs/ui", "").await;
+            assert_eq!((status, v["path"].as_str()), (StatusCode::OK, Some("/ns/team-a/")));
+            let (status, _, _) = send(&f, "GET", "/namespaces/team-a/plugins/obs/api/%2e%2e/%2e%2e/api/fleet", "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, _, _) = send(&f, "GET", "/namespaces/a%20b/plugins", "").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+
+            let (status, _, v) = send(&f, "DELETE", "/namespaces/team-a/plugins/obs", "").await;
+            assert_eq!((status, &v["installed"]), (StatusCode::OK, &serde_json::json!(false)));
+            f.state.plugins.set("obs", false, None).await.unwrap();
+        }
 
         async fn remove(f: &Fixture, etag: Option<&str>) -> StatusCode {
             let mut request = Request::builder().method("DELETE").uri("/deployments/obsolete/record");
@@ -9511,6 +9776,128 @@ mod tests {
             // which namespaces exist is fleet information.
             assert!(matches!(at(&fleet_hdr, "/feeds/team-a"), Verdict::Allow(_)));
             assert!(matches!(at(&scoped_hdr, "/feeds/team-a"), Verdict::Forbidden(_)));
+        }
+
+        /// A namespace's plugin routes are walled by the namespace in their
+        /// path, and a federated grant's tier is measured in that namespace.
+        #[test]
+        fn namespace_plugin_routes_are_walled_by_namespace() {
+            let t = store();
+            let ns_view = format!("Bearer {}", mint_in_namespace(&t, AdminScope::View, "team-a"));
+            let ns_admin =
+                format!("Bearer {}", mint_in_namespace(&t, AdminScope::Admin, "team-a"));
+            let fleet_hdr = format!("Bearer {}", mint(&t, AdminScope::Admin, &["*"]));
+            let scoped_hdr = format!("Bearer {}", mint(&t, AdminScope::Admin, &["web"]));
+            let at = |hdr: Option<&str>,
+                      federated: Option<Arc<crate::federated::Grant>>,
+                      matched: &str,
+                      path: &str,
+                      want: AdminScope| {
+                decide_access(
+                    Some(&basic()),
+                    &t,
+                    &Presented {
+                        header: hdr,
+                        matched: Some(matched),
+                        path,
+                        query: None,
+                        target_namespace: namespace_plugin_target(matched, path),
+                        federated,
+                    },
+                    want,
+                    NOW,
+                )
+            };
+            const SURFACE: &str = "/namespaces/:name/plugins/:id/*rest";
+            const ITEM: &str = "/namespaces/:name/plugins/:id";
+            const LIST: &str = "/namespaces/:name/plugins";
+
+            // Its own namespace: read the list and the plugin's pages.
+            for (m, p) in [
+                (LIST, "/namespaces/team-a/plugins"),
+                (SURFACE, "/namespaces/team-a/plugins/obs/api/fleet"),
+            ] {
+                assert!(matches!(at(Some(&ns_view), None, m, p, AdminScope::View), Verdict::Allow(_)));
+            }
+            // Another namespace: refused, on every tier.
+            for (m, p, want) in [
+                (LIST, "/namespaces/team-b/plugins", AdminScope::View),
+                (SURFACE, "/namespaces/team-b/plugins/obs/api/fleet", AdminScope::View),
+                (ITEM, "/namespaces/team-b/plugins/obs", AdminScope::Admin),
+            ] {
+                assert!(matches!(at(Some(&ns_admin), None, m, p, want), Verdict::Forbidden(_)));
+            }
+            // Installing is CRUD tier: a view token cannot, an admin one can.
+            let install = "/namespaces/team-a/plugins/obs";
+            assert!(matches!(
+                at(Some(&ns_view), None, ITEM, install, AdminScope::Admin),
+                Verdict::Forbidden(_)
+            ));
+            assert!(matches!(
+                at(Some(&ns_admin), None, ITEM, install, AdminScope::Admin),
+                Verdict::Allow(_)
+            ));
+            // Fleet scope reaches any namespace; a deployment-list token none.
+            assert!(matches!(
+                at(Some(&fleet_hdr), None, ITEM, "/namespaces/team-b/plugins/obs", AdminScope::Admin),
+                Verdict::Allow(_)
+            ));
+            assert!(matches!(
+                at(Some(&scoped_hdr), None, LIST, "/namespaces/team-a/plugins", AdminScope::View),
+                Verdict::Forbidden(_)
+            ));
+
+            // Admin in team-b and view in team-a must not post in team-a.
+            let g = grant(&[("team-a", AdminScope::View), ("team-b", AdminScope::Admin)], false);
+            let alerts = "/namespaces/team-a/plugins/obs/api/alerts";
+            assert!(matches!(
+                at(Some("Bearer eyJ.heyo.jwt"), Some(g.clone()), SURFACE, alerts, AdminScope::Admin),
+                Verdict::Forbidden(_)
+            ));
+            assert!(matches!(
+                at(Some("Bearer eyJ.heyo.jwt"), Some(g.clone()), SURFACE, alerts, AdminScope::View),
+                Verdict::Allow(_)
+            ));
+            assert!(matches!(
+                at(
+                    Some("Bearer eyJ.heyo.jwt"),
+                    Some(g),
+                    SURFACE,
+                    "/namespaces/team-b/plugins/obs/api/alerts",
+                    AdminScope::Admin
+                ),
+                Verdict::Allow(_)
+            ));
+        }
+
+        /// A namespace token narrowed to some of the namespace's deployments
+        /// reaches the plugin pages but cannot install for the whole room.
+        #[test]
+        fn installing_needs_the_whole_namespace() {
+            let t = store();
+            let narrow = t
+                .mint(
+                    NewToken {
+                        name: "narrow".into(),
+                        admin: AdminScope::Admin,
+                        namespace: Some("team-a".into()),
+                        deployments: vec!["web".into()],
+                        expires_in_secs: None,
+                    },
+                    NOW,
+                )
+                .unwrap()
+                .1;
+            let narrow = Caller::Token(t.verify(&narrow, NOW).unwrap());
+            assert!(narrow.reaches_namespace("team-a"));
+            assert!(refuse_unless_administers(Some(&narrow), "team-a").is_some());
+            let whole = Caller::Token(
+                t.verify(&mint_in_namespace(&t, AdminScope::Admin, "team-a"), NOW)
+                    .unwrap(),
+            );
+            assert!(refuse_unless_administers(Some(&whole), "team-a").is_none());
+            assert!(refuse_unless_administers(Some(&whole), "team-b").is_some());
+            assert!(refuse_unless_administers(None, "team-a").is_none());
         }
 
         #[test]

@@ -185,7 +185,7 @@ test("a Dockerfile's CMD, WORKDIR, ENV and EXPOSE become a start_command that re
   assert.equal(
     startCommand(info),
     'cd /app && export NODE_ENV=production && export PATH="/app/bin:$PATH" && ' +
-      "setsid nohup node server.js </dev/null >/var/log/app.log 2>&1 &",
+      "setsid nohup node server.js </dev/null &",
   );
   assert.equal(
     readStartInfo('FROM python:3\nENTRYPOINT ["python", "-m"]\nCMD ["app.main"]').command,
@@ -201,7 +201,7 @@ test("repo_deploy kind vm with no start_command derives it from the Dockerfile",
     undefined,
     "FROM node:20-slim\nWORKDIR /app\nCOPY . .\nEXPOSE 3001\nCMD [\"node\", \"server.js\"]\n",
   );
-  assert.equal(spec.vm.start_command, "cd /app && setsid nohup node server.js </dev/null >/var/log/app.log 2>&1 &");
+  assert.equal(spec.vm.start_command, "cd /app && setsid nohup node server.js </dev/null &");
   assert.equal(spec.vm.port, 3001, "EXPOSE supplies the port when none is given");
   assert.match(out, /start_command \(from the Dockerfile\)/);
 

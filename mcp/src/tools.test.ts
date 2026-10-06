@@ -241,17 +241,16 @@ test("a fleet-operations instance lists no sandbox tools at all", () => {
 });
 
 /**
- * app-obs has no namespaces. Its partitions are deployment ids and one token
- * reaches every one of them, so the only wall a log read can respect is
- * app-lb's — and `deployment_logs` has to consult it rather than assume the
- * caller owns what they named.
+ * app-obs's own token reads every namespace, so a namespace-confined caller
+ * must never be served on it. Such a caller reads through app-lb's obs plugin
+ * for its namespace, with its own credential — app-lb decides reach, and pins
+ * the namespace before app-obs is asked.
  */
-test("deployment_logs asks app-lb whether the deployment is the caller's before reading obs", async () => {
+test("a managed-door caller reads logs through its namespace's obs plugin, never app-obs's token", async () => {
   const stub = stubFetch((c) => {
     if (c.url.endsWith("/namespaces")) {
       return { body: { namespaces: [{ name: "team-a", scope: "admin" }] } };
     }
-    if (c.url.includes("/lb/deployments/")) return { body: { spec: { id: "web" } } };
     return { body: { rows: [{ ts: 1, level: "error", message: "giving up on VM" }] } };
   });
   try {
@@ -265,16 +264,190 @@ test("deployment_logs asks app-lb whether the deployment is the caller's before 
     );
     const out = await tool(tools, "deployment_logs").handler({ id: "web", limit: 5 });
 
-    // The reach check happens, through the namespace door, before obs is asked.
-    const paths = stub.calls.map((c) => c.url);
+    const urls = stub.calls.map((c) => c.url);
     assert.ok(
-      paths.some((u) => u === "https://server.heyo.computer/namespaces/team-a/lb/deployments/web"),
-      `no reach check: ${paths.join(", ")}`,
+      urls.some((u) =>
+        u.startsWith(
+          "https://server.heyo.computer/namespaces/team-a/lb/namespaces/team-a/plugins/obs/api/deployments/web/logs?",
+        ),
+      ),
+      `not read through the plugin: ${urls.join(", ")}`,
     );
-    const obsAt = paths.findIndex((u) => u.startsWith("https://obs.example.com"));
-    const reachAt = paths.findIndex((u) => u.endsWith("/lb/deployments/web"));
-    assert.ok(reachAt >= 0 && obsAt > reachAt, "obs must be asked after app-lb, not before");
+    assert.ok(!urls.some((u) => u.startsWith("https://obs.example.com")), "app-obs's own door was used");
     assert.match(out, /giving up on VM/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("deployment_logs refuses a deployment app-lb will not show this credential", async () => {
+  const stub = stubFetch((c) => {
+    if (c.url.endsWith("/namespaces")) {
+      return { body: { namespaces: [{ name: "team-a", scope: "admin" }] } };
+    }
+    // Another namespace's deployment: the plugin answers 404, exactly as it
+    // does for a name that does not exist at all.
+    if (c.url.includes("/plugins/obs/")) return { status: 404, body: { error: "not found" } };
+    return { body: { rows: [{ ts: 1, message: "someone else's logs" }] } };
+  });
+  try {
+    const tools = buildTools(
+      loadConfig({
+        HEYO_API_KEY: "heyo_api_x",
+        APPLB_TOKEN: "heyo_api_lb",
+        APP_OBS_URL: "https://obs.example.com",
+        APP_OBS_API_TOKEN: "applb_obs",
+      }),
+    );
+    const out = await tool(tools, "deployment_logs").handler({ id: "other-ns-app" });
+
+    assert.match(out, /is visible to this credential, so its logs are not either/);
+    assert.doesNotMatch(out, /someone else's logs/);
+    assert.ok(
+      !stub.calls.some((c) => c.url.startsWith("https://obs.example.com")),
+      "obs must not be asked directly for a confined caller",
+    );
+  } finally {
+    stub.restore();
+  }
+});
+
+test("an applb_ namespace token over HTTP reads through the plugin with its own token", async () => {
+  // The hosted shape: this process holds an operator-wide app-obs token, and
+  // the caller presents a namespace token. `/whoami` says confined, so the
+  // read goes to app-lb's plugin surface carrying the caller's bearer — the
+  // service token is never spent on their behalf.
+  const stub = stubFetch((c) => {
+    if (c.url.endsWith("/whoami")) return { body: { caller: "app-token", confined: true, namespace: "team-b" } };
+    return { body: { deployments: [{ id: "api", requests: 10 }] } };
+  });
+  const seen: (string | undefined)[] = [];
+  const original = globalThis.fetch;
+  const recording = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    seen.push((init?.headers as Record<string, string> | undefined)?.authorization);
+    return recording(input, init);
+  }) as typeof fetch;
+  try {
+    const config = withForwardedAuth(
+      loadConfig({
+        APPLB_URL: "http://127.0.0.1:9090",
+        APPLB_BASIC: "admin:pw",
+        APP_OBS_URL: "http://127.0.0.1:9600",
+        APP_OBS_API_TOKEN: "obs-service-token",
+        HEYO_MCP_HTTP_PORT: "9650",
+      }),
+      { authorization: "Bearer applb_abc_secret" },
+    );
+    const out = await tool(buildTools(config), "namespace_telemetry").handler({});
+    const urls = stub.calls.map((c) => c.url);
+    assert.ok(urls.includes("http://127.0.0.1:9090/namespaces/team-b/plugins/obs/api/fleet?window=1h"), urls.join(", "));
+    assert.ok(!urls.some((u) => u.startsWith("http://127.0.0.1:9600")), "app-obs's own door was used");
+    assert.ok(seen.every((a) => a === "Bearer applb_abc_secret"), `credentials sent: ${seen.join(", ")}`);
+    assert.match(out, /Namespace team-b/);
+  } finally {
+    globalThis.fetch = original;
+    stub.restore();
+  }
+});
+
+test("an unconfined operator still reads app-obs directly, after app-lb's reach check", async () => {
+  const stub = stubFetch((c) => {
+    if (c.url.endsWith("/whoami")) return { body: { caller: "operator", confined: false, fleet: true } };
+    if (c.url.includes("/deployments/web") && c.url.startsWith("http://127.0.0.1:9090")) {
+      return { body: { spec: { id: "web" } } };
+    }
+    return { body: { rows: [{ ts: 1, message: "operator view" }] } };
+  });
+  try {
+    const tools = buildTools(
+      loadConfig({
+        APPLB_URL: "http://127.0.0.1:9090",
+        APPLB_BASIC: "admin:pw",
+        APP_OBS_URL: "http://127.0.0.1:9600",
+        APP_OBS_API_TOKEN: "t",
+      }),
+    );
+    const out = await tool(tools, "deployment_logs").handler({ id: "web" });
+    const urls = stub.calls.map((c) => c.url);
+    const reachAt = urls.indexOf("http://127.0.0.1:9090/deployments/web");
+    const obsAt = urls.findIndex((u) => u.startsWith("http://127.0.0.1:9600/api/deployments/web/logs"));
+    assert.ok(reachAt >= 0 && obsAt > reachAt, `obs must be asked after app-lb: ${urls.join(", ")}`);
+    assert.match(out, /operator view/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("a deployment-scoped token never reaches app-obs on the server's own token", async () => {
+  const stub = stubFetch((c) => {
+    if (c.url.endsWith("/whoami")) return { body: { caller: "app-token", confined: false, fleet: false } };
+    return { body: { rows: [{ ts: 1, message: "every tenant's logs" }] } };
+  });
+  try {
+    const tools = buildTools(
+      loadConfig({
+        APPLB_URL: "http://127.0.0.1:9090",
+        APPLB_TOKEN: "applb_dep_secret",
+        APP_OBS_URL: "http://127.0.0.1:9600",
+        APP_OBS_API_TOKEN: "t",
+      }),
+    );
+    const out = await tool(tools, "namespace_telemetry").handler({}).catch((e: Error) => e.message);
+    assert.ok(
+      !stub.calls.some((c) => c.url.startsWith("http://127.0.0.1:9600")),
+      "app-obs's own door was used",
+    );
+    assert.doesNotMatch(String(out), /every tenant's logs/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("a namespace without the obs plugin is told how to install it", async () => {
+  const stub = stubFetch((c) => {
+    if (c.url.endsWith("/namespaces")) return { body: { namespaces: [{ name: "team-a", scope: "admin" }] } };
+    if (c.url.includes("/plugins/obs/")) {
+      return {
+        status: 409,
+        body: {
+          error: 'the obs plugin is not installed in namespace "team-a"',
+          code: "plugin_not_installed",
+        },
+      };
+    }
+    return { body: [] };
+  });
+  try {
+    await assert.rejects(
+      tool(twoKeys(), "deployment_logs").handler({ id: "web" }),
+      /heyctl plugins install obs -n team-a/,
+    );
+    const out = await tool(twoKeys(), "namespace_telemetry").handler({});
+    assert.match(out, /heyctl plugins install obs -n team-a/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("fleet_overview turns a confined caller away before app-obs is asked", async () => {
+  const stub = stubFetch((c) =>
+    c.url.endsWith("/namespaces")
+      ? { body: { namespaces: [{ name: "team-a", scope: "admin" }] } }
+      : { body: { deployments: ["everyone's"] } },
+  );
+  try {
+    const tools = buildTools(
+      loadConfig({
+        HEYO_API_KEY: "heyo_api_x",
+        APPLB_TOKEN: "heyo_api_lb",
+        APP_OBS_URL: "https://obs.example.com",
+        APP_OBS_API_TOKEN: "t",
+      }),
+    );
+    const out = await tool(tools, "fleet_overview").handler({});
+    assert.match(out, /namespace_telemetry/);
+    assert.ok(!stub.calls.some((c) => c.url.startsWith("https://obs.example.com")));
   } finally {
     stub.restore();
   }
@@ -326,38 +499,6 @@ test("applb_security_events sends nothing when no filter is given", async () => 
     const security = stub.calls.find((c) => c.url.includes("/security"))!.url;
     assert.ok(!security.includes("namespace="), `no namespace synthesized: ${security}`);
     assert.ok(!security.includes("severity="), `no severity synthesized: ${security}`);
-  } finally {
-    stub.restore();
-  }
-});
-
-test("deployment_logs refuses a deployment app-lb will not show this credential", async () => {
-  const stub = stubFetch((c) => {
-    if (c.url.endsWith("/namespaces")) {
-      return { body: { namespaces: [{ name: "team-a", scope: "admin" }] } };
-    }
-    // Another namespace's deployment: the door answers 404, exactly as it does
-    // for a name that does not exist at all.
-    if (c.url.includes("/lb/deployments/")) return { status: 404, body: { error: "not found" } };
-    return { body: { rows: [{ ts: 1, message: "someone else's logs" }] } };
-  });
-  try {
-    const tools = buildTools(
-      loadConfig({
-        HEYO_API_KEY: "heyo_api_x",
-        APPLB_TOKEN: "heyo_api_lb",
-        APP_OBS_URL: "https://obs.example.com",
-        APP_OBS_API_TOKEN: "applb_obs",
-      }),
-    );
-    const out = await tool(tools, "deployment_logs").handler({ id: "other-ns-app" });
-
-    assert.match(out, /is visible to this credential, so its logs are not either/);
-    assert.doesNotMatch(out, /someone else's logs/);
-    assert.ok(
-      !stub.calls.some((c) => c.url.startsWith("https://obs.example.com")),
-      "obs must not be asked at all once app-lb has refused",
-    );
   } finally {
     stub.restore();
   }

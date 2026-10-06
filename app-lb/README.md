@@ -707,7 +707,7 @@ round-trips and rollout waiting. It is a separate crate, so installing it doesn'
 or the ACME stack.
 
 ```sh
-cargo build --release -p heyctl
+cargo build --release -p hws
 
 heyctl login --server 127.0.0.1:9090   # saves a context; prompts if the server is gated
 heyctl create deployment demo --host demo.local --image nginx --port 80 --min 0 --max 4
@@ -3201,7 +3201,7 @@ work.
 
 | | |
 |---|---|
-| [`heyctl`](heyctl/README.md) | Rust — a client library *and* the kubectl-shaped CLI. `cargo install heyctl` for the CLI, `default-features = false` for the library. |
+| [`heyctl`](heyctl/README.md) | Rust — a client library *and* the kubectl-shaped CLI. `cargo install hws` for the CLI (crate `hws`), `default-features = false` for the library. |
 | [`heyctl` (npm)](sdk/typescript/README.md) | TypeScript — Node, Bun, Deno and browsers. |
 
 Both speak the same wire contract, and both are checked against it: the fixtures
@@ -3210,7 +3210,7 @@ has a test asserting it understands every field in them. A field app-lb starts
 sending fails a test in each client rather than going silently unread.
 
 ```rust
-let lb = heyctl::Client::builder("127.0.0.1:9090").token(token).build()?;
+let lb = hws::Client::builder("127.0.0.1:9090").token(token).build()?;
 let out = lb.exec("sb-7f3a9c", &ExecRequest::new("uname -a")).await?;
 ```
 

@@ -335,6 +335,36 @@ left alone. Configure neither and the process holds no credential for any of
 the four services — every call runs as whoever asked. That is the shape
 `deploy/vm.md` deploys.
 
+**A namespace-confined caller reads app-obs through app-lb's obs plugin, never
+directly.** app-obs's own `APP_OBS_API_TOKEN` reads every namespace, so it is
+the operator's alone. The telemetry tools (`namespace_telemetry`,
+`deployment_logs`, `diagnose_deployment`, `obs_request`) therefore decide a
+route per credential (`src/telemetry.ts`):
+
+1. a `namespace` argument, or the managed door's namespace, or a `/whoami`
+   that says `confined` → `GET /namespaces/{ns}/plugins/obs/api/…` on app-lb,
+   carrying the caller's own credential. app-lb checks reach and pins the
+   namespace before it calls app-obs; the service token never leaves app-lb.
+2. a `/whoami` that says unconfined (the operator, a fleet token) → app-obs
+   directly at `APP_OBS_URL`, as before; `deployment_logs` still checks the
+   deployment against app-lb first.
+
+`fleet_overview` is fleet-wide and refuses a confined caller, pointing it at
+`namespace_telemetry`. Because the plugin route needs only app-lb, a hosted
+instance with no `APP_OBS_URL` still lists the telemetry tools.
+
+Nothing is collected for a namespace until a namespace admin installs the
+plugin there — `heyctl plugins install obs -n <ns>`, or
+`PUT /namespaces/<ns>/plugins/obs` — and the tools answer a 409
+`plugin_not_installed` with exactly that instruction. Through cloud's managed
+door the plugin paths must also be on cloud's route allowlist
+(`lb_route_allowed` in the cloud service): `GET namespaces/{ns}/plugins`,
+`GET namespaces/{ns}/plugins/obs/api/{fleet,deployments/…,alerts}` and, for
+alert edits, `POST`/`DELETE …/plugins/obs/api/alerts[/{id}]` and
+`PUT`/`DELETE namespaces/{ns}/plugins/obs`, with `{ns}` equal to the door's own
+namespace. Until it is, those calls answer `404 route not exposed through the
+namespace proxy`.
+
 Cloud is outside this, and outside the borrow-when-empty rule too. An
 `applb_…` token is not a cloud credential — cloud has never heard of it — so it
 is never substituted for one. That leaves two honest configurations and no
@@ -553,6 +583,8 @@ Cross-service, shaped like the question rather than the endpoint.
 | `heyo_whoami` | read-only | What this server's credential is and what it may do: admin scope, namespace, deployment scope and expiry. |
 | `diagnose_deployment` | read-only | Everything about one deployment at once: app-lb's record and its VM pool, app-obs's bucketed series, and the most recent error-level logs. |
 | `deployment_logs` | read-only | Log lines for one deployment, newest first, with the filters app-obs supports: time window or explicit from/to, level, backend, a substring query, and a cursor for paging. |
+| `namespace_telemetry` | read-only | One namespace's telemetry: each deployment's requests, errors, latency, CPU and memory over a window, plus one deployment's series and recent errors when `deployment` is given. fleet_overview for a namespace-confined credential — call it first for 'how are my apps doing'. |
+| `diagnose_vm_boot` |  | Why a VM deployment boots but never passes its health check (ready 0, boot timeouts). |
 | `fleet_overview` | read-only | The whole managed fleet in one call: app-obs's per-deployment rows with host CPU and memory, app-lb's current topology with health and drain state, and app-obs's ingest counters. |
 | `diagnose_empty_pool` | read-only | Why a deployment's VM pool is empty or will not fill. |
 | `diagnose_ci_job` | read-only | Why a ci job is not running. |
@@ -682,7 +714,7 @@ Everything without a dedicated tool. Prefer a named tool when one exists — a r
 | `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
 | `art_request` |  | Raw HTTP against the artifact store, for endpoints without a dedicated tool above. |
 
-_77 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+_79 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
 
 <!-- END GENERATED CATALOGUE -->
 

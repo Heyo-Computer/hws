@@ -95,6 +95,10 @@ pub struct Config {
     /// owns; `APP_OBS_ALERTS_FILE` overrides it. Loaded on startup and rewritten
     /// on every create/delete.
     pub alerts_file: String,
+    /// `APP_OBS_REQUIRE_INSTALL`: collect a tenant namespace only once the obs
+    /// plugin is installed in it on app-lb. On by default; `0` collects every
+    /// namespace, as before namespaces existed. See `namespaces`.
+    pub require_install: bool,
 }
 
 impl Default for Config {
@@ -121,6 +125,7 @@ impl Default for Config {
             query_concurrency: 4,
             query_timeout: Duration::from_secs(30),
             alerts_file: default_alerts_file(&default_data_dir()),
+            require_install: true,
         }
     }
 }
@@ -186,6 +191,9 @@ impl Config {
         }
         if let Some(v) = parse_env("APP_OBS_QUERY_CONCURRENCY") {
             cfg.query_concurrency = v;
+        }
+        if let Ok(v) = std::env::var("APP_OBS_REQUIRE_INSTALL") {
+            cfg.require_install = !matches!(v.trim(), "0" | "false" | "no" | "off");
         }
         if let Some(v) = parse_env("APP_OBS_QUERY_TIMEOUT_SECS") {
             cfg.query_timeout = Duration::from_secs(v);

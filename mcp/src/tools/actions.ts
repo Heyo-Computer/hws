@@ -13,7 +13,9 @@
  * description tell the truth about what the call does, which it does.
  */
 
+import { lintVmSpec } from "./vmboot.js";
 import { z } from "zod";
+import { telemetry, telemetryRoute } from "../telemetry.js";
 import { bool, num , DESTRUCTIVE_PREFIX } from "./schema.js";
 import type { Clients } from "../clients/index.js";
 import { json, report, type Section } from "../format.js";
@@ -511,13 +513,17 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         // A VM whose image comes from a build or a pull runs nothing unless
         // start_command says so: the rootfs drops the image's CMD.
         const vmBlock = spec.vm as Record<string, unknown> | undefined;
+        for (const f of lintVmSpec(vmBlock)) {
+          if (f.title === "No start_command") continue;
+          sections.push({ title: f.title, body: `${f.detail} diagnose_vm_boot {id} probes the guest.` });
+        }
         if (vmBlock && (spec.build || spec.artifact) && !vmBlock.start_command) {
           sections.push({
             title: "No start_command",
             body:
               "A VM does not run the image's CMD or ENTRYPOINT, so with no `vm.start_command` the app " +
               "never starts and the pool never becomes ready. Add one that returns " +
-              "(`cd /app && setsid nohup node server.js </dev/null >/var/log/app.log 2>&1 &`); " +
+              "(`cd /app && setsid nohup node server.js </dev/null &`); " +
               "repo_deploy derives it from the Dockerfile.",
           });
         }
@@ -1022,16 +1028,33 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         path: z.string().describe("path beginning with '/'"),
         query: z.record(z.string()).optional(),
         body: z.unknown().optional(),
+        // app-obs only. Its own token reads every namespace, so a confined
+        // caller is routed through app-lb's obs plugin for its namespace
+        // instead (`telemetry.ts`), with `path` being app-obs's API path
+        // either way.
+        ...(key === "obs"
+          ? {
+              namespace: z
+                .string()
+                .optional()
+                .describe(
+                  "go through this namespace's obs plugin on app-lb (path is then e.g. " +
+                    "'/api/fleet'); inferred from a confined credential when omitted",
+                ),
+            }
+          : {}),
       },
-      handler: async (a: Record<string, unknown>) =>
-        json(
-          await clients[key]({
-            method: a.method as string,
-            path: String(a.path),
-            query: a.query as Record<string, string> | undefined,
-            body: a.body,
-          }),
-        ),
+      handler: async (a: Record<string, unknown>) => {
+        const opts = {
+          method: a.method as string,
+          path: String(a.path),
+          query: a.query as Record<string, string> | undefined,
+          body: a.body,
+        };
+        if (key !== "obs") return json(await clients[key](opts));
+        const route = await telemetryRoute(clients, config, a.namespace as string | undefined);
+        return json(await telemetry(clients, route, opts));
+      },
     })),
   ];
 }

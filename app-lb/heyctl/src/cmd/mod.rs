@@ -7,6 +7,7 @@ pub mod observe;
 pub mod plugins;
 pub mod read;
 pub mod session;
+pub mod telemetry;
 pub mod token;
 pub mod write;
 
@@ -124,6 +125,26 @@ impl Ctx {
             endpoint,
             out: globals.output,
         })
+    }
+
+    /// The namespace a namespace-wide command acts on: the one named, or else
+    /// the one this credential is confined to.
+    ///
+    /// Asks `/whoami` only when nothing was named, so `-n` costs nothing extra.
+    /// A credential that reaches several namespaces, or the whole fleet, has
+    /// no namespace to assume — refusing is better than silently picking one.
+    pub fn namespace(&self, named: Option<&str>) -> Result<String> {
+        if let Some(ns) = named {
+            return Ok(ns.to_string());
+        }
+        let me = self.client.whoami()?;
+        match me.sole_namespace() {
+            Some(ns) => Ok(ns.to_string()),
+            None => bail!(
+                "name a namespace with -n — this credential ({}) is not confined to exactly one",
+                me.caller
+            ),
+        }
     }
 }
 

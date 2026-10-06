@@ -9,9 +9,13 @@
 //! app-lb can add to its response without breaking this.
 
 use crate::ingest::Sink;
+use crate::namespaces::{Directory, Gate};
 use crate::sources::VmTarget;
-use crate::store::schema::{MetricRecord, Record};
+use crate::store::schema::{LEGACY_NAMESPACE, MetricRecord, Record};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Reserved deployment id for whole-host samples, which belong to no
@@ -90,6 +94,10 @@ pub(crate) struct HostUsage {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct DeploymentView {
     pub id: String,
+    /// The app-lb namespace the deployment lives in. Absent from an app-lb
+    /// that predates reporting it, where every deployment was in `default`.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// `vm` or `static`. Optional because an older app-lb may not send it;
     /// see [`vm_targets`] for how that absence is handled.
     #[serde(default)]
@@ -191,9 +199,38 @@ pub struct Poller {
     /// restarting must not stop log collection from sandboxes that are still
     /// running.
     targets: Option<tokio::sync::watch::Sender<Vec<VmTarget>>>,
+    /// Where each deployment's namespace and the obs installs are published,
+    /// for the sink's attribution and gate.
+    directory: Arc<Directory>,
+    installs_url: String,
+    /// Set once an app-lb without the installs endpoint has been reported, so
+    /// a fleet that is simply older says so once rather than every tick.
+    warned_no_installs: AtomicBool,
+}
+
+/// The part of app-lb's `GET /api/plugins/obs/installs` this reads.
+#[derive(Debug, Deserialize)]
+struct InstallsResponse {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    namespaces: Vec<String>,
+}
+
+impl InstallsResponse {
+    fn gate(self) -> Gate {
+        if self.enabled {
+            Gate::Installed(self.namespaces.into_iter().collect::<HashSet<_>>())
+        } else {
+            // The fleet plugin is off, so no install is in force; collect as
+            // this collector always has. See `namespaces`.
+            Gate::Open
+        }
+    }
 }
 
 impl Poller {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_url: &str,
         user: Option<String>,
@@ -203,6 +240,7 @@ impl Poller {
         source: String,
         live: tokio::sync::watch::Sender<Option<LiveStatus>>,
         targets: Option<tokio::sync::watch::Sender<Vec<VmTarget>>>,
+        directory: Arc<Directory>,
     ) -> Self {
         // app-lb's admin API is loopback and answers promptly or not at all; a
         // short timeout keeps a wedged connection from stalling the poll loop
@@ -217,15 +255,62 @@ impl Poller {
         // defaults to `admin`.
         let auth = password.map(|p| (user.unwrap_or_else(|| "admin".into()), p));
 
+        let base = base_url.trim_end_matches('/');
         Self {
             client,
-            url: format!("{}/metrics", base_url.trim_end_matches('/')),
+            url: format!("{base}/metrics"),
             auth,
             interval,
             sink,
             source,
             live,
             targets,
+            directory,
+            installs_url: format!("{base}/api/plugins/obs/installs"),
+            warned_no_installs: AtomicBool::new(false),
+        }
+    }
+
+    /// Ask app-lb which namespaces installed the obs plugin, and publish the
+    /// answer as the gate. A failure leaves the previous gate in place: a
+    /// blip in app-lb must neither open collection to every namespace nor
+    /// close it on the ones that asked for it.
+    async fn refresh_installs(&self) {
+        if !self.directory.requires_install() {
+            return;
+        }
+        let mut request = self.client.get(&self.installs_url);
+        if let Some((user, password)) = &self.auth {
+            request = request.basic_auth(user, Some(password));
+        }
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(url = %self.installs_url, error = %e, "obs installs poll failed; keeping the last answer");
+                return;
+            }
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            if !self.warned_no_installs.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    url = %self.installs_url,
+                    "app-lb has no obs installs endpoint (it predates per-namespace \
+                     plugins); collecting every namespace",
+                );
+            }
+            self.directory.set_gate(Gate::Open);
+            return;
+        }
+        match response.error_for_status() {
+            Ok(r) => match r.json::<InstallsResponse>().await {
+                Ok(installs) => self.directory.set_gate(installs.gate()),
+                Err(e) => {
+                    tracing::warn!(url = %self.installs_url, error = %e, "unreadable obs installs; keeping the last answer")
+                }
+            },
+            Err(e) => {
+                tracing::warn!(url = %self.installs_url, error = %e, "obs installs poll failed; keeping the last answer")
+            }
         }
     }
 
@@ -255,6 +340,11 @@ impl Poller {
         let response = request.send().await?.error_for_status()?;
         let snapshot: MetricsResponse = response.json().await?;
 
+        // Attribution and the gate before a single row is sent, so this poll's
+        // rows are judged by this poll's answer.
+        self.directory.set_namespaces(namespaces_of(&snapshot));
+        self.refresh_installs().await;
+
         let live = LiveStatus {
             schema_version: 1,
             source: self.source.clone(),
@@ -269,7 +359,11 @@ impl Poller {
         if let Some(targets) = &self.targets {
             // send_if_modified so an unchanged fleet doesn't wake the tailer
             // manager every poll tick.
-            let current = vm_targets(&snapshot);
+            // Only sandboxes whose logs would be kept: tailing a namespace
+            // that has not installed obs would hold a stream open to drop
+            // every line it carries.
+            let mut current = vm_targets(&snapshot);
+            current.retain(|t| self.directory.admit(&t.deployment).is_some());
             targets.send_if_modified(|previous| {
                 if *previous == current {
                     false
@@ -287,6 +381,22 @@ impl Poller {
         }
         Ok(count)
     }
+}
+
+/// Deployment id → namespace, as `/metrics` reports it.
+fn namespaces_of(snapshot: &MetricsResponse) -> HashMap<String, String> {
+    snapshot
+        .deployments
+        .iter()
+        .map(|d| {
+            (
+                d.id.clone(),
+                d.namespace
+                    .clone()
+                    .unwrap_or_else(|| LEGACY_NAMESPACE.to_string()),
+            )
+        })
+        .collect()
 }
 
 fn now_ms() -> i64 {
@@ -376,6 +486,7 @@ fn flatten(snapshot: &MetricsResponse) -> Vec<Record> {
             // the next sample's delta against it is the first honest interval.
             latency_count: Some(deployment.metrics.latency_ms.count),
             latency_sum: Some(deployment.metrics.latency_ms.sum),
+            namespace: None,
         }));
 
         // Per-VM rows. Pool and traffic figures are deployment-wide and are left
@@ -416,7 +527,13 @@ fn flatten(snapshot: &MetricsResponse) -> Vec<Record> {
                 .then(|| sampled.iter().filter_map(|s| s.cpu_percent).sum()),
             memory_bytes: (!sampled.is_empty())
                 .then(|| sampled.iter().filter_map(|s| s.memory_bytes).sum()),
-            ready: Some(snapshot.host_sandboxes.iter().filter(|s| s.is_live()).count() as u32),
+            ready: Some(
+                snapshot
+                    .host_sandboxes
+                    .iter()
+                    .filter(|s| s.is_live())
+                    .count() as u32,
+            ),
             ..Default::default()
         }));
         for sandbox in &snapshot.host_sandboxes {
@@ -586,8 +703,16 @@ mod tests {
         assert!(snapshot.host_sandboxes.is_empty());
         let records = flatten(&snapshot);
         assert_eq!(records.len(), 4);
-        assert!(records.iter().all(|r| r.deployment() != UNMANAGED_DEPLOYMENT));
-        assert!(vm_targets(&snapshot).iter().all(|t| t.deployment != UNMANAGED_DEPLOYMENT));
+        assert!(
+            records
+                .iter()
+                .all(|r| r.deployment() != UNMANAGED_DEPLOYMENT)
+        );
+        assert!(
+            vm_targets(&snapshot)
+                .iter()
+                .all(|t| t.deployment != UNMANAGED_DEPLOYMENT)
+        );
     }
 
     /// `SNAPSHOT` with the `host_sandboxes` array removed, as an older app-lb
@@ -729,13 +854,25 @@ mod tests {
     fn a_stopped_unmanaged_sandbox_is_not_tailed() {
         let mut snapshot = parse();
         snapshot.host_sandboxes[0].status = Some("stopped".into());
-        assert!(vm_targets(&snapshot).iter().all(|t| t.deployment != UNMANAGED_DEPLOYMENT));
+        assert!(
+            vm_targets(&snapshot)
+                .iter()
+                .all(|t| t.deployment != UNMANAGED_DEPLOYMENT)
+        );
         // …and a status this build does not know is treated as not live rather
         // than guessed at.
         snapshot.host_sandboxes[0].status = Some("hibernating".into());
-        assert!(vm_targets(&snapshot).iter().all(|t| t.deployment != UNMANAGED_DEPLOYMENT));
+        assert!(
+            vm_targets(&snapshot)
+                .iter()
+                .all(|t| t.deployment != UNMANAGED_DEPLOYMENT)
+        );
         snapshot.host_sandboxes[0].status = None;
-        assert!(vm_targets(&snapshot).iter().all(|t| t.deployment != UNMANAGED_DEPLOYMENT));
+        assert!(
+            vm_targets(&snapshot)
+                .iter()
+                .all(|t| t.deployment != UNMANAGED_DEPLOYMENT)
+        );
     }
 
     #[test]
@@ -759,5 +896,113 @@ mod tests {
         let targets = vm_targets(&snapshot);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].backend, "sb-aaa");
+    }
+
+    #[test]
+    fn a_deployment_with_no_namespace_is_in_default() {
+        // app-lb omits `namespace` for `default`, and an older one never sends it.
+        let mut snapshot = parse();
+        let mut tenant = snapshot.deployments[0].clone();
+        tenant.id = "web".into();
+        tenant.namespace = Some("team-a".into());
+        snapshot.deployments.push(tenant);
+        let map = namespaces_of(&snapshot);
+        assert_eq!(map["demo"], "default");
+        assert_eq!(map["web"], "team-a");
+    }
+
+    #[test]
+    fn installs_gate_only_while_the_fleet_plugin_is_on() {
+        let on: InstallsResponse = serde_json::from_str(
+            r#"{"plugin":"obs","enabled":true,"namespaces":["a","b"],
+                "installs":{"a":{"installed_at":1,"installed_by":null,"config":{}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            on.gate(),
+            Gate::Installed(HashSet::from(["a".to_string(), "b".to_string()]))
+        );
+        let off: InstallsResponse =
+            serde_json::from_str(r#"{"plugin":"obs","enabled":false,"namespaces":["a"]}"#).unwrap();
+        assert_eq!(off.gate(), Gate::Open);
+    }
+
+    /// A fake app-lb: `/metrics` with `demo` in `default` and `web` in
+    /// `team-a`, and `installs` as given (`None` = a 404, an older app-lb).
+    async fn fake_applb(installs: Option<&'static str>) -> String {
+        use axum::routing::get;
+        let mut snapshot: serde_json::Value = serde_json::from_str(SNAPSHOT).unwrap();
+        let mut web = snapshot["deployments"][0].clone();
+        web["id"] = "web".into();
+        web["namespace"] = "team-a".into();
+        snapshot["deployments"].as_array_mut().unwrap().push(web);
+        let mut app = axum::Router::new().route(
+            "/metrics",
+            get(move || {
+                let s = snapshot.clone();
+                async move { axum::Json(s) }
+            }),
+        );
+        if let Some(body) = installs {
+            app = app.route(
+                "/api/plugins/obs/installs",
+                get(move || async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Poll once and return the deployments whose rows reached the queue.
+    async fn collected(installs: Option<&'static str>) -> std::collections::BTreeSet<String> {
+        let url = fake_applb(installs).await;
+        let directory = Arc::new(Directory::new(true));
+        let (sink, mut rx) = Sink::new(1024);
+        let sink = sink.with_directory(directory.clone());
+        let (live, _) = tokio::sync::watch::channel(None);
+        let poller = Poller::new(
+            &url,
+            None,
+            None,
+            Duration::from_secs(10),
+            sink,
+            "test".into(),
+            live,
+            None,
+            directory,
+        );
+        poller.poll_once().await.unwrap();
+        let mut out = std::collections::BTreeSet::new();
+        while let Ok(r) = rx.try_recv() {
+            out.insert(r.deployment().to_string());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn the_poll_collects_only_installed_namespaces() {
+        let got = collected(Some(
+            r#"{"plugin":"obs","enabled":true,"namespaces":["team-a"]}"#,
+        ))
+        .await;
+        assert!(got.contains("web"), "team-a installed obs");
+        assert!(!got.contains("demo"), "default did not");
+        assert!(
+            got.contains(HOST_DEPLOYMENT),
+            "the platform's rows are always kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_app_lb_without_installs_is_collected_as_before() {
+        let got = collected(None).await;
+        assert!(got.contains("web") && got.contains("demo"));
     }
 }

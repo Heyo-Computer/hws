@@ -695,6 +695,59 @@ PANELS.vapi = (() => {
   return { render: refresh, refresh };
 })();
 
+// ---- obs ---------------------------------------------------------------------
+//
+// Installed per namespace: the operator enables it here with app-obs's URL, and
+// each namespace installs it (from its own dashboard, `heyctl plugins install
+// obs -n <ns>`, or below). Installing starts collection for that namespace and
+// opens `/namespaces/<ns>/plugins/obs/ui` to its tokens.
+PANELS.obs = (() => {
+  let el = null;
+  function render(view, target) {
+    el = target;
+    el.innerHTML = `
+      <div class="tiles" id="obs-tiles"></div>
+      <div class="sub-title">Installed in</div>
+      <div class="scroll" id="obs-installs"></div>
+      <div class="row">
+        <input type="text" id="obs-ns" placeholder="namespace" size="18">
+        <button class="act" type="button" id="obs-install">Install</button>
+      </div>`;
+    el.querySelector("#obs-install").addEventListener("click", async () => {
+      const ns = el.querySelector("#obs-ns").value.trim();
+      if (!ns) { flash("bad", "Name a namespace to install into."); return; }
+      const r = await api("PUT", `/namespaces/${encodeURIComponent(ns)}/plugins/obs`, {});
+      if (!r.ok) { flash("bad", failure(r, "Installing")); return; }
+      flash("ok", `Observability installed in ${ns}.`);
+      el.querySelector("#obs-ns").value = "";
+      load();
+    });
+    refresh(view, target);
+  }
+  function refresh(view, target) {
+    el = target;
+    const s = view.status || {};
+    const tile = (k, v) => `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+    el.querySelector("#obs-tiles").innerHTML = view.enabled
+      ? tile("app-obs", s.url || "—") + tile("reachable", s.up ? "yes" : "no") + tile("namespaces", String((view.installed_in || []).length))
+      : "";
+    const list = view.installed_in || [];
+    const box = el.querySelector("#obs-installs");
+    box.innerHTML = list.length
+      ? `<table><tbody>${list.map(ns => `<tr><td class="mono">${esc(ns)}</td>
+          <td><a href="/namespaces/${encodeURIComponent(ns)}/plugins/obs/ui">open</a></td>
+          <td><button class="act" type="button" data-ns="${esc(ns)}">Uninstall</button></td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty">No namespace has installed it yet.</div>`;
+    box.querySelectorAll("[data-ns]").forEach(b => b.addEventListener("click", async () => {
+      const r = await api("DELETE", `/namespaces/${encodeURIComponent(b.dataset.ns)}/plugins/obs`);
+      if (!r.ok) { flash("bad", failure(r, "Uninstalling")); return; }
+      flash("ok", `Observability uninstalled from ${b.dataset.ns}.`);
+      load();
+    }));
+  }
+  return { render, refresh };
+})();
+
 async function load() {
   const r = await api("GET", "/api/plugins");
   const root = $("plugins");

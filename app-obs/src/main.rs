@@ -10,13 +10,14 @@
 // shared with app-lb, ci, heyosecret and artifacts. Included by path rather
 // than depended on as a crate: the five apps sit on three axum versions, so the
 // shared module names no framework type. See `ui/README.md`.
-#[path = "../../ui/ui.rs"]
-pub mod heyo_ui;
-mod api;
 mod alerts;
+mod api;
 mod compaction;
 mod config;
+#[path = "../../ui/ui.rs"]
+pub mod heyo_ui;
 mod ingest;
+mod namespaces;
 mod query;
 mod retention;
 mod sources;
@@ -90,7 +91,15 @@ async fn run(cfg: Config) {
         );
     }
 
+    // Which namespace each deployment is in and which installed the obs
+    // plugin, learned by the app-lb poller and applied by the sink to every
+    // record from every source.
+    let directory = Arc::new(namespaces::Directory::new(cfg.require_install));
+    if !cfg.require_install {
+        tracing::info!("APP_OBS_REQUIRE_INSTALL=0: collecting every namespace");
+    }
     let (sink, rx) = Sink::new(cfg.queue_capacity);
+    let sink = sink.with_directory(directory.clone());
 
     // The writer owns everything below the queue and is the only thing that
     // touches the data directory, so it needs no locking.
@@ -144,6 +153,7 @@ async fn run(cfg: Config) {
             cfg.source.clone(),
             live_tx,
             Some(targets_tx),
+            directory.clone(),
         )
         .run(),
     );
@@ -220,6 +230,7 @@ async fn run(cfg: Config) {
         ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::from_env("APP_OBS")),
         alerts: alerts.clone(),
         alerts_file: alerts_file.clone(),
+        directory,
     };
     let api_addr = cfg.api_addr.clone();
     tokio::spawn(async move {

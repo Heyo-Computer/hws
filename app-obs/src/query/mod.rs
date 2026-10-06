@@ -27,7 +27,7 @@
 //! happened.
 
 use crate::store::partition::check_deployment;
-use crate::store::schema::{Table, logs_schema, metrics_schema};
+use crate::store::schema::{LEGACY_NAMESPACE, Table, logs_schema, metrics_schema};
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use datafusion::arrow::array::{
     Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
@@ -247,6 +247,9 @@ pub struct LogRow {
 #[derive(Debug, Clone)]
 pub struct LogFilter {
     pub deployment: String,
+    /// Only rows attributed to this namespace. `None` is the operator's view:
+    /// every row, whoever owns it.
+    pub namespace: Option<String>,
     pub level: Option<String>,
     pub backend: Option<String>,
     /// Case-insensitive substring of the message.
@@ -409,6 +412,7 @@ impl Engine {
         window: Window,
         step_secs: u32,
         deployment: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<BTreeMap<String, Vec<MetricBucket>>, QueryError> {
         if let Some(id) = deployment {
             check_deployment(id).map_err(|_| QueryError::BadDeployment(id.to_string()))?;
@@ -419,6 +423,9 @@ impl Engine {
             .deadline(async {
                 let mut df = self.ctx.table(Table::Metrics.name()).await?;
                 df = df.filter(scan_filter(window, deployment, false))?;
+                if let Some(ns) = namespace {
+                    df = df.filter(namespace_filter(ns))?;
+                }
                 // Deployment-wide rows only. Per-VM rows leave the pool gauges
                 // and traffic counters null on purpose, so mixing them in would
                 // average real values against nothing.
@@ -474,6 +481,7 @@ impl Engine {
         window: Window,
         step_secs: u32,
         deployment: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<BTreeMap<String, Vec<LogBucket>>, QueryError> {
         if let Some(id) = deployment {
             check_deployment(id).map_err(|_| QueryError::BadDeployment(id.to_string()))?;
@@ -482,24 +490,28 @@ impl Engine {
 
         let batches = self
             .deadline(async {
-                self.ctx
+                let mut df = self
+                    .ctx
                     .table(Table::Logs.name())
                     .await?
-                    .filter(scan_filter(window, deployment, true))?
-                    .aggregate(
-                        vec![col("deployment"), bucket_expr(step_secs)],
-                        vec![
-                            count(lit(1i64)).alias("lines"),
-                            sum(when(is_error_level(), lit(1i64)).otherwise(lit(0i64))?)
-                                .alias("errors"),
-                        ],
-                    )?
-                    .sort(vec![
-                        col("deployment").sort(true, true),
-                        col("bucket").sort(true, true),
-                    ])?
-                    .collect()
-                    .await
+                    .filter(scan_filter(window, deployment, true))?;
+                if let Some(ns) = namespace {
+                    df = df.filter(namespace_filter(ns))?;
+                }
+                df.aggregate(
+                    vec![col("deployment"), bucket_expr(step_secs)],
+                    vec![
+                        count(lit(1i64)).alias("lines"),
+                        sum(when(is_error_level(), lit(1i64)).otherwise(lit(0i64))?)
+                            .alias("errors"),
+                    ],
+                )?
+                .sort(vec![
+                    col("deployment").sort(true, true),
+                    col("bucket").sort(true, true),
+                ])?
+                .collect()
+                .await
             })
             .await?;
 
@@ -553,6 +565,9 @@ impl Engine {
                     .table(Table::Logs.name())
                     .await?
                     .filter(scan_filter(window, Some(&filter.deployment), true))?;
+                if let Some(ns) = &filter.namespace {
+                    df = df.filter(namespace_filter(ns))?;
+                }
 
                 // Everything below is caller-supplied text. It goes in as an
                 // `Expr` literal, so it is compared as a value and never parsed.
@@ -610,6 +625,7 @@ impl Engine {
         &self,
         window: Window,
         deployment: &str,
+        namespace: Option<&str>,
     ) -> Result<Vec<String>, QueryError> {
         check_deployment(deployment)
             .map_err(|_| QueryError::BadDeployment(deployment.to_string()))?;
@@ -617,11 +633,15 @@ impl Engine {
 
         let batches = self
             .deadline(async {
-                self.ctx
+                let mut df = self
+                    .ctx
                     .table(Table::Logs.name())
                     .await?
-                    .filter(scan_filter(window, Some(deployment), true))?
-                    .filter(col("backend").is_not_null())?
+                    .filter(scan_filter(window, Some(deployment), true))?;
+                if let Some(ns) = namespace {
+                    df = df.filter(namespace_filter(ns))?;
+                }
+                df.filter(col("backend").is_not_null())?
                     .aggregate(vec![col("backend")], vec![max(col("ts")).alias("last_ts")])?
                     .sort(vec![col("backend").sort(true, true)])?
                     .collect()
@@ -700,6 +720,21 @@ fn scan_filter(window: Window, deployment: Option<&str>, hourly: bool) -> Expr {
             filter.and(col("hour").in_list(hours.into_iter().map(lit).collect::<Vec<_>>(), false));
     }
     filter
+}
+
+/// Rows attributed to `ns`.
+///
+/// A null `namespace` is a row written before the column existed, and every
+/// deployment then lived in [`LEGACY_NAMESPACE`] — so it belongs there and
+/// nowhere else. The value is a literal, compared and never parsed, like every
+/// other caller-supplied filter here.
+fn namespace_filter(ns: &str) -> Expr {
+    let exact = col("namespace").eq(lit(ns.to_string()));
+    if ns == LEGACY_NAMESPACE {
+        exact.or(col("namespace").is_null())
+    } else {
+        exact
+    }
 }
 
 /// True when `level` names an error, however the sender spells it.
@@ -1039,6 +1074,7 @@ mod tests {
             message: message.into(),
             fields: None,
             host: None,
+            namespace: None,
         })
     }
 
@@ -1080,6 +1116,152 @@ mod tests {
         Engine::new(dir, 2, Duration::from_secs(30)).await.unwrap()
     }
 
+    fn stamped(deployment: &str, namespace: Option<&str>, message: &str) -> Record {
+        let Record::Log(mut r) = log(deployment, TS, "info", message) else {
+            unreachable!()
+        };
+        r.namespace = namespace.map(str::to_string);
+        Record::Log(r)
+    }
+
+    /// A logs file as app-obs wrote them before the `namespace` column: the
+    /// current schema minus that column, placed where the writer would have.
+    fn write_legacy_log(dir: &Path, deployment: &str, message: &str) {
+        use datafusion::arrow::array::TimestampMillisecondArray;
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let schema = Arc::new(Schema::new(
+            logs_schema()
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "namespace")
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let utf8 = |v: Option<&str>| Arc::new(StringArray::from(vec![v])) as _;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![TS]).with_timezone("UTC")) as _,
+                utf8(Some("sb-old")),
+                utf8(Some("stdout")),
+                utf8(Some("info")),
+                utf8(Some(message)),
+                utf8(None),
+                utf8(None),
+            ],
+        )
+        .unwrap();
+        let partition = crate::store::partition::PartitionKey::new(Table::Logs, deployment, TS)
+            .unwrap()
+            .dir(dir);
+        std::fs::create_dir_all(&partition).unwrap();
+        let file = std::fs::File::create(partition.join("0000000000001-000000.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn log_filter(deployment: &str, namespace: Option<&str>) -> LogFilter {
+        LogFilter {
+            deployment: deployment.into(),
+            namespace: namespace.map(str::to_string),
+            level: None,
+            backend: None,
+            search: None,
+            limit: 100,
+            before_ms: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_namespace_sees_only_rows_written_under_it() {
+        let dir = tmpdir("ns-filter");
+        let mut writer = Writer::new(&dir, 10_000, Duration::from_secs(3600));
+        writer.push(stamped("web", Some("team-a"), "a's")).unwrap();
+        writer.push(stamped("api", Some("team-b"), "b's")).unwrap();
+        writer.push(stamped("_lb", Some("_"), "platform")).unwrap();
+        // The same id under two namespaces over time: re-registered elsewhere.
+        writer
+            .push(stamped("moved", Some("team-a"), "before"))
+            .unwrap();
+        writer
+            .push(stamped("moved", Some("team-b"), "after"))
+            .unwrap();
+        writer.flush_all().unwrap();
+        let engine = engine(&dir).await;
+        let window = Window::trailing(at(TS + 60_000), 3_600);
+
+        let volume = engine
+            .log_volume(window, 60, None, Some("team-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            volume.keys().collect::<Vec<_>>(),
+            vec!["moved", "web"],
+            "team-b's and the platform's rows stay out"
+        );
+
+        let rows = engine
+            .logs(window, &log_filter("moved", Some("team-a")))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message, "before", "history follows its namespace");
+
+        let rows = engine
+            .logs(window, &log_filter("web", Some("team-b")))
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+
+        // The operator sees everything.
+        let all = engine.log_volume(window, 60, None, None).await.unwrap();
+        assert_eq!(all.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parquet_from_before_namespaces_reads_as_default() {
+        let dir = tmpdir("ns-legacy");
+        write_legacy_log(&dir, "old", "from before namespaces");
+        let mut writer = Writer::new(&dir, 10_000, Duration::from_secs(3600));
+        writer
+            .push(stamped("old", Some("default"), "after"))
+            .unwrap();
+        writer.flush_all().unwrap();
+        let engine = engine(&dir).await;
+        let window = Window::trailing(at(TS + 60_000), 3_600);
+
+        let rows = engine
+            .logs(window, &log_filter("old", Some("default")))
+            .await
+            .unwrap();
+        let mut messages: Vec<_> = rows.iter().map(|r| r.message.as_str()).collect();
+        messages.sort();
+        assert_eq!(messages, vec!["after", "from before namespaces"]);
+
+        assert!(
+            engine
+                .logs(window, &log_filter("old", Some("team-a")))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a legacy row is default's, nobody else's"
+        );
+        assert_eq!(
+            engine
+                .logs(window, &log_filter("old", None))
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "and the operator's view reads both shapes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn written_rows_are_queryable_back_out() {
         // The one test that proves the schema, the partition layout and the
@@ -1102,6 +1284,7 @@ mod tests {
                 window,
                 &LogFilter {
                     deployment: "demo".into(),
+                    namespace: None,
                     level: None,
                     backend: None,
                     search: None,
@@ -1130,6 +1313,7 @@ mod tests {
         async fn matches(engine: &Engine, window: Window, search: &str) -> usize {
             let filter = LogFilter {
                 deployment: "demo".into(),
+                namespace: None,
                 level: None,
                 backend: None,
                 search: Some(search.into()),
@@ -1167,7 +1351,10 @@ mod tests {
             to: at(TS + 600_000),
         };
 
-        let volume = engine.log_volume(window, 3600, Some("demo")).await.unwrap();
+        let volume = engine
+            .log_volume(window, 3600, Some("demo"), None)
+            .await
+            .unwrap();
         let demo = volume.get("demo").expect("demo logged");
         assert_eq!(demo.iter().map(|b| b.lines).sum::<u64>(), 3);
         assert_eq!(demo.iter().map(|b| b.errors).sum::<u64>(), 1);
@@ -1184,7 +1371,10 @@ mod tests {
             to: at(TS + 600_000),
         };
 
-        let series = engine.metrics(window, 60, Some("demo")).await.unwrap();
+        let series = engine
+            .metrics(window, 60, Some("demo"), None)
+            .await
+            .unwrap();
         let demo = series.get("demo").expect("demo reported metrics");
         assert_eq!(demo.len(), 3);
 
@@ -1240,6 +1430,7 @@ mod tests {
                 },
                 60,
                 Some("demo"),
+                None,
             )
             .await
             .unwrap();
@@ -1273,6 +1464,7 @@ mod tests {
         async fn count(engine: &Engine, window: Window) -> usize {
             let filter = LogFilter {
                 deployment: "demo".into(),
+                namespace: None,
                 level: None,
                 backend: None,
                 search: None,
@@ -1306,10 +1498,16 @@ mod tests {
         assert!(engine.deployments().is_empty());
 
         let window = Window::trailing(at(TS), 3_600);
-        assert!(engine.metrics(window, 60, None).await.unwrap().is_empty());
         assert!(
             engine
-                .log_volume(window, 60, None)
+                .metrics(window, 60, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .log_volume(window, 60, None, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1324,7 +1522,7 @@ mod tests {
         let engine = engine(&dir).await;
         let window = Window::trailing(at(TS), 3_600);
         assert!(matches!(
-            engine.metrics(window, 60, Some("../etc")).await,
+            engine.metrics(window, 60, Some("../etc"), None).await,
             Err(QueryError::BadDeployment(_)),
         ));
         let _ = std::fs::remove_dir_all(&dir);

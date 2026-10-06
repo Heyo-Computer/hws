@@ -1,13 +1,25 @@
 [package]
-name = "heyctl"
+name = "hws"
 version.workspace = true
 edition.workspace = true
-description = "Client library and kubectl-shaped CLI for the app-lb admin API"
+description = "Heyo Web Services SDK: create and manage workloads on app-lb, read their telemetry, and the `heyctl` CLI"
 license = "Apache-2.0"
+repository = "https://github.com/Heyo-Computer/hws"
+homepage = "https://github.com/Heyo-Computer/hws"
+documentation = "https://docs.rs/hws"
+readme = "README.md"
+keywords = ["heyo", "microvm", "load-balancer", "sdk", "observability"]
+categories = ["api-bindings", "command-line-utilities", "web-programming::http-client"]
+# The installer and its manifest publisher are release tooling for the binary
+# on heyo.computer, not part of the crate.
+exclude = ["install.sh", "publish-versions.sh"]
 
+# Published to crates.io as `hws` (formerly `serverctl`); the binary keeps the
+# `heyctl` name.
+#
 # One crate, two products. The library is the whole crate minus `main.rs` and
 # `cmd/`; the CLI is a `[[bin]]` behind the default `cli` feature, so
-# `cargo install heyctl` still works and a library consumer writes
+# `cargo install hws` installs the `heyctl` binary and a library consumer writes
 # `default-features = false` to get none of clap, rpassword or a terminal.
 #
 # The CLI being the library's own first consumer is the point: a field the client
@@ -106,3 +118,11 @@ thiserror = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+# docs.rs builds the library surface: every feature a library consumer can
+# turn on, with the `doc(cfg)` badges that say which one a type needs. `cli` is
+# left out — its modules are `doc(hidden)` and pulling clap into the docs build
+# would document nothing.
+[package.metadata.docs.rs]
+features = ["blocking", "config-file", "artifact", "test-util"]
+rustdoc-args = ["--cfg", "docsrs"]

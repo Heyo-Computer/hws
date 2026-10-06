@@ -1,8 +1,14 @@
-//! A client for the [app-lb](https://github.com/sarocu/app-lb) admin API.
+//! The Heyo Web Services SDK: a client for the
+//! [app-lb](https://github.com/Heyo-Computer/hws) admin API.
 //!
-//! app-lb is a load balancer for heyvm Firecracker/KVM microVMs. This crate
-//! drives it: register deployments, scale pools, run commands inside a VM, and
-//! attach an interactive shell.
+//! app-lb is a load balancer for heyvm Firecracker/KVM microVMs, and the door
+//! to everything a Heyo namespace runs. This crate drives it: create and
+//! replace workloads ([`Client::create_deployment`], [`Client::start_rollout`]),
+//! scale pools, build and pull their images, run commands inside a VM, attach
+//! an interactive shell, and read their metrics and logs ([`Client::obs`]).
+//!
+//! Every call works with a namespace-scoped token — the credential a tenant is
+//! handed — and is narrowed by the server to that namespace.
 //!
 //! It is also the library behind the `heyctl` CLI, which is the point — the
 //! CLI is this crate's first consumer, so a field the client stops understanding
@@ -10,8 +16,8 @@
 //! terminal.
 //!
 //! ```no_run
-//! # async fn f() -> heyctl::Result<()> {
-//! use heyctl::{Client, ExecRequest};
+//! # async fn f() -> hws::Result<()> {
+//! use hws::{Client, ExecRequest};
 //!
 //! let lb = Client::builder("127.0.0.1:9090")
 //!     .token(std::env::var("APP_LB_TOKEN").unwrap())
@@ -29,8 +35,8 @@
 //! it is the operator credential, and the one that mints tokens.
 //!
 //! ```no_run
-//! # async fn f() -> heyctl::Result<()> {
-//! use heyctl::{AdminScope, Client, NewToken};
+//! # async fn f() -> hws::Result<()> {
+//! use hws::{AdminScope, Client, NewToken};
 //!
 //! let admin = Client::builder("127.0.0.1:9090").basic("admin", "s3cret").build()?;
 //! let minted = admin.mint_token(
@@ -69,6 +75,7 @@
 
 pub mod api;
 pub mod error;
+pub mod obs;
 pub mod shell;
 pub mod transport;
 pub mod types;
@@ -88,6 +95,7 @@ pub use api::{Client, ClientBuilder, ExecRequest, Gates, MetricsQuery, NewToken}
 /// name one.
 pub const DEFAULT_NAMESPACE: &str = "default";
 pub use error::{Credential, Error, Result};
+pub use obs::{LogQuery, NewAlert, OBS_PLUGIN, ObsClient};
 pub use shell::{Shell, ShellEvent, ShellExit, ShellOptions};
 pub use transport::{Auth, Transport};
 pub use types::*;

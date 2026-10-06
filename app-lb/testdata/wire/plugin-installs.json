@@ -1,0 +1,20 @@
+{
+  "plugin": "obs",
+  "enabled": true,
+  "namespaces": [
+    "team-a",
+    "team-b"
+  ],
+  "installs": {
+    "team-a": {
+      "installed_at": 1760000000,
+      "installed_by": "user:u_123",
+      "config": {}
+    },
+    "team-b": {
+      "installed_at": 1760000000,
+      "installed_by": null,
+      "config": {}
+    }
+  }
+}

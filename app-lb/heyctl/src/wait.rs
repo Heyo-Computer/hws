@@ -64,7 +64,7 @@ impl Client {
     /// being unable to *ask* is an `Err`.
     ///
     /// ```no_run
-    /// # async fn f(lb: &heyctl::Client) -> heyctl::Result<()> {
+    /// # async fn f(lb: &hws::Client) -> hws::Result<()> {
     /// let job = lb.start_build("api", None).await?;
     /// let done = lb.wait_for_job(&job.id)
     ///     .on_progress(|p| for line in p.new_log { println!("{line}"); })

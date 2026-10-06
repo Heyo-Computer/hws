@@ -9,11 +9,13 @@
  */
 
 import { z } from "zod";
-import { num } from "./schema.js";
+import { bool, num } from "./schema.js";
+import { foregroundScript, interpret, lintVmSpec, noVmFinding, parseStartCommand, probeScript, type Finding } from "./vmboot.js";
 import type { Clients } from "../clients/index.js";
 import { settle } from "../clients/index.js";
 import { report, section, json, type Section } from "../format.js";
 import { configured, credentialFaults, type Config } from "../config.js";
+import { obsPluginPrefix, telemetry, telemetryRoute } from "../telemetry.js";
 
 export interface Tool {
   name: string;
@@ -135,10 +137,23 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         "`host_sandboxes`: VMs on the host that no deployment owns (made through heyvm, the " +
         "cloud API or the desktop). They share the host's CPU and memory with every pool, so " +
         "a loaded host beside idle pools is usually explained there; their logs live under " +
-        "the app-obs deployment `_unmanaged`, filtered by `backend`.",
+        "the app-obs deployment `_unmanaged`, filtered by `backend`. Unconfined credentials " +
+        "only; a namespace-confined one uses namespace_telemetry.",
       schema: { window: z.string().optional().describe("app-obs window, e.g. '15m', '1h', '24h'") },
       handler: async (args) => {
         const window = (args.window as string) ?? "1h";
+        // The whole fleet is the operator's view. A confined caller must not
+        // be shown it on this server's app-obs token, so it is turned away
+        // before app-obs is asked anything.
+        const route = await telemetryRoute(clients, config);
+        if (route.via === "applb") {
+          return json({
+            error:
+              `this credential is confined to namespace ${JSON.stringify(route.namespace)}, ` +
+              "and fleet_overview is the whole fleet — use namespace_telemetry for that " +
+              "namespace's deployments",
+          });
+        }
         const r = await settle({
           fleet: clients.obs({ path: "/api/fleet", query: { window } }),
           platform: clients.obs({ path: "/api/platform-status" }),
@@ -164,18 +179,30 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
       schema: {
         id: z.string().describe("app-lb deployment id"),
         window: z.string().optional().describe("app-obs window, default '1h'"),
+        namespace: z
+          .string()
+          .optional()
+          .describe("read telemetry through this namespace's obs plugin; inferred from the credential when omitted"),
       },
       handler: async (args) => {
         const id = String(args.id);
         const window = (args.window as string) ?? "1h";
+        // Resolved once and shared by both telemetry reads. A failure to
+        // resolve is a section of the report, not the end of it: app-lb's
+        // record is still worth showing.
+        const route = telemetryRoute(clients, config, args.namespace as string | undefined);
         const r = await settle({
           deployment: clients.applb({ path: `/deployments/${encodeURIComponent(id)}` }),
           jobs: clients.applb({ path: `/deployments/${encodeURIComponent(id)}/jobs` }),
-          series: clients.obs({ path: `/api/deployments/${encodeURIComponent(id)}`, query: { window } }),
-          errors: clients.obs({
-            path: `/api/deployments/${encodeURIComponent(id)}/logs`,
-            query: { window, level: "error", limit: 50 },
-          }),
+          series: route.then((rt) =>
+            telemetry(clients, rt, { path: `/api/deployments/${encodeURIComponent(id)}`, query: { window } }),
+          ),
+          errors: route.then((rt) =>
+            telemetry(clients, rt, {
+              path: `/api/deployments/${encodeURIComponent(id)}/logs`,
+              query: { window, level: "error", limit: 50 },
+            }),
+          ),
         });
         return report(`Deployment ${id} over ${window}`, [
           section("app-lb record", r.deployment),
@@ -194,9 +221,9 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         "paging. Collected from the daemon's native tail of each sandbox's console and its " +
         "start_command's stdout/stderr, so no shipper inside the guest is required — and " +
         "including app-lb's own events for the deployment, which is where a VM that never " +
-        "booted says why, since a guest that panics has no console to tail. " +
-        "Needs APP_OBS_URL, and APP_OBS_API_TOKEN when app-obs sits behind an app-lb gate: " +
-        "without the token the gate answers 401 and no log line reaches this tool.",
+        "booted says why, since a guest that panics has no console to tail.\n\n" +
+        "A namespace-confined credential reads through that namespace's obs plugin on " +
+        "app-lb, which must be installed there; an unconfined one reads APP_OBS_URL.",
       schema: {
         id: z.string().describe("app-lb deployment id"),
         window: z.string().optional().describe("e.g. '15m'; ignored when from/to are given"),
@@ -207,39 +234,232 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         q: z.string().optional().describe("substring match on the message"),
         limit: num().optional().describe("default 100"),
         before: z.string().optional().describe("cursor from a previous page"),
+        namespace: z
+          .string()
+          .optional()
+          .describe("read through this namespace's obs plugin; inferred from the credential when omitted"),
       },
       handler: async (args) => {
         const id = String(args.id);
-        // app-obs knows nothing about namespaces: its partitions are deployment
-        // ids, and a token that reaches its API reaches all of them. The wall a
-        // caller is behind is app-lb's, so ask app-lb — with the caller's own
-        // credential, through whichever door this server is configured with —
-        // whether this deployment is theirs to see. A namespace-confined caller
-        // gets a 404 there, and gets one here.
-        try {
-          await clients.applb({ path: `/deployments/${encodeURIComponent(id)}` });
-        } catch (e) {
-          return json({
+        const route = await telemetryRoute(clients, config, args.namespace as string | undefined);
+        const notVisible = (e: unknown) =>
+          json({
             error:
               `no deployment ${JSON.stringify(id)} is visible to this credential, ` +
               "so its logs are not either",
             detail: e instanceof Error ? e.message : String(e),
           });
+        if (route.via === "obs") {
+          // The direct door reads every namespace on app-obs's own token, so
+          // the wall a caller is behind has to be checked against app-lb first
+          // — with the caller's own credential — before app-obs is asked.
+          // Through the plugin that check is app-lb's own, on every request.
+          try {
+            await clients.applb({ path: `/deployments/${encodeURIComponent(id)}` });
+          } catch (e) {
+            return notVisible(e);
+          }
         }
-        const out = await clients.obs({
-          path: `/api/deployments/${encodeURIComponent(id)}/logs`,
-          query: {
-            window: args.window as string | undefined,
-            from: args.from as string | undefined,
-            to: args.to as string | undefined,
-            level: args.level as string | undefined,
-            backend: args.backend as string | undefined,
-            q: args.q as string | undefined,
-            limit: (args.limit as number | undefined) ?? 100,
-            before: args.before as string | undefined,
-          },
+        const query = {
+          window: args.window as string | undefined,
+          from: args.from as string | undefined,
+          to: args.to as string | undefined,
+          level: args.level as string | undefined,
+          backend: args.backend as string | undefined,
+          q: args.q as string | undefined,
+          limit: (args.limit as number | undefined) ?? 100,
+          before: args.before as string | undefined,
+        };
+        try {
+          return json(
+            await telemetry(clients, route, {
+              path: `/api/deployments/${encodeURIComponent(id)}/logs`,
+              query,
+            }),
+          );
+        } catch (e) {
+          // Another namespace's deployment and one that does not exist are
+          // the same 404 behind the plugin, and are said the same way here.
+          if (route.via === "applb" && (e as { status?: number }).status === 404) return notVisible(e);
+          throw e;
+        }
+      },
+    },
+
+    {
+      name: "namespace_telemetry",
+      description:
+        "One namespace's telemetry: each deployment's requests, errors, latency, CPU and " +
+        "memory over a window, plus one deployment's series and recent errors when " +
+        "`deployment` is given. fleet_overview for a namespace-confined credential — call " +
+        "it first for 'how are my apps doing'. Read through app-lb's obs plugin with the " +
+        "caller's own credential; the plugin must be installed in the namespace, and " +
+        "nothing is collected before it is.",
+      schema: {
+        namespace: z
+          .string()
+          .optional()
+          .describe("namespace to read; inferred from the credential when it reaches exactly one"),
+        deployment: z.string().optional().describe("also show this deployment's series and recent errors"),
+        window: z.string().optional().describe("e.g. '15m', '1h', '24h'; default '1h'"),
+      },
+      handler: async (args) => {
+        const window = (args.window as string) ?? "1h";
+        const route = await telemetryRoute(clients, config, args.namespace as string | undefined);
+        if (route.via !== "applb") {
+          return json({
+            error:
+              "this credential is not confined to a namespace, so there is no namespace to " +
+              "infer — pass `namespace`, or use fleet_overview for the whole fleet",
+          });
+        }
+        const ns = route.namespace;
+        const dep = args.deployment ? String(args.deployment) : undefined;
+        const r = await settle({
+          plugins: clients.applb({ path: `/namespaces/${encodeURIComponent(ns)}/plugins` }),
+          fleet: telemetry(clients, route, { path: "/api/fleet", query: { window } }),
+          series: dep
+            ? telemetry(clients, route, { path: `/api/deployments/${encodeURIComponent(dep)}`, query: { window } })
+            : Promise.resolve(null),
+          errors: dep
+            ? telemetry(clients, route, {
+                path: `/api/deployments/${encodeURIComponent(dep)}/logs`,
+                query: { window, level: "error", limit: 20 },
+              })
+            : Promise.resolve(null),
         });
-        return json(out);
+        const sections: Section[] = [
+          section(`Deployments in ${ns} (app-obs via ${obsPluginPrefix(ns)}/api/fleet)`, r.fleet),
+          section(`Plugins installed in ${ns}`, r.plugins),
+        ];
+        if (dep) {
+          sections.push(section(`${dep}: series and summary`, r.series));
+          sections.push(section(`${dep}: most recent error logs`, r.errors));
+        }
+        return report(`Namespace ${ns} over ${window}`, sections);
+      },
+    },
+
+    {
+      name: "diagnose_vm_boot",
+      description:
+        "Why a VM deployment boots but never passes its health check (ready 0, boot " +
+        "timeouts). Lints start_command, reads the boot counters, then runs a read-only probe " +
+        "INSIDE a booting VM (waking one if needed): the start_command's captured output, any " +
+        "file it redirects to, processes, listening sockets, the health path, package.json. " +
+        "foreground: true also runs the start command for 15s to capture the crash. Names " +
+        "known causes with the fix (Node ESM/CommonJS mismatch, missing module, port in use, " +
+        "loopback bind, unwritable data path); fix the repo or spec, then redeploy.",
+      schema: {
+        id: z.string().describe("app-lb deployment id"),
+        foreground: bool()
+          .optional()
+          .describe("also run the start command in the foreground for 15s to capture its crash; default false"),
+        wake: bool().optional().describe("start a VM to probe if none is running; default true"),
+        sandbox_id: z.string().optional().describe("probe this VM of the pool"),
+      },
+      handler: async (args) => {
+        const id = String(args.id);
+        const path = `/deployments/${encodeURIComponent(id)}`;
+        const r = await settle({
+          deployment: clients.applb({ path }),
+          metrics: clients.applb({ path: "/metrics", query: { deployment: id, summary: "false" } }),
+        });
+        if (!r.deployment.ok) {
+          return report(`VM boot diagnosis for ${id}`, [section("app-lb record", r.deployment)]);
+        }
+        const record = r.deployment.value as Record<string, unknown>;
+        const spec = (record.spec ?? record) as Record<string, unknown>;
+        const vm = spec.vm as Record<string, unknown> | undefined;
+        if (!vm) {
+          return json({ error: `deployment ${JSON.stringify(id)} is not a VM deployment` });
+        }
+        const port = typeof vm.port === "number" ? vm.port : undefined;
+        const health = spec.health as { path?: string } | undefined;
+        const parts =
+          typeof vm.start_command === "string" ? parseStartCommand(vm.start_command) : undefined;
+
+        let pool: unknown = r.metrics.ok ? r.metrics.value : undefined;
+        if (r.metrics.ok) {
+          const deps = (r.metrics.value as { deployments?: Array<Record<string, unknown>> }).deployments ?? [];
+          const mine = deps.find((d) => d.id === id);
+          if (mine) {
+            pool = {
+              pool: mine.pool,
+              vms: mine.vms,
+              pending_vms: mine.pending_vms,
+              autoscale: (mine.metrics as Record<string, unknown> | undefined)?.autoscale,
+            };
+          }
+        }
+
+        const exec = (command: string, timeout_secs: number) =>
+          clients.applb({
+            method: "POST",
+            path: `${path}/exec`,
+            body: {
+              command,
+              timeout_secs,
+              wake: args.wake === undefined ? true : Boolean(args.wake),
+              ...(args.sandbox_id ? { sandbox_id: String(args.sandbox_id) } : {}),
+            },
+          });
+        const probe = await settle({
+          guest: exec(probeScript({ port, healthPath: health?.path, parts }), 25),
+        });
+        let fg: { ok: true; value: unknown } | { ok: false; error: string } | undefined;
+        if (args.foreground && parts?.foreground) {
+          const sandbox = probe.guest.ok
+            ? (probe.guest.value as { sandbox_id?: string }).sandbox_id
+            : undefined;
+          fg = (
+            await settle({
+              run: clients.applb({
+                method: "POST",
+                path: `${path}/exec`,
+                body: {
+                  command: foregroundScript(parts),
+                  timeout_secs: 25,
+                  wake: false,
+                  ...(sandbox ? { sandbox_id: sandbox } : {}),
+                },
+              }),
+            })
+          ).run;
+        }
+
+        const text = (x: typeof fg) =>
+          x && x.ok
+            ? ["output", "stdout", "stderr"]
+                .map((k) => (x.value as Record<string, unknown>)[k])
+                .filter((v): v is string => typeof v === "string")
+                .join("\n")
+            : "";
+        const findings: Finding[] = [
+          ...lintVmSpec(vm),
+          ...interpret(`${text(probe.guest)}\n${text(fg)}`, port),
+        ];
+        const noVm = probe.guest.ok ? undefined : noVmFinding(probe.guest.error);
+        if (noVm) findings.push(noVm);
+        const seen = new Set<string>();
+        const unique = findings.filter((f) => !seen.has(f.title) && seen.add(f.title));
+
+        const sections = [
+          {
+            title: unique.length ? "Findings — fix these" : "Findings",
+            body: unique.length
+              ? unique
+              : "No known signature matched. Read the guest output below; with foreground: false, " +
+                "try foreground: true to capture the crash itself.",
+          },
+          { title: "start_command", body: vm.start_command ?? null },
+          r.metrics.ok
+            ? { title: "Pool and boot counters (app-lb /metrics)", body: pool }
+            : section("Pool and boot counters (app-lb /metrics)", r.metrics),
+          section("Inside the guest (read-only probe)", probe.guest),
+        ];
+        if (fg) sections.push(section("Foreground run (15s)", fg));
+        return report(`VM boot diagnosis for ${id}`, sections);
       },
     },
 

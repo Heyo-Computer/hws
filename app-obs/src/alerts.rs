@@ -49,6 +49,11 @@ pub struct Alert {
     /// beyond logging: a missed webhook is recoverable from the next firing,
     /// while a retry storm against a slow receiver is not.
     pub webhook_url: String,
+    /// The namespace that created the rule through `/ns/{ns}/api/alerts`, or
+    /// `None` for the operator's. A namespace lists and deletes only its own.
+    /// Absent from rules stored before namespaces, which are the operator's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// Read the alert rules from `path`, or return an empty list when the file does
@@ -170,17 +175,14 @@ pub async fn checker(engine: Arc<Engine>, alerts: Arc<tokio::sync::RwLock<Vec<Al
         // A deployment whose query fails is left out of the map entirely, so a
         // query failure can never fire an alert against a phantom zero — absence
         // of evidence is not zero errors.
-        let mut deployments: Vec<String> = rules
-            .iter()
-            .map(|a| a.deployment.clone())
-            .collect();
+        let mut deployments: Vec<String> = rules.iter().map(|a| a.deployment.clone()).collect();
         deployments.sort();
         deployments.dedup();
         let mut errors_by_deployment: std::collections::HashMap<String, f64> =
             std::collections::HashMap::new();
         for deployment in &deployments {
             match engine
-                .metrics(window, CHECK_WINDOW_SECS as u32, Some(deployment))
+                .metrics(window, CHECK_WINDOW_SECS as u32, Some(deployment), None)
                 .await
             {
                 Ok(map) => {
@@ -284,10 +286,7 @@ mod tests {
     fn errors_in_window_sums_the_per_bucket_rate() {
         // 1 error/s for each of two 30s buckets = 60 errors over the minute,
         // regardless of how the bucket ladder split it.
-        let buckets = vec![
-            bucket(0, Some(1.0)),
-            bucket(30_000, Some(1.0)),
-        ];
+        let buckets = vec![bucket(0, Some(1.0)), bucket(30_000, Some(1.0))];
         assert_eq!(errors_in_window(&buckets, 30), 60.0);
     }
 
@@ -341,6 +340,7 @@ mod tests {
                 metric: AlertMetric::Errors,
                 threshold: 10.0,
                 webhook_url: "https://example.com/hook".into(),
+                namespace: None,
             },
             Alert {
                 id: "def456".into(),
@@ -348,6 +348,7 @@ mod tests {
                 metric: AlertMetric::Errors,
                 threshold: 0.0,
                 webhook_url: "https://example.com/other".into(),
+                namespace: Some("team-a".into()),
             },
         ];
         save(&path, &rules).unwrap();
