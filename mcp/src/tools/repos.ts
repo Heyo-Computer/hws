@@ -31,6 +31,7 @@ import { asChanges, decodeFiles, DEFAULT_EXCLUDE, fileSchema, readDirectory } fr
 import type { Tool } from "./diagnose.js";
 import { notVisible } from "./actions.js";
 import { num, bool } from "./schema.js";
+import { storeBuildCredential } from "./remote-auth.js";
 
 interface RepoInfo {
   name?: string;
@@ -120,7 +121,9 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           token: tok.token,
           token_expires_at: tok.expires_at ?? null,
           ...pushRecipe(String(repo.clone_url), tok.token, branch),
-          next: "repo_deploy once something is pushed; repo_write_files if git is not available.",
+          next:
+            "repo_deploy once something is pushed (or applb_deploy with this clone URL as " +
+            "`build.repo`); repo_write_files if git is not available.",
         });
       },
     },
@@ -221,7 +224,9 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
         return json({
           repo: `${ns}/${repo}`,
           ...(result as object),
-          next: "repo_deploy builds a site or vm from this repo.",
+          next:
+            "repo_deploy builds a site or vm from this repo. (With applb_deploy instead, put the " +
+            "clone URL in `build.repo`; the build credential is added for you.)",
         });
       },
     },
@@ -268,26 +273,17 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           ]);
         }
 
-        // A non-expiring read token, because app-lb uses it on every rebuild.
-        const secretId = `git-${id}`.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").slice(0, 64);
-        const tok = await mint(ns, repo, "read", 0, `applb-build-${id}`);
-        await clients.applb({
-          method: "POST",
-          path: "/secrets",
-          body: {
-            id: secretId,
-            namespace: ns,
-            description: `read token for ${ns}/${repo} on the Heyo git remote`,
-            data: { token: tok.token },
-          },
+        const cred = await storeBuildCredential(clients, { namespace: ns, repo }, id, ns);
+        sections.push({
+          title: "Build credential",
+          body: `read token ${cred.tokenId} stored as app-lb secret ${cred.secretId}`,
         });
-        sections.push({ title: "Build credential", body: `read token ${tok.id} stored as app-lb secret ${secretId}` });
 
         const build: Record<string, unknown> = {
           repo: info.clone_url,
           ...(a.ref ? { ref: a.ref } : info.default_branch ? { ref: info.default_branch } : {}),
           ...(a.context ? { context: a.context } : {}),
-          auth: { secret: secretId, key: "token", username: "x-access-token" },
+          auth: cred.auth,
         };
 
         // Edit in place when it exists, so routes, auth and scaling set by

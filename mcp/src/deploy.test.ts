@@ -282,3 +282,60 @@ test("the deploy prompt names the tools for the kind it was asked about", async 
     await close();
   }
 });
+
+test("a build.repo on the Heyo git remote gets a build credential; other repos do not", async () => {
+  const config = loadConfig({
+    APPLB_URL: "http://127.0.0.1:9090",
+    APPLB_TOKEN: "applb_x",
+    REMOTE_URL: "https://git.us5.example.com",
+  });
+  const deploy = buildTools(config).find((t) => t.name === "applb_deploy");
+  assert.ok(deploy);
+  for (const [repo, expectAuth] of [
+    ["https://git.us5.example.com/us5/newsfeed-app.git", true],
+    ["https://github.com/someone/public.git", false],
+  ] as const) {
+    const calls: Call[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      calls.push({ url, method, body });
+      const reply = (status: number, b: unknown) =>
+        new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/api/tokens")) return reply(201, { token: "hrm_1_s", id: "t1" });
+      if (method === "GET" && /\/deployments\/[^/]+$/.test(url)) return reply(404, { error: "not found" });
+      if (method === "POST" && /\/build$/.test(url)) return reply(202, { id: "job-1", status: "queued" });
+      return reply(200, { id: "newsfeed-app" });
+    }) as typeof fetch;
+    try {
+      const out = await deploy.handler({
+        spec: {
+          id: "newsfeed-app",
+          namespace: "us5",
+          routes: [{ host: "newsfeed.example.com" }],
+          vm: { driver: "firecracker", port: 8080 },
+          build: { repo, dockerfile: "Dockerfile" },
+        },
+        wait_seconds: 0,
+      });
+      const register = calls.find((c) => c.method === "POST" && c.url.endsWith("/deployments"));
+      const auth = (register?.body as { build?: { auth?: unknown } })?.build?.auth;
+      if (expectAuth) {
+        const mint = calls.find((c) => c.url.endsWith("/api/tokens"));
+        assert.deepEqual((mint?.body as { repos: string[] }).repos, ["newsfeed-app"]);
+        assert.equal((mint?.body as { namespace: string }).namespace, "us5");
+        const secret = calls.find((c) => c.url.endsWith("/secrets"));
+        assert.equal((secret?.body as { id: string }).id, "git-newsfeed-app");
+        assert.deepEqual(auth, { secret: "git-newsfeed-app", key: "token", username: "x-access-token" });
+        assert.match(out, /Build credential/);
+      } else {
+        assert.equal(auth, undefined);
+        assert.ok(!calls.some((c) => c.url.endsWith("/api/tokens")), "minted for a repo elsewhere");
+      }
+    } finally {
+      globalThis.fetch = original;
+    }
+  }
+});

@@ -73,7 +73,9 @@ export const SPEC_RULES: readonly SpecRule[] = [
     rule:
       "`build` takes exactly one source: `repo` (a git remote, with `dockerfile` and " +
       "`context` relative to the checkout) or `store` (an artifact store holding a " +
-      "Dockerfile manifest). `dockerfile` and `context` are meaningful only with `repo`.",
+      "Dockerfile manifest). `dockerfile` and `context` are meaningful only with `repo`. " +
+      "A repo on the Heyo git remote is private and needs `auth`; applb_deploy and " +
+      "repo_deploy add it for you. A namespace credential may only use https:// repos and stores.",
   },
   {
     blocks: ["WorkspaceSpec", "ScalingPolicy", "VmSpec"],
