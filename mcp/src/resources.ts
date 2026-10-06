@@ -49,7 +49,8 @@ const DEPLOY_GUIDE = `# Deploying with app-lb
 - **\`vm\`** — app-lb boots and autoscales microVMs from an image. Use this to run
   your own code without running a machine.
 - **\`upstreams\`** — \`host:port\` addresses you already run. app-lb proxies and
-  health-checks them; it does not start them.
+  health-checks them; it does not start them. With a namespace credential they
+  must be public addresses.
 - **\`site\`** — static files served from a directory on the app-lb host.
 
 Two backends is an error, and so is none.
@@ -84,7 +85,7 @@ than ignored:
 |---|---|---|
 | \`vm\` + \`build\` | rebuild the image | \`applb_build\` |
 | \`vm\` or \`site\` + \`artifact\` | roll onto new bytes | \`applb_pull\` |
-| \`upstreams\` or \`site\` + \`update\` | run commands on the app-lb host | \`applb_host_update\` |
+| \`upstreams\` or \`site\` + \`update\` | run commands on the app-lb host (operators only; a namespace credential is refused) | \`applb_host_update\` |
 | \`vm\` + \`mounts\` | re-fetch mounted trees | \`applb_pull_mounts\` |
 
 All four answer as soon as the work is *scheduled*. Poll \`applb_job\` with the id
