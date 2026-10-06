@@ -12,7 +12,7 @@ There is no root workspace, so you build and test each one with
 
 | Directory | What it is | Docs |
 | --- | --- | --- |
-| `app-lb/` | Pingora load balancer, autoscaler, and control plane for heyvm microVMs. A Cargo workspace whose member `heyctl/` is the CLI. `sdk/typescript/` is the TypeScript client; `examples/` holds deployment specs; `deploy/` holds the supervisor unit | [app-lb](app-lb.md), [heyctl](heyctl.md) |
+| `app-lb/` | Pingora load balancer, autoscaler, and control plane for heyvm microVMs. A Cargo workspace whose member `heyctl/` is the CLI. `sdk/typescript/` is the TypeScript client (`@heyocomputer/hws`); `examples/` holds deployment specs; `deploy/` holds the supervisor unit | [app-lb](app-lb.md), [heyctl](heyctl.md) |
 | `app-obs/` | Logs, metrics, retention, alerts, and query API fed by app-lb. Builds `app-obs` and `app-obs-dump` | [app-obs](app-obs.md) |
 | `artifacts/` | Content-addressed artifact store. Library plus the `art` CLI and `art serve` daemon | [artifacts](artifacts.md) |
 | `ci/` | heyvm-backed CI orchestrator with NATS JetStream as the job queue. `bin/git-submit` is the submit client; `migrations/` are compiled into the binary | [ci](ci.md) |

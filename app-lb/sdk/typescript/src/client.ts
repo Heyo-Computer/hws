@@ -5,9 +5,21 @@ import {
   TransportError,
   fromResponse,
 } from "./errors.js";
+import { ObsClient } from "./obs.js";
 import type {
   AdminScope,
+  AuthProviderView,
   CertStatus,
+  DiscoveryStatus,
+  DiskInventory,
+  NamespaceEntry,
+  NamespacePlugin,
+  PluginInstalls,
+  RolloutOperation,
+  UpstreamTrafficStatus,
+  WhoAmI,
+  WorkflowList,
+  WorkflowSpec,
   DeploymentSpec,
   DeploymentStatus,
   EvictOutcome,
@@ -259,6 +271,35 @@ export class Heyctl {
     return { view: await refused("/metrics"), crud: await refused("/deployments") };
   }
 
+  /**
+   * What the server makes of this client's credential: its tier, whether it is
+   * confined, and to which namespace. Needs no tier, so it answers even for a
+   * token every other route refuses.
+   */
+  whoami(signal?: AbortSignal): Promise<WhoAmI> {
+    return this.request("GET", "/whoami", { kind: "server", signal });
+  }
+
+  /**
+   * The status a `GET` answers with, treating a 4xx as an answer rather than an
+   * error, plus whatever the server said about it (`error — detail`).
+   */
+  async probe(path: string, signal?: AbortSignal): Promise<{ status: number; detail?: string }> {
+    const { status, text } = await this.send("GET", path, { signal });
+    let detail: string | undefined;
+    try {
+      const v = JSON.parse(text);
+      const field = (k: string) =>
+        typeof v?.[k] === "string" && v[k].trim() ? (v[k] as string).trim() : undefined;
+      const e = field("error");
+      const d = field("detail");
+      detail = e && d ? `${e} — ${d}` : (e ?? d);
+    } catch {
+      // Not JSON: no detail to report.
+    }
+    return { status, detail };
+  }
+
   // -- deployments ---------------------------------------------------------
 
   deployments(signal?: AbortSignal): Promise<DeploymentStatus[]> {
@@ -359,6 +400,84 @@ export class Heyctl {
     );
   }
 
+  /**
+   * Stop new requests to one static upstream. Existing requests finish; watch
+   * `in_flight` on the result to observe the drain.
+   */
+  cordonUpstream(
+    id: string,
+    upstream: string,
+    opts: { force?: boolean; reason?: string; signal?: AbortSignal } = {},
+  ): Promise<UpstreamTrafficStatus> {
+    const body: Record<string, unknown> = { force: opts.force ?? false };
+    if (opts.reason !== undefined) body.reason = opts.reason;
+    return this.request("PUT", `/deployments/${seg(id)}/upstreams/${seg(upstream)}/drain`, {
+      body,
+      kind: "upstream",
+      name: upstream,
+      signal: opts.signal,
+    });
+  }
+
+  /** Remove an administrative drain. An unhealthy upstream stays excluded until it recovers. */
+  uncordonUpstream(id: string, upstream: string, signal?: AbortSignal): Promise<UpstreamTrafficStatus> {
+    return this.request("DELETE", `/deployments/${seg(id)}/upstreams/${seg(upstream)}/drain`, {
+      kind: "upstream",
+      name: upstream,
+      signal,
+    });
+  }
+
+  /**
+   * Replace a managed deployment's spec by rolling a fresh pool beside the old
+   * one, verifying it, and only then draining the old one.
+   *
+   * `expectedRevision` is the deployment's `rollout_revision` as last read; the
+   * rollout is refused (409) if anything changed it since. `operationId` makes
+   * the call idempotent — retry a lost reply with the same id. Answers `202`;
+   * poll {@link rollout} until `status` is no longer `running`.
+   */
+  startRollout(
+    id: string,
+    req: { operationId: string; expectedRevision: string; spec: DeploymentSpec | Record<string, unknown> },
+    signal?: AbortSignal,
+  ): Promise<RolloutOperation> {
+    return this.request("POST", `/deployments/${seg(id)}/rollouts`, {
+      body: {
+        operation_id: req.operationId,
+        expected_revision: req.expectedRevision,
+        spec: req.spec,
+      },
+      kind: "deployment",
+      name: id,
+      signal,
+    });
+  }
+
+  rollout(id: string, operationId: string, signal?: AbortSignal): Promise<RolloutOperation> {
+    return this.request("GET", `/deployments/${seg(id)}/rollouts/${seg(operationId)}`, {
+      kind: "rollout",
+      name: operationId,
+      signal,
+    });
+  }
+
+  /**
+   * What this gateway publishes for the deployment to discovery. `staged` asks
+   * about the spec a pending change would publish instead of the live one.
+   */
+  discoveryStatus(
+    id: string,
+    opts: { staged?: boolean; signal?: AbortSignal } = {},
+  ): Promise<DiscoveryStatus> {
+    const q = opts.staged ? "?staged=true" : "";
+    return this.request("GET", `/deployments/${seg(id)}/discovery-status${q}`, {
+      kind: "deployment",
+      name: id,
+      signal: opts.signal,
+    });
+  }
+
   // -- running things inside a VM ------------------------------------------
 
   /**
@@ -399,6 +518,176 @@ export class Heyctl {
       timeoutMs: patienceMs,
       signal: opts.signal,
     });
+  }
+
+  // -- workflows ------------------------------------------------------------
+
+  /** Every CI workflow object. */
+  async workflows(signal?: AbortSignal): Promise<WorkflowSpec[]> {
+    const list = await this.request<WorkflowList>("GET", "/workflows", { kind: "workflow", signal });
+    return list?.workflows ?? [];
+  }
+
+  workflow(id: string, signal?: AbortSignal): Promise<WorkflowSpec> {
+    return this.request("GET", `/workflows/${seg(id)}`, { kind: "workflow", name: id, signal });
+  }
+
+  /** Create or replace. Sends the object as given, unknown fields included. */
+  createWorkflow(spec: WorkflowSpec | Record<string, unknown>, signal?: AbortSignal): Promise<WorkflowSpec> {
+    return this.request("POST", "/workflows", {
+      body: spec,
+      kind: "workflow",
+      name: String((spec as { id?: unknown }).id ?? ""),
+      signal,
+    });
+  }
+
+  replaceWorkflow(
+    id: string,
+    spec: WorkflowSpec | Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<WorkflowSpec> {
+    return this.request("PUT", `/workflows/${seg(id)}`, { body: spec, kind: "workflow", name: id, signal });
+  }
+
+  async deleteWorkflow(id: string, signal?: AbortSignal): Promise<void> {
+    await this.request<void>("DELETE", `/workflows/${seg(id)}`, {
+      kind: "workflow",
+      name: id,
+      signal,
+      expect: "nothing",
+    });
+  }
+
+  // -- auth providers -------------------------------------------------------
+
+  /**
+   * The declared auth providers this credential can see, or those of one
+   * namespace. Narrows itself server-side rather than refusing.
+   */
+  authProviders(namespace?: string, signal?: AbortSignal): Promise<AuthProviderView[]> {
+    return this.request("GET", `/auth-providers${nsQuery(namespace)}`, { kind: "auth provider", signal });
+  }
+
+  /** One provider. Unique within its namespace, so both halves are required. */
+  authProvider(namespace: string, name: string, signal?: AbortSignal): Promise<AuthProviderView> {
+    return this.request("GET", `/auth-providers/${seg(namespace)}/${seg(name)}`, {
+      kind: "auth provider",
+      name,
+      signal,
+    });
+  }
+
+  async authProviderExists(namespace: string, name: string): Promise<boolean> {
+    try {
+      await this.authProvider(namespace, name);
+      return true;
+    } catch (e) {
+      if (e instanceof HeyctlError && e.status === 404) return false;
+      throw e;
+    }
+  }
+
+  /**
+   * Declare or replace a provider (upserts, keeping `created_at`). The body may
+   * carry request-only `preset`/`secret` conveniences the server expands.
+   */
+  createAuthProvider(spec: Record<string, unknown>, signal?: AbortSignal): Promise<AuthProviderView> {
+    return this.request("POST", "/auth-providers", {
+      body: spec,
+      kind: "auth provider",
+      name: String(spec.name ?? ""),
+      signal,
+    });
+  }
+
+  /** Refused (409) while a deployment's gate still inherits it. */
+  async deleteAuthProvider(namespace: string, name: string, signal?: AbortSignal): Promise<void> {
+    await this.request<void>("DELETE", `/auth-providers/${seg(namespace)}/${seg(name)}`, {
+      kind: "auth provider",
+      name,
+      signal,
+      expect: "nothing",
+    });
+  }
+
+  // -- namespaces -----------------------------------------------------------
+
+  /** The namespaces this credential can see, narrowed server-side. */
+  namespaces(signal?: AbortSignal): Promise<NamespaceEntry[]> {
+    return this.request("GET", "/namespaces", { kind: "namespace", signal });
+  }
+
+  /** Declare a namespace. Idempotent; fleet scope and `admin` server-side. */
+  createNamespace(
+    spec: { name: string; description?: string; [extra: string]: unknown },
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.request("POST", "/namespaces", { body: spec, kind: "namespace", name: spec.name, signal });
+  }
+
+  /** Undeclare a namespace. Refused while deployments are still in it. */
+  async deleteNamespace(name: string, signal?: AbortSignal): Promise<void> {
+    await this.request<void>("DELETE", `/namespaces/${seg(name)}`, {
+      kind: "namespace",
+      name,
+      signal,
+      expect: "nothing",
+    });
+  }
+
+  // -- namespace plugins and telemetry --------------------------------------
+
+  /**
+   * The plugins that install per namespace, and whether each is switched on for
+   * the fleet (`enabled`) and installed here (`installed`).
+   */
+  namespacePlugins(namespace: string, signal?: AbortSignal): Promise<NamespacePlugin[]> {
+    return this.request("GET", `/namespaces/${seg(namespace)}/plugins`, {
+      kind: "namespace",
+      name: namespace,
+      signal,
+    });
+  }
+
+  /**
+   * Install a plugin into a namespace, or replace its per-namespace config.
+   * Idempotent. Needs `admin` over the whole namespace; a `ConflictError` with
+   * `code: "plugin_disabled"` while the operator has it off for the fleet.
+   */
+  installPlugin(
+    namespace: string,
+    id: string,
+    config?: unknown,
+    signal?: AbortSignal,
+  ): Promise<NamespacePlugin> {
+    const body: Record<string, unknown> = {};
+    if (config !== undefined) body.config = config;
+    return this.request("PUT", `/namespaces/${seg(namespace)}/plugins/${seg(id)}`, {
+      body,
+      kind: "plugin",
+      name: id,
+      signal,
+    });
+  }
+
+  /** Uninstall. For `obs` this stops collection; what was collected ages out. */
+  uninstallPlugin(namespace: string, id: string, signal?: AbortSignal): Promise<NamespacePlugin> {
+    return this.request("DELETE", `/namespaces/${seg(namespace)}/plugins/${seg(id)}`, {
+      kind: "plugin",
+      name: id,
+      signal,
+    });
+  }
+
+  /** Every namespace a plugin is installed in. Fleet scope only. */
+  pluginInstalls(id: string, signal?: AbortSignal): Promise<PluginInstalls> {
+    return this.request("GET", `/api/plugins/${seg(id)}/installs`, { kind: "plugin", name: id, signal });
+  }
+
+  /** One namespace's telemetry through the `obs` plugin. Makes no request. */
+  obs(namespace: string): ObsClient {
+    return new ObsClient(this, namespace);
   }
 
   // -- secrets --------------------------------------------------------------
@@ -584,6 +873,15 @@ export class Heyctl {
     });
   }
 
+  /** A namespace's feed as the RSS document a reader would fetch, verbatim. */
+  async feedRss(namespace: string, signal?: AbortSignal): Promise<string> {
+    const { status, text } = await this.send("GET", `/feeds/${seg(namespace)}`, { signal });
+    if (status < 200 || status >= 300) {
+      throw fromResponse(status, text, "feed", namespace, this.credential());
+    }
+    return text;
+  }
+
   // -- jobs -----------------------------------------------------------------
 
   startBuild(id: string, ref?: string, signal?: AbortSignal): Promise<JobRecord> {
@@ -603,6 +901,19 @@ export class Heyctl {
     if (ref) body.ref = ref;
     return this.request("POST", `/deployments/${seg(id)}/pull`, {
       body,
+      kind: "deployment",
+      name: id,
+      signal,
+    });
+  }
+
+  /**
+   * Unpack a managed deployment's guest mounts and roll the pool onto them.
+   * One job covers every mount, so there is no `ref` override.
+   */
+  startMountPull(id: string, force = false, signal?: AbortSignal): Promise<JobRecord> {
+    return this.request("POST", `/deployments/${seg(id)}/mounts/pull`, {
+      body: { force },
       kind: "deployment",
       name: id,
       signal,
@@ -682,6 +993,14 @@ export class Heyctl {
 
   certs(signal?: AbortSignal): Promise<CertStatus[]> {
     return this.request("GET", "/certs", { kind: "certificate", signal });
+  }
+
+  /**
+   * The host's disk inventory. Check `complete` before acting on it: an
+   * incomplete inventory classified nothing.
+   */
+  disks(signal?: AbortSignal): Promise<DiskInventory> {
+    return this.request("GET", "/disks", { kind: "disk", signal });
   }
 
   /**

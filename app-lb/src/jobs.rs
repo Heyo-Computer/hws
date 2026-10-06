@@ -664,6 +664,15 @@ impl Jobs {
             .collect()
     }
 
+    /// Put a finished record into the history, for handler tests.
+    #[cfg(test)]
+    pub(crate) fn remember_for_test(&self, record: JobRecord) {
+        self.history
+            .lock()
+            .expect("job history mutex poisoned")
+            .push_back(record);
+    }
+
     pub fn record(&self, job_id: &str) -> Option<JobRecord> {
         self.history
             .lock()

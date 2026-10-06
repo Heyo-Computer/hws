@@ -19,6 +19,12 @@ export type Credential = "none" | "basic" | "token";
 export class HeyctlError extends Error {
   /** The HTTP status behind this, when there was one. */
   readonly status?: number;
+  /**
+   * The machine-readable reason app-lb put beside `error`, when it gave one —
+   * e.g. `plugin_not_installed` or `plugin_disabled` on a namespace plugin's
+   * 409. Branch on this rather than on the message.
+   */
+  code?: string;
 
   constructor(message: string, status?: number) {
     super(message);
@@ -187,10 +193,14 @@ export function fromResponse(
   // The envelope if there is one; otherwise the body verbatim, which is where
   // the plain-text rejections live.
   let message: string | undefined;
+  let code: string | undefined;
   try {
     const parsed = JSON.parse(body);
     if (parsed && typeof parsed.error === "string" && parsed.error.trim()) {
       message = parsed.error;
+    }
+    if (parsed && typeof parsed.code === "string" && parsed.code) {
+      code = parsed.code;
     }
   } catch {
     // Not JSON. Normal — see the module comment.
@@ -200,6 +210,19 @@ export function fromResponse(
     const trimmed = body.trim();
     message = trimmed || undefined;
   }
+  const err = classify(status, message, hadEnvelope, kind, name, presented);
+  if (code !== undefined) err.code = code;
+  return err;
+}
+
+function classify(
+  status: number,
+  message: string | undefined,
+  hadEnvelope: boolean,
+  kind: string,
+  name: string,
+  presented: Credential,
+): HeyctlError {
 
   switch (status) {
     case 401:
