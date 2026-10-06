@@ -10,7 +10,7 @@
 
 import { z } from "zod";
 import { bool, num } from "./schema.js";
-import { foregroundScript, interpret, lintVmSpec, parseStartCommand, probeScript, type Finding } from "./vmboot.js";
+import { foregroundScript, interpret, lintVmSpec, noVmFinding, parseStartCommand, probeScript, type Finding } from "./vmboot.js";
 import type { Clients } from "../clients/index.js";
 import { settle } from "../clients/index.js";
 import { report, section, json, type Section } from "../format.js";
@@ -439,6 +439,8 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
           ...lintVmSpec(vm),
           ...interpret(`${text(probe.guest)}\n${text(fg)}`, port),
         ];
+        const noVm = probe.guest.ok ? undefined : noVmFinding(probe.guest.error);
+        if (noVm) findings.push(noVm);
         const seen = new Set<string>();
         const unique = findings.filter((f) => !seen.has(f.title) && seen.add(f.title));
 

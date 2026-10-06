@@ -112,7 +112,9 @@ export function probeScript(opts: { port?: number; healthPath?: string; parts?: 
   }
   lines.push(
     "echo '== processes'",
-    "ps -eo pid,args 2>/dev/null || ps 2>&1",
+    // Kernel threads print as `[name]`; a bracket expression rather than a
+    // backslash, which the exec channel strips.
+    "ps -eo pid,args 2>/dev/null | grep -v ' [[]' || ps 2>&1",
     "echo '== listening sockets'",
     "ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || cat /proc/net/tcp /proc/net/tcp6 2>&1",
   );
@@ -121,7 +123,7 @@ export function probeScript(opts: { port?: number; healthPath?: string; parts?: 
     const url = `http://127.0.0.1:${opts.port}${path}`;
     lines.push(
       `echo '== GET ${url}'`,
-      `curl -sS -m 3 -o /dev/null -w 'HTTP %{http_code}' '${url}' 2>&1 || wget -q -T 3 -S -O /dev/null '${url}' 2>&1 || echo 'no curl or wget in the image'`,
+      `curl -sS -m 3 -o /dev/null -w 'HTTP %{http_code}' '${url}' 2>&1 || wget -q -T 3 -S -O /dev/null '${url}' 2>&1 || echo '(no answer from curl or wget)'`,
       "echo",
     );
   }
@@ -141,6 +143,20 @@ export function probeScript(opts: { port?: number; healthPath?: string; parts?: 
 export function foregroundScript(parts: StartCommandParts, secs = 15): string {
   const quoted = parts.foreground.replace(/'/g, `'"'"'`);
   return `echo '== ${quoted.length > 200 ? "start_command" : quoted} (foreground, ${secs}s)'; timeout ${secs} sh -c '${quoted}' 2>&1; echo "exit=$?"`;
+}
+
+/** What an exec refusal means for a pool that cannot hold a VM. */
+export function noVmFinding(error: string): Finding | undefined {
+  if (!/has no VM|no running VM|none became available/.test(error)) return undefined;
+  return {
+    severity: "warning",
+    title: "No VM to probe right now",
+    detail:
+      "A pool whose VMs keep failing their health check backs off creating new ones (up to " +
+      "~16 minutes) so it does not churn. Call this again after the backoff, or redeploy " +
+      "(repo_deploy / applb_deploy), which starts a fresh VM at once. The spec lint above " +
+      "still applies.",
+  };
 }
 
 /** Known failure signatures in guest output, turned into what to change. */
@@ -187,6 +203,15 @@ export function interpret(output: string, port?: number): Finding[] {
       severity: "error",
       title: "The app cannot write where it expects to",
       detail: "Create the data directory in the Dockerfile, or point the app at a writable path.",
+    });
+  }
+  if (port && has(/Connection refused|can't connect to remote host|Failed to connect/)) {
+    out.push({
+      severity: "error",
+      title: `Nothing is listening on :${port}`,
+      detail:
+        "The app is not running in the guest — it crashed on start or never started. Its own " +
+        "output (above, or with foreground: true) says why.",
     });
   }
   if (port && (has(new RegExp(`127\\.0\\.0\\.1:${port}\\b`)) || has(new RegExp(`localhost:${port}\\b`)))

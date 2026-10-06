@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 
 import { loadConfig } from "./config.js";
 import { buildTools } from "./server.js";
-import { interpret, lintVmSpec, parseStartCommand, probeScript, foregroundScript } from "./tools/vmboot.js";
+import { interpret, lintVmSpec, noVmFinding, parseStartCommand, probeScript, foregroundScript } from "./tools/vmboot.js";
 
 const FARM =
   "cd /app && export NODE_ENV=production && export PORT=3001 && export HOST=0.0.0.0 && " +
@@ -71,6 +71,14 @@ test("known crash signatures turn into fixes", () => {
   assert.ok(loop.some((f) => f.title === "Listening on loopback only"));
   assert.ok(!interpret("LISTEN 0 511 0.0.0.0:3001 0.0.0.0:*", 3001).some((f) => /loopback/.test(f.title)));
   assert.deepEqual(interpret("all quiet"), []);
+  // What the probe printed in the real farm-backend guest on us5.
+  const refused = interpret("wget: can't connect to remote host (127.0.0.1): Connection refused", 3001);
+  assert.ok(refused.some((f) => f.title === "Nothing is listening on :3001"));
+  assert.match(
+    noVmFinding('deployment "farm-backend" has no VM and none became available within cold_start_timeout_secs')?.title ?? "",
+    /No VM to probe/,
+  );
+  assert.equal(noVmFinding("connection reset"), undefined);
 });
 
 test("diagnose_vm_boot probes a booting VM and names the farm-backend crash", async () => {
