@@ -39,7 +39,7 @@ const fleetOnly = (): Tool[] => buildTools(loadConfig({ APPLB_URL: "http://127.0
  * after the *question* it answers rather than the service it happens to hit.
  */
 const PREFIXES = ["applb_", "sandbox_", "art_", "repo_", "ci_", "obs_", "heyo_", "diagnose_"];
-const UNPREFIXED = ["fleet_overview", "deployment_logs"];
+const UNPREFIXED = ["fleet_overview", "deployment_logs", "namespace_telemetry"];
 
 test("every listed tool is well formed", () => {
   const listing = toolListing(everything());
@@ -118,7 +118,14 @@ test("a tool that advertises its own schema still agrees with the one that valid
 });
 
 test("the listing stays within its size budget", () => {
-  // Measured 2026-10-06: 65,628 bytes across 77 tools, down from 76,926.
+  // Measured 2026-10-06 (later): 67,096 bytes across 78 tools, up from 65,628.
+  //
+  // The +1,468 is `namespace_telemetry` (~1 KB), the telemetry read for a
+  // namespace-confined credential through app-lb's obs plugin, and a
+  // `namespace` argument on the three tools that read app-obs
+  // (deployment_logs, diagnose_deployment, obs_request).
+  //
+  // Earlier, 2026-10-06: 65,628 bytes across 77 tools, down from 76,926.
   //
   // applb_deploy stopped embedding the nested spec tree (~11 KB): it now
   // advertises each top-level field with its first sentence, and
@@ -150,7 +157,7 @@ test("the listing stays within its size budget", () => {
   // NOT enough to bring the nested spec tree back: applb_deploy advertises
   // top-level fields only (measured 65,628 bytes after that cut, from 76,926),
   // and applb_spec_schema serves any block on demand.
-  const BUDGET = 67_000;
+  const BUDGET = 68_000;
   const bytes = JSON.stringify(toolListing(everything())).length;
   assert.ok(
     bytes <= BUDGET,

@@ -116,8 +116,19 @@ test("the create-a-repo-and-deploy-it workflow fits a client that keeps only 40 
 
 test("a hosted server lists no tools for services it cannot reach; stdio keeps them", () => {
   const hosted = buildTools(loadConfig(HOSTED_US5)).map((t) => t.name);
-  for (const n of ["ci_run_status", "ci_request", "diagnose_ci_job", "obs_request", "deployment_logs"]) {
-    assert.ok(!hosted.includes(n), `${n} listed with no ${n.includes("obs") || n === "deployment_logs" ? "app-obs" : "ci"}`);
+  for (const n of ["ci_run_status", "ci_request", "diagnose_ci_job"]) {
+    assert.ok(!hosted.includes(n), `${n} listed with no ci`);
+  }
+  // app-obs is reachable through app-lb's per-namespace obs plugin, so the
+  // telemetry tools stay listed wherever app-lb is — with or without APP_OBS_URL.
+  for (const n of ["obs_request", "deployment_logs", "namespace_telemetry"]) {
+    assert.ok(hosted.includes(n), `${n} dropped although app-lb can reach app-obs`);
+  }
+  const nothing = buildTools(loadConfig({ REMOTE_URL: "https://git.example", HEYO_MCP_HTTP_PORT: "9650" })).map(
+    (t) => t.name,
+  );
+  for (const n of ["obs_request", "deployment_logs", "namespace_telemetry"]) {
+    assert.ok(!nothing.includes(n), `${n} listed with neither app-obs nor app-lb`);
   }
   assert.ok(hosted.includes("repo_create") && hosted.includes("applb_deploy"));
 

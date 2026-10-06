@@ -14,6 +14,7 @@ import type { Clients } from "../clients/index.js";
 import { settle } from "../clients/index.js";
 import { report, section, json, type Section } from "../format.js";
 import { configured, credentialFaults, type Config } from "../config.js";
+import { obsPluginPrefix, telemetry, telemetryRoute } from "../telemetry.js";
 
 export interface Tool {
   name: string;
@@ -135,10 +136,23 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         "`host_sandboxes`: VMs on the host that no deployment owns (made through heyvm, the " +
         "cloud API or the desktop). They share the host's CPU and memory with every pool, so " +
         "a loaded host beside idle pools is usually explained there; their logs live under " +
-        "the app-obs deployment `_unmanaged`, filtered by `backend`.",
+        "the app-obs deployment `_unmanaged`, filtered by `backend`. Unconfined credentials " +
+        "only; a namespace-confined one uses namespace_telemetry.",
       schema: { window: z.string().optional().describe("app-obs window, e.g. '15m', '1h', '24h'") },
       handler: async (args) => {
         const window = (args.window as string) ?? "1h";
+        // The whole fleet is the operator's view. A confined caller must not
+        // be shown it on this server's app-obs token, so it is turned away
+        // before app-obs is asked anything.
+        const route = await telemetryRoute(clients, config);
+        if (route.via === "applb") {
+          return json({
+            error:
+              `this credential is confined to namespace ${JSON.stringify(route.namespace)}, ` +
+              "and fleet_overview is the whole fleet — use namespace_telemetry for that " +
+              "namespace's deployments",
+          });
+        }
         const r = await settle({
           fleet: clients.obs({ path: "/api/fleet", query: { window } }),
           platform: clients.obs({ path: "/api/platform-status" }),
@@ -164,18 +178,30 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
       schema: {
         id: z.string().describe("app-lb deployment id"),
         window: z.string().optional().describe("app-obs window, default '1h'"),
+        namespace: z
+          .string()
+          .optional()
+          .describe("read telemetry through this namespace's obs plugin; inferred from the credential when omitted"),
       },
       handler: async (args) => {
         const id = String(args.id);
         const window = (args.window as string) ?? "1h";
+        // Resolved once and shared by both telemetry reads. A failure to
+        // resolve is a section of the report, not the end of it: app-lb's
+        // record is still worth showing.
+        const route = telemetryRoute(clients, config, args.namespace as string | undefined);
         const r = await settle({
           deployment: clients.applb({ path: `/deployments/${encodeURIComponent(id)}` }),
           jobs: clients.applb({ path: `/deployments/${encodeURIComponent(id)}/jobs` }),
-          series: clients.obs({ path: `/api/deployments/${encodeURIComponent(id)}`, query: { window } }),
-          errors: clients.obs({
-            path: `/api/deployments/${encodeURIComponent(id)}/logs`,
-            query: { window, level: "error", limit: 50 },
-          }),
+          series: route.then((rt) =>
+            telemetry(clients, rt, { path: `/api/deployments/${encodeURIComponent(id)}`, query: { window } }),
+          ),
+          errors: route.then((rt) =>
+            telemetry(clients, rt, {
+              path: `/api/deployments/${encodeURIComponent(id)}/logs`,
+              query: { window, level: "error", limit: 50 },
+            }),
+          ),
         });
         return report(`Deployment ${id} over ${window}`, [
           section("app-lb record", r.deployment),
@@ -194,9 +220,9 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         "paging. Collected from the daemon's native tail of each sandbox's console and its " +
         "start_command's stdout/stderr, so no shipper inside the guest is required — and " +
         "including app-lb's own events for the deployment, which is where a VM that never " +
-        "booted says why, since a guest that panics has no console to tail. " +
-        "Needs APP_OBS_URL, and APP_OBS_API_TOKEN when app-obs sits behind an app-lb gate: " +
-        "without the token the gate answers 401 and no log line reaches this tool.",
+        "booted says why, since a guest that panics has no console to tail.\n\n" +
+        "A namespace-confined credential reads through that namespace's obs plugin on " +
+        "app-lb, which must be installed there; an unconfined one reads APP_OBS_URL.",
       schema: {
         id: z.string().describe("app-lb deployment id"),
         window: z.string().optional().describe("e.g. '15m'; ignored when from/to are given"),
@@ -207,39 +233,109 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         q: z.string().optional().describe("substring match on the message"),
         limit: num().optional().describe("default 100"),
         before: z.string().optional().describe("cursor from a previous page"),
+        namespace: z
+          .string()
+          .optional()
+          .describe("read through this namespace's obs plugin; inferred from the credential when omitted"),
       },
       handler: async (args) => {
         const id = String(args.id);
-        // app-obs knows nothing about namespaces: its partitions are deployment
-        // ids, and a token that reaches its API reaches all of them. The wall a
-        // caller is behind is app-lb's, so ask app-lb — with the caller's own
-        // credential, through whichever door this server is configured with —
-        // whether this deployment is theirs to see. A namespace-confined caller
-        // gets a 404 there, and gets one here.
-        try {
-          await clients.applb({ path: `/deployments/${encodeURIComponent(id)}` });
-        } catch (e) {
-          return json({
+        const route = await telemetryRoute(clients, config, args.namespace as string | undefined);
+        const notVisible = (e: unknown) =>
+          json({
             error:
               `no deployment ${JSON.stringify(id)} is visible to this credential, ` +
               "so its logs are not either",
             detail: e instanceof Error ? e.message : String(e),
           });
+        if (route.via === "obs") {
+          // The direct door reads every namespace on app-obs's own token, so
+          // the wall a caller is behind has to be checked against app-lb first
+          // — with the caller's own credential — before app-obs is asked.
+          // Through the plugin that check is app-lb's own, on every request.
+          try {
+            await clients.applb({ path: `/deployments/${encodeURIComponent(id)}` });
+          } catch (e) {
+            return notVisible(e);
+          }
         }
-        const out = await clients.obs({
-          path: `/api/deployments/${encodeURIComponent(id)}/logs`,
-          query: {
-            window: args.window as string | undefined,
-            from: args.from as string | undefined,
-            to: args.to as string | undefined,
-            level: args.level as string | undefined,
-            backend: args.backend as string | undefined,
-            q: args.q as string | undefined,
-            limit: (args.limit as number | undefined) ?? 100,
-            before: args.before as string | undefined,
-          },
+        const query = {
+          window: args.window as string | undefined,
+          from: args.from as string | undefined,
+          to: args.to as string | undefined,
+          level: args.level as string | undefined,
+          backend: args.backend as string | undefined,
+          q: args.q as string | undefined,
+          limit: (args.limit as number | undefined) ?? 100,
+          before: args.before as string | undefined,
+        };
+        try {
+          return json(
+            await telemetry(clients, route, {
+              path: `/api/deployments/${encodeURIComponent(id)}/logs`,
+              query,
+            }),
+          );
+        } catch (e) {
+          // Another namespace's deployment and one that does not exist are
+          // the same 404 behind the plugin, and are said the same way here.
+          if (route.via === "applb" && (e as { status?: number }).status === 404) return notVisible(e);
+          throw e;
+        }
+      },
+    },
+
+    {
+      name: "namespace_telemetry",
+      description:
+        "One namespace's telemetry: each deployment's requests, errors, latency, CPU and " +
+        "memory over a window, plus one deployment's series and recent errors when " +
+        "`deployment` is given. fleet_overview for a namespace-confined credential — call " +
+        "it first for 'how are my apps doing'. Read through app-lb's obs plugin with the " +
+        "caller's own credential; the plugin must be installed in the namespace, and " +
+        "nothing is collected before it is.",
+      schema: {
+        namespace: z
+          .string()
+          .optional()
+          .describe("namespace to read; inferred from the credential when it reaches exactly one"),
+        deployment: z.string().optional().describe("also show this deployment's series and recent errors"),
+        window: z.string().optional().describe("e.g. '15m', '1h', '24h'; default '1h'"),
+      },
+      handler: async (args) => {
+        const window = (args.window as string) ?? "1h";
+        const route = await telemetryRoute(clients, config, args.namespace as string | undefined);
+        if (route.via !== "applb") {
+          return json({
+            error:
+              "this credential is not confined to a namespace, so there is no namespace to " +
+              "infer — pass `namespace`, or use fleet_overview for the whole fleet",
+          });
+        }
+        const ns = route.namespace;
+        const dep = args.deployment ? String(args.deployment) : undefined;
+        const r = await settle({
+          plugins: clients.applb({ path: `/namespaces/${encodeURIComponent(ns)}/plugins` }),
+          fleet: telemetry(clients, route, { path: "/api/fleet", query: { window } }),
+          series: dep
+            ? telemetry(clients, route, { path: `/api/deployments/${encodeURIComponent(dep)}`, query: { window } })
+            : Promise.resolve(null),
+          errors: dep
+            ? telemetry(clients, route, {
+                path: `/api/deployments/${encodeURIComponent(dep)}/logs`,
+                query: { window, level: "error", limit: 20 },
+              })
+            : Promise.resolve(null),
         });
-        return json(out);
+        const sections: Section[] = [
+          section(`Deployments in ${ns} (app-obs via ${obsPluginPrefix(ns)}/api/fleet)`, r.fleet),
+          section(`Plugins installed in ${ns}`, r.plugins),
+        ];
+        if (dep) {
+          sections.push(section(`${dep}: series and summary`, r.series));
+          sections.push(section(`${dep}: most recent error logs`, r.errors));
+        }
+        return report(`Namespace ${ns} over ${window}`, sections);
       },
     },
 

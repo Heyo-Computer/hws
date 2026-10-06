@@ -14,6 +14,7 @@
  */
 
 import { z } from "zod";
+import { telemetry, telemetryRoute } from "../telemetry.js";
 import { bool, num , DESTRUCTIVE_PREFIX } from "./schema.js";
 import type { Clients } from "../clients/index.js";
 import { json, report, type Section } from "../format.js";
@@ -1022,16 +1023,33 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         path: z.string().describe("path beginning with '/'"),
         query: z.record(z.string()).optional(),
         body: z.unknown().optional(),
+        // app-obs only. Its own token reads every namespace, so a confined
+        // caller is routed through app-lb's obs plugin for its namespace
+        // instead (`telemetry.ts`), with `path` being app-obs's API path
+        // either way.
+        ...(key === "obs"
+          ? {
+              namespace: z
+                .string()
+                .optional()
+                .describe(
+                  "go through this namespace's obs plugin on app-lb (path is then e.g. " +
+                    "'/api/fleet'); inferred from a confined credential when omitted",
+                ),
+            }
+          : {}),
       },
-      handler: async (a: Record<string, unknown>) =>
-        json(
-          await clients[key]({
-            method: a.method as string,
-            path: String(a.path),
-            query: a.query as Record<string, string> | undefined,
-            body: a.body,
-          }),
-        ),
+      handler: async (a: Record<string, unknown>) => {
+        const opts = {
+          method: a.method as string,
+          path: String(a.path),
+          query: a.query as Record<string, string> | undefined,
+          body: a.body,
+        };
+        if (key !== "obs") return json(await clients[key](opts));
+        const route = await telemetryRoute(clients, config, a.namespace as string | undefined);
+        return json(await telemetry(clients, route, opts));
+      },
     })),
   ];
 }

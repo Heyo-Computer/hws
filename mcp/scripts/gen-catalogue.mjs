@@ -74,7 +74,7 @@ const GROUPS = [
     blurb: "Cross-service, shaped like the question rather than the endpoint.",
     match: (n) =>
       n.startsWith("diagnose_") ||
-      ["heyo_status", "heyo_whoami", "fleet_overview", "deployment_logs"].includes(n),
+      ["heyo_status", "heyo_whoami", "fleet_overview", "namespace_telemetry", "deployment_logs"].includes(n),
   },
   {
     title: "Deploying",

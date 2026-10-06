@@ -107,7 +107,7 @@ export const GUIDES: readonly Guide[] = [
     keywords: ["status", "check", "health", "healthy", "working", "logs", "debug", "broken", "down", "verify"],
     steps: [
       "heyo_status — which services this server reaches, and any faults.",
-      "diagnose_deployment {id} — the app-lb record, recent jobs and (when app-obs is configured) logs, in one call.",
+      "diagnose_deployment {id} — the app-lb record, recent jobs and (when the obs plugin is installed in the namespace, or app-obs is configured) logs, in one call.",
       "applb_deployment_jobs {id} — every build/pull with its outcome; applb_job {job_id, deployment} for one.",
       "applb_metrics — whether replicas are healthy and taking traffic.",
     ],

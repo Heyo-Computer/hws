@@ -39,6 +39,22 @@ const listing = () => toolListing(buildTools(loadConfig(CONFIG)));
 const OFFLINE = new Set(["applb_spec_schema", "heyo_guide"]);
 
 /**
+ * Read-only tools that refuse CONFIG's credential before sending anything.
+ * `fleet_overview` is the whole fleet and CONFIG is the managed door, which is
+ * confined to `team-a` by construction — so it is turned away locally. It is
+ * driven under an unconfined credential below instead, so it is still checked.
+ */
+const REFUSED_HERE = new Set(["fleet_overview"]);
+
+/** An unconfined, self-hosted operator: app-lb's own listener and app-obs. */
+const OPERATOR = {
+  APPLB_URL: "http://127.0.0.1:9090",
+  APPLB_BASIC: "admin:pw",
+  APP_OBS_URL: "http://127.0.0.1:9600",
+  APP_OBS_API_TOKEN: "t",
+};
+
+/**
  * Arguments plausible enough for each read-only tool to reach the network.
  *
  * A tool that fails on missing arguments never issues a request, and would pass
@@ -53,6 +69,7 @@ const ARGS: Record<string, Record<string, unknown>> = {
   diagnose_empty_pool: { id: "web" },
   diagnose_ci_job: { run_id: "r1" },
   deployment_logs: { id: "web" },
+  namespace_telemetry: { deployment: "web" },
   ci_run_status: { run_id: "r1" },
   ci_run_logs: { run_id: "r1" },
   art_get_tag: { tag: "t" },
@@ -125,7 +142,9 @@ test("a tool marked read-only never sends anything but a GET", async () => {
       }
       const mutating = methods.filter((m) => !m.startsWith("GET "));
       if (mutating.length > 0) offenders.push(`${listed.name}: ${mutating.join(", ")}`);
-      if (methods.length === 0 && !OFFLINE.has(listed.name)) silent.push(listed.name);
+      if (methods.length === 0 && !OFFLINE.has(listed.name) && !REFUSED_HERE.has(listed.name)) {
+        silent.push(listed.name);
+      }
     }
   } finally {
     globalThis.fetch = original;
@@ -178,4 +197,27 @@ test("the three disk tools agree about what they do", () => {
   // And the read-only one is not caught up in it.
   const read = listing().find((t) => t.name === "applb_disks");
   assert.equal((read?.annotations as { readOnlyHint?: boolean }).readOnlyHint, true);
+});
+
+test("the read-only tools a confined credential is refused still only GET for an operator", async () => {
+  const tools = buildTools(loadConfig(OPERATOR));
+  const original = globalThis.fetch;
+  try {
+    for (const name of REFUSED_HERE) {
+      const methods: string[] = [];
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        methods.push(`${init?.method ?? "GET"} ${String(input)}`);
+        // `/whoami` says unconfined, so the tool goes on to app-obs.
+        return new Response(JSON.stringify({ caller: "operator", confined: false, fleet: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+      await tools.find((t) => t.name === name)!.handler({});
+      assert.ok(methods.length > 1, `${name} sent ${methods.length} request(s) for an operator`);
+      assert.deepEqual(methods.filter((m) => !m.startsWith("GET ")), [], `${name} mutates`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
 });
