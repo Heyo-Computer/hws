@@ -16,7 +16,7 @@
       "REMOTE_LISTEN": "0.0.0.0:9700",
       "REMOTE_PUBLIC_URL": "https://git.us5.heyo.work",
       "REMOTE_S3_REGION": "us-east-2",
-      "REMOTE_AUTH_URL": "https://auth.us2.heyo.work",
+      "REMOTE_AUTH_URL": "https://auth.heyo.computer",
       "REMOTE_APPLB_URL": "https://admin.us5.heyo.work",
       "REMOTE_CACHE_DIR": "/workspace/cache",
       "RUST_LOG": "info,remote=info",
