@@ -6356,6 +6356,12 @@ async fn get_workspace_recovery(State(state): State<AdminState>, axum::Extension
 }
 
 fn fleet_credential(caller: &Caller, headers: &axum::http::HeaderMap) -> Option<String> {
+    // The gate has verified this token and its scope. Only tokens explicitly
+    // minted for all servers may travel to configured caller-auth gateways.
+    if let Caller::Token(token) = caller {
+        return token.fleet.then(|| bearer(headers.get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())).map(str::to_owned)).flatten();
+    }
     if !matches!(caller, Caller::Federated(_)) { return None; }
     let session = browser_login::session(headers, &axum::http::Method::GET).ok().flatten();
     bearer(headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).or(session.as_deref())).map(str::to_owned)
@@ -6367,8 +6373,8 @@ async fn fleet_snapshot(State(state): State<AdminState>, axum::Extension(caller)
     if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
         return forbidden("authenticated fleet view required");
     }
-    // Only forward an already-authenticated Heyo identity. Never delegate a
-    // gateway-local app-token or Basic password to another gateway.
+    // Forward authenticated Heyo identities and all-server app-tokens, never
+    // gateway-local app-tokens or Basic passwords.
     let credential = fleet_credential(&caller, &headers);
     let snapshot = state.views.as_ref().map(|views| views.snapshot());
     let fleet = snapshot.as_ref().and_then(|s| s.fleet.as_ref());
@@ -9888,6 +9894,35 @@ mod tests {
             assert_eq!(fleet_credential(&federated, &headers).as_deref(), Some("explicit-token"));
             headers.insert(header::AUTHORIZATION, "Basic operator".parse().unwrap());
             assert!(fleet_credential(&federated, &headers).is_none());
+        }
+
+        #[test]
+        fn all_server_tokens_are_delegated_without_widening_namespace_scope() {
+            let authority = store();
+            for fleet in [false, true] {
+                let (_, raw) = authority.mint(NewToken {
+                    fleet, name: "regional-reader".into(), admin: AdminScope::View,
+                    namespace: Some("team-a".into()), deployments: vec![], expires_in_secs: None,
+                }, NOW).unwrap();
+                let caller = Caller::Token(authority.verify(&raw, NOW).unwrap());
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(header::AUTHORIZATION, format!("Bearer {raw}").parse().unwrap());
+                assert_eq!(fleet_credential(&caller, &headers), fleet.then(|| raw.clone()));
+                assert!(fleet_reach(&caller, Some("team-a")).is_ok());
+                assert!(fleet_reach(&caller, Some("team-b")).is_err());
+                assert!(fleet_reach(&caller, None).is_err());
+                if fleet {
+                    let directory = tempfile::tempdir().unwrap();
+                    let follower = TokenStore::new(directory.path().join("tokens.json"));
+                    follower.replace_mirror("authority", authority.fleet_export(NOW)).unwrap();
+                    let mirrored = Caller::Token(follower.verify(&raw, NOW).unwrap());
+                    assert_eq!(fleet_credential(&mirrored, &headers).as_deref(), Some(raw.as_str()));
+                    assert!(fleet_reach(&mirrored, Some("team-b")).is_err());
+                }
+                headers.remove(header::AUTHORIZATION);
+                headers.insert(header::COOKIE, "__Host-heyo-admin=unrelated.session".parse().unwrap());
+                assert!(fleet_credential(&caller, &headers).is_none());
+            }
         }
 
         fn spec_in(ns: &str, body_account: Option<&str>) -> DeploymentSpec {

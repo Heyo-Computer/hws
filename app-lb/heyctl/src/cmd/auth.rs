@@ -177,10 +177,12 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
             // completely different fixes, so they say completely different
             // things.
             401 => bail!(
-                "the server did not recognise this token. Either it is not this server's \
-                 token — one minted on a different app-lb, or copied incompletely — or a \
-                 sign-in gate in front answered before app-lb saw it, which is what \
-                 happens when the gate's `provider` does not list \"app-token\""
+                "the server did not recognise this token. Check that it is complete and \
+                 unexpired. Local app-tokens work only on their issuing server; tokens \
+                 minted with --all-servers require this server to mirror their authority. \
+                 An operator can inspect token_authority and token_sync at \
+                 /control-plane/config for missing configuration or failed synchronization. \
+                 A sign-in gate in front must also allow the credential's provider"
             ),
             403 => bail!(
                 "the server knows this token but will not let it list deployments. Most \

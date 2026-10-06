@@ -151,6 +151,28 @@ Without `--fleet`, existing reads and all deployment writes remain regional.
 Use an explicit regional context for host maintenance; fleet observation does not
 turn `apply` or `restart` into a coordinated release.
 
+For a reusable app-token across servers, mint it at the configured token authority:
+
+```sh
+heyctl token mint fleet-reader --admin view --all-deployments --all-servers
+heyctl login --server https://admin.us3.heyo.work --token-stdin
+heyctl get deployments --fleet
+```
+
+The mint command displays the secret once; supply it to `--token-stdin` without
+putting it on the command line. Each other server must have `token_authority`
+configured and a successful `token_sync` in `/control-plane/config`. Mirroring
+normally takes up to ten seconds. Failed synchronization retains the previous
+mirror, so revocations reach disconnected servers only after synchronization
+recovers; expiry is still enforced locally.
+
+Caller-auth fleet gateways accept forwarded, authenticated all-server tokens as
+well as Heyo identities. Ordinary local tokens and Basic passwords are never
+forwarded. `--all-servers` changes where a token works, not what it may do:
+namespace-scoped tokens still require `get deployments --fleet --namespace <name>`
+and cannot read other namespaces. Account login remains a separate option; it
+does not mint an all-server app-token. Neither option provides DNS/TLS failover.
+
 ### Precedence
 
 For each of the password, token and artifact API key, heyctl uses the first of:
