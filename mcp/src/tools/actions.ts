@@ -230,7 +230,8 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
     {
       name: "applb_deploy",
       description:
-        "**THE tool for 'deploy this'.** Takes a full spec and does the whole sequence: " +
+        "No spec yet, just files? repo_deploy or art_publish_files fit better; see heyo_guide.\n\n" +
+        "Takes a full spec and does the whole sequence: " +
         "checks the rules a schema cannot express, registers or edits as appropriate, starts " +
         "the job that matches the backend, waits for it, and reports what TLS will do.\n\n" +
         "The `spec` parameter carries app-lb's own generated schema — every field, type and " +
@@ -273,7 +274,15 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         // SpecError in a 400 body after a round trip; naming the rule in the
         // caller's own vocabulary before spending that is the point of a
         // composite.
-        const problems = checkSpec(spec);
+        // A namespace token's own namespace: fill it in when the spec leaves it
+        // out (app-lb refuses a spec it cannot place), and check the spec as a
+        // tenant's.
+        const ownNs = await clients.applbNamespace().catch(() => undefined);
+        if (ownNs && spec && typeof spec === "object" && !spec.namespace) {
+          spec.namespace = ownNs;
+          sections.push({ title: "Namespace", body: `\`namespace\` was not set; using your token's, ${ownNs}.` });
+        }
+        const problems = checkSpec(spec, { confined: Boolean(ownNs) });
         if (problems.length > 0) {
           return report(`${id || "spec"}: not sent — ${problems.length} rule(s) broken`, [
             { title: "Rules this spec breaks", body: problems },
@@ -414,10 +423,11 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
               title: `Site root: ${now.site.status}`,
               body:
                 (now.site.hint ?? "") +
-                (spec.build || spec.artifact || spec.update
-                  ? ""
-                  : " With no `build`, `artifact` or `update`, nothing will ever fill it: " +
-                    "repo_create + repo_deploy puts a repo's files there."),
+                " \"missing\": nothing has written the root yet; \"empty\": it exists with no files." +
+                (spec.build || spec.artifact
+                  ? " If the job above failed, fix it and run it again."
+                  : " With no `build` or `artifact`, nothing will fill it: repo_deploy (kind site) " +
+                    "puts a repo's files there, or art_publish_files with `deployment` puts a bundle there."),
             });
           }
         }
@@ -438,10 +448,12 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         sections.push({
           title: "Next",
           body: [
-            jobId ? `applb_job ${jobId} — the job continues whether or not this waited` : null,
+            jobId
+              ? `applb_job {job_id: "${jobId}", deployment: "${id}"} — the job continues whether or not this waited`
+              : null,
             "applb_metrics — whether replicas became healthy",
             "applb_certs — whether app-lb holds a certificate for each exact host",
-            "deployment_logs — what the application itself said",
+            config.obs ? "deployment_logs — what the application itself said" : "diagnose_deployment — the record and its jobs in one call",
           ].filter(Boolean),
         });
 
@@ -564,7 +576,8 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "like. It is checked against whichever source the spec names, so a git ref given to a " +
         "store-backed deployment is refused here rather than minutes into a build.\n\n" +
         "For a deployment whose image comes from an artifact store rather than a Dockerfile, " +
-        "the tool is applb_pull. For a static or site deployment, applb_host_update.",
+        "the tool is applb_pull. A site with a `build` block also uses this tool; " +
+        "applb_host_update is only for operator `update` blocks.",
       schema: {
         id: z.string(),
         git_ref: z
@@ -664,8 +677,33 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "applb_host_update each return. THE call to make after starting any of them: they " +
         "answer as soon as the work is scheduled, not when it is done.\n\n" +
         "For every job on one deployment rather than one job by id, use applb_deployment_jobs.",
-      schema: { job_id: z.string() },
-      handler: async (a) => json(await clients.applb({ path: `/jobs/${enc(String(a.job_id))}` })),
+      schema: {
+        job_id: z.string(),
+        deployment: z
+          .string()
+          .optional()
+          .describe("the job's deployment; required with a namespace token"),
+      },
+      handler: async (a) => {
+        const jid = String(a.job_id);
+        try {
+          return json(await clients.applb({ path: `/jobs/${enc(jid)}` }));
+        } catch (e) {
+          // `/jobs/:id` is fleet-wide; a namespace token reads the same record
+          // from its deployment's job list.
+          if (!(e instanceof ServiceError && e.status === 403)) throw e;
+          if (!a.deployment) {
+            throw new Error(
+              `${e.message}\n\nThis token may not read jobs by id alone. Call applb_job again ` +
+                "with `deployment` set to the job's deployment id, or use applb_deployment_jobs.",
+            );
+          }
+          const list = (await clients.applb({ path: `/deployments/${enc(String(a.deployment))}/jobs` })) as unknown;
+          const row = (Array.isArray(list) ? (list as Record<string, unknown>[]) : []).find((r) => r.id === jid);
+          if (!row) throw new Error(`No job ${jid} on deployment ${String(a.deployment)}.`);
+          return json(row);
+        }
+      },
     },
     {
       name: "applb_deployment_jobs",

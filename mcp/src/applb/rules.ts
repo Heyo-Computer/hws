@@ -174,7 +174,16 @@ export function rulesFor(block?: string): readonly SpecRule[] {
  * refuses a spec app-lb would accept is the failure this whole design is
  * organised against.
  */
-export function checkSpec(spec: unknown): string[] {
+export interface CheckOptions {
+  /**
+   * The caller is confined to a namespace (a tenant). app-lb refuses such a
+   * caller any field that acts on its host; naming the alternative here, before
+   * the round trip, is what keeps an agent from guessing.
+   */
+  confined?: boolean;
+}
+
+export function checkSpec(spec: unknown, opts: CheckOptions = {}): string[] {
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
     return ["The spec must be a JSON object."];
   }
@@ -277,6 +286,42 @@ export function checkSpec(spec: unknown): string[] {
     }
   }
 
+  if (site && !has("build") && !has("artifact") && !has("update")) {
+    problems.push(
+      "A `site` with no `build` or `artifact` is never filled, so every request 404s. Use " +
+        "repo_deploy (kind site) for files in a repo, or `artifact` from art_publish_files.",
+    );
+  }
+  if (opts.confined) {
+    if (site && typeof site.root === "string" && site.root.trim() !== "") {
+      problems.push("Leave out `site.root`: app-lb assigns your site a root in your namespace.");
+    }
+    for (const k of ["update", "gateway", "discovery"]) {
+      if (has(k)) {
+        problems.push(
+          `\`${k}\` is operator-only: it acts on the app-lb host. Use \`build\` (repo_deploy) or ` +
+            "`artifact` (art_publish_files) instead.",
+        );
+      }
+    }
+    const vm = s.vm as Record<string, unknown> | undefined;
+    if (vm?.image_download_url) {
+      problems.push("`vm.image_download_url` is set by Heyo cloud; use `build` or `artifact` for the image.");
+    }
+    const artifact = s.artifact as Record<string, unknown> | undefined;
+    for (const [name, v] of [
+      ["build.repo", build?.repo],
+      ["build.store", build?.store],
+      ["artifact.store", artifact?.store],
+    ] as const) {
+      if (typeof v === "string" && !v.startsWith("https://")) {
+        problems.push(
+          `\`${name}\` must be an https:// URL for a namespace credential (no host paths, ssh or ` +
+            "s3://). repo_create gives you an https repo on the Heyo remote.",
+        );
+      }
+    }
+  }
   return problems;
 }
 

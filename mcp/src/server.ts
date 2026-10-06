@@ -24,6 +24,7 @@ import { sandboxTools } from "./tools/sandbox.js";
 import { feedTools } from "./tools/feed.js";
 import { artifactTools } from "./tools/artifacts.js";
 import { repoTools } from "./tools/repos.js";
+import { explainFailure, guideTool } from "./tools/guide.js";
 
 /**
  * The tools this configuration can actually serve.
@@ -60,6 +61,7 @@ export function buildTools(config: Config): Tool[] {
   const clients = makeClients(config);
   const actions = actionTools(clients, config);
   const all = [
+    guideTool(config),
     ...diagnosticTools(clients, config),
     ...(cloudUsable(config) ? sandboxTools(clients) : []),
     ...feedTools(clients),
@@ -104,6 +106,7 @@ function reachable(name: string, config: Config): boolean {
  * under any cap of at least this many tools.
  */
 export const WORKFLOW_FIRST = [
+  "heyo_guide",
   "heyo_status",
   "heyo_whoami",
   "repo_create",
@@ -135,10 +138,26 @@ function workflowFirst<T extends { name: string }>(tools: T[]): T[] {
 }
 
 /**
+ * A failure an agent is holding, with the plan that gets it out. Applied to
+ * every result here, the one place all of them pass, so the pointer arrives
+ * where the failure is read: a job record, a 403, a site status. The tools
+ * that *describe* failures are exempt, or every plan would hint at itself.
+ */
+const UNHINTED = new Set(["heyo_guide", "applb_spec_schema"]);
+
+export function withHint(tool: string, text: string): string {
+  if (UNHINTED.has(tool)) return text;
+  const hint = explainFailure(text);
+  return hint ? `${text}\n\n${hint}` : text;
+}
+
+/**
  * Sent to the client at `initialize`; most hosts put it in front of the model.
  * Short on purpose: the common paths, and where the details live.
  */
 export const INSTRUCTIONS = `Heyo: deploy apps to app-lb from git repos or published artifacts.
+
+Not sure how? Call heyo_guide with your goal (or an error message) for a step-by-step plan.
 
 Your token confines you to one namespace. Pass that namespace to repo_* tools; artifact tags you publish must start with "<namespace>/".
 
@@ -147,7 +166,9 @@ Static site (HTML/JS/CSS, already built):
   To update it, repo_write_files again, then repo_deploy again. Nothing in the repo is run.
   Alternative: art_publish_files (tag "<namespace>/<name>:<version>"), then applb_deploy a site whose artifact is {store, ref}.
 
-App with a Dockerfile: repo_create, repo_write_files including the Dockerfile, then repo_deploy with kind "vm", port and start_command.
+App with a Dockerfile: repo_create, repo_write_files including the Dockerfile, then repo_deploy with kind "vm", port and start_command. start_command must background itself (setsid nohup ... &) and the app must listen on 0.0.0.0:<port>.
+
+Never set site.root or an update block: app-lb assigns the root, and update is operator-only.
 
 applb_spec_schema has the full deployment spec and examples. When something fails, run heyo_status first, then diagnose_deployment.`;
 
@@ -261,6 +282,7 @@ export function toolListing(tools: Tool[]) {
  * by test failure, not by review.
  */
 const READ_ONLY = new Set([
+  "heyo_guide",
   "heyo_status",
   "heyo_whoami",
   "heyo_capacity",
@@ -364,13 +386,14 @@ export function createServer(config: Config, tools: Tool[]): Server {
     }
     try {
       const text = await tool.handler((req.params.arguments ?? {}) as Record<string, unknown>);
-      return { content: [{ type: "text" as const, text }] };
+      return { content: [{ type: "text" as const, text: withHint(tool.name, text) }] };
     } catch (e) {
       // Returned, not thrown: a failed diagnostic is itself diagnostic, and
       // "app-obs 401" belongs in the transcript rather than in a dead call.
+      const text = e instanceof Error ? e.message : String(e);
       return {
         isError: true,
-        content: [{ type: "text" as const, text: e instanceof Error ? e.message : String(e) }],
+        content: [{ type: "text" as const, text: withHint(tool.name, text) }],
       };
     }
   });

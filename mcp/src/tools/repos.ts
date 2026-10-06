@@ -251,7 +251,10 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
         spa: bool().optional().describe("site: serve index.html for unknown paths"),
         dockerfile: z.string().optional().describe("vm: Dockerfile path in the repo"),
         port: num().optional().describe("vm: port the app listens on; default 8080"),
-        start_command: z.string().optional().describe("vm: command that starts the app in the guest"),
+        start_command: z
+          .string()
+          .optional()
+          .describe("vm: must return; background the app (setsid nohup … &), listening on 0.0.0.0:<port>"),
         namespace: z.string().optional(),
         wait_seconds: num().optional().describe("poll the build this long; default 120"),
       },
@@ -298,10 +301,14 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
 
         let spec: Record<string, unknown>;
         if (kind === "site") {
+          // No root: app-lb assigns one under its own sites dir. The caller
+          // cannot know that host's filesystem, which is the whole point. A
+          // namespace token drops an existing one too: app-lb refuses a
+          // tenant's root outside its namespace, and reassigns the right one.
+          const prev = { ...((existing?.site as Record<string, unknown> | undefined) ?? {}) };
+          if (await clients.applbNamespace().catch(() => undefined)) delete prev.root;
           const site = {
-            // No root: app-lb assigns one under its own sites dir. The caller
-            // cannot know that host's filesystem, which is the whole point.
-            ...((existing?.site as object | undefined) ?? {}),
+            ...prev,
             ...(a.spa !== undefined ? { spa: Boolean(a.spa) } : {}),
           };
           spec = {
@@ -331,6 +338,8 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
             build,
           };
           delete spec.artifact;
+          delete spec.site;
+          delete spec.update;
         }
 
         const deployed = await deployTool.handler({

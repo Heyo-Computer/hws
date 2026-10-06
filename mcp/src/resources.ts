@@ -51,7 +51,8 @@ const DEPLOY_GUIDE = `# Deploying with app-lb
 - **\`upstreams\`** — \`host:port\` addresses you already run. app-lb proxies and
   health-checks them; it does not start them. With a namespace credential they
   must be public addresses.
-- **\`site\`** — static files served from a directory on the app-lb host.
+- **\`site\`** — static files app-lb serves from a root it assigns. Fill it with
+  \`repo_deploy\` (kind site) or \`art_publish_files\`; leave \`root\` unset.
 
 Two backends is an error, and so is none.
 
@@ -203,9 +204,12 @@ function deployPlan(kind: string, id: string, host?: string): string {
   if (kind === "vm") {
     return [
       ...shared,
+      "Have source and a Dockerfile? `repo_create` → `repo_write_files` → `repo_deploy` with",
+      "`kind: \"vm\"` does all of this (see `heyo_guide` topic deploy-vm-from-source). By hand:",
       "1. Write the spec against `applb_create_deployment`'s schema:",
       `   - \`id\`, \`routes: [${route}]\``,
-      "   - `vm`: `driver` (`firecracker`), `port`, and usually `start_command` and `size_class`",
+      "   - `vm`: `driver` (`firecracker`), `port`, and usually `start_command` and `size_class`;",
+      "     `start_command` must background itself (`setsid nohup … &`) and the app must listen on 0.0.0.0",
       "   - `build` (a Dockerfile) **or** `artifact` (bytes already in a store) — never both",
       "   - `scaling` if the defaults (max 5, scale to zero after 300s) are wrong",
       "2. `applb_deploy` with that spec. It checks the cross-field rules, registers, and",
@@ -218,11 +222,12 @@ function deployPlan(kind: string, id: string, host?: string): string {
   if (kind === "site") {
     return [
       ...shared,
-      "1. Write the spec: `id`, `routes`, and `site` with an absolute `root`. `index`",
-      "   defaults to `index.html`; set `spa: true` to serve it for unknown paths.",
-      "2. `applb_deploy` with that spec.",
-      "3. To move it onto new files later: `applb_pull` if the files come from an artifact",
-      "   store, `applb_host_update` if an `update` block rebuilds them on the host.",
+      "1. Files you have (built): `repo_create` → `repo_write_files` → `repo_deploy` with",
+      "   `kind: \"site\"` and a host. Or `art_publish_files`, then `applb_deploy` a `site`",
+      "   with `artifact: {store, ref}`. Leave `site.root` out (app-lb assigns it) and never",
+      "   use `update` (operator-only). `spa: true` serves `index.html` for unknown paths.",
+      "2. To ship new files: `repo_deploy` again, or `art_publish_files` with `deployment`.",
+      "   `heyo_guide` topic deploy-static-site has the full plan.",
       ...tail,
     ].join("\n");
   }

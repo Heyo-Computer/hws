@@ -65,6 +65,11 @@ function everyTool() {
  */
 const GROUPS = [
   {
+    title: "Start here",
+    blurb: "Step-by-step plans for common tasks and failures, and what this server can reach.",
+    match: (n) => n === "heyo_guide",
+  },
+  {
     title: "Diagnostics",
     blurb: "Cross-service, shaped like the question rather than the endpoint.",
     match: (n) =>
