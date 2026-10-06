@@ -9,7 +9,7 @@
 use super::{Sink, token_matches};
 use crate::store::schema::{LogRecord, Record};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -81,8 +81,19 @@ pub fn router(state: IngestState) -> Router {
         .route("/ingest", post(ingest))
         // Unauthenticated so a shipper can check reachability before it holds
         // any credentials, and so a health probe needs no secret.
-        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/healthz", get(health))
         .with_state(state)
+}
+
+async fn health() -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    if let Some(value) = std::env::var("APP_OBS_REVISION")
+        .ok()
+        .and_then(|value| HeaderValue::from_str(&value).ok())
+    {
+        headers.insert("x-heyo-revision", value);
+    }
+    (headers, "ok\n")
 }
 
 async fn ingest(

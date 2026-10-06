@@ -265,6 +265,15 @@ jobs:
           # and registers — but it is the other half of "deploy this", and
           # shipping it with the binary keeps the two in step.
           cp queue/examples/queue.json dist/queue.deployment.example.json
+          cat > dist/start.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          CDPATH= cd -- "$(dirname -- "$0")"
+          export QUEUE_REVISION="${QUEUE_REVISION:-$(cat ./REVISION)}"
+          exec ./queue
+          SH
+          chmod +x dist/start.sh
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
           describe="$(git -C /workspace describe --tags --always --dirty 2>/dev/null || echo 'no-git')"
           cat > dist/BUILD-INFO <<EOF
           describe  $describe
@@ -272,7 +281,7 @@ jobs:
           branch    ${{ ci.branch }}
           run       ${{ ci.run_id }}
           EOF
-          ( cd dist && sha256sum queue > SHA256SUMS )
+          ( cd dist && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS )
           ls -la dist
           cat dist/BUILD-INFO
           bytes="$(tar czf - dist | wc -c)"

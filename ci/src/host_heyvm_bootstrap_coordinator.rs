@@ -119,14 +119,20 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
     }
     let run=d.store.get_run(&msg.run_id).await?.ok_or_else(||anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(REPOSITORY,&run.repo_url),"only the private Heyo repository may bootstrap hosts");
-    let release=crate::release::get(&d.store,&msg.run_id).await.map_err(anyhow::Error::msg)?.filter(|r|r.status=="published")
-        .ok_or_else(||anyhow::anyhow!("bootstrap requires a confirmed merged release"))?;
-    ensure!(release.prepared.release_sha==run.sha,"bootstrap release does not match frozen submission");
+    let (revision, git_ref)=crate::release::deployment_source(&d.store,&msg.run_id).await.map_err(anyhow::Error::msg)?;
+    ensure!(revision==run.sha,"host release does not match frozen source");
     let stored=crate::submission::artifact(&d.store,&msg.run_id,workflow,name,None).await.map_err(anyhow::Error::msg)?;
     ensure!(stored.sink=="artifacts"&&stored.size_bytes as usize<=LIMIT,"bootstrap requires a bounded CI HTTP artifact");
     let digest=stored.digest.clone().ok_or_else(||anyhow::anyhow!("artifact digest missing"))?;
     let store=d.config.artifacts.as_ref().ok_or_else(||anyhow::anyhow!("CI artifact HTTP sink is not configured"))?.url.trim_end_matches('/');
-    let expected_url=format!("{store}/blobs/{digest}"); ensure!(stored.public_url.as_deref()==Some(expected_url.as_str()),"bootstrap artifact must be public from the configured CI HTTP sink");
+    let expected_url=format!("{store}/blobs/{digest}");
+    // Retained bundles intentionally carry no public_url. Verify that the
+    // configured immutable blob endpoint is readable by the host instead.
+    let response=client()?.head(&expected_url).send().await?;
+    let size=response.headers().get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    ensure!(response.status().is_success() && size==Some(stored.size_bytes),
+        "host artifact must be public from the configured CI HTTP sink with its exact size");
     let bytes=d.artifacts.get(&stored).await.map_err(|e|anyhow::anyhow!(e.to_string()))?; ensure!(sha(&bytes)==digest,"artifact digest mismatch");
     ensure!(matches!(component,"heyvm"|"heyvmd"),"unsupported host component");
     if component=="heyvmd" {
@@ -151,7 +157,7 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
     ensure!(!active_bootstrap,"runner has an active host heyvm bootstrap");
     sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='superseded',updated_at=now() WHERE runner_hd_id=$1 AND phase='failed'").bind(&target.runner_hd_id).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$3,$4,$5,$6,'running','draining',$7,$8)")
-        .bind(&id).bind(step).bind(&msg.run_id).bind(&msg.job_id).bind(&target.backend_server_id).bind(sha(&serde_json::to_vec(&value)?)).bind(&run.sha).bind(&release.prepared.git_ref).execute(&mut *tx).await?;
+        .bind(&id).bind(step).bind(&msg.run_id).bind(&msg.job_id).bind(&target.backend_server_id).bind(sha(&serde_json::to_vec(&value)?)).bind(&run.sha).bind(&git_ref).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO ci_host_heyvm_bootstrap(id,runner_hd_id,request,launcher_recipe,deadline,launcher_deployment_id,phase) VALUES($1,$2,$3,$4,now()+make_interval(secs=>$5),$6,'releasing')")
         .bind(&id).bind(&target.runner_hd_id).bind(value).bind(spec).bind(timeout.min(d.config.max_job_duration).as_secs() as f64).bind(launcher).execute(&mut *tx).await?;
     Store::add_service_deployment_event(&mut tx,&id).await?; tx.commit().await?;

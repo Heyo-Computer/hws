@@ -262,9 +262,17 @@ pub fn router(state: ServeState) -> Router {
         .merge(rest)
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         // Registered after the auth layer, so it is not subject to it.
-        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/healthz", get(|| async { health_response(std::env::var("ART_REVISION").ok()) }))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+fn health_response(revision: Option<String>) -> Response {
+    let mut response = "ok\n".into_response();
+    if let Some(value) = revision.and_then(|r| r.parse::<axum::http::HeaderValue>().ok()) {
+        response.headers_mut().insert("x-heyo-revision", value);
+    }
+    response
 }
 
 /// The dashboard, on its own credentials — or on none, when the operator has
@@ -1113,6 +1121,13 @@ mod tests {
 
     async fn body_string(r: Response) -> String {
         String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn health_identifies_the_selected_release() {
+        let response = health_response(Some("retained-release-a".into()));
+        assert_eq!(response.headers()["x-heyo-revision"], "retained-release-a");
+        assert!(!health_response(None).headers().contains_key("x-heyo-revision"));
     }
 
     #[tokio::test]

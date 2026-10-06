@@ -31,6 +31,12 @@ pub struct Policy {
     #[serde(default)]
     pub service_targets: BTreeMap<String, crate::service_rollout::Target>,
     #[serde(default)]
+    pub pooler_targets: BTreeMap<String, crate::pooler_rollout::Target>,
+    #[serde(default)]
+    pub site_targets: BTreeMap<String, crate::site_rollout::Target>,
+    #[serde(default)]
+    pub stateful_targets: BTreeMap<String, crate::stateful_rollout::Target>,
+    #[serde(default)]
     pub placements: BTreeMap<String, String>,
 }
 
@@ -115,7 +121,11 @@ fn plan(name: &str, policy: &Policy) -> Result<Plan> {
                     step.uses.as_deref(),
                     Some(
                         "ci/rollout-service"
+                            | "ci/rollout-pooler"
+                            | "ci/rollout-site"
+                            | "ci/rollout-stateful-service"
                             | "ci/rollout-host-app-lb"
+                            | "ci/rollout-host-heyvmd"
                             | "ci/promote-service-archive"
                             | "ci/host-heyvm-maintenance"
                             | "ci/deploy-controller"
@@ -277,6 +287,9 @@ pub async fn admit(
         workflow: policy.workflow.clone(),
         submission_mode: Default::default(),
         service_targets: policy.service_targets.clone(),
+        pooler_targets: policy.pooler_targets.clone(),
+        site_targets: policy.site_targets.clone(),
+        stateful_targets: policy.stateful_targets.clone(),
         placements: policy.placements.clone(),
     };
     plan = crate::release_policy::prepare_plan(d, &policy.repository, &target_policy, plan).await?;
@@ -613,6 +626,9 @@ mod tests {
             network: None,
             workflow: "on: promotion\njobs:\n  first:\n    steps: [{uses: ci/rollout-service}]\n  second:\n    needs: [first]\n    steps: [{uses: ci/rollout-service}]\n".into(),
             service_targets: BTreeMap::new(),
+            pooler_targets: BTreeMap::new(),
+            site_targets: BTreeMap::new(),
+            stateful_targets: BTreeMap::new(),
             placements: BTreeMap::new(),
         }
     }
@@ -661,7 +677,13 @@ mod tests {
     fn promotion_policy_requires_sequential_deployment_only() {
         let valid = policy();
         assert_eq!(plan("any-region", &valid).unwrap().jobs.len(), 2);
+        let daemon = Policy {
+            workflow: valid.workflow.replace("ci/rollout-service", "ci/rollout-host-heyvmd"),
+            ..valid.clone()
+        };
+        assert_eq!(plan("stage", &daemon).unwrap().jobs.len(), 2);
         for workflow in [
+            valid.workflow.replace("ci/rollout-service", "ci/bootstrap-host-heyvm"),
             valid.workflow.replace("    needs: [first]\n", ""),
             valid
                 .workflow

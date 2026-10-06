@@ -172,6 +172,15 @@ jobs:
           [ -f "$src" ] || { echo "FATAL: art was not built at $src" >&2; exit 1; }
           cp "$src" dist/art
           strip dist/art
+          cat > dist/start.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          CDPATH= cd -- "$(dirname -- "$0")"
+          export ART_REVISION="${ART_REVISION:-$(cat ./REVISION)}"
+          exec ./art serve
+          SH
+          chmod +x dist/start.sh
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
           describe="$(git -C /workspace describe --tags --always --dirty 2>/dev/null || echo 'no-git')"
           cat > dist/BUILD-INFO <<EOF
           version   $(dist/art --version)
@@ -180,7 +189,7 @@ jobs:
           branch    ${{ ci.branch }}
           run       ${{ ci.run_id }}
           EOF
-          ( cd dist && sha256sum art > SHA256SUMS )
+          ( cd dist && sha256sum art start.sh REVISION BUILD-INFO > SHA256SUMS )
           ls -la dist
           cat dist/BUILD-INFO
 

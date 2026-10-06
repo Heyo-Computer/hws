@@ -17,7 +17,7 @@ use crate::query::{
 };
 use crate::sources::applb::{HostSandboxView, LiveStatus};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get};
@@ -103,13 +103,25 @@ pub fn router(state: ApiState) -> Router {
         // Always open, and deliberately not behind a query slot: app-lb health
         // checks this, and a probe that fails because a dashboard is busy would
         // take the deployment out of rotation for no reason.
-        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/healthz", get(health))
         // Open alongside `/healthz`: the stylesheet and fonts are static public
         // bytes, and a page that renders unstyled because its CSS needed a
         // token is worse than one whose CSS anyone can fetch.
         .route("/__ui/{*path}", get(ui_asset))
         .merge(protected)
         .with_state(state)
+}
+
+async fn health() -> impl IntoResponse {
+    health_response(std::env::var("APP_OBS_REVISION").ok())
+}
+
+fn health_response(revision: Option<String>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    if let Some(value) = revision.and_then(|value| HeaderValue::from_str(&value).ok()) {
+        headers.insert("x-heyo-revision", value);
+    }
+    (headers, "ok\n")
 }
 
 async fn require_api_token(
@@ -871,6 +883,12 @@ mod tests {
     use crate::sources::applb::{
         DeploymentMetrics, DeploymentView, Histogram, HostUsage, PoolStatus, StatusCounts, VmView,
     };
+
+    #[test]
+    fn health_reports_the_managed_release_revision() {
+        let response = health_response(Some("release-sha".into())).into_response();
+        assert_eq!(response.headers()["x-heyo-revision"], "release-sha");
+    }
 
     fn bucket(t: i64, cpu: Option<f64>, latency: Option<f64>) -> MetricBucket {
         MetricBucket {

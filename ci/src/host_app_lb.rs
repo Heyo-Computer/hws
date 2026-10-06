@@ -9,9 +9,9 @@ use std::{collections::BTreeMap, time::Duration};
 #[path = "../../app-lb/src/host_bundle.rs"]
 pub(crate) mod bundle;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Target {
+pub struct Target {
     pub repository: String, pub url: String, pub deployment: String, pub namespace: String, pub health_url: String,
 }
 
@@ -52,10 +52,7 @@ pub(crate) fn mapping(raw: Option<&str>, alias: &str) -> Result<Target> {
     Ok(target)
 }
 
-pub async fn deploy(d: &Dispatcher, msg: &JobMessage, step: &str, alias: &str, token: &str,
-    workflow: &str, artifact: &str, timeout: Duration, masker: &Masker) -> Result<String> {
-    crate::submission::authorize_publication(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
-    ensure!(!token.trim().is_empty(), "host rollout requires a credential");
+pub(crate) async fn trusted(d: &Dispatcher, alias: &str) -> Result<Target> {
     let managed;
     let raw = match d.config.host_app_lb_targets.as_deref() {
         Some(raw) => raw,
@@ -64,7 +61,17 @@ pub async fn deploy(d: &Dispatcher, msg: &JobMessage, step: &str, alias: &str, t
             managed.as_str()
         }
     };
-    let target = mapping(Some(raw), alias)?;
+    mapping(Some(raw), alias)
+}
+
+pub async fn deploy(d: &Dispatcher, msg: &JobMessage, plan: &crate::plan::JobPlan, step: &str, alias: &str, token: &str,
+    workflow: &str, artifact: &str, timeout: Duration, masker: &Masker) -> Result<String> {
+    crate::submission::authorize_publication(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
+    ensure!(!token.trim().is_empty(), "host rollout requires a credential");
+    let target = trusted(d, alias).await?;
+    if let Some(policy) = &plan.release_policy {
+        ensure!(policy.app_lbs.get(alias) == Some(&target), "app-lb target changed since release admission");
+    }
     let run = d.store.get_run(&msg.run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(&target.repository, &run.repo_url), "repository is not authorized for this host");
     let (release_sha, git_ref) = crate::release::deployment_source(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;

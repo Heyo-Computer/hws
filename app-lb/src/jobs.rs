@@ -800,10 +800,10 @@ impl Jobs {
             return Err(StartError::BadRef("correlated pulls require `ref` to be a pinned 64-character lowercase SHA-256 digest".into()));
         }
         let deployment = self.claimable(deployment_id, JobKind::ArtifactPull)?;
-        if deployment.spec.vm.is_none() {
-            return Err(StartError::BadRef("correlated pulls require a managed VM deployment".into()));
+        if deployment.spec.vm.is_none() && deployment.spec.site.is_none() {
+            return Err(StartError::BadRef("correlated pulls require a managed VM or static-site deployment".into()));
         }
-        if deployment.desired_replicas() == 0 {
+        if deployment.spec.vm.is_some() && deployment.desired_replicas() == 0 {
             return Err(StartError::BadRef("correlated pulls require a non-zero desired replica target; app-lb will not invent scaling demand".into()));
         }
         let Some(mut artifact) = deployment.spec.artifact.clone() else {
@@ -1644,7 +1644,7 @@ impl Jobs {
         // everything after the resolve differs: where the bytes land, what
         // proves they landed, and whether there is a pool to roll afterwards.
         if let Some(site) = self.registry.get(deployment_id).and_then(|d| d.spec.site.clone()) {
-            return self.run_site_pull(job_id, spec, &site, api_key.as_deref(), force).await;
+            return self.run_site_pull(job_id, deployment_id, spec, &site, api_key.as_deref(), force).await;
         }
 
         let mut log = |line: String| self.log(job_id, line);
@@ -1736,16 +1736,52 @@ impl Jobs {
     async fn run_site_pull(
         &self,
         job_id: &str,
+        deployment_id: &str,
         spec: &ArtifactSpec,
         site: &crate::config::SiteSpec,
         api_key: Option<&str>,
         force: bool,
     ) -> Result<String, String> {
+        let correlated_source = self
+            .history
+            .lock()
+            .expect("job history mutex poisoned")
+            .iter()
+            .find(|r| r.id == job_id && r.operation_id.is_some())
+            .map(|r| {
+                (
+                    r.source_spec_fingerprint.clone(),
+                    r.config_fingerprint.clone(),
+                    r.target_namespace.clone(),
+                )
+            });
         let mut log = |line: String| self.log(job_id, line);
-        let pulled = self
+        let prepared = self
             .puller
-            .pull_tree(spec, site, api_key, force, &mut log)
+            .prepare_tree(spec, site, api_key, force, &mut log)
             .await?;
+        // Downloads, unpacking and index validation are deliberately outside
+        // the global mutation gate. Only revalidation and publication need to
+        // exclude an administrative configuration change.
+        let _change_guard = if correlated_source.is_some() {
+            Some(self.registry.change_guard().await)
+        } else {
+            None
+        };
+        if let Some((source, config, namespace)) = correlated_source {
+            let current = self
+                .registry
+                .get(deployment_id)
+                .ok_or_else(|| "deployment was removed before site publication".to_string())?;
+            if current.spec.site.is_none()
+                || source.as_deref() != Some(&fingerprint(&current.spec))
+                || config.as_deref() != Some(&deployment_config_fingerprint(&current.spec))
+                || namespace.as_deref() != Some(current.spec.namespace.as_str())
+            {
+                return Err("site deployment configuration changed before publication".into());
+            }
+        }
+        let pulled = self.puller.publish_tree(prepared, &mut log)?;
 
         let root = pulled.root.display().to_string();
         self.update_record(job_id, |r| {
@@ -2808,6 +2844,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn correlated_site_rejects_config_change_after_real_preparation() {
+        use axum::{
+            Router,
+            body::Bytes,
+            extract::{Path as AxumPath, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+        };
+        #[derive(Clone)]
+        struct BlobState {
+            bytes: Bytes,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        async fn blob(
+            State(state): State<BlobState>,
+            headers: HeaderMap,
+        ) -> axum::response::Response {
+            if headers.contains_key("range") {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            state.entered.notify_one();
+            state.release.notified().await;
+            state.bytes.into_response()
+        }
+        async fn head_blob(State(state): State<BlobState>) -> axum::response::Response {
+            ([("content-length", state.bytes.len().to_string())], "").into_response()
+        }
+        async fn no_manifest(AxumPath(_): AxumPath<String>) -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        let dir = scratch("site-correlated-boundary");
+        let bundle_dir = dir.join("bundle-src");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("index.html"), "candidate").unwrap();
+        let bundle = dir.join("site.tar.gz");
+        assert!(
+            std::process::Command::new("tar")
+                .args(["-czf"])
+                .arg(&bundle)
+                .arg("-C")
+                .arg(&bundle_dir)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bytes = Bytes::from(std::fs::read(&bundle).unwrap());
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let state = BlobState {
+            bytes,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let app = Router::new()
+            .route("/manifests/:id", get(no_manifest))
+            .route("/blobs/:id", get(blob).head(head_blob))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let jobs = jobs_with_timeout(&dir, Duration::from_secs(30));
+        let root = dir.join("sites/public/retail");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), "live-v1").unwrap();
+        let spec: crate::config::DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id":"retail", "namespace":"public", "routes":[],
+            "site":{"root":root,"index":"index.html"},
+            "artifact":{"store":base,"ref":digest}
+        }))
+        .unwrap();
+        jobs.registry.upsert(spec.clone());
+        let mut record = JobRecord::new("job-site".into(), "retail".into(), JobKind::ArtifactPull);
+        record.operation_id = Some("ci-site-op".into());
+        record.target_namespace = Some("public".into());
+        record.config_fingerprint = Some(deployment_config_fingerprint(&spec));
+        record.source_spec_fingerprint = Some(fingerprint(&spec));
+        record.artifact_ref = Some(digest.clone());
+        jobs.history.lock().unwrap().push_back(record);
+        let artifact = spec.artifact.clone().unwrap();
+        let site = spec.site.clone().unwrap();
+        let running = {
+            let jobs = jobs.clone();
+            tokio::spawn(async move {
+                jobs.run_site_pull("job-site", "retail", &artifact, &site, None, true)
+                    .await
+            })
+        };
+        state.entered.notified().await;
+        let mut changed = spec;
+        changed.site.as_mut().unwrap().index = "home.html".into();
+        jobs.registry.upsert(changed);
+        state.release.notify_one();
+        let error = running.await.unwrap().unwrap_err();
+        assert!(error.contains("configuration changed"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("index.html")).unwrap(),
+            "live-v1"
+        );
+        let receipt = jobs.records(Some("retail")).remove(0);
+        assert_eq!(receipt.operation_id.as_deref(), Some("ci-site-op"));
+        assert_eq!(receipt.target_namespace.as_deref(), Some("public"));
+        assert_eq!(receipt.artifact_ref.as_deref(), Some(digest.as_str()));
+        assert!(receipt.digest.is_none() && receipt.site_root.is_none());
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_status_persistence_cannot_later_report_success() {
         let dir = scratch("status-persistence");
         let jobs = jobs_at(&dir);
@@ -2882,6 +3032,21 @@ mod tests {
         spec.vm.as_mut().unwrap().port = 9090;
         assert_ne!(deployment_config_fingerprint(&spec), authorized);
         assert_ne!(fingerprint(&("a", false, &authorized)), fingerprint(&("b", false, &authorized)));
+    }
+
+    #[test]
+    fn site_intent_ignores_only_the_artifact_selector() {
+        let mut spec: crate::config::DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id":"retail", "namespace":"public", "routes":[],
+            "site":{"root":"/srv/retail","index":"index.html"},
+            "artifact":{"store":"/artifacts","ref":"old"}
+        }))
+        .unwrap();
+        let authorized = deployment_config_fingerprint(&spec);
+        spec.artifact.as_mut().unwrap().artifact_ref = "new-digest".into();
+        assert_eq!(deployment_config_fingerprint(&spec), authorized);
+        spec.site.as_mut().unwrap().index = "home.html".into();
+        assert_ne!(deployment_config_fingerprint(&spec), authorized);
     }
 
     #[tokio::test]

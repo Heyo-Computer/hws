@@ -16,7 +16,7 @@
 use crate::logs::{LogBuffer, LogFilter, LogLine, LogStatus, normalize_level};
 use crate::state::Store;
 use axum::extract::{Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -65,13 +65,25 @@ pub fn router(state: ApiState) -> Router {
         // Always open: app-lb health-checks this, and a probe that failed
         // because the monitoring port was down would take this deployment out
         // of rotation for reporting exactly the thing it exists to report.
-        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/healthz", get(health))
         // Open alongside `/healthz`, as in app-obs: a page that renders
         // unstyled because its stylesheet needed a token is worse than one
         // whose stylesheet anyone can fetch.
         .route("/__ui/{*path}", get(ui_asset))
         .merge(protected)
         .with_state(state)
+}
+
+async fn health() -> impl IntoResponse {
+    health_response(std::env::var("QUEUE_REVISION").ok())
+}
+
+fn health_response(revision: Option<String>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    if let Some(value) = revision.and_then(|value| HeaderValue::from_str(&value).ok()) {
+        headers.insert("x-heyo-revision", value);
+    }
+    (headers, "ok\n")
 }
 
 async fn require_api_token(
@@ -230,6 +242,12 @@ struct LogsResponse {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn health_reports_the_managed_release_revision() {
+        let response = health_response(Some("release-sha".into())).into_response();
+        assert_eq!(response.headers()["x-heyo-revision"], "release-sha");
+    }
 
     fn state() -> ApiState {
         ApiState {

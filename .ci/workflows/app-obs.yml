@@ -264,6 +264,15 @@ jobs:
           cp "$src" dist/app-obs-dump
           strip dist/app-obs-dump
           cp app-obs/deploy/supervisor/app-obs.conf dist/
+          cat > dist/start.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          CDPATH= cd -- "$(dirname -- "$0")"
+          export APP_OBS_REVISION="${APP_OBS_REVISION:-$(cat ./REVISION)}"
+          exec ./app-obs
+          SH
+          chmod +x dist/start.sh
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
           describe="$(git -C /workspace describe --tags --always --dirty 2>/dev/null || echo 'no-git')"
           cat > dist/BUILD-INFO <<EOF
           describe  $describe
@@ -271,7 +280,7 @@ jobs:
           branch    ${{ ci.branch }}
           run       ${{ ci.run_id }}
           EOF
-          ( cd dist && sha256sum app-obs app-obs-dump > SHA256SUMS )
+          ( cd dist && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS )
           ls -la dist
           cat dist/BUILD-INFO
           # What the upload below has to move: the tarball, gzipped, which the

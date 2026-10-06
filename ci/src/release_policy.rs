@@ -24,6 +24,12 @@ pub struct Policy {
     pub submission_mode: SubmissionMode,
     #[serde(default)]
     pub service_targets: BTreeMap<String, service_rollout::Target>,
+    #[serde(default)]
+    pub pooler_targets: BTreeMap<String, crate::pooler_rollout::Target>,
+    #[serde(default)]
+    pub site_targets: BTreeMap<String, crate::site_rollout::Target>,
+    #[serde(default)]
+    pub stateful_targets: BTreeMap<String, crate::stateful_rollout::Target>,
     /// Job ID -> existing maintenance target alias of its coordinator host.
     #[serde(default)]
     pub placements: BTreeMap<String, String>,
@@ -34,6 +40,8 @@ pub struct Snapshot {
     pub digest: String,
     pub maintenance: BTreeMap<String, host_maintenance::Target>,
     pub hosts: BTreeMap<String, host_heyvm_bootstrap_coordinator::Target>,
+    #[serde(default)]
+    pub app_lbs: BTreeMap<String, crate::host_app_lb::Target>,
     /// Expressions only; credential values are never persisted here.
     pub token_expressions: Vec<String>,
 }
@@ -91,7 +99,7 @@ pub async fn prepare(d: &Dispatcher, repository: &str, policy: &Policy) -> Resul
 pub(crate) async fn prepare_plan(d: &Dispatcher, repository: &str, policy: &Policy, mut plan: Plan) -> Result<Plan> {
     let mut effective = policy.clone();
     effective.placements.retain(|id, _| plan.jobs.iter().any(|job| &job.base_id == id));
-    let mut snapshot = Snapshot { digest: String::new(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), token_expressions: Vec::new() };
+    let mut snapshot = Snapshot { digest: String::new(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), token_expressions: Vec::new() };
     let mut aliases: Vec<String> = effective.placements.values().cloned().collect();
     for job in &plan.jobs {
         for step in &job.steps {
@@ -100,6 +108,12 @@ pub(crate) async fn prepare_plan(d: &Dispatcher, repository: &str, policy: &Poli
                 if !snapshot.token_expressions.contains(token) { snapshot.token_expressions.push(token.clone()); }
             }
             match step.uses.as_deref() {
+                Some("ci/rollout-host-app-lb") => {
+                    let alias = input(step, "target")?;
+                    let target = crate::host_app_lb::trusted(d, &alias).await?;
+                    ensure!(crate::repos::same_repo(repository, &target.repository), "app-lb target is not authorized for this repository");
+                    snapshot.app_lbs.insert(alias, target);
+                }
                 Some("ci/host-heyvm-maintenance" | "ci/promote-service-archive") => aliases.push(input(step, "target")?),
                 Some("ci/bootstrap-host-heyvm" | "ci/rollout-host-heyvmd") => {
                     let alias = input(step, "target")?;
@@ -140,6 +154,10 @@ fn submission_plan(policy: &Policy) -> Result<Plan> {
 }
 
 pub async fn check_targets(d: &Dispatcher, snapshot: &Snapshot) -> Result<()> {
+    for (alias, expected) in &snapshot.app_lbs {
+        ensure!(&crate::host_app_lb::trusted(d, alias).await? == expected,
+            "app-lb mapping changed since admission; resubmit before merging");
+    }
     for (alias, expected) in &snapshot.maintenance {
         ensure!(&host_maintenance::trusted_target(d, alias).await? == expected,
             "maintenance mapping changed since admission; resubmit before merging");
@@ -178,6 +196,31 @@ fn bind(plan: &mut Plan, repository: &str, policy: &Policy, snapshot: &Snapshot)
                         step.with.insert(key.into(), value.clone());
                     }
                 }
+                Some("ci/rollout-pooler") => {
+                    exclusive(step, &["resolved-target", "url", "name", "namespace", "pooler"])?;
+                    let alias = input(step, "target")?;
+                    let target = policy.pooler_targets.get(&alias).ok_or_else(|| anyhow::anyhow!("unknown pooler target"))?;
+                    crate::pooler_rollout::validate_target(target)?;
+                    host_maintenance::token_secret(step.with.get("token").map(String::as_str).unwrap_or(""))?;
+                    step.with.remove("target");
+                    step.with.insert("resolved-target".into(), serde_json::to_string(target)?);
+                }
+                Some("ci/rollout-site" | "ci/rollout-stateful-service") => {
+                    exclusive(step, &["resolved-target", "url", "deployment", "namespace"])?;
+                    let alias = input(step, "target")?;
+                    let target = if step.uses.as_deref() == Some("ci/rollout-site") {
+                        let target = policy.site_targets.get(&alias).ok_or_else(|| anyhow::anyhow!("unknown site target"))?;
+                        crate::site_rollout::validate_target(target)?;
+                        serde_json::to_string(target)?
+                    } else {
+                        let target = policy.stateful_targets.get(&alias).ok_or_else(|| anyhow::anyhow!("unknown stateful target"))?;
+                        crate::stateful_rollout::validate_target(target)?;
+                        serde_json::to_string(target)?
+                    };
+                    host_maintenance::token_secret(step.with.get("token").map(String::as_str).unwrap_or(""))?;
+                    step.with.remove("target");
+                    step.with.insert("resolved-target".into(), target);
+                }
                 Some("ci/host-heyvm-maintenance" | "ci/promote-service-archive") => {
                     exclusive(step, &["url", "user-id", "runner"])?;
                     let alias = input(step, "target")?;
@@ -214,7 +257,8 @@ mod tests {
     fn policy() -> Policy {
         Policy { workflow_path: ".ci/workflows/regional-release.yml".into(), workflow: RELEASE.into(),
             submission_mode: SubmissionMode::MergeAndDeploy,
-            service_targets: BTreeMap::new(), placements: BTreeMap::new() }
+            service_targets: BTreeMap::new(), pooler_targets: BTreeMap::new(),
+            site_targets: BTreeMap::new(), stateful_targets: BTreeMap::new(), placements: BTreeMap::new() }
     }
 
     #[test]
@@ -241,7 +285,7 @@ mod tests {
     }
 
     fn snapshot() -> Snapshot {
-        Snapshot { digest: "frozen-policy".into(), token_expressions: Vec::new(), hosts: BTreeMap::new(), maintenance: BTreeMap::from([
+        Snapshot { digest: "frozen-policy".into(), token_expressions: Vec::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), maintenance: BTreeMap::from([
             ("us3".into(), host_maintenance::Target { repository: REPO.into(), runner_hd_id: "us-runner".into(),
                 backend_server_id: "us-backend".into(), cloud_url: "https://cloud.eu.example".into(),
                 orchestrator_url: "https://archive.eu.example".into(), artifact_user_id: "archive-owner".into(),
@@ -296,11 +340,22 @@ mod tests {
         let legacy = serde_json::to_value(&job).unwrap();
         assert!(legacy.get("release_policy").is_none());
         assert!(serde_json::from_value::<crate::plan::JobPlan>(legacy).unwrap().release_policy.is_none());
-        job.release_policy = Some(snapshot());
+        let mut frozen = snapshot();
+        frozen.app_lbs.insert("ingress".into(), crate::host_app_lb::Target {
+            repository: REPO.into(), url: "https://admin.first.example".into(),
+            deployment: "host-ingress".into(), namespace: "default".into(),
+            health_url: "https://admin.first.example/healthz".into(),
+        });
+        job.release_policy = Some(frozen);
         let stored = serde_json::to_vec(&job).unwrap();
         let restored: crate::plan::JobPlan = serde_json::from_slice(&stored).unwrap();
         assert_eq!(restored, job);
-        assert_eq!(restored.release_policy.unwrap().maintenance["us3"].cloud_url, "https://cloud.eu.example");
+        let frozen = restored.release_policy.unwrap();
+        assert_eq!(frozen.maintenance["us3"].cloud_url, "https://cloud.eu.example");
+        assert_eq!(frozen.app_lbs["ingress"].url, "https://admin.first.example");
+        let mut old = serde_json::to_value(frozen).unwrap();
+        old.as_object_mut().unwrap().remove("app_lbs");
+        assert!(serde_json::from_value::<Snapshot>(old).unwrap().app_lbs.is_empty());
     }
 
     #[test]

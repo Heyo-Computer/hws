@@ -3100,7 +3100,37 @@ impl Dispatcher {
                     .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
             }
             "ci/rollout-host-app-lb" => {
-                crate::host_app_lb::deploy(self, msg, sid, &required("target")?, &required("token")?,
+                crate::host_app_lb::deploy(self, msg, plan, sid, &required("target")?, &required("token")?,
+                    &required("workflow")?, &required("artifact")?, step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
+            }
+            "ci/rollout-pooler" => {
+                if plan.release_policy.is_none() {
+                    return Err(DispatchError::StepFailed("pooler rollout requires frozen operator policy".into()));
+                }
+                let target = serde_json::from_str(&required("resolved-target")?)
+                    .map_err(|e| DispatchError::StepFailed(format!("invalid frozen pooler target: {e}")))?;
+                crate::pooler_rollout::deploy(self, msg, sid, target, &required("token")?,
+                    &required("workflow")?, &required("artifact")?, step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
+            }
+            "ci/rollout-site" => {
+                if plan.release_policy.is_none() {
+                    return Err(DispatchError::StepFailed("site rollout requires frozen operator policy".into()));
+                }
+                let target = serde_json::from_str(&required("resolved-target")?)
+                    .map_err(|e| DispatchError::StepFailed(format!("invalid frozen site target: {e}")))?;
+                crate::site_rollout::deploy(self, msg, sid, target, &required("token")?,
+                    &required("workflow")?, &required("artifact")?, step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
+            }
+            "ci/rollout-stateful-service" => {
+                if plan.release_policy.is_none() {
+                    return Err(DispatchError::StepFailed("stateful rollout requires frozen operator policy".into()));
+                }
+                let target = serde_json::from_str(&required("resolved-target")?)
+                    .map_err(|e| DispatchError::StepFailed(format!("invalid frozen stateful target: {e}")))?;
+                crate::stateful_rollout::deploy(self, msg, sid, target, &required("token")?,
                     &required("workflow")?, &required("artifact")?, step_timeout(step, plan), masker).await
                     .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
             }

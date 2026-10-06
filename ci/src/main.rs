@@ -27,6 +27,9 @@ mod dispatch;
 mod executor;
 mod expr;
 mod host_app_lb;
+mod pooler_rollout;
+mod site_rollout;
+mod stateful_rollout;
 mod host_bootstrap;
 mod host_bootstrap_delivery;
 mod host_heyvm_bootstrap;
@@ -420,6 +423,7 @@ async fn start_execution(dispatcher: Arc<Dispatcher>) {
     controller_rollout::spawn(dispatcher.clone());
     regional_update::spawn(dispatcher.clone());
     service_rollout::spawn(dispatcher.clone());
+    stateful_rollout::spawn(dispatcher.clone());
     managed_update::spawn(dispatcher.clone());
     host_maintenance::spawn(dispatcher.clone());
     host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());

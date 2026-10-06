@@ -142,6 +142,20 @@ pub struct PulledTree {
     pub reused: bool,
 }
 
+/// A site tree whose download, unpack and index validation are complete, but
+/// which has not yet replaced the served tree. Correlated callers use this
+/// boundary to perform their final configuration check immediately before the
+/// two-rename publication and digest-marker update.
+pub(crate) struct PreparedTree {
+    digest: String,
+    root: PathBuf,
+    files: usize,
+    unpacked: u64,
+    bytes_written: u64,
+    reused: bool,
+    staged: Option<crate::unpack::Staged>,
+}
+
 /// What a *guest mount* pull did. The third reading of a bundle, and its own
 /// type for the same reason [`PulledTree`] is: nothing here is a rootfs, and the
 /// destination is a content-addressed tree rather than a directory somebody
@@ -524,6 +538,18 @@ impl Puller {
         force: bool,
         log: &mut (dyn FnMut(String) + Send),
     ) -> Result<PulledTree, String> {
+        let prepared = self.prepare_tree(spec, site, api_key, force, log).await?;
+        self.publish_tree(prepared, log)
+    }
+
+    pub(crate) async fn prepare_tree(
+        &self,
+        spec: &ArtifactSpec,
+        site: &crate::config::SiteSpec,
+        api_key: Option<&str>,
+        force: bool,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<PreparedTree, String> {
         let root = PathBuf::from(site.root.trim());
         let remote = spec.is_remote();
         let base = spec.store.trim().trim_end_matches('/').to_string();
@@ -557,13 +583,14 @@ impl Puller {
                 "{} is already serving this digest; nothing to unpack",
                 root.display()
             ));
-            return Ok(PulledTree {
+            return Ok(PreparedTree {
                 digest,
                 root,
                 files: 0,
                 unpacked: 0,
                 bytes_written: 0,
                 reused: true,
+                staged: None,
             });
         }
 
@@ -591,26 +618,38 @@ impl Puller {
         // on this runtime thread for the duration.
         let strip = spec.strip();
         let index = site.index.trim().to_string();
-        let (root, unpacked) = {
+        let (staged, unpacked) = {
             let root = root.clone();
             let bundle_path = bundle.path().to_path_buf();
             tokio::task::spawn_blocking(move || {
                 let (staged, unpacked) = crate::unpack::stage(&root, &bundle_path, strip)?;
                 crate::unpack::verify_index(staged.dir(), &index, strip)?;
-                staged.commit()?;
-                Ok::<_, String>((root, unpacked))
+                Ok::<_, String>((staged, unpacked))
             })
             .await
             .map_err(|e| format!("the unpack task did not finish: {e}"))??
         };
 
-        log(format!(
-            "unpacked {} file{} ({}) into {}",
-            unpacked.files,
-            if unpacked.files == 1 { "" } else { "s" },
-            human(unpacked.bytes),
-            root.display(),
-        ));
+        self.preparation_stage("site_tree_prepared");
+        Ok(PreparedTree { digest, root, files: unpacked.files, unpacked: unpacked.bytes,
+            bytes_written, reused: false, staged: Some(staged) })
+    }
+
+    pub(crate) fn publish_tree(
+        &self,
+        mut prepared: PreparedTree,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<PulledTree, String> {
+        if let Some(staged) = prepared.staged.take() {
+            staged.commit()?;
+            log(format!(
+                "unpacked {} file{} ({}) into {}",
+                prepared.files,
+                if prepared.files == 1 { "" } else { "s" },
+                human(prepared.unpacked),
+                prepared.root.display(),
+            ));
+        }
 
         // After the swap, so the marker can only ever describe a tree that is
         // actually in place.
@@ -621,18 +660,18 @@ impl Puller {
         // report "already serving" over a tree holding something else. Losing
         // the marker only costs the next pull its shortcut, so the failure is
         // logged rather than raised — the deploy itself succeeded.
-        if let Err(e) = crate::unpack::record_digest(&root, &digest) {
-            crate::unpack::forget_digest(&root);
+        if !prepared.reused && let Err(e) = crate::unpack::record_digest(&prepared.root, &prepared.digest) {
+            crate::unpack::forget_digest(&prepared.root);
             log(format!("{e}; the next pull will unpack again rather than skip"));
         }
 
         Ok(PulledTree {
-            digest,
-            root,
-            files: unpacked.files,
-            unpacked: unpacked.bytes,
-            bytes_written,
-            reused: false,
+            digest: prepared.digest,
+            root: prepared.root,
+            files: prepared.files,
+            unpacked: prepared.unpacked,
+            bytes_written: prepared.bytes_written,
+            reused: prepared.reused,
         })
     }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::extract::{Query, State};
-use axum::http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
+use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -108,8 +108,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn health_check() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+async fn health_check() -> impl IntoResponse {
+    health_response(std::env::var("HEYOSECRET_REVISION").ok())
+}
+
+fn health_response(revision: Option<String>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    if let Some(value) = revision.and_then(|value| HeaderValue::from_str(&value).ok()) {
+        headers.insert("x-heyo-revision", value);
+    }
+    (headers, Json(json!({ "status": "ok" })))
 }
 
 async fn read_secret(
@@ -268,4 +276,15 @@ fn error(status: StatusCode, message: impl Into<String>) -> axum::response::Resp
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_reports_the_managed_release_revision() {
+        let response = health_response(Some("release-sha".into())).into_response();
+        assert_eq!(response.headers()["x-heyo-revision"], "release-sha");
+    }
 }
