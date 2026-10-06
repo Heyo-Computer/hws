@@ -42,12 +42,12 @@ export const GUIDES: readonly Guide[] = [
       "Build the site first if it needs building (dist/, build/). Nothing in the repo is run on the server.",
       "repo_create {name} — a git repo in your namespace on the Heyo remote.",
       "repo_write_files {repo, files: [{path, content, encoding?}], message} — commit the BUILT files (use encoding \"base64\" for images and other binaries).",
-      "repo_deploy {repo, host: \"<name>.<region>.heyo.work\", kind: \"site\", context?: \"dist\", spa?: true} — registers the site and copies the files into a root app-lb manages.",
-      "Open https://<host>/. To change it: repo_write_files again, then repo_deploy again.",
+      "repo_deploy {repo, kind: \"site\", context?: \"dist\", spa?: true, host?} — registers the site and copies the files into a root app-lb manages. Without `host` it is <repo>.<this region's domain>; the result says which.",
+      "Open https://<host>/. To change it: repo_write_files again, then repo_deploy again (pass `deployment` if its id is not the repo name).",
     ],
     pitfalls: [
       "Do NOT set `site.root`: app-lb assigns one. Do NOT use an `update` block: it runs commands on the app-lb host and is for platform operators only; a namespace credential is refused.",
-      "No git repo wanted? art_publish_files {tag: \"<namespace>/<name>:<version>\", files} then applb_deploy a site with `artifact: {store, ref}`, or pass `deployment` to art_publish_files to roll an existing site onto the new files (see guide publish-files-as-artifact).",
+      "Prefer this repo path. Serving an artifact instead only works if app-lb can read the tag (see guide publish-files-as-artifact).",
     ],
   },
   {
@@ -58,7 +58,7 @@ export const GUIDES: readonly Guide[] = [
       "Write a Dockerfile at the repo root that installs the app (e.g. into /app).",
       "repo_create {name}.",
       "repo_write_files {repo, files: [... source ..., Dockerfile], message}.",
-      `repo_deploy {repo, host, kind: "vm", port, start_command}. ${DAEMONIZE}`,
+      `repo_deploy {repo, kind: "vm", port, start_command, host?}. ${DAEMONIZE}`,
       "repo_deploy waits for the image build. Then applb_get_deployment {id} and applb_metrics show whether replicas are healthy.",
     ],
     pitfalls: [
@@ -72,7 +72,7 @@ export const GUIDES: readonly Guide[] = [
     keywords: ["repo", "repository", "git", "push", "pushed", "existing", "clone", "remote"],
     steps: [
       "repo_list or repo_get {repo} — confirm it is not empty (an empty repo has nothing to deploy).",
-      "repo_deploy {repo, host, kind: \"site\" | \"vm\", ...} — mints a read token, stores it as an app-lb secret, registers the deployment with `build` pointing at the repo, and builds it.",
+      "repo_deploy {repo, kind: \"site\" | \"vm\", ...} — mints a read token, stores it as an app-lb secret, registers the deployment with `build` pointing at the repo, and builds it. Pass `deployment` to target a deployment whose id is not the repo name.",
       "To redeploy after a push: repo_deploy again (or applb_build {id}).",
     ],
     pitfalls: [
@@ -86,7 +86,8 @@ export const GUIDES: readonly Guide[] = [
     steps: [
       "art_publish_files {tag: \"<namespace>/<name>:<version>\", files: [{path, content, encoding?: \"base64\"}]} — files are passed INLINE: this server is remote and cannot read paths on your machine. Up to 64 MiB in total.",
       "A tarball you already have: art_publish {tag, content_base64}.",
-      "Serve it: applb_deploy a site with `artifact: {store: <the store URL heyo_status reports for artifacts>, ref: <tag>}`, or for an existing site pass `deployment` to art_publish_files and it pulls the new files.",
+      "To serve it, app-lb must be able to read the tag. Your tags are private, and a namespace cannot hold the store's key, so a site or vm that pulls one fails with 401 — unless the repo is public (anyone can then download it). For a website that is fine; otherwise deploy from a repo (guide deploy-static-site).",
+      "Then: applb_deploy a site with `artifact: {store, ref: <tag>}` (art_publish_files' result gives the block), or for a site that already has `artifact`, pass `deployment` to art_publish_files.",
     ],
     pitfalls: ["The tag must start with \"<namespace>/\" (your token's namespace); heyo_whoami shows it."],
   },
@@ -117,9 +118,9 @@ export const GUIDES: readonly Guide[] = [
     keywords: ["username", "authentication", "auth", "terminal", "prompts", "clone", "128", "credential", "private"],
     steps: [
       "The build cloned a private repo with no credential: the spec's `build.auth` is missing.",
-      "Fix: repo_deploy {repo, host, kind} again — it adds the credential. Or applb_get_deployment {id}, then applb_deploy with that spec unchanged: applb_deploy adds `build.auth` for a repo on the Heyo remote.",
+      "Fix: repo_deploy {repo, kind, deployment: <id>} again — it adds the credential. Or applb_get_deployment {id}, then applb_deploy with that spec (minus `site.root`): applb_deploy adds `build.auth` for a repo on the Heyo remote.",
       "applb_build alone will fail the same way: it rebuilds the spec as it is.",
-      "For a repo hosted elsewhere (e.g. GitHub), store a token with applb_create_secret and set `build.auth: {secret, key, username}`.",
+      "For a repo hosted elsewhere (e.g. GitHub): applb_request {method: \"POST\", path: \"/secrets\", body: {id, namespace, data: {token}}}, then set `build.auth: {secret: <id>, key: \"token\", username}`.",
     ],
   },
   {
@@ -128,8 +129,8 @@ export const GUIDES: readonly Guide[] = [
     keywords: ["empty", "missing", "404", "root", "blank", "not found", "nothing", "site is empty", "site empty", "status empty", "status missing", "site missing", "no files"],
     steps: [
       "\"missing\": the site's root has never been written. \"empty\": it exists with no files. Registering a site does not put files in it.",
-      "Fill it from a repo: repo_create + repo_write_files + repo_deploy kind \"site\" (guide deploy-static-site).",
-      "Or from an artifact: art_publish_files with `deployment: <id>` (guide publish-files-as-artifact).",
+      "Fill it from a repo: repo_create + repo_write_files + repo_deploy {repo, kind: \"site\", deployment: <this site's id>} — it replaces the site's source (and drops any `update`/root).",
+      "Only if the site already has an `artifact` block: art_publish_files with `deployment: <id>`.",
     ],
     pitfalls: ["`update` commands and a hand-set `site.root` will not fix this for a namespace credential: both are refused."],
   },
@@ -201,12 +202,17 @@ const FAILURES: { pattern: RegExp; guide: string; hint: string }[] = [
   {
     pattern: /could not read Username|terminal prompts disabled|Authentication failed for 'http/i,
     guide: "fix-git-auth",
-    hint: "the build cloned a private repo without `build.auth`. Re-run repo_deploy, or applb_deploy with the same spec (it adds the credential); applb_build alone fails again.",
+    hint: "the build cloned a private repo without `build.auth`. Re-run repo_deploy (with `deployment` if its id is not the repo name), or applb_deploy with the same spec (it adds the credential); applb_build alone fails again.",
   },
   {
     pattern: /"status"\s*:\s*"(empty|missing)"|Site root: (empty|missing)/,
     guide: "fix-empty-site",
-    hint: "nothing has put files in this site's root. Fill it with repo_deploy (kind site) or art_publish_files with `deployment`.",
+    hint: "nothing has put files in this site's root. Fill it with repo_deploy {repo, kind: \"site\", deployment: <id>}.",
+  },
+  {
+    pattern: /\bpull[^\n]{0,200}\b401\b|\b401\b[^\n]{0,200}\bpull/i,
+    guide: "publish-files-as-artifact",
+    hint: "app-lb could not read the artifact: your tags are private and a namespace cannot hold the store key. Make the repo public, or deploy from a repo instead.",
   },
   {
     pattern: /namespace credential (may not|cannot)|operators only|site\.root must be under|may only proxy to public|must be an https:\/\//i,

@@ -73,7 +73,7 @@ primitives underneath it are \`applb_create_deployment\` (register or replace) a
 \`applb_update_deployment\` (edit, **preserving the VM pool** when \`vm\` is
 unchanged).
 
-Write the spec against \`applb_create_deployment\`'s schema, which is generated
+Write the spec against \`applb_deploy\`'s schema, which is generated
 from app-lb's own types. \`applb_spec_schema\` returns any block in full plus the
 rules that constrain it.
 
@@ -206,7 +206,7 @@ function deployPlan(kind: string, id: string, host?: string): string {
       ...shared,
       "Have source and a Dockerfile? `repo_create` → `repo_write_files` → `repo_deploy` with",
       "`kind: \"vm\"` does all of this (see `heyo_guide` topic deploy-vm-from-source). By hand:",
-      "1. Write the spec against `applb_create_deployment`'s schema:",
+      "1. Write the spec against `applb_deploy`'s schema:",
       `   - \`id\`, \`routes: [${route}]\``,
       "   - `vm`: `driver` (`firecracker`), `port`, and usually `start_command` and `size_class`;",
       "     `start_command` must background itself (`setsid nohup … &`) and the app must listen on 0.0.0.0",
@@ -237,9 +237,9 @@ function deployPlan(kind: string, id: string, host?: string): string {
     "   already run. Add `health` if `/` is not the right probe — `\"path\": null` means a",
     "   bare TCP connect.",
     "2. `applb_deploy` with that spec. Nothing is booted: app-lb proxies to what you run.",
-    "3. Add an `update` block if app-lb should rebuild the code on this host; then",
-    "   `applb_host_update` runs it. `applb_pull` and `applb_build` do NOT apply to a",
-    "   static deployment.",
+    "3. Operators only (a namespace credential is refused): an `update` block makes",
+    "   app-lb rebuild the code on its own host, run by `applb_host_update`.",
+    "   `applb_pull` and `applb_build` do NOT apply to a static deployment.",
     ...tail,
   ].join("\n");
 }

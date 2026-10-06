@@ -102,3 +102,68 @@ test("applb_job with a namespace token falls back to the deployment's job list",
     globalThis.fetch = original;
   }
 });
+
+test("the advertised spec schema carries the tenant notes on the fields that invite mistakes", () => {
+  const deploy = tools().find((t) => t.name === "applb_deploy")!;
+  const spec = (deploy.inputSchema as { properties: { spec: Record<string, any> } }).properties.spec;
+  assert.match(spec.properties.site.description, /^Omit `root`/);
+  assert.match(spec.properties.update.description, /^Operators only/);
+  assert.match(spec.$defs.BuildSpec.properties.repo.description, /^Namespace credentials: https:\/\/ only/);
+  assert.match(spec.$defs.VmSpec.properties.start_command.description, /^Must return/);
+});
+
+/** repo_deploy against a stub app-lb + remote; returns the spec it registered. */
+async function repoDeploy(args: Record<string, unknown>, existing?: Record<string, unknown>) {
+  const config = loadConfig({
+    APPLB_URL: "http://127.0.0.1:9090",
+    APPLB_TOKEN: "applb_x",
+    APPLB_NAMESPACE: "us5",
+    REMOTE_URL: "https://git.us5.example.com",
+  });
+  const tool = buildTools(config).find((t) => t.name === "repo_deploy")!;
+  const writes: { method: string; url: string; body: any }[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+    if (method !== "GET") writes.push({ method, url, body });
+    const reply = (status: number, b: unknown) =>
+      new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
+    if (url.includes("/api/repos/")) {
+      return reply(200, { clone_url: "https://git.us5.example.com/us5/app.git", default_branch: "main", empty: false });
+    }
+    if (url.endsWith("/api/tokens")) return reply(201, { token: "hrm_1_s", id: "t1" });
+    if (url.includes("/onboarding")) return reply(200, { fastcar: { url: "https://fastcar-us5.us5.example.com" } });
+    if (method === "GET" && /\/deployments\/[^/?]+$/.test(url)) {
+      return existing ? reply(200, { spec: existing }) : reply(404, { error: "not found" });
+    }
+    if (method === "POST" && /\/build$/.test(url)) return reply(202, { id: "job-1", status: "queued" });
+    return reply(200, { id: "app" });
+  }) as typeof fetch;
+  try {
+    const out = await tool.handler({ ...args, wait_seconds: 0 });
+    const reg = writes.find((w) => /\/deployments(\/app)?$/.test(w.url) && (w.method === "POST" || w.method === "PUT"));
+    return { out, spec: reg?.body };
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test("repo_deploy names a host from app-lb's base domain when none is given", async () => {
+  const { out, spec } = await repoDeploy({ repo: "app", kind: "site" });
+  assert.deepEqual(spec.routes, [{ host: "app.us5.example.com" }]);
+  assert.match(out, /using app\.us5\.example\.com/);
+});
+
+test("a corrected port wins over the existing spec on redeploy", async () => {
+  const existing = {
+    id: "app", namespace: "us5", routes: [{ host: "app.example.com" }],
+    vm: { driver: "firecracker", port: 3000, start_command: "node server.js" },
+  };
+  const { spec } = await repoDeploy({ repo: "app", kind: "vm", port: 8080 }, existing);
+  assert.equal(spec.vm.port, 8080);
+  assert.equal(spec.vm.start_command, "node server.js", "the rest of the vm block is kept");
+  const kept = await repoDeploy({ repo: "app", kind: "vm" }, existing);
+  assert.equal(kept.spec.vm.port, 3000, "no port given keeps the existing one");
+});

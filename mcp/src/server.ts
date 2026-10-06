@@ -170,7 +170,7 @@ App with a Dockerfile: repo_create, repo_write_files including the Dockerfile, t
 
 Never set site.root or an update block: app-lb assigns the root, and update is operator-only.
 
-applb_spec_schema has the full deployment spec and examples. When something fails, run heyo_status first, then diagnose_deployment.`;
+applb_spec_schema has the full deployment spec. On a 401 or 403 run heyo_whoami; on any other failure, heyo_guide with the error, then diagnose_deployment.`;
 
 /**
  * Check a tool's arguments against the schema it advertises, before its handler

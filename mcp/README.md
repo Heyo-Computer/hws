@@ -563,7 +563,7 @@ Cross-service, shaped like the question rather than the endpoint.
 
 | Tool | | Does |
 | --- | --- | --- |
-| `applb_deploy` |  | No spec yet, just files? repo_deploy or art_publish_files fit better; see heyo_guide. |
+| `applb_deploy` |  | Just files, no spec? repo_deploy fits better; see heyo_guide. |
 | `applb_spec_schema` | read-only | The deployment spec in full: every field of a named block with its complete documentation, plus the cross-field rules that apply to it. |
 | `applb_create_deployment` |  | Register a deployment from a full spec, REPLACING any deployment with the same id and recycling its VM pool. |
 | `applb_update_deployment` |  | Edit an existing deployment in place, replacing its whole spec. |

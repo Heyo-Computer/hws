@@ -243,9 +243,15 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
         "Redeploy after a push by calling it again, or applb_build.",
       schema: {
         repo: z.string(),
-        host: z.string().describe("hostname to route, e.g. 'my-app.us2.heyo.work'"),
+        host: z
+          .string()
+          .optional()
+          .describe("default <deployment>.<region domain>"),
         kind: z.enum(["site", "vm"]).optional().describe("default site"),
-        deployment: z.string().optional().describe("deployment id; default the repo name"),
+        deployment: z
+          .string()
+          .optional()
+          .describe("deployment id; default the repo name"),
         ref: z.string().optional().describe("branch, tag or commit; default the repo's default branch"),
         context: z.string().optional().describe("directory in the repo: the site's files, or the docker context"),
         spa: bool().optional().describe("site: serve index.html for unknown paths"),
@@ -254,7 +260,7 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
         start_command: z
           .string()
           .optional()
-          .describe("vm: must return; background the app (setsid nohup … &), listening on 0.0.0.0:<port>"),
+          .describe("vm: must return (setsid nohup … &); listen on 0.0.0.0"),
         namespace: z.string().optional(),
         wait_seconds: num().optional().describe("poll the build this long; default 120"),
       },
@@ -299,6 +305,26 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           if (!(e instanceof ServiceError && notVisible(e))) throw e;
         }
 
+        // A new deployment needs a host. Without one, use app-lb's own base
+        // domain, read from its onboarding answer (the hostname it gives the
+        // namespace's starter app, minus that app's label).
+        let host = a.host as string | undefined;
+        if (!existing?.routes && !host) {
+          const ob = (await clients.applb({ path: "/onboarding", query: { namespace: ns } }).catch(() => undefined)) as
+            | { fastcar?: { url?: string | null } }
+            | undefined;
+          const starter = ob?.fastcar?.url ? new URL(ob.fastcar.url).hostname : undefined;
+          const base = starter?.split(".").slice(1).join(".");
+          if (!base) {
+            throw new Error(
+              "Pass `host`: this app-lb does not report a base domain, so no default hostname " +
+                "can be made (e.g. host: \"my-app.<region>.heyo.work\").",
+            );
+          }
+          host = `${id}.${base}`;
+          sections.push({ title: "Host", body: `no host given; using ${host}` });
+        }
+
         let spec: Record<string, unknown>;
         if (kind === "site") {
           // No root: app-lb assigns one under its own sites dir. The caller
@@ -315,7 +341,7 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
             ...(existing ?? {}),
             id,
             namespace: ns,
-            routes: existing?.routes ?? [{ host: a.host }],
+            routes: existing?.routes ?? [{ host }],
             site,
             build,
           };
@@ -327,11 +353,14 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
             ...(existing ?? {}),
             id,
             namespace: ns,
-            routes: existing?.routes ?? [{ host: a.host }],
+            routes: existing?.routes ?? [{ host }],
             vm: {
               driver: "firecracker",
-              port: a.port === undefined ? 8080 : Number(a.port),
+              port: 8080,
               ...((existing?.vm as object | undefined) ?? {}),
+              // Given now, it wins over the existing spec: a corrected port is
+              // the usual reason to redeploy a VM that never became ready.
+              ...(a.port !== undefined ? { port: Number(a.port) } : {}),
               ...(a.start_command ? { start_command: a.start_command } : {}),
             },
             scaling: existing?.scaling ?? { min_replicas: 1, max_replicas: 1 },

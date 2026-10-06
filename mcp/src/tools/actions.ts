@@ -35,6 +35,35 @@ const DESTRUCTIVE = DESTRUCTIVE_PREFIX;
  * For a register-or-edit that means "register"; if the id is taken in
  * another namespace, the POST is what refuses it.
  */
+/**
+ * The generated spec schema, with a note on the four fields whose app-lb
+ * description invites what a namespace credential may not do. The schema
+ * itself stays generated (`applb/spec.schema.ts`); these are prepended only
+ * where it is advertised, so the first thing a hand-writer reads is the safe
+ * route.
+ */
+export const TENANT_NOTES: readonly (readonly [string[], string])[] = [
+  [["properties", "site"], "Omit `root`; fill via `build` or `artifact`."],
+  [["properties", "update"], "Operators only: a namespace credential is refused."],
+  [["$defs", "BuildSpec", "properties", "repo"], "Namespace credentials: https:// only."],
+  [["$defs", "VmSpec", "properties", "start_command"], "Must return (setsid nohup … &)."],
+];
+
+function withTenantNotes<T>(schema: T): T {
+  const copy = JSON.parse(JSON.stringify(schema)) as Record<string, unknown>;
+  for (const [path, note] of TENANT_NOTES) {
+    let node: unknown = copy;
+    for (const k of path) node = (node as Record<string, unknown> | undefined)?.[k];
+    if (node && typeof node === "object") {
+      const n = node as { description?: string };
+      n.description = n.description ? `${note} ${n.description}` : note;
+    }
+  }
+  return copy as T;
+}
+
+const ADVERTISED_SPEC = withTenantNotes(DEPLOYMENT_SPEC_SCHEMA);
+
 export function notVisible(e: ServiceError): boolean {
   return e.status === 404 || (e.status === 403 && /not scoped to deployment/.test(e.body));
 }
@@ -188,7 +217,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
       description:
         "The deployment spec in full: every field of a named block with its complete " +
         "documentation, plus the cross-field rules that apply to it. Read this when " +
-        "applb_create_deployment's schema summarises a block you need to write — `auth`, " +
+        "applb_deploy's schema summarises a block you need to write — `auth`, " +
         "`jwt`, `mounts`, `workspace` — or when a spec was refused and the reason names a " +
         "rule rather than a field.\n\n" +
         "Generated from app-lb's own types, so it cannot disagree with what the server " +
@@ -230,7 +259,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
     {
       name: "applb_deploy",
       description:
-        "No spec yet, just files? repo_deploy or art_publish_files fit better; see heyo_guide.\n\n" +
+        "Just files, no spec? repo_deploy fits better; see heyo_guide.\n\n" +
         "Takes a full spec and does the whole sequence: " +
         "checks the rules a schema cannot express, registers or edits as appropriate, starts " +
         "the job that matches the backend, waits for it, and reports what TLS will do.\n\n" +
@@ -253,7 +282,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
       inputSchema: {
         type: "object",
         properties: {
-          spec: DEPLOYMENT_SPEC_SCHEMA,
+          spec: ADVERTISED_SPEC,
           wait_seconds: {
             type: "number",
             description: "how long to poll the job before returning; default 120, 0 to skip",
@@ -281,6 +310,25 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         if (ownNs && spec && typeof spec === "object" && !spec.namespace) {
           spec.namespace = ownNs;
           sections.push({ title: "Namespace", body: `\`namespace\` was not set; using your token's, ${ownNs}.` });
+        }
+        // A tenant's site root is app-lb's to assign. A spec copied from
+        // applb_get_deployment carries the assigned one; drop it rather than
+        // refuse a spec that only echoes what app-lb said.
+        const site = spec?.site as Record<string, unknown> | undefined;
+        if (ownNs && site && site.root !== undefined) {
+          delete site.root;
+          sections.push({ title: "site.root", body: "removed: app-lb assigns a namespace's site roots itself." });
+        }
+        // A tenant's tags are private and a namespace cannot hold the store's
+        // key, so a pull with no `auth` is refused unless the repo is public.
+        const art = spec?.artifact as Record<string, unknown> | undefined;
+        if (ownNs && art && !art.auth) {
+          sections.push({
+            title: "Artifact access",
+            body:
+              "app-lb pulls this tag without a credential, so it fails with 401 unless the tag's repo " +
+              "is public. To keep it private, deploy from a repo instead (heyo_guide deploy-static-site).",
+          });
         }
         const problems = checkSpec(spec, { confined: Boolean(ownNs) });
         if (problems.length > 0) {
@@ -510,13 +558,13 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "for an edit this is the tool and that one is not.\n\n" +
         "The whole spec is replaced, not merged — read applb_get_deployment first and send it " +
         "back changed. The path id wins, so the body cannot retarget another deployment. The " +
-        "spec's schema is on applb_create_deployment; applb_spec_schema has it in full.",
+        "spec's schema is on applb_deploy; applb_spec_schema has it in full.",
       schema: {
         id: z.string(),
         spec: z
           .record(z.unknown())
           .describe(
-            "the complete replacement spec — see applb_create_deployment's schema, or " +
+            "the complete replacement spec — see applb_deploy's schema, or " +
               "applb_spec_schema for any block in full",
           ),
       },
@@ -682,7 +730,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         deployment: z
           .string()
           .optional()
-          .describe("the job's deployment; required with a namespace token"),
+          .describe("its deployment; needed with a namespace token"),
       },
       handler: async (a) => {
         const jid = String(a.job_id);
