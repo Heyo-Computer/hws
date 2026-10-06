@@ -299,7 +299,7 @@ When a base domain is configured (`APP_LB_DEPLOY_BASE_DOMAIN`, or the first `APP
 | `image` | daemon default (`ubuntu:24.04`) | Image name in the daemon catalog. For `lxc`, a required OCI reference. |
 | `rootfs` | `copy` | `copy` boots each replica from a private copy of the image (heyvm copies it on every cold boot; a full copy on ext4). `shared` attaches the image itself read-only, so nothing is copied: the image must supply its own writable layer (the hub's base images do), and what must persist lives on the data disk or the workspace. Needs a heyvm with per-sandbox `rootfs_mode`; an older one ignores it and copies. Refused for `lxc`. |
 | `port` | required | Guest port traffic is proxied to. |
-| `start_command` | | Shell command run once per replica after boot. It must return, so daemonize the workload (`setsid nohup prog </dev/null >/var/log/prog.log 2>&1 &`). Its output goes to `/var/log/heyvm-start.log` inside the guest. |
+| `start_command` | | Shell command run once per replica after boot. It must return, so daemonize the workload (`setsid nohup prog </dev/null &`). Its stdout and stderr go to `/var/log/heyvm-start.log` and `.err.log` inside the guest, and from there to app-obs when the image has `socat` (see below). Don't redirect them to a file of your own: that output then never leaves the guest. |
 | `working_directory` | guest default | Directory `start_command` runs in. |
 | `size_class` | daemon default | `micro`, `mini`, `small`, `medium`, `large`, `xlarge`. This is the only CPU and memory setting. |
 | `disk_size_gb` | none | Per-sandbox data disk mounted at `/workspace`. It belongs to one sandbox: a restart, rollout or `vm` edit boots a replica with a fresh disk. |
@@ -368,6 +368,8 @@ Builds a new rootfs with `heyvm mvm build`. On success, app-lb rewrites `vm.imag
 The init mounts `/proc`, `/sys` and `/dev`, finishes network setup and starts `sshd` if the image has one. It then prints `HEYVM_READY` and never exits. It does **not** start the app: `vm.start_command` does that after boot, and must return (`setsid nohup … &`).
 
 The image's `CMD`, `ENTRYPOINT` and `ENV` do not survive the rootfs export, so put what they did into `start_command`. A Dockerfile that mentions `/init.sh` is built as written.
+
+**Install `socat` in custom images.** heyvm forwards the `start_command`'s stdout and stderr to the host over vsock using `socat` inside the guest, and only when the image has it. Without it, the app's logs stay in `/var/log/heyvm-start.log` in the guest: they never reach app-obs, `heyctl logs`, the obs plugin or MCP's `deployment_logs`, and they are gone when the VM is. heyvm logs `guest lacks socat/vsock, workload logs stay in guest files` at boot when this happens. The socat must be built with VSOCK support (socat 1.7.4 or newer; the Alpine, Debian and Ubuntu packages are). Add it with `apk add socat` or `apt-get install -y socat`. The hub's base images (`heyo/alpine`, `heyo/debian`, `heyo/ubuntu`) include it.
 
 ### `artifact`
 
@@ -780,7 +782,7 @@ For `obs`, `/namespaces/<ns>/plugins/obs/ui` is the app-obs dashboard narrowed t
 
 **A pool stays at zero ready.** Start with `GET /metrics?deployment=<id>` and look at `metrics.autoscale`:
 
-- `vms_created` and `boot_timeouts` both rising: the daemon creates VMs but the guest never passes health. Read the start log inside the guest with `heyctl exec <id> -- cat /var/log/heyvm-start.log` (and `.err.log`). It is not in app-obs, and it lives only as long as that boot. Common causes: a `start_command` that blocks instead of daemonizing, a server bound to `127.0.0.1` instead of the guest interface, the wrong `port`, or a `health.path` behind auth or returning 5xx.
+- `vms_created` and `boot_timeouts` both rising: the daemon creates VMs but the guest never passes health. Read the start log inside the guest with `heyctl exec <id> -- cat /var/log/heyvm-start.log` (and `.err.log`). It reaches app-obs only when the image has `socat` (see "Install `socat` in custom images"); otherwise it lives only as long as that boot. Common causes: a `start_command` that blocks instead of daemonizing, a server bound to `127.0.0.1` instead of the guest interface, the wrong `port`, or a `health.path` behind auth or returning 5xx.
 - `vms_created` flat while desired is above zero: creates fail before a VM exists (`create_failures` and `last_create_error` say why). Check for a missing image (for example, after `heyvm prune --images`), a full disk, host memory admission in heyvmd, a secret in `env_from` that doesn't exist, or a mount or workspace that isn't ready. The app-lb log names the reason (`not creating a replica yet: ...`).
 - `vms_created` and `vms_drained` climbing together with no failures: scale-to-zero churn. Check `scale_to_zero_after_secs`, but first find out why the replica was retired.
 
