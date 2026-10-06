@@ -65,6 +65,11 @@ pub struct MintArgs {
     #[arg(long, value_name = "HOURS")]
     pub expires_in: Option<u64>,
 
+    /// Valid on every server of the fleet, not only this one. Mint it at the
+    /// control-plane app-lb; the other servers pick it up within seconds.
+    #[arg(long)]
+    pub all_servers: bool,
+
     /// Print only the token, for capturing into a variable.
     #[arg(long, short = 'q')]
     pub quiet: bool,
@@ -164,6 +169,9 @@ fn mint(ctx: &Ctx, args: &MintArgs) -> Result<()> {
     if let Some(hours) = args.expires_in {
         req = req.expires_in(std::time::Duration::from_secs(hours * 3600));
     }
+    if args.all_servers {
+        req = req.on_all_servers();
+    }
 
     let minted = ctx.client.raw().mint_token(&req)?;
     let secret = minted
@@ -183,6 +191,9 @@ fn mint(ctx: &Ctx, args: &MintArgs) -> Result<()> {
     // then captures the credential and nothing else, even without `-q`.
     eprintln!("Minted {:?}.", args.name);
     eprintln!("This is the only time the token is shown — app-lb stores only its hash.\n");
+    if args.all_servers {
+        eprintln!("Valid on every server that mirrors this control plane, within seconds.\n");
+    }
     println!("{secret}");
     eprintln!("\nUse it as: Authorization: Bearer <token>");
     Ok(())
@@ -200,6 +211,16 @@ fn scope_cell(t: &TokenSummary) -> String {
     match &t.namespace {
         Some(ns) => format!("{ns}:{deployments}"),
         None => deployments,
+    }
+}
+
+/// Where the token works: this server, every server, or every server by way
+/// of a control plane — the one place it can then be changed or revoked.
+fn servers_cell(t: &TokenSummary) -> String {
+    match (&t.mirrored_from, t.fleet) {
+        (Some(from), _) => format!("all (from {from})"),
+        (None, true) => "all".to_string(),
+        (None, false) => "this".to_string(),
     }
 }
 
@@ -232,13 +253,14 @@ fn list(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     let now = now_secs();
-    let mut table = Table::new(["ID", "NAME", "ADMIN", "DEPLOYMENTS", "LAST USED", "EXPIRES"]);
+    let mut table = Table::new(["ID", "NAME", "ADMIN", "DEPLOYMENTS", "SERVERS", "LAST USED", "EXPIRES"]);
     for t in &tokens {
         table.row(&[
             t.id.clone(),
             t.name.clone(),
             t.admin.to_string(),
             scope_cell(t),
+            servers_cell(t),
             // "never" and "not since the store was last written" are
             // indistinguishable here; the stamp is flushed opportunistically.
             t.last_used_at
@@ -285,6 +307,14 @@ fn describe(ctx: &Ctx, id: &str) -> Result<()> {
             .unwrap_or_else(|| "never, or not since the store was last written".into()),
     );
     output::field("Expires", expiry_cell(&t, now));
+    output::field(
+        "Servers",
+        match &t.mirrored_from {
+            Some(from) => format!("every server — mirrored from {from}; change or revoke it there"),
+            None if t.fleet => "every server that mirrors this control plane".to_string(),
+            None => "this one only".to_string(),
+        },
+    );
     if !t.covers_fleet() && t.admin == AdminScope::Admin {
         println!(
             "\nScoped to specific deployments, so the fleet-wide routes — creating\n\
@@ -362,8 +392,19 @@ mod tests {
             created_at: 0,
             expires_at,
             last_used_at: None,
+            fleet: false,
+            mirrored_from: None,
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn the_servers_cell_says_where_a_token_works_and_where_to_revoke_it() {
+        assert_eq!(servers_cell(&token(&["*"], None)), "this");
+        let fleet = TokenSummary { fleet: true, ..token(&["*"], None) };
+        assert_eq!(servers_cell(&fleet), "all");
+        let mirrored = TokenSummary { mirrored_from: Some("us2".into()), ..fleet };
+        assert_eq!(servers_cell(&mirrored), "all (from us2)");
     }
 
     #[test]

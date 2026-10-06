@@ -927,8 +927,29 @@ fn token_responses_are_stable() {
         expires_at: None,
         minted_by: None,
         last_used_at: Some(1_722_403_600),
+        fleet: false,
+        mirrored_from: None,
     };
     golden("token-summary", &fleet);
+
+    // A fleet token as a member server lists it: minted at the control plane
+    // `us2`, mirrored here, and changed or revoked only there.
+    golden(
+        "token-summary-mirrored",
+        &TokenSummary {
+            id: "c3d4e5f6a1b2".into(),
+            name: "deploy bot".into(),
+            admin: AdminScope::Admin,
+            namespace: None,
+            deployments: vec!["*".into()],
+            created_at: 1_722_400_000,
+            expires_at: None,
+            minted_by: None,
+            last_used_at: None,
+            fleet: true,
+            mirrored_from: Some("us2".into()),
+        },
+    );
 
     // The narrow shape: an agent's own sandbox, no admin API access, expiring.
     golden(
@@ -943,6 +964,8 @@ fn token_responses_are_stable() {
             expires_at: Some(1_722_486_400),
             minted_by: None,
             last_used_at: None,
+            fleet: false,
+            mirrored_from: None,
         },
     );
 
@@ -961,6 +984,8 @@ fn token_responses_are_stable() {
             expires_at: None,
             minted_by: None,
             last_used_at: None,
+            fleet: false,
+            mirrored_from: None,
         },
     );
 

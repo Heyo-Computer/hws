@@ -714,6 +714,9 @@ impl Client {
         if let Some(s) = req.expires_in_secs {
             body["expires_in_secs"] = json!(s);
         }
+        if req.all_servers {
+            body["fleet"] = json!(true);
+        }
         self.read(
             Request::new(Method::Post, "/tokens").json(body),
             "token",
@@ -1258,6 +1261,7 @@ impl Raw<'_> {
             "namespace": req.namespace,
             "deployments": req.deployments,
             "expires_in_secs": req.expires_in_secs,
+            "fleet": req.all_servers,
         });
         self.0
             .read(
@@ -1610,6 +1614,8 @@ pub struct NewToken {
     pub namespace: Option<String>,
     pub deployments: Vec<String>,
     pub expires_in_secs: Option<u64>,
+    /// Valid on every server of the fleet. See [`NewToken::on_all_servers`].
+    pub all_servers: bool,
 }
 
 impl NewToken {
@@ -1652,6 +1658,14 @@ impl NewToken {
 
     pub fn expires_in(mut self, d: Duration) -> Self {
         self.expires_in_secs = Some(d.as_secs());
+        self
+    }
+
+    /// Valid on every server that mirrors this control plane's tokens, not
+    /// only the one minting it. Sent as `fleet: true`; only a control-plane
+    /// app-lb (one with gateways configured) accepts it.
+    pub fn on_all_servers(mut self) -> Self {
+        self.all_servers = true;
         self
     }
 }

@@ -633,6 +633,13 @@ fn main() {
     if tokens.sweep_expired(deployment::now_secs()) > 0 {
         let _ = tokens.persist();
     }
+    // Fleet tokens last pulled from the token authority, so a restart while the
+    // control plane is unreachable does not log those clients out here.
+    match tokens.load_mirror() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "loaded mirrored fleet tokens"),
+        Err(e) => panic!("cannot read the fleet token mirror beside {}: {e}", cfg.tokens_path),
+    }
 
     // Block rules, restored before the data plane accepts anything. Fatal on a
     // corrupt file, for the same reason the token store is: coming up with an
