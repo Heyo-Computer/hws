@@ -27,6 +27,11 @@ pub struct Fleet {
 pub struct ViewConfig {
     pub gateways: Vec<Gateway>,
     pub control_plane: Vec<Gateway>,
+    /// The control-plane app-lb whose fleet tokens this server accepts. Set on
+    /// each member server; the control plane itself needs no entry, because it
+    /// holds its fleet tokens in its own store. Service credential only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_authority: Option<Gateway>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +54,8 @@ pub struct ViewSnapshot {
     pub fleet: Option<Arc<Fleet>>,
     #[serde(skip)]
     pub control_plane: Option<Arc<Fleet>>,
+    #[serde(skip)]
+    pub token_authority: Option<Arc<Fleet>>,
 }
 
 /// Gateway-local bindings, never application or rollout authority. Persist
@@ -81,13 +88,27 @@ impl ViewStore {
         if config.control_plane.iter().any(|g| g.use_caller_auth) {
             return Err("Orchestrator bindings require service credentials".into());
         }
+        // Pulled in the background with no caller to forward, so it can only
+        // ever use a service credential.
+        let token_authority = match config.token_authority.take() {
+            None => None,
+            Some(authority) if authority.use_caller_auth => {
+                return Err("the token authority requires a service credential".into());
+            }
+            Some(authority) => {
+                let authority = parse(&serde_json::to_string(&[authority]).map_err(|_| "invalid view configuration")?)?
+                    .remove(0);
+                config.token_authority = Some(authority.clone());
+                Some(Arc::new(Fleet::new(vec![authority], secrets.clone())?))
+            }
+        };
         let mut clients = Vec::new();
         for targets in [&mut config.gateways, &mut config.control_plane] {
             if targets.is_empty() { clients.push(None); continue; }
             *targets = parse(&serde_json::to_string(targets).map_err(|_| "invalid view configuration")?)?;
             clients.push(Some(Arc::new(Fleet::new(targets.clone(), secrets.clone())?)));
         }
-        Ok(ViewSnapshot { revision, config, externally_managed, fleet: clients.remove(0), control_plane: clients.remove(0) })
+        Ok(ViewSnapshot { revision, config, externally_managed, fleet: clients.remove(0), control_plane: clients.remove(0), token_authority })
     }
 
     pub fn snapshot(&self) -> Arc<ViewSnapshot> { self.current.load_full() }
@@ -104,7 +125,7 @@ impl ViewStore {
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         // Reject unresolved credentials before acknowledging activation. Values
         // stay in SecretStore; neither persistence nor the response contains them.
-        for gateway in next.config.gateways.iter().chain(&next.config.control_plane) {
+        for gateway in next.config.gateways.iter().chain(&next.config.control_plane).chain(&next.config.token_authority) {
             if gateway.auth.as_ref().is_some_and(|auth| self.secrets.resolve(auth).map_or(true, |value| value.trim().is_empty())) {
                 return Err((StatusCode::BAD_REQUEST, "view credential unavailable".into()));
             }
@@ -315,6 +336,14 @@ impl Fleet {
             }
         }
         Err(last)
+    }
+
+    /// Pull the control plane's fleet tokens. Only ever called on a
+    /// single-gateway `token_authority` binding; returns its id with the export.
+    pub async fn fleet_tokens(&self) -> Result<(String, crate::tokens::FleetExport), &'static str> {
+        let authority = self.gateways.first().ok_or("token authority not configured")?;
+        let export = self.fetch(authority, "/fleet/tokens", None).await?;
+        Ok((authority.id.clone(), export))
     }
 
     pub async fn observe(&self, caller: Option<&str>) -> Vec<Observation> {
@@ -814,6 +843,34 @@ mod tests {
     }
 
     #[test]
+    fn the_token_authority_takes_a_service_credential_https_origin_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("views.json");
+        let secrets = Arc::new(SecretStore::new(dir.path().join("secrets.json"), None));
+        secrets.put(crate::secrets::SecretSpec { id:"fleet-observer".into(),namespace:"default".into(),
+            description:None,updated_at:0,data:std::collections::BTreeMap::from([("token".into(),"member-pull".into())]) });
+        let store = ViewStore::open(path.clone(), secrets.clone(), [None,None]).unwrap();
+        let config = |authority: serde_json::Value| -> ViewConfig {
+            serde_json::from_value(serde_json::json!({"gateways":[],"control_plane":[],"token_authority":authority})).unwrap()
+        };
+
+        let caller = serde_json::json!({"id":"us2","region":"US2","url":"https://admin.us2.example","use_caller_auth":true});
+        assert_eq!(store.configure(ConfigureViews { expected_revision:0, config:config(caller) }).err().unwrap().0, http::StatusCode::BAD_REQUEST);
+        let plain = serde_json::json!({"id":"us2","region":"US2","url":"http://admin.us2.example","auth":{"secret":"fleet-observer","key":"token"}});
+        assert_eq!(store.configure(ConfigureViews { expected_revision:0, config:config(plain) }).err().unwrap().0, http::StatusCode::BAD_REQUEST);
+        let missing = serde_json::json!({"id":"us2","region":"US2","url":"https://admin.us2.example","auth":{"secret":"absent","key":"token"}});
+        assert_eq!(store.configure(ConfigureViews { expected_revision:0, config:config(missing) }).err().unwrap().0, http::StatusCode::BAD_REQUEST);
+
+        let good = serde_json::json!({"id":"us2","region":"US2","url":"https://admin.us2.example","auth":{"secret":"fleet-observer","key":"token"}});
+        let updated = store.configure(ConfigureViews { expected_revision:0, config:config(good) }).unwrap();
+        assert!(updated.token_authority.is_some());
+        assert!(updated.fleet.is_none(), "a member is not a control plane");
+        let restarted = ViewStore::open(path, secrets, [None,None]).unwrap();
+        assert!(restarted.snapshot().token_authority.is_some());
+        assert_eq!(serde_json::to_value(&*restarted.snapshot()).unwrap()["config"]["token_authority"]["url"], "https://admin.us2.example/");
+    }
+
+    #[test]
     fn view_configuration_is_durable_conditional_and_keeps_old_readers_pinned() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -909,9 +966,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let secrets = Arc::new(SecretStore::new(dir.path().join("secrets"), None));
         let store = ViewStore::open(dir.path().join("views"), secrets, [None,None]).unwrap();
-        let config = ViewConfig { gateways:gateways.clone(), control_plane:vec![] };
+        let config = ViewConfig { gateways:gateways.clone(), control_plane:vec![], token_authority:None };
         assert_eq!(store.configure(ConfigureViews {expected_revision:0,config}).unwrap().revision,1);
-        let config = ViewConfig { gateways:vec![], control_plane:gateways };
+        let config = ViewConfig { gateways:vec![], control_plane:gateways, token_authority:None };
         assert_eq!(store.configure(ConfigureViews {expected_revision:1,config}).err().unwrap().0,http::StatusCode::BAD_REQUEST);
         assert_eq!(store.snapshot().revision,1);
         g["use_caller_auth"] = false.into();

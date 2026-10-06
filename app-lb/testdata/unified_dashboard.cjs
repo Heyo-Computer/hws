@@ -52,10 +52,22 @@ const inventory = {services:[{serviceId:'shared-app', desiredReplicas:2, replica
     });
     servers.push(proxy);urls.push('https://localhost:'+await listen(proxy));
   }
-  async function api(i,endpoint,data,authorization=basic) {
-    const r=await fetch(adminUrls[i]+endpoint,{method:data?'POST':'GET',headers:{Authorization:authorization,'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});
+  async function api(i,endpoint,data,authorization=basic,method) {
+    const r=await fetch(adminUrls[i]+endpoint,{method:method||(data?'POST':'GET'),headers:{Authorization:authorization,'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});
     assert(r.ok,endpoint+': '+r.status);return r.json();
   }
+  // The rollup as GET /fleet/deployments answers it. eu1 drops out when `unavailable`.
+  const rollup=()=>{
+    const gw=[{id:'us3',region:'US',deployments:2,totals:{ready:1,pending:0,draining:0,desired:2,in_flight:7}},
+              {id:'eu1',region:'eu1',deployments:5,totals:{ready:3,pending:0,draining:0,desired:5,in_flight:11}}]
+      .map((g,i)=>({...g,dashboard_url:urls[i]+'/dashboard?view=local',observed_at:1790000000,generated_at:1790000000,truncated:false,error:null}));
+    if(unavailable)Object.assign(gw[1],{deployments:0,generated_at:null,totals:{ready:0,pending:0,draining:0,desired:0,in_flight:0},error:'gateway unavailable'});
+    const cell=(g,ready,desired)=>({gateway:g.id,region:g.region,ready,pending:0,draining:0,desired,in_flight:1,health:ready>=desired?'healthy':'degraded',error:null});
+    const errCell=g=>({gateway:g.id,region:g.region,ready:null,pending:null,draining:null,desired:null,in_flight:null,health:null,error:g.error});
+    const rows=[{namespace:'default',id:'shared-web',kind:'vm',routed:true,hosts:['web.example.com'],health:'healthy',
+      totals:{ready:2,pending:0,draining:0,desired:2,in_flight:2},cells:[cell(gw[0],1,1),unavailable?errCell(gw[1]):cell(gw[1],1,1)]}];
+    return {configured:true,fleet_view:true,gateways:gw,rows,totals:{ready:4,pending:0,draining:0,desired:7,in_flight:18}};
+  };
   const gateways=urls.map((url,i)=>({id:['us3','eu1'][i],region:['US','eu1'][i],url,use_caller_auth:true}));
   for(let i=0;i<2;i++) {
     await api(i,'/secrets',{id:'authority',data:{token:'authority-token'}});
@@ -69,36 +81,74 @@ const inventory = {services:[{serviceId:'shared-app', desiredReplicas:2, replica
   browser=await chromium.launch({headless:true});
   const c=await browser.newContext({ignoreHTTPSErrors:true,viewport:{width:1280,height:900}});
   await c.route('**/services',r=>r.fulfill({json:{configured:true,inventory}}));
-  await c.route('**/fleet',r=>r.fulfill({json:{configured:true,gateways:urls.map((url,i)=>({
-    id:['us3','eu1'][i],region:['US','eu1'][i],dashboard_url:url+'/dashboard?view=local',
-    error:i===1&&unavailable?'gateway unavailable':null,
-    metrics:i===1&&unavailable?null:{generated_at:1790000000,fleet:{deployments:[2,5][i],ready:[1,3][i],draining:0,pending:0,total_in_flight:[7,11][i]}}
-  }))}}));
+  await c.route('**/fleet/deployments*',r=>r.fulfill({json:rollup()}));
   await c.addCookies([{name:'__Host-heyo-admin',value:'fixture-admin',domain:'localhost',path:'/',secure:true,httpOnly:true,sameSite:'Strict'}]);
   let expected;
   for(let i=0;i<2;i++){
     const p=await c.newPage(), requested=[];
     p.on('request',r=>requested.push(new URL(r.url()).pathname));
     await p.goto(urls[i]+'/dashboard');
-    await p.getByRole('link',{name:'Open eu1 gateway details'}).waitFor();
-    await p.locator('#global-services').getByRole('heading',{name:'shared-app'}).waitFor();
+    await p.locator('#servers').getByText('5 deployments').waitFor();
+    await p.locator('#global-services').getByRole('cell',{name:'shared-app'}).waitFor();
+    await p.locator('#fleet-tokens').getByText('No tokens for every server',{exact:false}).waitFor();
     assert.equal(await p.locator('#local-view').isVisible(),false);
     assert.equal(await p.getByRole('link',{name:'Security',exact:true}).isVisible(),false);
-    assert(!requested.some(x=>['/metrics','/secrets','/tokens','/jobs'].includes(x)),JSON.stringify(requested));
+    assert.equal(await p.locator('#regional-fleet').count(),0,'the regional gateways section is gone');
+    assert(!requested.some(x=>['/metrics','/secrets','/jobs','/fleet'].includes(x)),JSON.stringify(requested));
     const content=await p.locator('#global-services').innerText();if(expected)assert.equal(content,expected);else expected=content;
-    const regional=await p.locator('#regional-fleet').innerText();assert(regional.includes('Deployments: 2')&&regional.includes('Deployments: 5'));
+    const servers=await p.locator('#servers').innerText();assert(servers.includes('2 deployments')&&servers.includes('5 deployments'),servers);
+    const where=await p.locator('#workloads').innerText();assert(where.includes('us3 1/1')&&where.includes('eu1 1/1'),where);
     if(i===0 && process.env.SCREENSHOT_DIR)await p.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'unified-dashboard-desktop.png')});
     if(i===1){await p.setViewportSize({width:390,height:844});assert(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));if(process.env.SCREENSHOT_DIR)await p.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'unified-dashboard-mobile.png')});}
+    // The nav collapses behind the menu button at phone width; the local-view
+    // checks below are about which sections render, so read them at desktop width.
+    await p.setViewportSize({width:1280,height:900});requested.length=0;
     await p.goto(urls[i]+'/dashboard?view=local');assert(await p.locator('#local-view').isVisible());assert(await p.getByRole('link',{name:'Security',exact:true}).isVisible());
     await p.waitForFunction(()=>document.getElementById('fleet-tiles').textContent.trim().length>0);
+    await p.locator('#tokens').getByText('local-view').waitFor();
+    // One server's page is that server alone: no cross-server sections, and no polls for them.
+    for(const id of ['#servers','#workloads','#global-services','#fleet-tokens'])assert.equal(await p.locator(id).isVisible(),false,id);
+    assert(!requested.some(x=>x.startsWith('/fleet')||x==='/services'),JSON.stringify(requested));
     if(i===0 && process.env.SCREENSHOT_DIR)await p.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'unified-dashboard-local.png')});
     await p.close();
   }
   unavailable=true;
   const p=await c.newPage();await p.goto(urls[0]+'/dashboard');await p.getByText('gateway unavailable',{exact:false}).waitFor();
-  const fleet=await p.locator('#regional-fleet').innerText();assert(fleet.includes('Deployments: 2')&&!fleet.includes('Deployments: 5'));
+  const fleet=await p.locator('#servers').innerText();assert(fleet.includes('2 deployments')&&!fleet.includes('5 deployments'),fleet);
   if(process.env.SCREENSHOT_DIR)await p.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'unified-dashboard-unavailable.png')});
-  console.log('PASS dashboard rendering: identical global content, asymmetric regional counts, explicit local view, missing-region state, no local polls. Observation API responses are fixtures.');
+  unavailable=false;
+
+  // A token minted on the control plane's page works on the other server once
+  // that server names the control plane as its token authority. Real pull, real
+  // verification; only the browser's observation responses are fixtures.
+  await p.goto(urls[0]+'/dashboard');
+  await p.locator('#fleet-token-new').click();
+  await p.locator('#tk-name').fill('fleet-bot');
+  await p.locator('#tk-admin').selectOption('view');
+  await p.locator('#modal-ok').click();
+  const secret=await p.locator('#tk-secret').inputValue();assert(secret.startsWith('applb_'),secret);
+  await p.locator('#modal-cancel').click();
+  await p.locator('#fleet-tokens').getByText('fleet-bot').waitFor();
+  const r=await fetch(adminUrls[1]+'/metrics?summary=true&limit=0',{headers:{Authorization:'Bearer '+secret}});
+  assert.equal(r.status,401,'not yet trusted on the member');
+  const puller=await api(0,'/tokens',{name:'member-pull',admin:'view',deployments:['*']});
+  await api(1,'/secrets',{id:'token-authority',data:{token:puller.token}});
+  const current=await api(1,'/control-plane/config');
+  await api(1,'/control-plane/config',{expected_revision:current.revision,config:{...current.config,
+    token_authority:{id:'us3',region:'US',url:urls[0],auth:{secret:'token-authority',key:'token'}}}},basic,'PUT');
+  // The export the member pulls, read with the member's own credential.
+  const exported=await api(0,'/fleet/tokens',undefined,'Bearer '+puller.token);
+  assert.deepEqual(exported.tokens.map(t=>t.name),['fleet-bot'],'only fleet tokens leave the control plane');
+  assert(!JSON.stringify(exported).includes(secret.split('_').pop()),'never the secret');
+  // app-lb's outbound TLS trusts only public roots (rustls, webpki), so it cannot
+  // pull through this fixture's self-signed proxy. That makes this the failed-pull
+  // case: reported, never silent, and nothing is mirrored. The mirror and its
+  // verification are covered by the Rust tests; a live pull needs real origins.
+  let sync;
+  for(let n=0;n<150;n++){sync=(await api(1,'/control-plane/config')).token_sync;if(sync.error)break;await sleep(100);}
+  assert.equal(sync.error,'gateway unreachable',JSON.stringify(sync));assert.equal(sync.tokens,0);
+  assert.equal((await api(1,'/control-plane/config')).config.token_authority.id,'us3');
+  console.log('PASS dashboard rendering: identical global content, per-server tiles, per-deployment server chips, local view without cross-server sections, missing-server state, fleet token mint and export, member pull failure reported. Observation API responses are fixtures.');
 })().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{
   if(browser)await browser.close();
   for(const p of children)p.kill('SIGKILL');

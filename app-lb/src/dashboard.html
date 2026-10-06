@@ -342,6 +342,19 @@ button.cellbtn:hover .tag, button.cellbtn:focus-visible .tag { outline: 1px soli
 #server-detail .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; margin-bottom: 10px; }
 #server-detail .head h3 { margin: 0; font-size: 15px; font-weight: 650; }
 #server-detail .head .spacer { flex: 1 1 auto; }
+/* Servers: one compact tile each, wrapping onto as many rows as the fleet
+   needs, so a dozen regions cost a few lines of page rather than a screen. */
+.srv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+.srv-tile { border: 1px solid var(--grid); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.srv-tile .srv-name { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; min-width: 0; }
+.srv-tile .srv-name span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srv-tile .srv-region { font-size: 11px; color: var(--muted); }
+.srv-tile .srv-value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.srv-tile .srv-sub { font-size: 11px; color: var(--text-2); }
+.srv-tile .srv-links { display: flex; gap: 12px; font-size: 12px; margin-top: 2px; }
+.wl-tools { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 10px; font-size: 12px; color: var(--text-2); }
+.wl-tools input { max-width: 220px; }
+table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
 </style>
 <!-- The theme used to be read from localStorage by a blocking script here.
      It is now stamped on <html> by the server from a cookie, which is both
@@ -383,21 +396,33 @@ button.cellbtn:hover .tag, button.cellbtn:focus-visible .tag { outline: 1px soli
        for Claude Code, the hosted MCP server, and a first deployment. -->
   <section class="card" id="get-started" hidden aria-labelledby="gs-title"></section>
 
-  <section aria-labelledby="workloads-title" data-fleet-only>
+  <!-- `data-control-plane`: the cross-server view, shown only on the control
+       plane's default page. A single server's page (`?view=local`, or any
+       app-lb with no gateways configured) is that server alone. -->
+  <section aria-labelledby="servers-title" data-control-plane>
+    <div class="section-title" id="servers-title">Servers <span class="count" id="servers-count"></span></div>
+    <div class="card" id="servers" aria-live="polite">Loading servers…</div>
+  </section>
+
+  <section aria-labelledby="workloads-title" data-control-plane>
     <div class="section-title" id="workloads-title">Workloads <span class="count" id="workloads-count"></span></div>
     <div class="card" id="workloads" aria-live="polite">Loading workloads across servers…</div>
     <div class="card" id="server-detail" hidden aria-live="polite"></div>
   </section>
 
-  <section aria-labelledby="services-title" data-fleet-only>
-    <div class="section-title" id="services-title">Global applications</div>
+  <section aria-labelledby="services-title" data-control-plane>
+    <div class="section-title" id="services-title">Global applications <span class="count" id="services-count"></span></div>
     <div class="card" id="global-services" aria-live="polite">Loading shared application state…</div>
     <div><button class="btn btn-sm" id="services-first" hidden>First page</button> <button class="btn btn-sm" id="services-next" hidden>Next page</button></div>
   </section>
 
-  <section aria-labelledby="regions-title" data-fleet-only>
-    <div class="section-title" id="regions-title">Regional gateways</div>
-    <div class="card" id="regional-fleet" aria-live="polite">Loading regional observations…</div>
+  <section aria-labelledby="fleet-tokens-title" data-control-plane data-admin-only>
+    <div class="section-title" id="fleet-tokens-title">
+      Tokens for every server <span class="count" id="fleet-tokens-count"></span>
+      <span class="spacer"></span>
+      <button class="btn mini" id="fleet-token-new">New token</button>
+    </div>
+    <div class="card" id="fleet-tokens" aria-live="polite">Loading tokens…</div>
   </section>
 
   <section id="local-view" hidden aria-label="Selected gateway details">
@@ -543,6 +568,8 @@ const localView = pageParams.get("view") === "local" || !!pinnedNamespace;
 if (pinnedNamespace) {
   document.querySelectorAll("[data-fleet-only]").forEach(el => el.hidden = true);
 }
+// One server's page never shows the cross-server sections, and never polls them.
+document.querySelectorAll("[data-control-plane]").forEach(el => el.hidden = localView);
 document.getElementById("local-view").hidden = !localView;
 document.querySelectorAll("[data-local-nav]").forEach(el => el.hidden = !localView);
 document.querySelector(".topbar-brand").href = "/dashboard";
@@ -1525,11 +1552,26 @@ function tokenScope(t) {
   return `<div class="chips">${bits.join("")}</div>`;
 }
 
-function renderTokens(tokens) {
-  $("tokens-count").textContent = tokens.length ? `${tokens.length} live` : "";
+// Where a token works. A mirrored one is changed and revoked only at the
+// control plane it came from, so the row says which one that is.
+function tokenServers(t) {
+  if (t.mirrored_from) return `<span class="chip">every server</span> <span class="sub">from ${esc(t.mirrored_from)}</span>`;
+  return t.fleet ? `<span class="chip">every server</span>` : `<span class="sub">this server</span>`;
+}
+
+function tokenActions(t) {
+  if (t.mirrored_from) return `<span class="sub">revoke on ${esc(t.mirrored_from)}</span>`;
+  return `<button class="btn mini danger" data-tact="revoke" data-tid="${esc(t.id)}"
+                data-tname="${esc(t.name)}">Revoke</button>`;
+}
+
+function renderTokens(tokens, target = "tokens", count = "tokens-count", fleetOnly = false) {
+  $(count).textContent = tokens.length ? `${tokens.length} live` : "";
   if (!tokens.length) {
-    $("tokens").innerHTML =
-      `<div class="empty">No app-tokens. A token is how an SDK client authenticates —
+    $(target).innerHTML = fleetOnly
+      ? `<div class="empty">No tokens for every server yet. A token minted here works on each
+         server that names this control plane as its <code>token_authority</code>, within seconds.</div>`
+      : `<div class="empty">No app-tokens. A token is how an SDK client authenticates —
        scoped, revocable, and usable both here and against a deployment whose
        <code>auth.provider</code> includes <code>app-token</code>.</div>`;
     return;
@@ -1549,27 +1591,28 @@ function renderTokens(tokens) {
       <td>${esc(t.name)}</td>
       <td class="mono">${esc(t.id)}</td>
       <td>${tokenScope(t)}</td>
+      ${fleetOnly ? "" : `<td>${tokenServers(t)}</td>`}
       <td>${fmtDur(Math.max(0, now - t.created_at))} ago</td>
       <td>${used}</td>
       <td>${expires}</td>
-      <td class="rowactions">
-        <button class="btn mini danger" data-tact="revoke" data-tid="${esc(t.id)}"
-                data-tname="${esc(t.name)}">Revoke</button>
-      </td>
+      <td class="rowactions">${tokenActions(t)}</td>
     </tr>`;
   }).join("");
 
-  $("tokens").innerHTML = `<div style="overflow-x:auto"><table class="vms">
-      <thead><tr><th>name</th><th>id</th><th>scope</th><th>created</th><th>last used</th>
-        <th>expires</th><th>actions</th></tr></thead>
+  $(target).innerHTML = `<div style="overflow-x:auto"><table class="vms">
+      <thead><tr><th>name</th><th>id</th><th>scope</th>${fleetOnly ? "" : "<th>servers</th>"}<th>created</th>
+        <th>last used${fleetOnly ? " here" : ""}</th><th>expires</th><th>actions</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
     <div class="note">The secret is shown once, when the token is minted, and is not
-      recoverable — only its hash is stored. Revoking takes effect on the next request.</div>`;
+      recoverable — only its hash is stored. ${fleetOnly
+        ? "Servers pick up a new token, and drop a revoked one, on their next pull (about ten seconds). A server that cannot reach this control plane keeps the tokens it last pulled."
+        : "Revoking takes effect on the next request."}</div>`;
 }
 
-function tokenForm() {
-  const options = Object.keys(depsById).sort()
+function tokenForm(fleet) {
+  const ids = fleet ? fleetDeploymentIds : Object.keys(depsById);
+  const options = [...new Set(ids)].sort()
     .map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
   return `
     <label>Name
@@ -1650,11 +1693,15 @@ function tenantMaxTtlHours() {
 }
 
 // `preset` fills the form in, for the "Get started" card's mint step.
+// `preset.fleet` mints at the control plane for every server.
 function openNewToken(preset) {
+  const fleet = !!(preset && preset.fleet);
   openModal(
-    "New app-token",
-    "A scoped, revocable credential. The secret is shown once and cannot be retrieved again.",
-    tokenForm(),
+    fleet ? "New token for every server" : "New app-token",
+    fleet
+      ? "Works on every server that mirrors this control plane, within seconds. The secret is shown once and cannot be retrieved again."
+      : "A scoped, revocable credential. The secret is shown once and cannot be retrieved again.",
+    tokenForm(fleet),
     async () => {
       const name = $("tk-name").value.trim();
       if (!name) return modalErr("A token needs a name — it is how you know what to revoke.");
@@ -1670,6 +1717,7 @@ function openNewToken(preset) {
         deployments: scope ? [scope] : (ns ? [] : ["*"]),
       };
       if (ns) body.namespace = ns;
+      if (fleet) body.fleet = true;
       const ttl = $("tk-ttl").value.trim();
       if (ttl) {
         const hours = parseInt(ttl, 10);
@@ -1679,6 +1727,7 @@ function openNewToken(preset) {
       const res = await api("POST", "tokens", body);
       if (!res.ok) return modalErr(errMsg(res));
       showMintedToken(res.data);
+      if (fleet) pollFleetTokens();
     },
     "Mint",
   );
@@ -1718,6 +1767,11 @@ function showMintedToken(t) {
      </div>
      <input id="tk-secret" class="mono" readonly value="${esc(t.token)}"
             style="width:100%" onclick="this.select()">
+     ${t.fleet && fleetServers.length
+        ? `<div class="note" style="margin-top:10px">Valid on every server mirroring this
+             control plane: ${fleetServers.map(g => `<code>${esc(g.id)}</code>`).join(", ")}.
+             Point heyctl at any of them with <code>--server</code>.</div>`
+        : ""}
      ${mcpUrl && t.admin === "admin"
         ? `<div class="note" style="margin-top:10px">
              Add it to Claude Code as the <code>${esc(mcpName())}</code> MCP server:
@@ -1757,7 +1811,7 @@ function showMintedToken(t) {
   if (el) { el.focus(); el.select(); }
 }
 
-$("tokens").addEventListener("click", async (e) => {
+for (const list of ["tokens", "fleet-tokens"]) $(list).addEventListener("click", async (e) => {
   const b = e.target.closest("[data-tact]");
   if (!b) return;
   const { tid, tname } = b.dataset;
@@ -1771,12 +1825,26 @@ $("tokens").addEventListener("click", async (e) => {
       if (!res.ok) return modalErr(errMsg(res));
       toast(`Revoked ${tname}`);
       closeModal();
+      if (list === "fleet-tokens") pollFleetTokens();
     },
     "Revoke",
   );
 });
 
 $("token-new").addEventListener("click", () => openNewToken());
+$("fleet-token-new").addEventListener("click", () => openNewToken({ fleet: true }));
+
+// The control plane's own tokens marked for every server. Read through the
+// same `/tokens` list; the servers that mirror them pull them on their own.
+async function pollFleetTokens() {
+  const res = await api("GET", "tokens");
+  if (!res.ok) {
+    $("fleet-tokens").textContent = res.status === 401 || res.status === 403
+      ? "Tokens need an admin credential on this control plane." : "Tokens unavailable — retrying.";
+    return;
+  }
+  renderTokens((res.data || []).filter(t => t.fleet && !t.mirrored_from), "fleet-tokens", "fleet-tokens-count", true);
+}
 
 // ---- Deploy jobs --------------------------------------------------------
 
@@ -2535,6 +2603,7 @@ function renderServices(result) {
   servicesNext = result.ok ? result.data.inventory?.nextCursor : null;
   $("services-first").hidden = !servicesCursor;
   $("services-next").hidden = !servicesNext;
+  $("services-count").textContent = "";
   if (!result.ok) {
     target.textContent = result.status === 401 || result.status === 403
       ? "Global applications require an authenticated fleet-wide view."
@@ -2546,61 +2615,43 @@ function renderServices(result) {
     return;
   }
   const services = result.data.inventory.services;
-  target.innerHTML = `<div class="sub">Shared Orchestrator state · recorded health, not a live reachability test.</div>` +
-    (services.length ? services.map(s => {
-      if (s.external) {
-        const external = s.external;
-        return `<article style="margin-top:16px;overflow-wrap:anywhere"><h3>${esc(s.serviceId)}</h3>
-          <div>${esc(external.region)} · Deployment: ${esc(external.deploymentId)}</div>
-          <div>Update: ${s.update ? `${esc(s.update.status)} · ${esc(s.update.phase || "awaiting activation")} · ${esc(s.update.operationId)}` : "none recorded"}</div>
-          ${s.update ? `<div>Target revision: ${esc(s.update.targetRevision)} · CI run: ${esc(s.update.runId)}</div>
-          <div>Last update status: ${esc(s.update.observedAt || "not yet available")}</div>
-          ${s.update.error ? `<div class="sub">${esc(s.update.error)}</div>` : ""}` : ""}
-          <div class="sub">Updates drain CI jobs and retain its workspace. One controller in ${esc(external.region)}; no regional failover.</div></article>`;
-      }
-      const endpoints = s.endpoints;
-      const regions = [...new Set([...(s.replicaRegions || []), ...(endpoints || []).map(e => e.region || "unplaced")])];
-      const ready = endpoints?.filter(e => e.healthStatus === "healthy" && !e.draining).length;
-      return `<article style="margin-top:16px;overflow-wrap:anywhere"><h3>${esc(s.serviceId)}</h3>
-        <div>Desired replicas: ${s.desiredReplicas ?? "unknown"} · Recorded eligible: ${ready ?? "unknown"} · Discovery version: ${s.discoveryVersion ?? "unknown"}</div>
-        ${regions.map(region => {
-          const members = (endpoints || []).filter(e => (e.region || "unplaced") === region);
-          return `<div><strong>${esc(region)}</strong>: ${members.length ? members.map(e => `${esc(e.revision || "revision unknown")} · ${esc(e.healthStatus)}${e.draining ? " · draining" : ""}`).join("; ") : "no recorded endpoint"}</div>`;
-        }).join("")}
-        <div>Regional rollout: ${s.rollout ? `${esc(s.rollout.status)} · ${esc(s.rollout.phase)} · ${esc(s.rollout.operationId)}` : "none recorded"}</div></article>`;
-    }).join("") : `<div>No applications on this page.</div>`);
-}
-
-function renderFleet(result) {
-  const target = $("regional-fleet");
-  if (!result.ok) {
-    target.textContent = result.status === 401 || result.status === 403
-      ? "Regional inventory requires an authenticated fleet-wide view."
-      : "Regional observations unavailable — retrying. No current regional capacity is known.";
-    return;
-  }
-  if (!result.data.configured) {
-    // Without a fleet this gateway is the whole deployment, so its local view is
-    // the only truthful default. An explicit ?view= is always respected.
-    const params = new URLSearchParams(location.search);
-    if (!params.has("view")) {
-      params.set("view", "local");
-      location.replace(location.pathname + "?" + params + location.hash);
-      return;
+  $("services-count").textContent = services.length ? `${services.length}${servicesNext ? "+" : ""}` : "";
+  // One row per service and one chip per region, so the table grows down with
+  // services rather than across with regions.
+  const rows = services.map(s => {
+    if (s.external) {
+      const x = s.external, u = s.update;
+      return `<tr>
+        <td class="mono">${esc(s.serviceId)}<div class="sub">external · ${esc(x.deploymentId)}</div></td>
+        <td>—</td><td>—</td>
+        <td class="where"><div class="chips"><span class="chip">${esc(x.region)}</span></div>
+          <div class="sub">one controller; no regional failover</div></td>
+        <td>${u ? `${esc(u.status)} · ${esc(u.phase || "awaiting activation")}
+          <div class="sub">${esc(u.targetRevision)} · run ${esc(u.runId)}${u.error ? " · " + esc(u.error) : ""}</div>` : `<span class="sub">none recorded</span>`}</td>
+      </tr>`;
     }
-    target.textContent = "Regional observations are not configured. No region is assumed from this page's hostname.";
-    return;
-  }
-  target.innerHTML = `<div class="sub">Independent gateway observations, not a shared rollout snapshot. Counts may include the same application on several gateways; do not sum them as unique capacity.</div>
-    <div>${result.data.gateways.map(g => {
-      const m = g.metrics, p = m?.fleet;
-      return `<article style="margin-top:16px;overflow-wrap:anywhere"><strong>${esc(g.region)}</strong> · ${esc(g.id)}
-        <div>${m ? "Observed" : `<strong>Unavailable</strong> · ${esc(g.error)}`}</div>
-        <div>Deployments: ${p ? fmt(p.deployments) : "—"} · In-flight: ${p ? fmt(p.total_in_flight) : "—"}</div>
-        <div>Backends: ${p ? `${fmt(p.ready)} tracked · ${fmt(p.draining)} draining · ${fmt(p.pending)} pending` : "—"}</div>
-        <div>Sample time: ${m ? esc(new Date(m.generated_at * 1000).toLocaleTimeString()) : "—"}</div>
-        <a href="${esc(g.dashboard_url)}">Open ${esc(g.region)} gateway details</a></article>`;
-    }).join("")}</div>`;
+    const endpoints = s.endpoints || [];
+    const regions = [...new Set([...(s.replicaRegions || []), ...endpoints.map(e => e.region || "unplaced")])];
+    const ready = s.endpoints ? endpoints.filter(e => e.healthStatus === "healthy" && !e.draining).length : null;
+    const chips = regions.map(region => {
+      const members = endpoints.filter(e => (e.region || "unplaced") === region);
+      if (!members.length) return healthTag("down", `${region} · none`, "no recorded endpoint");
+      const healthy = members.filter(e => e.healthStatus === "healthy" && !e.draining).length;
+      const health = members.some(e => e.draining) ? "draining" : healthy === members.length ? "healthy" : healthy ? "degraded" : "down";
+      const title = members.map(e => `${e.revision || "revision unknown"} · ${e.healthStatus}${e.draining ? " · draining" : ""}`).join("\n");
+      return healthTag(health, `${region} ${healthy}/${members.length}`, title);
+    }).join("");
+    return `<tr>
+      <td class="mono">${esc(s.serviceId)}${s.discoveryVersion != null ? `<div class="sub">discovery v${fmt(s.discoveryVersion)}</div>` : ""}</td>
+      <td>${s.desiredReplicas ?? "?"}</td>
+      <td>${ready ?? "?"}</td>
+      <td class="where"><div class="chips">${chips || `<span class="sub">none</span>`}</div></td>
+      <td>${s.rollout ? `${esc(s.rollout.status)} · ${esc(s.rollout.phase)}<div class="sub">${esc(s.rollout.targetRevision)}</div>` : `<span class="sub">none recorded</span>`}</td>
+    </tr>`;
+  }).join("");
+  target.innerHTML = `<div class="sub" style="margin-bottom:8px">Shared Orchestrator state · recorded health, not a live reachability test.</div>
+    <div class="wl-scroll"><table class="wl"><thead><tr><th>service</th><th>desired</th><th>eligible</th><th>regions</th><th>rollout</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="5" class="empty">No applications on this page.</td></tr>`}</tbody></table></div>`;
 }
 
 // ---- workloads across servers ---------------------------------------------
@@ -2613,6 +2664,10 @@ function renderFleet(result) {
 const HEALTH_TAG = { healthy: "ok", degraded: "slow", starting: "boot", draining: "drain", down: "down", idle: "idle" };
 let fleetNs = NS_RE.test(pageParams.get("fleet_namespace") || "") ? pageParams.get("fleet_namespace") : "";
 let serverDetail = null; // { id, ns, offset } while the drill-down is open
+let wlFilter = "";        // client-side id/host filter; the rollup is already in hand
+let lastWorkloads = null; // the last rollup, re-rendered as the filter is typed
+let fleetServers = [];    // the configured servers, for the minted-token note
+let fleetDeploymentIds = []; // deployment ids across servers, for the token form
 
 // Static and site deployments have no desired count; show what is ready.
 const readyOf = (ready, desired) => desired ? `${fmt(ready)}/${fmt(desired)}` : fmt(ready);
@@ -2640,8 +2695,64 @@ async function pollWorkloads() {
   if (serverDetail) loadServerDetail();
 }
 
+// Without a fleet this app-lb is the whole deployment, so its own page is the
+// only truthful default. An explicit ?view= is always respected.
+function redirectToLocal() {
+  const params = new URLSearchParams(location.search);
+  if (params.has("view")) return false;
+  params.set("view", "local");
+  location.replace(location.pathname + "?" + params + location.hash);
+  return true;
+}
+
+// One tile per server, from the rollup's per-server totals (narrowed with the
+// namespace like the rows are). Sorted by region so a region's servers sit
+// together, and wrapping, so the strip grows by rows rather than off the page.
+function renderServers(result) {
+  const target = $("servers");
+  if (!result.ok) {
+    $("servers-count").textContent = "";
+    target.textContent = result.status === 401 || result.status === 403
+      ? "Servers require an authenticated fleet-wide view."
+      : "Server observations unavailable — retrying. No current capacity is known.";
+    return;
+  }
+  const gateways = [...result.data.gateways].sort((a, b) => a.region.localeCompare(b.region) || a.id.localeCompare(b.id));
+  const down = gateways.filter(g => g.error).length;
+  const regions = new Set(gateways.map(g => g.region)).size;
+  $("servers-count").textContent = `${gateways.length} server${gateways.length === 1 ? "" : "s"} · ${regions} region${regions === 1 ? "" : "s"}${down ? ` · ${down} unavailable` : ""}`;
+  target.innerHTML = `<div class="srv-grid">${gateways.map(g => {
+    const t = g.totals;
+    const health = g.deployments ? serverHealth(t) : "idle";
+    const state = g.error ? healthTag("down", "unavailable", g.error)
+      : g.truncated ? healthTag("degraded", "truncated", "more deployments than the rollup reads")
+      : healthTag(health, health === "healthy" ? "ok" : HEALTH_TAG[health] || health);
+    return `<div class="srv-tile">
+      <div class="srv-name"><span>${esc(g.id)}</span>${state}</div>
+      <div class="srv-region">${esc(g.region)}</div>
+      <div class="srv-value">${g.error ? "—" : readyOf(t.ready, t.desired)}</div>
+      <div class="srv-sub">${g.error ? esc(g.error)
+        : `${fmt(g.deployments)} deployment${g.deployments === 1 ? "" : "s"} · ${fmt(t.in_flight)} in-flight${t.pending ? ` · ${fmt(t.pending)} booting` : ""}`}</div>
+      <div class="srv-sub">${g.generated_at ? "sampled " + esc(new Date(g.generated_at * 1000).toLocaleTimeString()) : "&nbsp;"}</div>
+      <div class="srv-links"><button class="linkish" data-wl-gw="${esc(g.id)}">Details</button>
+        <a href="${esc(g.dashboard_url)}">Dashboard ↗</a></div>
+    </div>`;
+  }).join("")}</div>
+  <div class="note">Ready / desired backends as each server's app-lb reports its own pools. Each server runs its own VMs; nothing here places or scales anything.</div>`;
+}
+
+// A server's health from its summed pools, as the rows derive theirs.
+function serverHealth(t) {
+  const serving = Math.max(0, t.ready - t.draining);
+  if (!t.desired && !serving) return t.pending ? "starting" : "idle";
+  if (serving >= t.desired) return "healthy";
+  if (serving) return "degraded";
+  return t.pending ? "starting" : t.draining ? "draining" : "down";
+}
+
 function renderWorkloads(result) {
   const target = $("workloads");
+  renderServers(result);
   if (!result.ok) {
     $("workloads-count").textContent = "";
     target.textContent = result.status === 401 || result.status === 403
@@ -2650,50 +2761,58 @@ function renderWorkloads(result) {
     return;
   }
   if (!result.data.configured) {
+    if (redirectToLocal()) return;
+    $("servers").textContent = "No servers are configured for this control plane.";
     target.textContent = "No servers are configured for this control plane.";
     return;
   }
+  lastWorkloads = result;
   const { gateways, rows, totals } = result.data;
-  $("workloads-count").textContent = `${rows.length} deployment${rows.length === 1 ? "" : "s"} · ${gateways.length} server${gateways.length === 1 ? "" : "s"}`;
+  fleetServers = gateways;
+  fleetDeploymentIds = rows.map(r => r.id);
+  const needle = wlFilter.trim().toLowerCase();
+  const shown = needle
+    ? rows.filter(r => r.id.toLowerCase().includes(needle) || r.namespace.toLowerCase().includes(needle)
+        || r.hosts.some(h => h.toLowerCase().includes(needle)))
+    : rows;
+  $("workloads-count").textContent = `${rows.length} deployment${rows.length === 1 ? "" : "s"}`;
   const scope = fleetNs
     ? `<span>Namespace <span class="chip ns">${esc(fleetNs)}</span></span><button class="linkish" data-wl-ns="">All namespaces</button>`
-    : `<span>All namespaces · select a namespace to narrow, a server to drill in.</span>`;
-  const srvHead = gateways.map(g => {
-    const state = g.error ? healthTag("down", "unavailable", g.error)
-      : g.truncated ? healthTag("degraded", "truncated", "more deployments than the rollup reads") : "";
-    return `<th class="srv"><button class="linkish" data-wl-gw="${esc(g.id)}" title="Open ${esc(g.id)} details">${esc(g.region)} · ${esc(g.id)}</button>${state ? "<br>" + state : ""}</th>`;
+    : `<span>All namespaces · select one to narrow, a server to drill in.</span>`;
+  // Where each deployment runs: a chip per server it is registered on, not a
+  // column per server — most deployments live on one or two of them.
+  const where = (row) => row.cells.map(c => {
+    if (c.error) return healthTag("down", `${c.gateway} ?`, `${c.region} · ${c.error}`);
+    const title = `${c.region} · ${c.health} · ${c.ready} ready · ${c.pending} pending · ${c.draining} draining · ${c.in_flight} in-flight`;
+    return `<button class="cellbtn" data-wl-gw="${esc(c.gateway)}" data-wl-row-ns="${esc(row.namespace)}">${healthTag(c.health, `${c.gateway} ${readyOf(c.ready, c.desired)}`, title)}</button>`;
   }).join("");
-  const cellOf = (row, g) => {
-    const c = row.cells.find(x => x.gateway === g.id);
-    if (!c) return `<td class="srv"><span class="sub">—</span></td>`;
-    if (c.error) return `<td class="srv">${healthTag("down", "?", c.error)}</td>`;
-    const title = `${c.health} · ${c.ready} ready · ${c.pending} pending · ${c.draining} draining · ${c.in_flight} in-flight`;
-    return `<td class="srv"><button class="cellbtn" data-wl-gw="${esc(g.id)}" data-wl-row-ns="${esc(row.namespace)}">${healthTag(c.health, readyOf(c.ready, c.desired), title)}</button></td>`;
-  };
-  const body = rows.map(row => `<tr>
+  const body = shown.map(row => `<tr>
       <td><button class="linkish" data-wl-ns="${esc(row.namespace)}">${esc(row.namespace)}</button></td>
       <td class="mono">${esc(row.id)}${row.hosts.length ? `<div class="sub">${esc(row.hosts.slice(0, 2).join(", "))}${row.hosts.length > 2 ? " …" : ""}</div>` : ""}</td>
-      ${gateways.map(g => cellOf(row, g)).join("")}
-      <td class="srv">${healthTag(row.health, readyOf(row.totals.ready, row.totals.desired), row.health)}</td>
+      <td>${healthTag(row.health, row.health)}</td>
+      <td>${readyOf(row.totals.ready, row.totals.desired)}</td>
+      <td>${fmt(row.totals.in_flight)}</td>
+      <td class="where"><div class="chips">${where(row)}</div></td>
     </tr>`).join("");
-  const totalRow = `<tr class="total"><td colspan="2">Total</td>${gateways.map(g => `<td class="srv">${g.error ? "—" : readyOf(g.totals.ready, g.totals.desired)}</td>`).join("")}
-    <td class="srv">${readyOf(totals.ready, totals.desired)}</td></tr>`;
-  const perServer = fleetNs ? `<div class="section-title" style="margin-top:18px">Servers · namespace ${esc(fleetNs)}</div>
-    <div class="wl-scroll"><table class="wl"><thead><tr><th>server</th><th>deployments</th><th>ready / desired</th><th>pending</th><th>draining</th><th>in-flight</th><th>observed</th></tr></thead><tbody>
-    ${gateways.map(g => `<tr><td><button class="linkish" data-wl-gw="${esc(g.id)}">${esc(g.region)} · ${esc(g.id)}</button></td>
-      ${g.error ? `<td colspan="5">${healthTag("down", "unavailable")} <span class="sub">${esc(g.error)}</span></td>`
-        : `<td>${fmt(g.deployments)}</td><td>${readyOf(g.totals.ready, g.totals.desired)}</td><td>${fmt(g.totals.pending)}</td><td>${fmt(g.totals.draining)}</td><td>${fmt(g.totals.in_flight)}</td>`}
-      <td>${g.generated_at ? esc(new Date(g.generated_at * 1000).toLocaleTimeString()) : "—"}</td></tr>`).join("")}
-    </tbody></table></div>` : "";
-  target.innerHTML = `<div class="wl-scope">${scope}</div>
-    <div class="wl-scroll"><table class="wl"><thead><tr><th>namespace</th><th>deployment</th>${srvHead}<th class="srv">all servers</th></tr></thead>
-    <tbody>${body || `<tr><td colspan="${gateways.length + 3}" class="empty">No deployments${fleetNs ? " in namespace " + esc(fleetNs) : ""} on the servers that answered.</td></tr>`}
-    ${rows.length ? totalRow : ""}</tbody></table></div>
-    <div class="note">Cells are ready / desired backends (ready alone where nothing is desired, as for static upstreams) as each server's app-lb reports its own pool. Each server runs its own VMs, so the totals are per-server sums; nothing here places or scales anything.</div>
-    ${perServer}`;
+  const totalRow = `<tr class="total"><td colspan="3">Total${needle ? " (all rows)" : ""}</td>
+    <td>${readyOf(totals.ready, totals.desired)}</td><td>${fmt(totals.in_flight)}</td><td></td></tr>`;
+  const empty = rows.length
+    ? `No deployments match “${esc(wlFilter.trim())}”.`
+    : `No deployments${fleetNs ? " in namespace " + esc(fleetNs) : ""} on the servers that answered.`;
+  // The filter input is rendered once and kept, so typing does not lose focus.
+  if (!$("wl-filter")) {
+    target.innerHTML = `<div class="wl-tools"><input id="wl-filter" type="search" placeholder="filter by id, namespace or host"
+      autocomplete="off" spellcheck="false"><span id="wl-scope" class="wl-scope" style="margin:0"></span></div><div id="wl-table"></div>`;
+    $("wl-filter").addEventListener("input", (e) => { wlFilter = e.target.value; if (lastWorkloads) renderWorkloads(lastWorkloads); });
+  }
+  $("wl-scope").innerHTML = scope;
+  $("wl-table").innerHTML = `<div class="wl-scroll"><table class="wl"><thead><tr><th>namespace</th><th>deployment</th><th>health</th>
+      <th>ready / desired</th><th>in-flight</th><th>servers</th></tr></thead>
+    <tbody>${body || `<tr><td colspan="6" class="empty">${empty}</td></tr>`}
+    ${shown.length ? totalRow : ""}</tbody></table></div>`;
 }
 
-$("workloads").addEventListener("click", (e) => {
+for (const section of ["workloads", "servers"]) $(section).addEventListener("click", (e) => {
   const ns = e.target.closest("[data-wl-ns]");
   if (ns) { setFleetNs(ns.dataset.wlNs); return; }
   const gw = e.target.closest("[data-wl-gw]");
@@ -2779,10 +2898,11 @@ async function pollSlow() {
   try {
     // Independent of the local CRUD reads, which can fail for a view token.
     // Clear old values on failure instead of leaving a disconnected region green.
-    if (!pinnedNamespace) await Promise.all([
-      api("GET", "fleet").then(renderFleet).catch(() => renderFleet({ ok: false })),
+    // The cross-server sections exist only on the control plane's own page.
+    if (!localView) await Promise.all([
+      pollWorkloads(),
       pollServices(),
-      localView ? null : pollWorkloads(),
+      document.body.dataset.tier === "view" ? null : pollFleetTokens(),
     ]);
     if (!localView) {
       $("updated").textContent = "checked " + new Date().toLocaleTimeString();

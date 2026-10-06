@@ -103,6 +103,12 @@ export interface NewToken {
   /** Deployment ids, or `["*"]`. Defaults to none, which can reach nothing. */
   deployments?: string[];
   expiresInSecs?: number;
+  /**
+   * Valid on every server that mirrors this control plane's tokens, not only
+   * the one minting it. Only a control-plane app-lb (one with gateways
+   * configured) accepts it; anywhere else the mint is refused with 409.
+   */
+  allServers?: boolean;
 }
 
 /** Percent-encode one path segment. */
@@ -787,6 +793,7 @@ export class Heyctl {
     };
     if (req.namespace !== undefined) body.namespace = req.namespace;
     if (req.expiresInSecs !== undefined) body.expires_in_secs = req.expiresInSecs;
+    if (req.allServers) body.fleet = true;
     return this.request("POST", "/tokens", {
       body,
       kind: "token",

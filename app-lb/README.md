@@ -2557,12 +2557,18 @@ It exercises selection, rollback and hold/resume payloads, disabled controls,
 responsive rendering and CI-unavailable errors. These fixtures are not live
 rollout or multi-region availability evidence.
 
-`/dashboard` defaults to the fleet overview on every gateway: shared applications
-and the same explicitly configured regional observations. It does not poll or show
-the entry gateway's local metrics, secrets, tokens, jobs or host inventory.
-Each regional card links to that gateway's `/dashboard?view=local`, where existing
-local controls remain available and the hostname identifies the selected gateway.
-The overview does not sum regional pool counts as unique application capacity.
+On a control plane (an app-lb with `gateways` configured), `/dashboard` defaults
+to the fleet overview: a tile per server, workloads across servers, global
+applications and [tokens for every server](#tokens-for-every-server). It does not
+poll or show the entry gateway's local metrics, secrets, jobs or host inventory.
+Each server tile links to that server's `/dashboard?view=local`, where its local
+controls remain available and the hostname identifies the selected server.
+
+A server with no gateways configured redirects `/dashboard` to its local view.
+That view, and `?view=local` on a control plane, shows only the one server: it
+neither shows nor polls the servers, workloads, global applications or fleet
+token sections. Fleet tokens mirrored onto a server appear in its App-tokens
+list, marked with the control plane they came from.
 
 Configure an already-running gateway with fleet-admin GET and PUT at
 `/control-plane/config`; these routes require authentication even when the admin
@@ -2628,7 +2634,8 @@ credentials are forbidden for Orchestrator bindings, which retain their service 
 Install identical gateway bindings on both regions. Regional links may require
 sign-in on that origin because session cookies remain host-only.
 
-The dashboard's **Regional gateways** section reads `GET /fleet`. Configure
+`GET /fleet` returns each configured gateway's own summary (the dashboard's
+server tiles come from the `/fleet/deployments` rollup instead). Configure
 `APP_LB_FLEET_FILE` with the path to a JSON array of explicitly trusted gateways:
 
 ```json
@@ -2738,10 +2745,13 @@ checks it again. Service-credential gateways are never queried on its behalf:
 they appear with `error: "fleet-wide view required for this gateway"` (403 on
 the drill-down). `/fleet/network` and `/fleet` stay fleet-wide only.
 
-On the dashboard, the control-plane view's **Workloads** section renders the
-rollup: select a namespace to narrow (kept in the page URL as
-`?fleet_namespace=`), a server column or cell to open that server's drill-down
-in place. `/network` defaults to the global topology from `/fleet/network`
+On the dashboard, the control-plane view renders the rollup in two parts.
+**Servers** has one tile per server, sorted by region, showing ready/desired,
+deployments and in-flight. **Workloads** has one row per deployment with a chip
+for each server it runs on, so the table grows down with deployments rather than
+across with servers. A filter box narrows rows by id, namespace or host. Select a
+namespace to narrow (kept in the page URL as `?fleet_namespace=`), or a server
+tile or chip to open that server's drill-down in place. `/network` defaults to the global topology from `/fleet/network`
 (polled every five seconds) and falls back to the local view when the fleet
 view is not configured or not permitted; `?view=local` forces the local view
 and the header links between the two.
@@ -3301,6 +3311,61 @@ call into a file write. So it lags, and a busy token can still read as unused.
 
 Tokens live in `app-lb-tokens.json` (`APP_LB_TOKENS_PATH`), mode `0600`. Only
 hashes are in it, so unlike the secret store there is nothing to encrypt.
+
+### Tokens for every server
+
+A token is a row in one server's store, so it works on the server that minted
+it and nowhere else. A **control-plane** app-lb — one with `gateways`
+configured (see [Fleet workloads](#fleet-workloads-server-drill-down-and-network))
+— can mint a token that works on every server instead:
+
+```sh
+heyctl token mint deploy-bot --admin admin --all-deployments --all-servers   # at the control plane
+curl -u admin:s3cret -XPOST https://admin.us2.example/tokens -H 'content-type: application/json' \
+  -d '{"name":"deploy-bot","admin":"admin","deployments":["*"],"fleet":true}'
+```
+
+Anywhere else `"fleet": true` is refused with 409. The dashboard's control-plane
+page has a **Tokens for every server** section that mints these.
+
+Each other server opts in by naming the control plane as its
+`token_authority` in its own `/control-plane/config`:
+
+```json
+{"expected_revision": 3, "config": {"gateways": [], "control_plane": [],
+  "token_authority": {"id": "us2", "region": "US2", "url": "https://admin.us2.example/",
+                      "auth": {"secret": "token-authority", "key": "token"}}}}
+```
+
+The `token-authority` secret holds a token minted **on the control plane** with
+`--admin view --all-deployments` (a fleet view). Only a service credential is
+accepted here, never `use_caller_auth`. The control plane itself needs no
+`token_authority`, because its fleet tokens are already in its own store.
+
+Every ten seconds the server pulls `GET /fleet/tokens` from the authority. The
+response holds the fleet tokens' records (scope, expiry and `sha256(secret)`),
+never a secret. It replaces the server's **mirror**, and the server checks the
+mirror with the same hash lookup it uses for its own tokens. As a result:
+
+- A token minted, re-scoped or revoked at the control plane reaches every
+  server within about ten seconds. Expiry is enforced locally with no pull.
+- **A failed pull keeps the last mirror.** If the control plane is unreachable,
+  servers keep accepting the fleet tokens they already had and keep serving.
+  The tradeoff is that a revoke made while a server cannot reach the control
+  plane only takes effect there once a pull succeeds. `token_sync` on
+  `GET /control-plane/config` shows `last_success_at`, the last `error` and the
+  mirrored count.
+- The mirror is persisted beside the token file (`app-lb-tokens.fleet.json`),
+  so it survives a restart while the control plane is down. Removing
+  `token_authority` deletes it, and the server stops accepting those tokens.
+- A server's own token always wins over a mirrored record with the same id.
+- Mirrored tokens appear in the server's `GET /tokens` with `fleet: true` and
+  `mirrored_from: "<authority id>"`. They are read-only there: `PATCH` and
+  `DELETE` answer 409 and name the control plane to use instead.
+
+Namespace walls still apply: a fleet token confined to `team-a` reaches `team-a`
+on every server and nothing else, and a namespace admin may mint one for its own
+namespace under the usual tenant expiry cap.
 
 ### Gating a deployment with app-tokens
 

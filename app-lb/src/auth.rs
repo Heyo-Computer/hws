@@ -1355,6 +1355,7 @@ impl Authenticator {
             // Expires with the session. A token outliving the cookie that
             // carries it is a credential nobody can present and nobody revokes.
             expires_in_secs: Some(gate.session_ttl_secs),
+            fleet: false,
         };
         match tokens.mint(req, now_secs()) {
             Ok((summary, secret)) => {
@@ -2923,6 +2924,7 @@ mod tests {
         fn mint(t: &TokenStore, deployments: &[&str]) -> String {
             t.mint(
                 NewToken {
+                    fleet: false,
                     name: "agent".into(),
                     namespace: None,
                     // No admin API access at all — the point of this credential is
@@ -3005,6 +3007,7 @@ mod tests {
             let secret = t
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "team-a agent".into(),
                         namespace: Some("team-a".into()),
                         admin: AdminScope::None,
@@ -3276,6 +3279,7 @@ mod tests {
         fn admin_token(t: &TokenStore, deployments: &[&str], admin: AdminScope) -> String {
             t.mint(
                 NewToken {
+                    fleet: false,
                     name: "api".into(),
                     namespace: None,
                     admin,
@@ -3405,6 +3409,7 @@ mod tests {
             let confined = tokens
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "ns".into(),
                         admin: AdminScope::Admin,
                         namespace: Some("samcurrie".into()),
@@ -3491,6 +3496,7 @@ mod tests {
             let confined = tokens
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "ns".into(),
                         admin: AdminScope::Admin,
                         namespace: Some("samcurrie".into()),
@@ -3526,6 +3532,7 @@ mod tests {
             let low = tokens
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "low".into(),
                         admin: AdminScope::View,
                         namespace: Some("samcurrie".into()),
@@ -3564,6 +3571,7 @@ mod tests {
             let t = tokens
                 .mint(
                     NewToken {
+                        fleet: false,
                         name: "sam".into(),
                         admin: AdminScope::Admin,
                         namespace: Some("samcurrie".into()),

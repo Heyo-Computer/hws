@@ -592,3 +592,19 @@ mod requests {
         assert_eq!(stub.calls()[0].path, "/deployments/web/discovery-status?staged=true");
     }
 }
+
+/// A fleet token as a member server lists it. `fleet` and `mirrored_from` are
+/// what tell an operator where a token works and where it can be revoked.
+#[test]
+fn mirrored_token_summary_understands_every_field() {
+    let t: hws::types::TokenSummary =
+        serde_json::from_str(&fixture("token-summary-mirrored")).expect("fixture parses");
+    assert!(
+        t.extra.is_empty(),
+        "heyctl does not understand these fields app-lb sends: {:?}\n\
+         Add them to TokenSummary in src/types.rs.",
+        t.extra.keys().collect::<Vec<_>>()
+    );
+    assert!(t.fleet);
+    assert_eq!(t.mirrored_from.as_deref(), Some("us2"));
+}
