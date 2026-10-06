@@ -123,6 +123,17 @@ async function resolveRoute(clients: Clients, config: Config): Promise<Telemetry
   }
   const ns = confinedNamespace(who);
   if (ns) return { via: "applb", namespace: ns };
+  // Unconfined is not the same as fleet-wide: a token scoped to a list of
+  // deployments is neither, and app-obs's own token would hand it every
+  // deployment's telemetry. Only a credential app-lb says covers the fleet
+  // may use the direct door.
+  if ((who as { fleet?: unknown } | null)?.fleet !== true) {
+    throw new Error(
+      "This credential is scoped to specific deployments rather than a namespace or the " +
+        "fleet, so app-obs cannot be narrowed to it. Use a namespace token to read that " +
+        "namespace's telemetry through app-lb's obs plugin.",
+    );
+  }
   if (config.obs) return { via: "obs" };
   throw new Error(
     "This credential is not confined to a namespace and no APP_OBS_URL is configured, so " +

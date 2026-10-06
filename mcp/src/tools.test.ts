@@ -379,6 +379,31 @@ test("an unconfined operator still reads app-obs directly, after app-lb's reach 
   }
 });
 
+test("a deployment-scoped token never reaches app-obs on the server's own token", async () => {
+  const stub = stubFetch((c) => {
+    if (c.url.endsWith("/whoami")) return { body: { caller: "app-token", confined: false, fleet: false } };
+    return { body: { rows: [{ ts: 1, message: "every tenant's logs" }] } };
+  });
+  try {
+    const tools = buildTools(
+      loadConfig({
+        APPLB_URL: "http://127.0.0.1:9090",
+        APPLB_TOKEN: "applb_dep_secret",
+        APP_OBS_URL: "http://127.0.0.1:9600",
+        APP_OBS_API_TOKEN: "t",
+      }),
+    );
+    const out = await tool(tools, "namespace_telemetry").handler({}).catch((e: Error) => e.message);
+    assert.ok(
+      !stub.calls.some((c) => c.url.startsWith("http://127.0.0.1:9600")),
+      "app-obs's own door was used",
+    );
+    assert.doesNotMatch(String(out), /every tenant's logs/);
+  } finally {
+    stub.restore();
+  }
+});
+
 test("a namespace without the obs plugin is told how to install it", async () => {
   const stub = stubFetch((c) => {
     if (c.url.endsWith("/namespaces")) return { body: { namespaces: [{ name: "team-a", scope: "admin" }] } };
