@@ -2341,8 +2341,39 @@ async fn set_plugin(
     config: Option<serde_json::Value>,
 ) -> Response {
     match state.plugins.set(id, enabled, config).await {
-        Ok(view) => Json(view).into_response(),
+        Ok(view) => {
+            // Switching an auto-installing plugin on reaches every namespace
+            // that already exists, not only the ones created afterwards.
+            if view.enabled && view.per_namespace {
+                for ns in known_namespaces(state) {
+                    state.plugins.auto_install(&ns, None).await;
+                }
+            }
+            match state.plugins.get(id).await {
+                Some(fresh) => Json(fresh).into_response(),
+                None => Json(view).into_response(),
+            }
+        }
         Err(e) => plugin_set_error(e),
+    }
+}
+
+/// Every namespace app-lb knows: declared ones and any a deployment names.
+fn known_namespaces(state: &AdminState) -> std::collections::BTreeSet<String> {
+    state
+        .namespaces
+        .list()
+        .iter()
+        .map(|n| n.name.clone())
+        .chain(state.registry.deployments().values().map(|d| d.spec.namespace.clone()))
+        .collect()
+}
+
+async fn auto_install_plugins(state: &AdminState, ns: &str, caller: Option<&Caller>) {
+    let by = caller.and_then(Caller::principal).or_else(|| Some("auto".into()));
+    let installed = state.plugins.auto_install(ns, by).await;
+    if !installed.is_empty() {
+        tracing::info!(namespace = ns, plugins = ?installed, "installed plugins in namespace automatically");
     }
 }
 
@@ -2796,11 +2827,14 @@ async fn create_namespace(
     };
     let existed = state.namespaces.contains(&spec.name);
     match state.namespaces.upsert(spec) {
-        Ok(ns) => (
-            if existed { StatusCode::OK } else { StatusCode::CREATED },
-            Json(ns),
-        )
-            .into_response(),
+        Ok(ns) => {
+            auto_install_plugins(&state, &ns.name, caller.as_deref()).await;
+            (
+                if existed { StatusCode::OK } else { StatusCode::CREATED },
+                Json(ns),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "namespace write failed");
             err(StatusCode::INTERNAL_SERVER_ERROR, "could not persist the namespace").into_response()
@@ -4031,6 +4065,10 @@ async fn register(
         fence.finish();
     }
     tracing::info!(deployment = %id, "registered");
+    // A namespace on the managed platform is created in cloud, not here, so
+    // its first deployment is when app-lb meets it. Idempotent: nothing
+    // happens for a namespace that has the plugins already or declined them.
+    auto_install_plugins(&state, &deployment.spec.namespace, caller.as_deref()).await;
     state.feed.announce(
         &deployment.spec,
         if replaced { crate::feed::FeedEventKind::Updated } else { crate::feed::FeedEventKind::Deployed },
@@ -8202,6 +8240,51 @@ mod tests {
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             (status, (), serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        }
+
+        /// Observability is set up with the namespace: declaring one, a first
+        /// deployment in one, and switching the plugin on (for every namespace
+        /// that already exists) all install it.
+        #[tokio::test]
+        async fn the_obs_plugin_is_installed_as_namespaces_appear() {
+            let obs = Router::new().fallback(|| async { "ok" });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let obs_url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, obs).await.unwrap() });
+            let f = fixture(true).await;
+            let mut existing = (*empty()).spec.clone();
+            existing.id = "older".into();
+            existing.namespace = "team-old".into();
+            f.registry.upsert(existing);
+            let installed = |ns: &str| f.state.plugins.is_installed("obs", ns);
+
+            // Switching it on backfills the namespaces that already exist.
+            let (status, _, v) = send(&f, "PUT", "/api/plugins/obs",
+                &serde_json::json!({"enabled": true, "config": {"url": obs_url}}).to_string()).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert!(installed("team-old") && installed("default"));
+            assert_eq!(v["installed_in"], serde_json::json!(["default", "team-old"]));
+
+            // Declaring a namespace installs it.
+            let (status, _, _) = send(&f, "POST", "/namespaces", r#"{"name":"team-new"}"#).await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert!(installed("team-new"));
+
+            // A namespace first seen through a deployment gets it too.
+            let mut spec = serde_json::to_value(&(*empty()).spec).unwrap();
+            spec["id"] = "first".into();
+            spec["namespace"] = "team-cloud".into();
+            let (status, _, v) = send(&f, "POST", "/deployments", &spec.to_string()).await;
+            assert!(status.is_success(), "{status} {v}");
+            assert!(installed("team-cloud"));
+
+            // An uninstall is respected by later deployments.
+            let (status, _, _) = send(&f, "DELETE", "/namespaces/team-cloud/plugins/obs", "").await;
+            assert_eq!(status, StatusCode::OK);
+            spec["id"] = "second".into();
+            send(&f, "POST", "/deployments", &spec.to_string()).await;
+            assert!(!installed("team-cloud"));
+            f.state.plugins.set("obs", false, None).await.unwrap();
         }
 
         /// A namespace token watches the jobs of its own deployments — the pull
