@@ -198,3 +198,18 @@ test("mount pull, disks, feed RSS and probe", async () => {
   const p2 = stub({ status: 200, body: "ok" });
   assert.deepEqual(await lb(p2).probe("/healthz"), { status: 200, detail: undefined });
 });
+
+test("a job is waited on through its deployment when told which", async () => {
+  const rec = (status) => [
+    { id: "job-other", deployment: "web", kind: "artifact-pull", status: "succeeded", started_at: 1, log: [] },
+    { id: "job-1", deployment: "web", kind: "artifact-pull", status, started_at: 1, log: ["pulling"] },
+  ];
+  const s = stub({ body: rec("running") }, { body: rec("succeeded") });
+  const done = await lb(s).waitForJob("job-1", { deployment: "web", pollMs: 1 });
+  assert.equal(done.status, "succeeded");
+  assert.deepEqual(
+    s.seen.map((r) => `${r.method} ${r.url}`),
+    ["GET /deployments/web/jobs", "GET /deployments/web/jobs"],
+  );
+  await assert.rejects(lb(stub({ body: [] })).waitForJob("job-9", { deployment: "web" }), /no job/);
+});

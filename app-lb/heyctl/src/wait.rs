@@ -76,6 +76,7 @@ impl Client {
         JobWaiter {
             client: self,
             job_id,
+            deployment: None,
             poll: JOB_POLL,
             timeout: Duration::from_secs(1800),
             on_progress: None,
@@ -101,6 +102,7 @@ impl Client {
 pub struct JobWaiter<'a> {
     client: &'a Client,
     job_id: &'a str,
+    deployment: Option<&'a str>,
     poll: Duration,
     timeout: Duration,
     #[allow(clippy::type_complexity)]
@@ -108,6 +110,18 @@ pub struct JobWaiter<'a> {
 }
 
 impl<'a> JobWaiter<'a> {
+    /// Poll the job through its deployment's job list
+    /// (`GET /deployments/:id/jobs`) rather than `GET /jobs/:id`.
+    ///
+    /// A namespace token can read the former; app-lb releases before the
+    /// namespace-scoped `GET /jobs/:id` refuse it the latter. The deployment is
+    /// the one the job was started on — `job.deployment` on the record a
+    /// `start_*` call returned.
+    pub fn in_deployment(mut self, deployment: &'a str) -> Self {
+        self.deployment = Some(deployment);
+        self
+    }
+
     pub fn poll_every(mut self, d: Duration) -> Self {
         self.poll = d;
         self
@@ -128,7 +142,19 @@ impl<'a> JobWaiter<'a> {
         let started = Instant::now();
         let mut seen = 0usize;
         loop {
-            let job = self.client.job(self.job_id).await?;
+            let job = match self.deployment {
+                None => self.client.job(self.job_id).await?,
+                Some(d) => self
+                    .client
+                    .deployment_jobs(d)
+                    .await?
+                    .into_iter()
+                    .find(|j| j.id == self.job_id)
+                    .ok_or_else(|| Error::NotFound {
+                        kind: "job",
+                        name: format!("{} (in deployment {d})", self.job_id),
+                    })?,
+            };
 
             if let Some(f) = self.on_progress.as_mut() {
                 // Only the tail is new. app-lb keeps a bounded log, so if it

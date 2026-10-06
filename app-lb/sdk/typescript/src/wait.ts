@@ -14,7 +14,7 @@
  */
 
 import type { Heyctl } from "./client.js";
-import { TimeoutError } from "./errors.js";
+import { NotFoundError, TimeoutError } from "./errors.js";
 import type { DeploymentStatus, JobRecord } from "./types.js";
 
 export const JOB_POLL_MS = 3_000;
@@ -35,6 +35,13 @@ export interface PoolProgress {
 }
 
 export interface WaitForJobOptions {
+  /**
+   * Poll through this deployment's job list (`GET /deployments/:id/jobs`)
+   * rather than `GET /jobs/:id`. A namespace token can read the former;
+   * app-lb releases before the namespace-scoped `GET /jobs/:id` refuse it
+   * the latter. Pass `job.deployment` from the record a `start*` call returned.
+   */
+  deployment?: string;
   pollMs?: number;
   timeoutMs?: number;
   onProgress?: (p: JobProgress) => void;
@@ -79,7 +86,10 @@ export async function waitForJob(
   let seen = 0;
 
   for (;;) {
-    const job = await client.job(jobId, opts.signal);
+    const job = opts.deployment
+      ? (await client.deploymentJobs(opts.deployment, opts.signal)).find((j) => j.id === jobId)
+      : await client.job(jobId, opts.signal);
+    if (!job) throw new NotFoundError("job", `${jobId} (in deployment ${opts.deployment})`);
     const log = job.log ?? [];
     if (opts.onProgress) {
       // Only the tail is new. app-lb keeps a bounded log, so if it truncated

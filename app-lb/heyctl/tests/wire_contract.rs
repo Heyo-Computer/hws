@@ -498,6 +498,34 @@ mod requests {
         (Client::with_transport(stub.clone()), stub)
     }
 
+    /// A namespace token cannot read `GET /jobs/:id` on older app-lbs, so a
+    /// waiter told the deployment polls that deployment's job list instead.
+    #[tokio::test]
+    async fn a_job_is_waited_on_through_its_deployment() {
+        let rec = |status: &str| {
+            json!([
+                {"id": "job-other", "deployment": "web", "kind": "artifact-pull", "status": "succeeded",
+                 "started_at": 1, "finished_at": 2, "log": []},
+                {"id": "job-1", "deployment": "web", "kind": "artifact-pull", "status": status,
+                 "started_at": 1, "finished_at": null, "log": ["pulling"]}
+            ])
+        };
+        let (c, stub) = client(Stub::new().json(200, rec("running")).json(200, rec("succeeded")));
+        let done = c
+            .wait_for_job("job-1")
+            .in_deployment("web")
+            .poll_every(std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(done.status, "succeeded");
+        let paths: Vec<_> = stub.calls().into_iter().map(|c| (c.method, c.path)).collect();
+        assert_eq!(paths, vec![(Method::Get, "/deployments/web/jobs".to_string()); 2]);
+
+        let (c, _) = client(Stub::new().json(200, json!([])));
+        let gone = c.wait_for_job("job-9").in_deployment("web").await.unwrap_err();
+        assert!(matches!(gone, hws::Error::NotFound { .. }), "{gone:?}");
+    }
+
     /// The shape app-lb's `/whoami` answers a namespace token with, and the
     /// namespace a command may therefore assume.
     #[tokio::test]

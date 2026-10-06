@@ -84,7 +84,7 @@ async function create(lb, id) {
 
   // An artifact deployment boots nothing until its image is pulled.
   const job = await lb.startPull(id);
-  const done = await lb.waitForJob(job.id, { timeoutMs: 300_000 });
+  const done = await lb.waitForJob(job.id, { deployment: id, timeoutMs: 300_000 });
   assert.equal(done.status, "succeeded", `${id}: pull ${done.status}: ${done.error}`);
   const pulled = ms(t0);
 

@@ -126,6 +126,7 @@ async fn create(lb: &Client, env: &Env, id: &str) -> Result<Creation, String> {
         .map_err(|e| format!("{id}: pull: {e}"))?;
     let done = lb
         .wait_for_job(&job.id)
+        .in_deployment(id)
         .timeout(Duration::from_secs(300))
         .await_done()
         .await
