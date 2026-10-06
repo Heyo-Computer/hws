@@ -56,7 +56,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -110,6 +110,13 @@ pub trait Plugin: Send + Sync + 'static {
         false
     }
 
+    /// Whether, under this fleet configuration, the plugin installs itself in
+    /// every namespace: when one is created, when a deployment first lands
+    /// in one, and in every known namespace when the plugin is switched on.
+    fn auto_install(&self, _config: &Value) -> bool {
+        false
+    }
+
     /// Reject a namespace's install configuration before it is persisted.
     fn validate_install(&self, _namespace: &str, _config: &Value) -> Result<(), String> {
         Ok(())
@@ -156,6 +163,11 @@ pub struct PluginRecord {
     /// than forgetting them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub installs: BTreeMap<String, NamespaceInstall>,
+    /// Namespaces whose administrator uninstalled this plugin. Automatic
+    /// installs ([`PluginHost::auto_install`]) skip them, so an opt-out sticks;
+    /// an explicit install clears it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub declined: BTreeSet<String>,
 }
 
 // ---- the store ------------------------------------------------------------
@@ -447,6 +459,7 @@ impl PluginHost {
             config: config.clone(),
             updated_at: crate::deployment::now_secs(),
             installs: current.installs,
+            declined: current.declined,
         };
         self.store.put(id, record).map_err(SetError::Io)?;
         self.apply_slot(&slot, enabled.then_some(config)).await;
@@ -532,6 +545,7 @@ impl PluginHost {
                 config,
             },
         );
+        record.declined.remove(ns);
         self.store.put(id, record).map_err(SetError::Io)?;
         tracing::info!(plugin = id, namespace = ns, "plugin installed in namespace");
         Ok(self.namespace_view(&slot, ns))
@@ -543,7 +557,9 @@ impl PluginHost {
         let slot = self.installable(id).ok_or(SetError::NotFound)?.clone();
         let _held = slot.lock.lock().await;
         let mut record = self.store.get(id).unwrap_or_default();
-        if record.installs.remove(ns).is_some() {
+        let removed = record.installs.remove(ns).is_some();
+        let newly_declined = record.declined.insert(ns.to_string());
+        if removed || newly_declined {
             self.store.put(id, record).map_err(SetError::Io)?;
             tracing::info!(
                 plugin = id,
@@ -552,6 +568,30 @@ impl PluginHost {
             );
         }
         Ok(self.namespace_view(&slot, ns))
+    }
+
+    /// Install every enabled, auto-installing plugin into `ns`, unless `ns`
+    /// already has it or declined it. Idempotent and cheap when there is
+    /// nothing to do, so callers run it on every namespace event rather than
+    /// working out whether the namespace is new. Returns what it installed.
+    pub async fn auto_install(&self, ns: &str, by: Option<String>) -> Vec<&'static str> {
+        let mut installed = Vec::new();
+        for slot in self.slots.iter().filter(|s| s.plugin.per_namespace()) {
+            let id = slot.plugin.meta().id;
+            let Some(record) = self.store.get(id) else { continue };
+            if !record.enabled
+                || !slot.plugin.auto_install(&record.config)
+                || record.installs.contains_key(ns)
+                || record.declined.contains(ns)
+            {
+                continue;
+            }
+            match self.install(id, ns, Value::Object(Default::default()), by.clone()).await {
+                Ok(_) => installed.push(id),
+                Err(e) => tracing::warn!(plugin = id, namespace = ns, error = %e, "automatic plugin install failed"),
+            }
+        }
+        installed
     }
 
     /// Serve one request on a plugin's namespace surface. `req`'s URI is

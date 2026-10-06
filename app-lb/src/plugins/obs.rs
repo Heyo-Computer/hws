@@ -59,10 +59,19 @@ pub struct ObsConfig {
     pub api_token: Option<SecretRef>,
     #[serde(default = "default_poll_secs")]
     pub poll_secs: u64,
+    /// Install into every namespace automatically: each new one when it is
+    /// created or first gets a deployment, and every existing one when the
+    /// plugin is switched on. A namespace that uninstalls is left alone.
+    #[serde(default = "default_auto_install")]
+    pub auto_install: bool,
 }
 
 fn default_poll_secs() -> u64 {
     DEFAULT_POLL_SECS
+}
+
+fn default_auto_install() -> bool {
+    true
 }
 
 fn parse_config(config: &Value) -> Result<ObsConfig, String> {
@@ -185,7 +194,8 @@ impl Plugin for ObsPlugin {
                         "required": ["secret"],
                         "properties": {"secret": {"type": "string"}, "key": {"type": "string"}}
                     },
-                    "poll_secs": {"type": "integer", "minimum": 5, "maximum": 3600, "default": DEFAULT_POLL_SECS}
+                    "poll_secs": {"type": "integer", "minimum": 5, "maximum": 3600, "default": DEFAULT_POLL_SECS},
+                    "auto_install": {"type": "boolean", "default": true, "description": "Install into every namespace automatically (new ones as they appear, existing ones when switched on); a namespace that uninstalls is left alone."}
                 }
             }),
         }
@@ -239,6 +249,10 @@ impl Plugin for ObsPlugin {
 
     fn per_namespace(&self) -> bool {
         true
+    }
+
+    fn auto_install(&self, config: &Value) -> bool {
+        parse_config(config).is_ok_and(|c| c.auto_install)
     }
 
     fn validate_install(&self, _namespace: &str, config: &Value) -> Result<(), String> {
@@ -579,6 +593,43 @@ mod tests {
         host.uninstall("obs", "team-a").await.unwrap();
         let (code, _) = dispatch(&host, "team-a", "GET", "/api/fleet", "").await;
         assert_eq!(code, StatusCode::CONFLICT);
+        plugin.apply(None).await.unwrap();
+    }
+
+    /// With `auto_install` (the default), every namespace gets the plugin
+    /// unless it declined it; an explicit install undoes the opt-out.
+    #[tokio::test]
+    async fn auto_install_reaches_every_namespace_except_one_that_declined() {
+        let url = fake_obs("obs-auto").await;
+        let dir = TempDir::new("auto");
+        let plugin = ObsPlugin::new(secrets_with("obs-auto"));
+        let host = PluginHost::new(vec![plugin.clone()], PluginStore::new(&dir.0));
+
+        // Disabled: nothing is installed automatically.
+        assert!(host.auto_install("team-a", None).await.is_empty());
+
+        host.set("obs", true, Some(configured(&url))).await.unwrap();
+        assert_eq!(host.auto_install("team-a", Some("auto".into())).await, vec!["obs"]);
+        assert!(host.is_installed("obs", "team-a"));
+        assert!(host.auto_install("team-a", None).await.is_empty(), "idempotent");
+
+        host.uninstall("obs", "team-a").await.unwrap();
+        assert!(host.auto_install("team-a", None).await.is_empty(), "an opt-out sticks");
+        assert!(!host.is_installed("obs", "team-a"));
+        // Disabling and re-enabling keeps the opt-out too.
+        host.set("obs", false, None).await.unwrap();
+        host.set("obs", true, None).await.unwrap();
+        assert!(host.auto_install("team-a", None).await.is_empty());
+        host.install("obs", "team-a", json!({}), None).await.unwrap();
+        host.uninstall("obs", "team-a").await.unwrap();
+        host.install("obs", "team-a", json!({}), None).await.unwrap();
+        assert!(host.store().get("obs").unwrap().declined.is_empty(), "installing clears it");
+
+        // Opted out at the fleet level.
+        let mut off = configured(&url);
+        off["auto_install"] = json!(false);
+        host.set("obs", true, Some(off)).await.unwrap();
+        assert!(host.auto_install("team-b", None).await.is_empty());
         plugin.apply(None).await.unwrap();
     }
 
