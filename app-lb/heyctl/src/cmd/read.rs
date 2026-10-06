@@ -29,6 +29,10 @@ pub struct GetArgs {
     #[arg(long, short = 'n', value_name = "NAMESPACE")]
     pub namespace: Option<String>,
 
+    /// List deployments across configured gateways, without changing local write targets.
+    #[arg(long)]
+    pub fleet: bool,
+
     /// Re-render every --interval seconds until interrupted.
     #[arg(long, short = 'w')]
     pub watch: bool,
@@ -51,6 +55,12 @@ pub fn get(ctx: &Ctx, args: &GetArgs) -> Result<()> {
 }
 
 fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Result<()> {
+    if args.fleet {
+        if !matches!(kind, Resource::Deployment) || !names.is_empty() || args.deployment.is_some() {
+            bail!("--fleet supports `get deployments` without names or --deployment; use --namespace to narrow it");
+        }
+        return get_fleet_deployments(ctx, args.namespace.as_deref());
+    }
     match kind {
         Resource::Deployment => get_deployments(ctx, names, args.namespace.as_deref()),
         Resource::Vm => get_vms(ctx, names, args.deployment.as_deref()),
@@ -67,6 +77,38 @@ fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Resu
             get_vms(ctx, &[], None)
         }
     }
+}
+
+fn get_fleet_deployments(ctx: &Ctx, namespace: Option<&str>) -> Result<()> {
+    let raw = ctx.client.raw().fleet_deployments(namespace)?;
+    if raw.get("configured").and_then(Value::as_bool) != Some(true) {
+        bail!("this gateway has no fleet configured; use a regional context without --fleet");
+    }
+    let rows = raw["rows"].as_array().context("fleet response has no rows")?;
+    if ctx.out.is_machine() {
+        let names = rows.iter().map(|r| format!("deployment/{}/{}",
+            r["namespace"].as_str().unwrap_or("?"), r["id"].as_str().unwrap_or("?"))).collect::<Vec<_>>();
+        return output::emit(&raw, ctx.out, &names);
+    }
+    let mut table = Table::new(["NAMESPACE", "NAME", "GATEWAY", "REGION", "READY", "PENDING", "HEALTH", "ERROR"]);
+    for row in rows {
+        for cell in row["cells"].as_array().context("fleet row has no cells")? {
+            let text = |v: &Value| match v { Value::Null => "—".to_owned(), Value::String(s) => s.clone(), v => v.to_string() };
+            table.row([text(&row["namespace"]), text(&row["id"]), text(&cell["gateway"]),
+                text(&cell["region"]), text(&cell["ready"]), text(&cell["pending"]),
+                text(&cell["health"]), text(&cell["error"])]);
+        }
+    }
+    table.print();
+    for gateway in raw["gateways"].as_array().context("fleet response has no gateways")? {
+        if let Some(error) = gateway["error"].as_str() {
+            eprintln!("Warning: gateway {} unavailable: {error}; its inventory is unknown", gateway["id"]);
+        }
+        if gateway["truncated"].as_bool() == Some(true) {
+            eprintln!("Warning: gateway {} inventory is truncated", gateway["id"]);
+        }
+    }
+    Ok(())
 }
 
 /// Fetch either the whole list or the named subset, as raw JSON plus the parsed

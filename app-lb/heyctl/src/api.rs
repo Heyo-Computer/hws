@@ -1087,6 +1087,15 @@ impl Raw<'_> {
         plugins     => "plugin",     "/api/plugins";
     }
 
+    /// Cross-gateway observations; unavailable gateways remain explicit errors.
+    pub async fn fleet_deployments(&self, namespace: Option<&str>) -> Result<Value> {
+        let path = match namespace {
+            Some(ns) => format!("/fleet/deployments?namespace={}", seg(ns)),
+            None => "/fleet/deployments".to_owned(),
+        };
+        self.0.read(Request::new(Method::Get, path), "fleet", "").await
+    }
+
     /// Deployments in one namespace, as app-lb sent them.
     ///
     /// A separate method rather than an argument on `deployments()` because the
@@ -1664,6 +1673,17 @@ mod tests {
     fn client(stub: Stub) -> (Client, Arc<Stub>) {
         let s = Arc::new(stub);
         (Client::with_transport(s.clone()), s)
+    }
+
+    #[tokio::test]
+    async fn fleet_read_preserves_partial_results_and_encodes_namespace() {
+        let expected = json!({"configured":true,"rows":[{"id":"ci","cells":[
+            {"gateway":"west","ready":3}, {"gateway":"east","ready":null,"error":"gateway unavailable"}
+        ]}],"gateways":[{"id":"east","error":"gateway unavailable"}]});
+        let (c, stub) = client(Stub::new().json(200, expected.clone()));
+        assert_eq!(c.raw().fleet_deployments(Some("team/a&b")).await.unwrap(), expected);
+        assert_eq!(stub.calls()[0].path, "/fleet/deployments?namespace=team%2Fa%26b");
+        assert_eq!(stub.calls()[0].method, Method::Get);
     }
 
     #[tokio::test]

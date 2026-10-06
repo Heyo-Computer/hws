@@ -1,8 +1,9 @@
 //! `login`, `logout`, `whoami` and `config` — everything about *which* app-lb
 //! this CLI talks to and as whom.
 //!
-//! app-lb authenticates with HTTP Basic and has no token endpoint, so "logging
-//! in" means verifying credentials once and storing them in the config file.
+//! Gateway Basic login verifies credentials and stores them in the config file.
+//! Heyo account login exchanges credentials at `/login` and stores only the
+//! resulting expiring bearer token; it does not retain the account password.
 //! The two gates it exposes are independent — `APP_LB_DASHBOARD_PASSWORD` gates
 //! the dashboard and `/metrics`, `APP_LB_ADMIN_AUTH` extends that to the
 //! deployment CRUD API — so login probes both and says which it found.
@@ -31,6 +32,10 @@ pub struct LoginArgs {
     /// Basic-auth user. app-lb's default is `admin`.
     #[arg(long, value_name = "NAME")]
     pub user: Option<String>,
+
+    /// Sign in as a Heyo platform administrator, storing an expiring token, not the password.
+    #[arg(long, conflicts_with_all = ["user", "token", "token_stdin", "token_command", "password_command", "insecure_skip_tls_verify"])]
+    pub email: Option<String>,
 
     /// The password. Prefer --password-stdin or the interactive prompt: an
     /// argument is visible in `ps` and your shell history.
@@ -81,6 +86,32 @@ pub struct LoginArgs {
     pub no_switch: bool,
 }
 
+fn platform_login(server: &str, email: &str, password: &str, timeout: Duration) -> Result<String> {
+    let mut url = reqwest::Url::parse(server).context("Heyo login requires an HTTPS admin origin")?;
+    if url.scheme() != "https" || url.host_str().is_none() || !url.username().is_empty()
+        || url.password().is_some() || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        bail!("Heyo login requires an HTTPS admin origin without credentials, path or query");
+    }
+    let origin = url.origin().ascii_serialization();
+    url.set_path("/login");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(async {
+        let response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none()).timeout(timeout).build()?
+            .post(url).header("Origin", origin)
+            .json(&serde_json::json!({"email":email,"password":password}))
+            .send().await.context("Heyo sign-in unavailable")?;
+        if !response.status().is_success() {
+            bail!("Heyo sign-in refused or unavailable (HTTP {}); check the account and platform administrator access", response.status());
+        }
+        response.headers().get_all(reqwest::header::SET_COOKIE).iter()
+            .filter_map(|h| h.to_str().ok())
+            .filter_map(|h| h.split(';').next()?.strip_prefix("__Host-heyo-admin="))
+            .find(|t| !t.is_empty() && t.len() <= 3800 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+            .map(str::to_owned).context("Heyo sign-in returned no valid session token")
+    })
+}
+
 pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
     let path = Config::path(globals.config.as_deref())?;
     let mut config = Config::load(&path)?;
@@ -100,7 +131,7 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
 
     // A token login: no gate to probe (Cloud's door has none and answers 404
     // for `/healthz`), so the one request that must work is the verification.
-    let token = match (&args.token_command, &args.token, args.token_stdin) {
+    let mut token = match (&args.token_command, &args.token, args.token_stdin) {
         (Some(cmd), _, _) => Some(run_command(cmd)?),
         (None, Some(t), _) => Some(t.clone()),
         (None, None, true) => {
@@ -111,6 +142,21 @@ pub fn login(globals: &GlobalOpts, args: &LoginArgs) -> Result<()> {
         }
         (None, None, false) => globals.token.clone(),
     };
+    if let Some(email) = &args.email {
+        if token.is_some() || globals.user.is_some() || insecure {
+            bail!("--email cannot be combined with gateway credentials or insecure TLS");
+        }
+        let password = if args.password_stdin {
+            let mut value = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut value)?;
+            value.trim_end_matches(['\n', '\r']).to_owned()
+        } else if let Some(value) = args.password.as_ref().or(globals.password.as_ref()) {
+            value.clone()
+        } else {
+            rpassword::prompt_password(format!("Heyo password for {email}: "))?
+        };
+        token = Some(platform_login(&server, email, &password, timeout)?);
+    }
     if let Some(token) = token {
         if token.is_empty() {
             bail!("an empty token will not authenticate against anything");
@@ -635,6 +681,15 @@ pub fn config(globals: &GlobalOpts, cmd: &ConfigCmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::context_name_for;
+
+    #[test]
+    fn platform_password_never_goes_to_an_unsafe_origin() {
+        for url in ["http://localhost", "https://u:p@example.com", "https://example.com/path",
+            "https://example.com?query=1", "https://example.com#fragment"] {
+            assert!(super::platform_login(url, "user@example.com", "not-a-real-password",
+                std::time::Duration::from_secs(1)).is_err(), "{url}");
+        }
+    }
 
     #[test]
     fn context_names_come_from_the_host() {

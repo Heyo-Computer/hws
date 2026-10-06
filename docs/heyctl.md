@@ -128,6 +128,29 @@ app-lb accepts three credentials on its admin API. See [app-lb auth](app-lb-auth
 
 A namespace-scoped Heyo API key is used against Cloud's namespace door, `https://<cloud>/namespaces/<ns>/lb`, and reaches only that namespace at the tier it was minted with (`view` or `admin`).
 
+### Heyo account login and regional visibility
+
+For a platform administrator account, use `--email`, not `--user` (gateway Basic auth):
+
+```sh
+heyctl login --server https://admin.heyo.work --email sam@heyo.computer
+heyctl get deployments --fleet
+heyctl get deployments --fleet --namespace default -o json
+```
+
+Login prompts for the account password and uses the same HTTPS `/login` exchange
+as the dashboard. It saves only the expiring session token in the existing
+permission-restricted config. Run login again when it expires; no password is
+retained for unattended refresh. Redirects and insecure TLS are not allowed.
+
+`--fleet` reads the gateway's configured fleet, showing each deployment's gateway,
+region, health and unavailable-region errors. JSON/YAML preserves the server's
+full response, including truncation and error fields. It does not discover servers
+from DNS, change write targets, or fail over the selected admin endpoint.
+Without `--fleet`, existing reads and all deployment writes remain regional.
+Use an explicit regional context for host maintenance; fleet observation does not
+turn `apply` or `restart` into a coordinated release.
+
 ### Precedence
 
 For each of the password, token and artifact API key, heyctl uses the first of:

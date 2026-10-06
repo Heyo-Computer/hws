@@ -766,6 +766,10 @@ macro_rules! raw_blocking_id {
 impl Raw<'_> {
     raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows, feeds, disks, namespaces, plugins);
 
+    pub fn fleet_deployments(&self, namespace: Option<&str>) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().fleet_deployments(namespace))?
+    }
+
     /// Deployments in one namespace. See [`crate::api::Raw::deployments_in`].
     pub fn deployments_in(&self, namespace: &str) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().deployments_in(namespace))?
