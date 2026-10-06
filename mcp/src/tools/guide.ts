@@ -57,7 +57,7 @@ export const GUIDES: readonly Guide[] = [
     title: "Run an app (API, server, worker) from source with a Dockerfile",
     keywords: ["vm", "api", "server", "node", "python", "go", "rust", "docker", "dockerfile", "backend", "service", "app", "container", "worker"],
     steps: [
-      "Write a Dockerfile at the repo root that installs the app (e.g. into /app).",
+      "Write a Dockerfile at the repo root that installs the app (e.g. into /app), plus `socat` (`apk add socat` / `apt-get install -y socat`): heyvm uses it to stream the app's stdout/stderr out of the VM, so without it deployment_logs never sees the app's output.",
       "repo_create {name}.",
       "repo_write_files {repo, files: [... source ..., Dockerfile], message}.",
       `repo_deploy {repo, kind: "vm", port, start_command, host?}. ${DAEMONIZE}`,

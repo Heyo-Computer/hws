@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         ca-certificates \
         curl \
+        socat \
     && rm -rf /var/lib/apt/lists/*
 
 # Key-only SSH for `heyvm exec` / `heyvm sh`; heyvmd supplies the keys. Host

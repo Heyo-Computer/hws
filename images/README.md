@@ -39,9 +39,15 @@ which is also the only process that receives `env_vars`:
 }
 ```
 
-Each image ships bash, iproute2, e2fsprogs, blkid, ca-certificates and curl. Each
-Docker build runs [`base/smoke.sh`](base/smoke.sh), which fails the build if a
-tool `init.sh` calls is missing or sshd would accept passwords.
+Each image ships bash, iproute2, e2fsprogs, blkid, ca-certificates, curl and
+socat. Each Docker build runs [`base/smoke.sh`](base/smoke.sh), which fails the
+build if a tool `init.sh` calls is missing, if socat lacks VSOCK support, or if
+sshd would accept passwords.
+
+socat is what gets a deployment's logs out of the VM: heyvm pipes the
+`start_command`'s stdout and stderr to the host over vsock with it, and from
+there they reach app-obs. An image without it keeps them in
+`/var/log/heyvm-start.log` inside the guest. Custom images should install it too.
 
 ## Building and publishing
 

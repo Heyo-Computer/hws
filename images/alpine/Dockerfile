@@ -20,7 +20,8 @@ RUN apk add --no-cache \
         e2fsprogs \
         blkid \
         ca-certificates \
-        curl
+        curl \
+        socat
 
 # Key-only SSH for `heyvm exec` / `heyvm sh`; heyvmd supplies the keys. Host
 # keys are generated now so sshd does not wait on entropy at boot.
