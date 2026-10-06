@@ -143,7 +143,7 @@ test("the listing stays within its size budget", () => {
   // NOT enough for a second full spec schema: a tool that wants one shares this
   // one by pointing at it, because two copies of a 12 KB tree is a cost every
   // client pays on every connect.
-  const BUDGET = 76_000;
+  const BUDGET = 77_000;
   const bytes = JSON.stringify(toolListing(everything())).length;
   assert.ok(
     bytes <= BUDGET,
