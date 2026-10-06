@@ -22,6 +22,7 @@
 
 use crate::api::{ExecRequest, Gates, MetricsQuery, NewToken};
 use crate::error::{Error, Result};
+use crate::obs::{LogQuery, NewAlert};
 use crate::shell::{ShellEvent, ShellExit, ShellOptions};
 use crate::transport::Auth;
 use crate::types::*;
@@ -496,6 +497,97 @@ impl Client {
     pub fn set_plugin(&self, id: &str, enabled: bool, config: Option<&Value>) -> Result<PluginView> {
         run!(self, self.inner.set_plugin(id, enabled, config))
     }
+
+    // -- namespace plugins and telemetry ------------------------------------
+
+    pub fn namespace_plugins(&self, namespace: &str) -> Result<Vec<NamespacePlugin>> {
+        run!(self, self.inner.namespace_plugins(namespace))
+    }
+
+    pub fn install_plugin(
+        &self,
+        namespace: &str,
+        id: &str,
+        config: Option<&Value>,
+    ) -> Result<NamespacePlugin> {
+        run!(self, self.inner.install_plugin(namespace, id, config))
+    }
+
+    pub fn uninstall_plugin(&self, namespace: &str, id: &str) -> Result<NamespacePlugin> {
+        run!(self, self.inner.uninstall_plugin(namespace, id))
+    }
+
+    pub fn plugin_installs(&self, id: &str) -> Result<PluginInstalls> {
+        run!(self, self.inner.plugin_installs(id))
+    }
+
+    /// One namespace's telemetry. See [`crate::Client::obs`].
+    pub fn obs(&self, namespace: impl Into<String>) -> ObsClient<'_> {
+        ObsClient {
+            client: self,
+            inner: self.inner.obs(namespace),
+        }
+    }
+
+    // -- identity, rollouts, discovery ---------------------------------------
+
+    pub fn whoami(&self) -> Result<WhoAmI> {
+        run!(self, self.inner.whoami())
+    }
+
+    pub fn start_rollout(
+        &self,
+        id: &str,
+        operation_id: &str,
+        expected_revision: &str,
+        spec: &Value,
+    ) -> Result<RolloutOperation> {
+        run!(self, self.inner.start_rollout(id, operation_id, expected_revision, spec))
+    }
+
+    pub fn rollout(&self, id: &str, operation_id: &str) -> Result<RolloutOperation> {
+        run!(self, self.inner.rollout(id, operation_id))
+    }
+
+    pub fn discovery_status(&self, id: &str, staged: bool) -> Result<DiscoveryStatus> {
+        run!(self, self.inner.discovery_status(id, staged))
+    }
+}
+
+/// One namespace's telemetry, blocking. See [`crate::ObsClient`].
+pub struct ObsClient<'a> {
+    client: &'a Client,
+    inner: crate::ObsClient,
+}
+
+impl ObsClient<'_> {
+    pub fn namespace(&self) -> &str {
+        self.inner.namespace()
+    }
+
+    pub fn fleet(&self, window: Option<&str>) -> Result<ObsFleet> {
+        block_on(&self.client.rt, self.inner.fleet(window))?
+    }
+
+    pub fn deployment(&self, id: &str, window: Option<&str>) -> Result<ObsDeployment> {
+        block_on(&self.client.rt, self.inner.deployment(id, window))?
+    }
+
+    pub fn logs(&self, id: &str, query: &LogQuery) -> Result<ObsLogs> {
+        block_on(&self.client.rt, self.inner.logs(id, query))?
+    }
+
+    pub fn alerts(&self) -> Result<Vec<ObsAlert>> {
+        block_on(&self.client.rt, self.inner.alerts())?
+    }
+
+    pub fn create_alert(&self, alert: &NewAlert) -> Result<ObsAlert> {
+        block_on(&self.client.rt, self.inner.create_alert(alert))?
+    }
+
+    pub fn delete_alert(&self, id: &str) -> Result<()> {
+        block_on(&self.client.rt, self.inner.delete_alert(id))?
+    }
 }
 
 pub struct ClientBuilder {
@@ -682,6 +774,33 @@ impl Raw<'_> {
 
     pub fn metrics(&self, query: &MetricsQuery) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().metrics(query))?
+    }
+
+    pub fn namespace_plugins(&self, namespace: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().namespace_plugins(namespace))?
+    }
+
+    pub fn plugin_installs(&self, id: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().plugin_installs(id))?
+    }
+
+    pub fn obs_fleet(&self, namespace: &str, window: Option<&str>) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().obs_fleet(namespace, window))?
+    }
+
+    pub fn obs_deployment(&self, namespace: &str, id: &str, window: Option<&str>) -> Result<Value> {
+        block_on(
+            &self.client.rt,
+            self.client.inner.raw().obs_deployment(namespace, id, window),
+        )?
+    }
+
+    pub fn obs_logs(&self, namespace: &str, id: &str, query: &LogQuery) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().obs_logs(namespace, id, query))?
+    }
+
+    pub fn obs_alerts(&self, namespace: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().obs_alerts(namespace))?
     }
 
     pub fn create_deployment(&self, spec: &Value) -> Result<Value> {

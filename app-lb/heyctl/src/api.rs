@@ -63,7 +63,7 @@ fn secret_path(namespace: Option<&str>, id: &str, force: Option<bool>) -> String
     path
 }
 
-fn seg(s: &str) -> String {
+pub(crate) fn seg(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -144,7 +144,7 @@ impl Client {
 
     // -- plumbing ----------------------------------------------------------
 
-    async fn send(&self, req: Request, kind: &'static str, name: &str) -> Result<Response> {
+    pub(crate) async fn send(&self, req: Request, kind: &'static str, name: &str) -> Result<Response> {
         let r = self.transport.send(req).await?;
         if r.is_success() {
             Ok(r)
@@ -159,7 +159,7 @@ impl Client {
         }
     }
 
-    async fn read<T: DeserializeOwned>(
+    pub(crate) async fn read<T: DeserializeOwned>(
         &self,
         req: Request,
         kind: &'static str,
@@ -169,7 +169,7 @@ impl Client {
         serde_json::from_str(&r.body).map_err(Error::Decode)
     }
 
-    async fn unit(&self, req: Request, kind: &'static str, name: &str) -> Result<()> {
+    pub(crate) async fn unit(&self, req: Request, kind: &'static str, name: &str) -> Result<()> {
         self.send(req, kind, name).await.map(|_| ())
     }
 
@@ -203,6 +203,17 @@ impl Client {
             .as_ref()
             .is_some_and(refused);
         Ok(Gates { view, crud })
+    }
+
+    /// `GET /whoami` — what the server makes of this client's credential: its
+    /// tier, whether it is confined, and to which namespace.
+    ///
+    /// Needs no tier at all, so it answers even for a token every other route
+    /// refuses. [`WhoAmI::sole_namespace`] is the namespace a namespace-scoped
+    /// caller may leave implicit.
+    pub async fn whoami(&self) -> Result<WhoAmI> {
+        self.read(Request::new(Method::Get, "/whoami"), "server", "")
+            .await
     }
 
     // -- deployments --------------------------------------------------------
@@ -363,6 +374,62 @@ impl Client {
             upstream,
         )
         .await
+    }
+
+    /// `POST /deployments/:id/rollouts` — replace a managed deployment's spec by
+    /// rolling a fresh pool beside the old one, verifying it, and only then
+    /// draining the old one.
+    ///
+    /// `expected_revision` is the deployment's
+    /// [`DeploymentStatus::rollout_revision`] as last read: the rollout is
+    /// refused (409) if anything changed it since. `operation_id` makes the
+    /// call idempotent — repeating it with the same payload returns the same
+    /// operation rather than starting a second one, so a caller that lost the
+    /// reply retries with the same id. Answers `202` with the operation; poll
+    /// [`Client::rollout`] until [`RolloutOperation::is_finished`].
+    pub async fn start_rollout(
+        &self,
+        id: &str,
+        operation_id: &str,
+        expected_revision: &str,
+        spec: &Value,
+    ) -> Result<RolloutOperation> {
+        let body = json!({
+            "operation_id": operation_id,
+            "expected_revision": expected_revision,
+            "spec": spec,
+        });
+        self.read(
+            Request::new(Method::Post, format!("/deployments/{}/rollouts", seg(id))).json(body),
+            "deployment",
+            id,
+        )
+        .await
+    }
+
+    /// `GET /deployments/:id/rollouts/:operation`.
+    pub async fn rollout(&self, id: &str, operation_id: &str) -> Result<RolloutOperation> {
+        self.read(
+            Request::new(
+                Method::Get,
+                format!("/deployments/{}/rollouts/{}", seg(id), seg(operation_id)),
+            ),
+            "rollout",
+            operation_id,
+        )
+        .await
+    }
+
+    /// `GET /deployments/:id/discovery-status` — what this gateway publishes
+    /// for the deployment to discovery. `staged: true` asks about the spec a
+    /// pending change would publish instead of the live one.
+    pub async fn discovery_status(&self, id: &str, staged: bool) -> Result<DiscoveryStatus> {
+        let path = if staged {
+            format!("/deployments/{}/discovery-status?staged=true", seg(id))
+        } else {
+            format!("/deployments/{}/discovery-status", seg(id))
+        };
+        self.read(Request::new(Method::Get, path), "deployment", id).await
     }
 
     // -- running things inside a VM ----------------------------------------
@@ -980,7 +1047,7 @@ impl Client {
 
 /// Unparsed reads. See [`Client::raw`].
 #[derive(Debug, Clone, Copy)]
-pub struct Raw<'a>(&'a Client);
+pub struct Raw<'a>(pub(crate) &'a Client);
 
 /// A collection route: no id, fixed path.
 macro_rules! raw_list {

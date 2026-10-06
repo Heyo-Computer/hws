@@ -175,8 +175,15 @@ enum Command {
     #[command(visible_alias = "rm")]
     Delete(cmd::write::DeleteArgs),
 
-    /// Resource usage for deployments, VMs or the host.
+    /// Resource usage for deployments, VMs or the host — or, with -n, a
+    /// namespace's telemetry from the obs plugin.
     Top(cmd::observe::TopArgs),
+
+    /// Print a deployment's logs, collected by the obs plugin.
+    ///
+    /// Needs the plugin installed in the deployment's namespace
+    /// (`heyctl plugins install obs -n <namespace>`).
+    Logs(cmd::telemetry::LogsArgs),
 
     /// A whole-LB overview: uptime, host, fleet and traffic.
     #[command(visible_alias = "cluster-info")]
@@ -370,6 +377,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Shell(args) => cmd::session::shell(&Ctx::new(g)?, args),
         Command::Delete(args) => cmd::write::delete(&Ctx::new(g)?, args),
         Command::Top(args) => cmd::observe::top(&Ctx::new(g)?, args),
+        Command::Logs(args) => cmd::telemetry::logs(&Ctx::new(g)?, args),
         Command::Status => cmd::observe::status(&Ctx::new(g)?),
     }
 }
@@ -400,6 +408,27 @@ mod tests {
         .unwrap();
         assert_eq!(cli.globals.output, OutputFormat::Json);
         assert_eq!(cli.globals.server.as_deref(), Some("http://lb:9090"));
+    }
+
+    #[test]
+    fn telemetry_and_namespace_plugin_commands_parse() {
+        for argv in [
+            &["heyctl", "plugins", "install", "obs", "-n", "team-a"][..],
+            &["heyctl", "plugins", "install", "obs"],
+            &["heyctl", "plugins", "uninstall", "obs", "-n", "team-a"],
+            &["heyctl", "plugins", "list", "-n", "team-a"],
+            &["heyctl", "plugins", "installs", "obs"],
+            &["heyctl", "logs", "web", "-n", "team-a", "--since", "15m", "--level", "error", "--grep", "boom", "--limit", "20"],
+            &["heyctl", "top", "-n", "team-a", "--window", "6h"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(argv) {
+                panic!("{argv:?}: {e}");
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["heyctl", "top", "--window", "6h"]).is_err(),
+            "--window means nothing without -n"
+        );
     }
 
     #[test]

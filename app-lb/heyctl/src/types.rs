@@ -1539,6 +1539,11 @@ pub struct PluginView {
     pub description: String,
     /// JSON Schema for `config`. Advisory; app-lb validates on write.
     pub config_schema: Value,
+    /// Whether namespaces install this plugin for themselves (`heyctl plugins
+    /// install`), on top of the fleet-wide switch.
+    pub per_namespace: bool,
+    /// The namespaces it is installed in. Empty for a fleet-only plugin.
+    pub installed_in: Vec<String>,
     pub enabled: bool,
     /// Kept while disabled, so re-enabling does not lose it.
     pub config: Value,
@@ -2008,4 +2013,353 @@ pub struct MintedToken {
     #[serde(flatten)]
     pub summary: TokenSummary,
     pub token: String,
+}
+
+// -- GET /whoami ------------------------------------------------------------
+
+/// What the server makes of the credential presented, from `GET /whoami`.
+///
+/// The one admin route with no tier requirement, so even a token minted with
+/// `admin: none` can ask it why everything else refuses.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct WhoAmI {
+    /// `ungated`, `operator`, `app-token` or `federated`.
+    pub caller: String,
+    /// `none`, `view`, `admin` — or `unchecked` on an ungated listener. For a
+    /// federated caller, the strongest tier it holds anywhere.
+    pub admin_scope: String,
+    /// Whether this credential may use the fleet-wide routes.
+    pub fleet: bool,
+    /// Whether it is behind a namespace wall.
+    pub confined: bool,
+    pub may: WhoAmIMay,
+    /// An app-token's id and name.
+    pub token: Option<WhoAmIToken>,
+    /// An app-token's namespace, when it is confined to one.
+    pub namespace: Option<String>,
+    /// An app-token's deployment list, verbatim: `["*"]` is every deployment,
+    /// and empty on a namespace token is everything in that namespace.
+    pub deployments: Option<Vec<String>>,
+    pub expires_at: Option<u64>,
+    pub expires_in_secs: Option<u64>,
+    /// A federated caller's identity, as the auth service reported it.
+    pub subject: Option<Value>,
+    /// A federated caller's namespaces and the tier it holds in each.
+    pub namespaces: Option<BTreeMap<String, String>>,
+    pub detail: Option<String>,
+    pub note: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl WhoAmI {
+    /// The single namespace this credential is confined to, if there is
+    /// exactly one — the namespace a command may assume when none is named.
+    pub fn sole_namespace(&self) -> Option<&str> {
+        if !self.confined {
+            return None;
+        }
+        if let Some(ns) = self.namespace.as_deref() {
+            return Some(ns);
+        }
+        match &self.namespaces {
+            Some(map) if map.len() == 1 => map.keys().next().map(String::as_str),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct WhoAmIMay {
+    pub read_view_routes: bool,
+    pub use_admin_routes: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct WhoAmIToken {
+    pub id: String,
+    pub name: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// -- rollouts ---------------------------------------------------------------
+
+/// A replace-by-rollout operation, from `POST /deployments/:id/rollouts` and
+/// `GET /deployments/:id/rollouts/:operation`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct RolloutOperation {
+    pub operation_id: String,
+    pub deployment: String,
+    /// The deployment's `rollout_revision` the operation was admitted against.
+    pub source_revision: String,
+    pub target_spec_sha256: String,
+    /// `running`, `succeeded`, `failed` or `reconciliation_required`.
+    pub status: String,
+    pub phase: String,
+    pub readiness_verified: bool,
+    pub previous_stopped: bool,
+    pub error: Option<String>,
+    pub preparation_stage: Option<String>,
+    /// Present once a failed rollout's candidates have been reclaimed.
+    pub failure_settlement: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl RolloutOperation {
+    /// Whether the operation has stopped moving, successfully or not.
+    pub fn is_finished(&self) -> bool {
+        !matches!(self.status.as_str(), "running" | "reconciliation_required")
+    }
+}
+
+// -- discovery --------------------------------------------------------------
+
+/// What a gateway publishes about a deployment for discovery, from
+/// `GET /deployments/:id/discovery-status`. camelCase on the wire.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DiscoveryStatus {
+    pub service_id: String,
+    pub source_url: Option<String>,
+    pub version: Option<u64>,
+    /// The regional discovery state, when the deployment declares one. Its
+    /// shape belongs to the regional protocol, so it is carried opaquely.
+    pub regional: Option<Value>,
+    pub upstreams: Vec<DiscoveryUpstream>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DiscoveryUpstream {
+    pub peer: String,
+    pub draining: bool,
+    pub in_flight: usize,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// -- namespace plugins ------------------------------------------------------
+
+/// A plugin as one namespace sees it, from `GET /namespaces/:ns/plugins`.
+///
+/// Only plugins that install per namespace are listed. `enabled` is the
+/// fleet-wide switch the operator controls; `installed` is this namespace's.
+/// A plugin does nothing for a namespace unless both are true.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct NamespacePlugin {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub installed: bool,
+    pub installed_at: Option<u64>,
+    /// Who installed it — `token:<id>` or `user:<id>`; absent for the operator.
+    pub installed_by: Option<String>,
+    pub config: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// Every namespace a plugin is installed in, from
+/// `GET /api/plugins/:id/installs`. Fleet scope only.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PluginInstalls {
+    pub plugin: String,
+    pub enabled: bool,
+    pub namespaces: Vec<String>,
+    pub installs: BTreeMap<String, NamespaceInstall>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct NamespaceInstall {
+    pub installed_at: u64,
+    pub installed_by: Option<String>,
+    pub config: Value,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// -- telemetry (the obs plugin) ---------------------------------------------
+
+/// Whether recently ingested telemetry is queryable yet.
+///
+/// app-obs flushes on a timer, so the newest rows are legitimately missing
+/// from a query until `flush_secs` has passed.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsFreshness {
+    pub buffered_rows: usize,
+    pub flush_secs: u64,
+    /// Records dropped because the ingest buffer was full.
+    pub dropped: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One time bucket of a deployment's metrics.
+///
+/// Every measure is optional: `None` means nothing was sampled in the bucket,
+/// which is different from zero.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsMetricBucket {
+    /// Bucket start, epoch milliseconds UTC.
+    pub t: i64,
+    pub requests_per_sec: Option<f64>,
+    pub errors_per_sec: Option<f64>,
+    pub mean_latency_ms: Option<f64>,
+    /// Cumulative since app-lb started, not windowed.
+    pub p50_ms: Option<f64>,
+    pub p90_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub cpu_percent: Option<f64>,
+    pub memory_bytes: Option<f64>,
+    pub in_flight: Option<f64>,
+    pub ready: Option<f64>,
+    pub pending: Option<f64>,
+    pub draining: Option<f64>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One time bucket of a deployment's log volume.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsLogBucket {
+    pub t: i64,
+    pub lines: u64,
+    pub errors: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A namespace's telemetry overview, from `…/plugins/obs/api/fleet`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsFleet {
+    pub generated_at_ms: i64,
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub step_secs: u32,
+    /// The window this answer covers, e.g. `1h`.
+    pub window: String,
+    /// Every window label the server accepts.
+    pub windows: Vec<String>,
+    pub retain_days: u32,
+    pub freshness: ObsFreshness,
+    /// Whole-host usage. Operator view only; absent in a namespace's.
+    pub host: Option<Vec<ObsMetricBucket>>,
+    pub deployments: Vec<ObsFleetRow>,
+    /// Sandboxes outside every deployment. Operator view only.
+    pub host_sandboxes: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One deployment's row in [`ObsFleet`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsFleetRow {
+    pub id: String,
+    pub buckets: Vec<ObsMetricBucket>,
+    pub log_buckets: Vec<ObsLogBucket>,
+    /// The most recent non-null value of each measure in the window.
+    pub latest: ObsMetricBucket,
+    pub log_lines: u64,
+    pub error_logs: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One deployment's telemetry, from `…/plugins/obs/api/deployments/:id`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsDeployment {
+    pub id: String,
+    pub generated_at_ms: i64,
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub step_secs: u32,
+    pub window: String,
+    pub windows: Vec<String>,
+    pub retain_days: u32,
+    pub freshness: ObsFreshness,
+    pub buckets: Vec<ObsMetricBucket>,
+    pub log_buckets: Vec<ObsLogBucket>,
+    pub latest: ObsMetricBucket,
+    pub log_lines: u64,
+    pub error_logs: u64,
+    /// Backends that logged in the window.
+    pub backends: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One page of a deployment's logs, from
+/// `…/plugins/obs/api/deployments/:id/logs`. Newest first.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsLogs {
+    pub id: String,
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub rows: Vec<ObsLogRow>,
+    /// Pass back as [`crate::LogQuery::before`] for the next page; `None` at
+    /// the end. Inclusive, so the next page may repeat lines from the same
+    /// millisecond — drop the ones already seen.
+    pub next_before_ms: Option<i64>,
+    pub limit: usize,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One stored log line.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsLogRow {
+    /// Epoch milliseconds UTC.
+    pub ts: i64,
+    pub level: Option<String>,
+    /// `stdout`, `stderr`, `console`, `access`, `security`, …
+    pub source: String,
+    pub message: String,
+    /// The VM (sandbox id) or upstream that produced it.
+    pub backend: Option<String>,
+    pub host: Option<String>,
+    /// The structured payload, still a JSON string.
+    pub fields: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// An alert rule, from `…/plugins/obs/api/alerts`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObsAlert {
+    pub id: String,
+    pub deployment: String,
+    /// The namespace the rule belongs to. Absent on rules made before
+    /// namespaces existed in app-obs.
+    pub namespace: Option<String>,
+    /// `errors` — errors over the trailing minute.
+    pub metric: String,
+    pub threshold: f64,
+    pub webhook_url: String,
+    #[serde(flatten)]
+    pub extra: Extra,
 }

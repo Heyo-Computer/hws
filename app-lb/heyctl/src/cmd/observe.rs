@@ -23,6 +23,15 @@ pub struct TopArgs {
 
     #[arg(long, value_name = "SECS", default_value_t = 2, requires = "watch")]
     pub interval: u64,
+
+    /// Rank a namespace's deployments by their telemetry over --window instead
+    /// of the LB's live counters. Needs the obs plugin installed there.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
+
+    /// With -n: the window to summarise (15m, 1h, 6h, 1d, 7d, …).
+    #[arg(long, value_name = "WINDOW", default_value = "1h", requires = "namespace")]
+    pub window: String,
 }
 
 /// `top host` has no [`Resource`] of its own — it is the whole-machine view the
@@ -45,6 +54,13 @@ fn top_kind(word: &str) -> Result<TopKind> {
 }
 
 pub fn top(ctx: &Ctx, args: &TopArgs) -> Result<()> {
+    if let Some(ns) = &args.namespace {
+        if !matches!(top_kind(&args.resource)?, TopKind::Deployments) {
+            bail!("`top -n` ranks deployments only");
+        }
+        let every = args.watch.then(|| Duration::from_secs(args.interval.max(1)));
+        return super::telemetry::top(ctx, ns, &args.window, every);
+    }
     let kind = top_kind(&args.resource)?;
     if args.watch {
         if ctx.out.is_machine() {

@@ -1,6 +1,6 @@
 # heyctl
 
-`heyctl` is a kubectl-style command-line client, and a Rust client library, for the app-lb admin API: deployments, VM pools, secrets, tokens, auth providers, builds, pulls and artifact stores.
+`heyctl` is a kubectl-style command-line client, and a Rust client library, for the app-lb admin API: deployments, VM pools, secrets, tokens, auth providers, builds, pulls, artifact stores, and the telemetry the `obs` plugin collects. The crate is published on crates.io as [`hws`](https://crates.io/crates/hws), the Heyo Web Services SDK; the binary it installs is `heyctl`.
 
 ## What it is
 
@@ -65,22 +65,24 @@ It detects `linux`/`darwin` and `x86_64`/`aarch64`, and tells you which platform
 
 ### From source
 
-heyctl is a member of the app-lb Cargo workspace:
+heyctl is the `hws` package in the app-lb Cargo workspace:
 
 ```sh
+cargo install hws                    # from crates.io
+# or, from this repository:
 cd app-lb
-cargo build --release -p heyctl
+cargo build --release -p hws
 install -m 0755 target/release/heyctl ~/.local/bin/
 ```
 
-As a library:
+As a library (the Heyo Web Services SDK):
 
 ```toml
 [dependencies]
-heyctl = { version = "0.1", default-features = false }
+hws = { version = "0.2", default-features = false }
 ```
 
-The library is async. The `blocking` feature adds `heyctl::blocking::Client`, which is what the CLI uses. `cargo doc -p heyctl --no-default-features --open` builds the API docs.
+The library is async. The `blocking` feature adds `hws::blocking::Client`, which is what the CLI uses. The [crate README](../app-lb/heyctl/README.md#as-a-library) has a quick start that creates a workload, reads its telemetry and rolls it out with a namespace token; [`examples/namespace_workload.rs`](../app-lb/heyctl/examples/namespace_workload.rs) is the same program. `cargo doc -p hws --no-default-features --open` builds the API docs; the [changelog](../app-lb/heyctl/CHANGELOG.md) lists what changed between releases.
 
 ## Connecting
 
@@ -366,6 +368,21 @@ A token scoped to specific deployments cannot mint tokens, so it cannot widen it
 | `plugins describe ID` | Configuration and live status |
 | `plugins enable ID` / `plugins disable ID` | Toggle; configuration is kept |
 | `plugins set ID -f FILE [--enable]` | Replace a plugin's configuration from JSON (`-` for stdin) |
+| `plugins list -n NS` | Plugins a namespace can install, and whether it has |
+| `plugins install ID [-n NS] [-f FILE]` | Install a per-namespace plugin into a namespace (needs `admin` there) |
+| `plugins uninstall ID [-n NS]` | Uninstall it |
+| `plugins installs ID` | Every namespace a plugin is installed in (fleet scope) |
+
+`enable`/`disable` are the operator's fleet-wide switch. Per-namespace plugins (`obs`) also have to be installed in a namespace before they do anything there. Where `-n` is optional, it defaults to the namespace the token is confined to.
+
+### Telemetry
+
+| Command | Does |
+| --- | --- |
+| `logs DEPLOYMENT [-n NS]` | A deployment's logs, oldest first: `--since 1h`, `--level error`, `--grep TEXT`, `--backend SANDBOX`, `--limit N` |
+| `top -n NS [--window 1h] [-w]` | Every deployment in a namespace with request/error rates, latency, CPU, memory and log counts over the window |
+
+Both read app-obs through app-lb's `obs` plugin, so they need it installed in the namespace (`heyctl plugins install obs -n NS`) and nothing beyond a namespace token. `top` without `-n` still shows the LB's live counters.
 
 ### Artifact stores
 
@@ -466,7 +483,15 @@ A store root on the app-lb host (`--store /srv/artifacts`) is much cheaper than 
 
 ### Follow logs
 
-heyctl has no separate `logs` command. Job output comes with the job:
+Application logs come from the `obs` plugin, once it is installed in the namespace:
+
+```sh
+heyctl plugins install obs -n team-a
+heyctl logs web -n team-a --since 15m --level error
+heyctl top -n team-a
+```
+
+Job output comes with the job:
 
 ```sh
 heyctl build web --logs        # stream build output, then wait
@@ -475,7 +500,7 @@ heyctl update app-obs --logs
 heyctl get job job-3f2a1c8e    # status plus log tail of any job
 ```
 
-For application logs, run a command in the guest (`heyctl exec web -- tail -n 100 /var/log/heyvm-start.log`) or use [app-obs](app-obs.md), which receives app-lb's access log and events.
+Without the plugin, run a command in the guest (`heyctl exec web -- tail -n 100 /var/log/heyvm-start.log`). Guest start-command errors live in that file, not in app-obs.
 
 ### Scale
 
@@ -515,6 +540,7 @@ heyctl create deployment api -n team-a --host api.example.com --port 8080
 heyctl create secret db -n team-a --from-env url=DATABASE_URL
 heyctl token mint team-a-ci --admin admin --namespace team-a -q
 heyctl get deployments -n team-a
+heyctl plugins install obs -n team-a                             # telemetry for every app in it
 ```
 
 A token minted with `--namespace` and no `--deployment` reaches every deployment in that namespace and nothing outside it. Secrets and auth providers are resolved per namespace: `get secrets -n team-a` is the only way to name one when ids collide across namespaces.

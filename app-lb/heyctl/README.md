@@ -1,12 +1,16 @@
-# heyctl
+# hws — the Heyo Web Services SDK (and `heyctl`)
 
-A client library **and** a kubectl-shaped CLI for the [app-lb](../README.md)
-admin API.
+A Rust SDK **and** a kubectl-shaped CLI for creating and managing workloads on
+Heyo: deployments and their microVM pools, images, secrets, tokens — and the
+metrics and logs the `obs` plugin collects for them. Everything goes through the
+[app-lb](../README.md) admin API, and everything works with a namespace-scoped
+token.
 
-Published on crates.io as `hws` (formerly `serverctl`).
+Published on crates.io as [`hws`](https://crates.io/crates/hws) (formerly
+`serverctl`). See the [changelog](CHANGELOG.md).
 
 One crate, two products. `cargo install hws` gets the `heyctl` CLI;
-`hws = { version = "0.1", default-features = false }` gets the library
+`hws = { version = "0.2", default-features = false }` gets the library
 with none of clap, rpassword or a terminal linked in. The CLI is the library's
 own first consumer, which is the point: a field the client stops understanding
 becomes a compile error rather than a silently blank column at somebody's
@@ -117,8 +121,93 @@ served over HTTPS from a host you control.
 
 ```toml
 [dependencies]
-hws = { version = "0.1", default-features = false }
+hws = { version = "0.2", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
 ```
+
+### Quick start: a workload in your namespace
+
+A namespace token (`heyctl token mint … --namespace team-a`, or the one your
+Heyo account hands you) is all this needs. The server narrows every call to the
+token's namespace, and fills in `namespace` when a spec leaves it out.
+
+```rust,no_run
+use hws::{Client, LogQuery};
+use serde_json::json;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> hws::Result<()> {
+    let lb = Client::builder(
+        std::env::var("HEYCTL_SERVER").unwrap_or_else(|_| "http://127.0.0.1:9090".into()),
+    )
+    .token(std::env::var("HEYCTL_TOKEN").expect("set HEYCTL_TOKEN"))
+    .build()?;
+
+    // Who am I, and where can I deploy?
+    let me = lb.whoami().await?;
+    let ns = me.sole_namespace().unwrap_or("default").to_string();
+
+    // Create a workload: a managed microVM pool behind a hostname.
+    lb.create_deployment(&json!({
+        "id": "web",
+        "namespace": ns,
+        "routes": [{"host": "web.example.com"}],
+        "vm": {"image": "nginx-fc", "port": 80},
+        "scaling": {"min_replicas": 1, "max_replicas": 4},
+    }))
+    .await?;
+    lb.wait_for_ready("web")
+        .timeout(Duration::from_secs(300))
+        .await?;
+
+    // Collect its telemetry — once per namespace — and read it back.
+    lb.install_plugin(&ns, "obs", None).await?;
+    let obs = lb.obs(&ns);
+    for d in obs.fleet(Some("1h")).await?.deployments {
+        println!(
+            "{}: {} log lines, {} errors",
+            d.id, d.log_lines, d.error_logs
+        );
+    }
+    for line in obs
+        .logs("web", &LogQuery::new().level("error").limit(20))
+        .await?
+        .rows
+    {
+        println!("{} {}", line.ts, line.message);
+    }
+
+    // Change it: whole-spec replace, or a rollout that verifies the new pool
+    // before draining the old one.
+    let current = lb.deployment("web").await?;
+    let mut spec = lb.raw().spec("web").await?;
+    spec["vm"]["image"] = json!("nginx-fc:1.27");
+    let op = lb
+        .start_rollout("web", "web-1-27", &current.rollout_revision, &spec)
+        .await?;
+    println!("rollout {} is {}", op.operation_id, op.status);
+
+    lb.delete_deployment("web").await?;
+    Ok(())
+}
+```
+
+The same in a terminal:
+
+```sh
+heyctl create deployment web --host web.example.com --image nginx-fc --port 80 --min 1 --max 4
+heyctl rollout status web
+heyctl plugins install obs          # namespace taken from the token
+heyctl top -n team-a
+heyctl logs web --level error --since 1h
+```
+
+This is [`examples/namespace_workload.rs`](examples/namespace_workload.rs):
+`HEYCTL_SERVER=… HEYCTL_TOKEN=… cargo run --example namespace_workload`.
+
+### The rest of the surface
 
 ```rust
 use hws::{Client, ExecRequest};

@@ -16,7 +16,7 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use hws::types::{
-    AuthProviderView, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, PluginView,
+    AuthProviderView, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView,
     UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
@@ -438,5 +438,129 @@ fn plugin_view_understands_every_field() {
     assert!(on.enabled);
     assert_eq!(on.last_error.as_deref(), Some("connection refused"), "enabled and failing is a state");
     assert_eq!(on.config["url"], "http://127.0.0.1:34199");
+    assert!(on.per_namespace);
+    assert_eq!(on.installed_in, ["team-a"]);
     assert!(!plugins[1].enabled);
+    assert!(!plugins[1].per_namespace);
+}
+
+/// What `heyctl plugins list -n` renders: both halves of "does this plugin
+/// serve my namespace" — the operator's switch and the namespace's install.
+#[test]
+fn namespace_plugin_understands_every_field() {
+    let plugins: Vec<NamespacePlugin> =
+        serde_json::from_str(&fixture("namespace-plugins")).expect("fixture parses");
+    for p in &plugins {
+        assert!(
+            p.extra.is_empty(),
+            "unknown namespace plugin fields: {:?}",
+            p.extra.keys().collect::<Vec<_>>()
+        );
+    }
+    let obs = &plugins[0];
+    assert_eq!(obs.id, "obs");
+    assert!(obs.enabled && obs.installed);
+    assert_eq!(obs.installed_at, Some(1_760_000_000));
+    assert_eq!(obs.installed_by.as_deref(), Some("token:0123456789ab"));
+    let other = &plugins[1];
+    assert!(!other.enabled && !other.installed);
+    assert!(other.installed_at.is_none() && other.config.is_none());
+}
+
+/// The install set app-obs polls to decide what to collect.
+#[test]
+fn plugin_installs_understands_every_field() {
+    let i: PluginInstalls =
+        serde_json::from_str(&fixture("plugin-installs")).expect("fixture parses");
+    assert!(i.extra.is_empty(), "{:?}", i.extra.keys().collect::<Vec<_>>());
+    assert_eq!(i.plugin, "obs");
+    assert!(i.enabled);
+    assert_eq!(i.namespaces, ["team-a", "team-b"]);
+    for (ns, install) in &i.installs {
+        assert!(install.extra.is_empty(), "{ns}: {:?}", install.extra.keys().collect::<Vec<_>>());
+    }
+    assert_eq!(i.installs["team-a"].installed_by.as_deref(), Some("user:u_123"));
+    assert!(i.installs["team-b"].installed_by.is_none(), "the operator installs unattributed");
+}
+
+/// The request half of the contract for the workload routes: what this crate
+/// *sends*, checked against a scripted transport. Needs `test-util`.
+#[cfg(feature = "test-util")]
+mod requests {
+    use hws::Client;
+    use hws::transport::Method;
+    use hws::transport::stub::Stub;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn client(stub: Stub) -> (Client, Arc<Stub>) {
+        let stub = Arc::new(stub);
+        (Client::with_transport(stub.clone()), stub)
+    }
+
+    /// The shape app-lb's `/whoami` answers a namespace token with, and the
+    /// namespace a command may therefore assume.
+    #[tokio::test]
+    async fn whoami_names_the_namespace_a_token_is_confined_to() {
+        let (c, stub) = client(
+            Stub::new()
+                .json(200, json!({
+                    "caller": "app-token", "admin_scope": "admin", "fleet": false, "confined": true,
+                    "may": {"read_view_routes": true, "use_admin_routes": true},
+                    "token": {"id": "0123456789ab", "name": "ci"}, "namespace": "team-a",
+                    "deployments": [], "expires_at": null, "expires_in_secs": null, "note": "…"
+                }))
+                .json(200, json!({
+                    "caller": "federated", "admin_scope": "view", "fleet": false, "confined": true,
+                    "may": {"read_view_routes": true, "use_admin_routes": false},
+                    "subject": {"user_id": "u"}, "namespaces": {"a": "view", "b": "admin"}
+                }))
+                .json(200, json!({"caller": "operator", "admin_scope": "admin", "fleet": true, "confined": false})),
+        );
+        let me = c.whoami().await.unwrap();
+        assert!(me.extra.is_empty(), "{:?}", me.extra.keys().collect::<Vec<_>>());
+        assert_eq!(me.sole_namespace(), Some("team-a"));
+        assert_eq!(me.token.unwrap().name, "ci");
+        assert_eq!(c.whoami().await.unwrap().sole_namespace(), None, "two namespaces, none assumed");
+        assert_eq!(c.whoami().await.unwrap().sole_namespace(), None, "the operator is everywhere");
+        assert_eq!(stub.calls()[0].path, "/whoami");
+    }
+
+    #[tokio::test]
+    async fn a_rollout_carries_its_idempotency_key_and_revision() {
+        let op = json!({"operation_id": "op-1", "deployment": "web", "source_revision": "r1",
+            "target_spec_sha256": "abc", "status": "running", "phase": "preparing",
+            "readiness_verified": false, "previous_stopped": false, "error": null,
+            "preparation_stage": null});
+        let mut done = op.clone();
+        done["status"] = json!("succeeded");
+        let (c, stub) = client(Stub::new().json(202, op).json(200, done));
+        let spec = json!({"id": "web", "vm": {"image": "x"}});
+        let started = c.start_rollout("web", "op-1", "r1", &spec).await.unwrap();
+        assert!(started.extra.is_empty(), "{:?}", started.extra.keys().collect::<Vec<_>>());
+        assert!(!started.is_finished());
+        assert!(c.rollout("web", "op-1").await.unwrap().is_finished());
+
+        let calls = stub.calls();
+        assert_eq!(calls[0].method, Method::Post);
+        assert_eq!(calls[0].path, "/deployments/web/rollouts");
+        assert_eq!(
+            calls[0].body,
+            Some(json!({"operation_id": "op-1", "expected_revision": "r1", "spec": spec}))
+        );
+        assert_eq!(calls[1].path, "/deployments/web/rollouts/op-1");
+    }
+
+    #[tokio::test]
+    async fn discovery_status_is_camel_case_on_the_wire() {
+        let (c, stub) = client(Stub::new().json(200, json!({
+            "serviceId": "web", "version": 3,
+            "upstreams": [{"peer": "10.0.0.2:8080", "draining": false, "inFlight": 2}]
+        })));
+        let s = c.discovery_status("web", true).await.unwrap();
+        assert!(s.extra.is_empty(), "{:?}", s.extra.keys().collect::<Vec<_>>());
+        assert_eq!(s.service_id, "web");
+        assert_eq!(s.upstreams[0].in_flight, 2);
+        assert_eq!(stub.calls()[0].path, "/deployments/web/discovery-status?staged=true");
+    }
 }
