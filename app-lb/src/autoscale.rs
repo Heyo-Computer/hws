@@ -120,6 +120,9 @@ pub struct Autoscaler {
     /// *create* and travels the create-failure path — counted, fed, embargoed
     /// — instead of being discovered as a guest that boots without its token.
     secrets: Arc<crate::secrets::SecretStore>,
+    /// The image inventory, asked before a VM is created whether its image is
+    /// on heyvm. Unset (tests, and a host with no inventory) creates as before.
+    images: std::sync::OnceLock<Arc<crate::images::ImageCatalog>>,
 }
 
 impl Autoscaler {
@@ -141,7 +144,13 @@ impl Autoscaler {
             feed,
             workspaces,
             secrets,
+            images: std::sync::OnceLock::new(),
         }
+    }
+
+    /// See [`Autoscaler::images`]. Set once at startup.
+    pub fn set_images(&self, images: Arc<crate::images::ImageCatalog>) {
+        let _ = self.images.set(images);
     }
 
     /// The values a template's `env_from` names, keyed by variable name.
@@ -1372,6 +1381,13 @@ impl Autoscaler {
             Some(guard)
         } else { None };
         if !self.is_live(d) || d.state().create_attempts.iter().any(|a|a.sandbox_id.is_none()) {return;}
+        // A VM is created only once its image is on heyvm: a missing one is
+        // pulled or thawed first, instead of booting heyvm's default image.
+        if let Some(images) = self.images.get()
+            && !images.ensure_image(d).await
+        {
+            return;
+        }
         tracing::info!(deployment = %d.spec.id, count, "scaling up");
         // Keep the slot until the resulting pending pool has been published,
         // not just until the daemon answered. A replacement draining these
@@ -2569,6 +2585,7 @@ mod tests {
                 image_sha256: None,
                 driver: Driver::Firecracker,
                 image: None,
+                rootfs: Default::default(),
                 port: 8080,
                 start_command: None,
                 size_class: None,

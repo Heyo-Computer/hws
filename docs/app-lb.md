@@ -171,6 +171,17 @@ HTTP-01 validation needs the proxy on port 80. To bind 80/443 as a non-root user
 | `APP_LB_WORKSPACE_TIMEOUT_SECS` | `3600` | Time limit for one workspace capture, push or restore. |
 | `APP_LB_TAR_BIN` | `tar` | `tar` used for workspace captures and restores. |
 
+### Images
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `APP_LB_IMAGE_OFFLOAD` | `true` | Offload images nothing has used for `APP_LB_IMAGE_IDLE_SECS`. Off leaves `GET /images` and the explicit routes. |
+| `APP_LB_IMAGE_IDLE_SECS` | `86400` | How long an image must go unreferenced before the pacer offloads it. |
+| `APP_LB_IMAGE_SWEEP_SECS` | `600` | Interval between offload passes. `0` stops the pacer. |
+| `APP_LB_IMAGE_PRESSURE_PCT` | `85` | Disk use (from heyvm's `GET /storage`) at which idle age stops protecting an unreferenced image. |
+| `APP_LB_IMAGE_OFFLOAD_STORE` | unset | `art serve` URL or store root a **built** image is pushed to (tag `app-lb-offload:<name>`) before it is deleted. Unset: built images are never offloaded. |
+| `APP_LB_IMAGE_OFFLOAD_STORE_KEY` | unset | That store's API key, as a secret id: `<secret>` or `<secret>/<key>`. |
+
 ### Discovery, fleet views and host updates
 
 | Variable | Default | Meaning |
@@ -286,6 +297,7 @@ When a base domain is configured (`APP_LB_DEPLOY_BASE_DOMAIN`, or the first `APP
 | --- | --- | --- |
 | `driver` | `firecracker` | `firecracker` or `kvm` (heyvm microVMs), or `lxc` (Incus system container from an OCI image). `libvirt` and `firecracker_containerd` are rejected. |
 | `image` | daemon default (`ubuntu:24.04`) | Image name in the daemon catalog. For `lxc`, a required OCI reference. |
+| `rootfs` | `copy` | `copy` boots each replica from a private copy of the image (heyvm copies it on every cold boot; a full copy on ext4). `shared` attaches the image itself read-only, so nothing is copied: the image must supply its own writable layer (the hub's base images do), and what must persist lives on the data disk or the workspace. Needs a heyvm with per-sandbox `rootfs_mode`; an older one ignores it and copies. Refused for `lxc`. |
 | `port` | required | Guest port traffic is proxied to. |
 | `start_command` | | Shell command run once per replica after boot. It must return, so daemonize the workload (`setsid nohup prog </dev/null >/var/log/prog.log 2>&1 &`). Its output goes to `/var/log/heyvm-start.log` inside the guest. |
 | `working_directory` | guest default | Directory `start_command` runs in. |
@@ -367,8 +379,10 @@ Pulls bytes that already exist in an [artifacts](artifacts.md) store. Nothing is
 | `ref` | Tag or 64-hex digest. A tag follows moves. A digest is immutable and is what a rollback names. |
 | `auth` | Secret reference for a store started with `ART_API_KEY`. URL form only. |
 | `grow_gb` | Managed only. Extends the materialized rootfs (sparse). |
-| `image_name` | Managed only. Base name for the materialized image. |
+| `image_name` | Managed only. Base name for the materialized image (`<name>-<digest[..12]>`). Unset, the image is named by content, `img-<digest[..16]>` (`-g<N>` when grown), and every deployment pulling the same bytes shares it. |
 | `strip_components` | Sites only. Leading path components to drop while unpacking (`1` for a `tar czf dist.tgz dist` bundle). |
+
+A deployment with an `artifact` block boots nothing until its image is on heyvm. Registering one, or scaling one whose image was offloaded, starts the pull (or the thaw) automatically; the first VM is created once it lands.
 
 ### `site`
 
@@ -525,6 +539,7 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `POST /secrets`, `GET /secrets`, `GET`/`PUT`/`PATCH`/`DELETE /secrets/:id` | Secret store (`?namespace=` on per-id routes). |
 | `POST /security/rules`, `PATCH`/`DELETE /security/rules/:id` | Block and allow rules. |
 | `PATCH /disks/:id`, `DELETE /disks/:id`, `POST /disks/:id/archive`, `POST /disks/sweep`, `POST /disks/purge-orphans` | Disk retention and reclamation. |
+| `POST /images/sweep`, `POST /images/:name/offload`, `DELETE /images/:name`, `PATCH /images/:name {"pinned"}` | Image offload, deletion and pins. A referenced or pinned image is refused (409, naming what holds it). Fleet scope. |
 | `POST`/`GET /workflows`, `GET`/`PUT`/`DELETE /workflows/:id` | CI workflow objects that [ci](ci.md) polls. |
 | `POST /tokens`, `GET /tokens`, `GET`/`PATCH`/`DELETE /tokens/:id` | App-tokens. |
 | `POST /namespaces`, `DELETE /namespaces/:name` | Declare or remove namespaces (fleet scope). |
@@ -678,6 +693,20 @@ heyvmd leaves per-sandbox disk directories behind in several cases. app-lb inven
 Unclaimed disks expire after `APP_LB_DISK_TTL_SECS` (7 days). Disks the daemon has no record of expire after `APP_LB_DISK_ORPHAN_TTL_SECS` (15 minutes). `POST /disks/purge-orphans` reclaims all orphans immediately. `POST /disks/:id/archive {"purge": true}` streams a sparse `tar.gz` to `s3://$APP_LB_DISK_ARCHIVE_BUCKET/<prefix>/<id>/<ts>.tar.gz`, then reclaims the disk only if the upload succeeded. Startup logs how much the first sweep will delete. It runs one interval later, so you have time to pin disks or set the TTL to `0`.
 
 `heyvm prune` is complementary. It clears `/tmp` scratch and, with `--images`, can delete an image a scaled-to-zero deployment still needs. Re-run `pull` or `build` if that happens.
+
+## Image management
+
+`GET /images` (view tier, fleet scope) lists heyvm's image catalog with what holds each image: a deployment's `vm.image`, a kept rollout operation's spec, a live or inactive sandbox, a running job, or a pin. Records live in `app-lb-images.d/`. The **Images** section of `/storage` and `heyctl images` show the same.
+
+An image nothing has held for `APP_LB_IMAGE_IDLE_SECS` is offloaded by a pacer that runs one at a time and stands down while any pool is booting:
+
+- **Pulled** images: the store they came from is checked to still serve the blob (`HEAD /blobs/<digest>`, or `art stat`), the record is marked offloaded, then the image is deleted from heyvm.
+- **Built** images: pushed to `APP_LB_IMAGE_OFFLOAD_STORE` first; never offloaded without it.
+- Images app-lb did not make are listed and never removed.
+
+A failed offload backs off (30 minutes, doubling, up to a day). Above `APP_LB_IMAGE_PRESSURE_PCT` disk use the idle age is ignored, but references, pins and verification still hold. Nothing is removed when the references cannot be determined. A deployment that needs an offloaded image gets it pulled back under its own name before its next VM is created.
+
+Deleting images needs heyvm's `DELETE /images/:name`. Against an older heyvm the inventory works and offload reports `delete_supported: false`.
 
 ## Discovery and regions
 

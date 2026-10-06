@@ -165,6 +165,8 @@ struct AdminState {
     views: Option<Arc<crate::fleet::ViewStore>>,
     /// The last pull of the token authority's fleet tokens, if one is bound.
     token_sync: Arc<std::sync::Mutex<TokenSyncStatus>>,
+    /// heyvm's image catalog as app-lb manages it; `None` in tests.
+    images: Option<Arc<crate::images::ImageCatalog>>,
     rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
@@ -372,6 +374,7 @@ impl AdminApi {
             state: AdminState {
                 views: None,
                 token_sync: Default::default(),
+                images: None,
                 rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
@@ -418,6 +421,11 @@ impl AdminApi {
 
     pub fn with_views(mut self, views: Arc<crate::fleet::ViewStore>) -> Self {
         self.state.views = Some(views);
+        self
+    }
+
+    pub fn with_images(mut self, images: Arc<crate::images::ImageCatalog>) -> Self {
+        self.state.images = Some(images);
         self
     }
 }
@@ -2163,6 +2171,113 @@ async fn storage_console(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     Html(render_page(&state, &state.disks_html, &headers))
+}
+
+// ---- images ---------------------------------------------------------------
+
+#[allow(clippy::result_large_err)]
+fn images_of(state: &AdminState) -> Result<&Arc<crate::images::ImageCatalog>, Response> {
+    state.images.as_ref().ok_or_else(|| {
+        err(StatusCode::SERVICE_UNAVAILABLE, "the image inventory is not running").into_response()
+    })
+}
+
+fn image_error(e: crate::images::ImageError) -> Response {
+    use crate::images::ImageError as E;
+    let status = match &e {
+        E::NotFound(_) => StatusCode::NOT_FOUND,
+        E::InUse(..) | E::NotEligible(..) => StatusCode::CONFLICT,
+        E::Unclassifiable(_) | E::Unsupported => StatusCode::SERVICE_UNAVAILABLE,
+        E::Unverified(..) | E::Failed(_) => StatusCode::BAD_GATEWAY,
+    };
+    let mut body = serde_json::json!({ "error": e.to_string() });
+    if let E::InUse(_, refs, sandboxes) = &e {
+        body["references"] = serde_json::to_value(refs).unwrap_or_default();
+        if !sandboxes.is_empty() {
+            body["sandboxes"] = serde_json::to_value(sandboxes).unwrap_or_default();
+        }
+    }
+    (status, Json(body)).into_response()
+}
+
+fn bad_image_name(name: &str) -> Option<Response> {
+    (!crate::images::is_catalog_name(name)).then(|| {
+        err(StatusCode::BAD_REQUEST, format!("{name:?} is not an image name")).into_response()
+    })
+}
+
+/// `GET /images` — heyvm's catalog, what references each image, and what the
+/// offload pacer would do with it. Fleet-wide: images are shared across
+/// namespaces now that they are named by content.
+async fn list_images(State(state): State<AdminState>) -> Response {
+    match images_of(&state) {
+        Ok(images) => Json(images.inventory().await).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `POST /images/sweep` — one offload pass now.
+async fn sweep_images(State(state): State<AdminState>) -> Response {
+    match images_of(&state) {
+        Ok(images) => Json(images.sweep().await).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `POST /images/:name/offload` — verify the remote copy, then delete it from
+/// heyvm. Skips the idle age, and nothing else.
+async fn offload_image(State(state): State<AdminState>, Path(name): Path<String>) -> Response {
+    if let Some(r) = bad_image_name(&name) {
+        return r;
+    }
+    let images = match images_of(&state) {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
+    match images.offload(&name, true).await {
+        Ok(()) => Json(images.store().get(&name)).into_response(),
+        Err(e) => image_error(e),
+    }
+}
+
+/// `DELETE /images/:name` — remove an unreferenced image outright.
+async fn delete_image(State(state): State<AdminState>, Path(name): Path<String>) -> Response {
+    if let Some(r) = bad_image_name(&name) {
+        return r;
+    }
+    let images = match images_of(&state) {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
+    match images.delete(&name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => image_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchImage {
+    pinned: bool,
+}
+
+/// `PATCH /images/:name` — `{pinned}`. A pin is a reference: a pinned image
+/// is never offloaded or deleted.
+async fn patch_image(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(body): Json<PatchImage>,
+) -> Response {
+    if let Some(r) = bad_image_name(&name) {
+        return r;
+    }
+    let images = match images_of(&state) {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
+    match images.set_pinned(&name, body.pinned) {
+        Ok(record) => Json(record).into_response(),
+        Err(e) => image_error(e),
+    }
 }
 
 // ---- plugins --------------------------------------------------------------
@@ -6449,6 +6564,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/:id", get(get_plugin))
         .route("/api/plugins/:id/installs", get(plugin_installs))
+        // heyvm's image catalog. Fleet-wide, like the disk inventory beside it.
+        .route("/images", get(list_images))
         // A namespace's plugins: what it has installed, and the installed
         // plugins' own pages. Walled by the namespace in the path (see
         // `decide_access`), so a namespace token reaches these for its own
@@ -6557,6 +6674,9 @@ fn router(state: AdminState) -> Router {
         .route("/api/plugins/:id", put(put_plugin))
         .route("/api/plugins/:id/enable", post(enable_plugin))
         .route("/api/plugins/:id/disable", post(disable_plugin))
+        .route("/images/sweep", post(sweep_images))
+        .route("/images/:name/offload", post(offload_image))
+        .route("/images/:name", axum::routing::delete(delete_image).patch(patch_image))
         .route(
             "/namespaces/:name/plugins/:id",
             put(install_namespace_plugin).delete(uninstall_namespace_plugin),
@@ -10038,6 +10158,31 @@ mod tests {
                 NOW,
             );
             assert!(matches!(verdict, Verdict::Allow(Caller::Ungated)));
+        }
+
+        /// heyvm's image catalog is shared by every namespace now that images
+        /// are named by content, so its routes are fleet-only: a namespace
+        /// token reads none of it and changes none of it.
+        #[test]
+        fn image_routes_are_fleet_only_and_mutations_need_admin() {
+            let t = store();
+            let ns = format!("Bearer {}", mint_in_namespace(&t, AdminScope::Admin, "team-a"));
+            let view = format!("Bearer {}", mint(&t, AdminScope::View, &["*"]));
+            let admin = format!("Bearer {}", mint(&t, AdminScope::Admin, &["*"]));
+            let at = |hdr: &str, matched: &str, path: &str, want: AdminScope| {
+                on(Some(&basic()), &t, Some(hdr), matched, path, want)
+            };
+            for (m, p, want) in [
+                ("/images", "/images", AdminScope::View),
+                ("/images/sweep", "/images/sweep", AdminScope::Admin),
+                ("/images/:name/offload", "/images/img-a/offload", AdminScope::Admin),
+                ("/images/:name", "/images/img-a", AdminScope::Admin),
+            ] {
+                assert!(matches!(at(&ns, m, p, want), Verdict::Forbidden(_)), "{m} for a namespace token");
+                assert!(matches!(at(&admin, m, p, want), Verdict::Allow(_)), "{m} for a fleet admin");
+            }
+            assert!(matches!(at(&view, "/images", "/images", AdminScope::View), Verdict::Allow(_)));
+            assert!(matches!(at(&view, "/images/:name", "/images/img-a", AdminScope::Admin), Verdict::Forbidden(_)));
         }
 
         #[test]

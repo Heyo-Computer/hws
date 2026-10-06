@@ -500,6 +500,7 @@ mod tests {
                 image_sha256: None,
                 driver: Driver::Firecracker,
                 image: None,
+                rootfs: Default::default(),
                 port: 8080,
                 start_command: None,
                 size_class: None,

@@ -33,6 +33,7 @@ mod guard;
 mod health;
 mod host_bundle;
 mod host_update;
+mod images;
 mod incus;
 mod instance_lock;
 mod jobs;
@@ -937,6 +938,7 @@ fn main() {
             .clone()
             .unwrap_or_else(|| "/var/lib/app-lb/images".to_string()),
     );
+    let image_scratch = images_dir.clone();
 
     // The job runner is not a service: it has no loop of its own, it runs a task
     // per job. It needs the autoscaler because finishing an image build means
@@ -962,6 +964,27 @@ fn main() {
         // event stream (`APP_LB_OBS_EVENTS`) rather than getting a third one.
         obs.as_ref().and_then(|o| o.events.clone()),
     ));
+
+    // The image inventory: what heyvm's catalog holds, what references it,
+    // and offload of what nothing has used in a while. Records live beside the
+    // other stores, in `app-lb-images.d/`.
+    let image_store = images::ImageStore::new(images::image_dir(&cfg.state_path));
+    match image_store.load() {
+        (0, 0) => tracing::debug!(dir = %image_store.dir().display(), "no image records"),
+        (n, 0) => tracing::info!(count = n, "restored image records"),
+        (n, skipped) => tracing::warn!(count = n, skipped, "restored image records; some were unreadable and were left on disk"),
+    }
+    let image_catalog = images::ImageCatalog::new(
+        images::ImagesConfig::from_env(),
+        image_store,
+        autoscaler.vms().clone(),
+        registry.clone(),
+        secrets.clone(),
+        artifact::Puller::new(cfg.art_bin.clone(), image_scratch, cfg.heyvm_home.clone(), autoscaler.vms().clone()),
+    );
+    image_catalog.set_jobs(&jobs);
+    jobs.set_images(image_catalog.clone());
+    autoscaler.set_images(image_catalog.clone());
 
     // ACME runs only when a contact address is configured. Its `Notify` goes to
     // the admin API so registering a deployment starts issuance immediately
@@ -1045,7 +1068,8 @@ fn main() {
         ).with_views(Arc::new(fleet::ViewStore::open(
             std::path::Path::new(&cfg.state_path).with_extension("views.json"), secrets.clone(),
             ["APP_LB_FLEET_FILE", "APP_LB_CONTROL_PLANE_FILE"].map(|key| std::env::var_os(key).map(Into::into)),
-        ).unwrap_or_else(|error| panic!("invalid view configuration: {error}")))),
+        ).unwrap_or_else(|error| panic!("invalid view configuration: {error}"))))
+        .with_images(image_catalog.clone()),
     );
 
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
@@ -1114,6 +1138,8 @@ fn main() {
     // Plugins own their tasks; this only starts the enabled ones and stops
     // them on shutdown. Not a dependency of the proxy, like the others.
     server.add_service(background_service("plugins", plugins::PluginService::new(plugin_host)));
+    // Offloads idle images one at a time, standing down while pools boot.
+    server.add_service(background_service("images", images::ImagePacer::new(image_catalog)));
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and
     // built the warm pool; otherwise the first requests all eat a cold start.

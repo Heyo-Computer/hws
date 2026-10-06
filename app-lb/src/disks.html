@@ -222,6 +222,14 @@
 
   <div class="section-title">Archives</div>
   <div class="card" id="archives"><div class="empty">Loading…</div></div>
+
+  <div class="section-title">Images</div>
+  <p class="sub2" id="images-lede">heyvm's image catalog: what each image is held by, and what the offload pacer would do with it.</p>
+  <div class="filters">
+    <span class="spacer"></span>
+    <button class="act" id="images-sweep" type="button">Offload idle images now</button>
+  </div>
+  <div class="card"><div class="scroll" id="images"><div class="empty">Loading…</div></div></div>
 </div>
 
 <script>
@@ -632,6 +640,81 @@ $("purge-orphans").addEventListener("click", async () => {
   await load();
 });
 
+// --- images ---------------------------------------------------------------
+//
+// GET /images: heyvm's catalog with what references each image. Offload
+// verifies the remote copy before anything is deleted; a referenced or pinned
+// image is refused by the server whatever this page shows.
+
+function describeRef(r) {
+  switch (r.kind) {
+    case "deployment": return "deployment " + r.id;
+    case "rollout": return "rollout of " + r.deployment;
+    case "sandbox": return "sandbox " + r.id;
+    case "job": return "job " + r.job;
+    case "pinned": return "pinned";
+    default: return r.kind;
+  }
+}
+
+async function loadImages() {
+  const r = await api("GET", "/images");
+  const box = $("images");
+  if (!r.ok) {
+    box.innerHTML = `<div class="empty">${esc(r.status === 503 ? "The image inventory is not running." : denied(r, "Listing images"))}</div>`;
+    return;
+  }
+  const v = r.data || {};
+  const lede = [`${(v.images || []).filter(i => i.present).length} on this host, ${bytes(v.local_bytes || 0)}`];
+  if (v.disk_used_pct != null) lede.push(`disk ${v.disk_used_pct}% used (offload pressure at ${v.pressure_pct}%)`);
+  if (!v.complete) lede.push("references unknown — nothing is removed: " + (v.error || ""));
+  if (v.delete_supported === false) lede.push("this heyvm cannot delete images; upgrade it to offload");
+  if (!v.offload) lede.push("automatic offload is off (APP_LB_IMAGE_OFFLOAD=0)");
+  $("images-lede").textContent = lede.join(" · ");
+  const rows = (v.images || []).map(i => {
+    const refs = (i.references || []).map(describeRef);
+    const tier = i.present ? "local" : (i.tier === "offloaded" ? "offloaded" : "absent");
+    const cls = tier === "local" ? "running" : tier === "offloaded" ? "archived" : "unknown";
+    const actions = i.present
+      ? `<button class="act" data-img-act="offload" data-img="${esc(i.name)}" ${refs.length ? "disabled" : ""}>Offload</button>
+         <button class="act" data-img-act="pin" data-img="${esc(i.name)}" data-pinned="${i.pinned ? 1 : 0}">${i.pinned ? "Unpin" : "Pin"}</button>
+         <button class="act danger" data-img-act="delete" data-img="${esc(i.name)}" ${refs.length ? "disabled" : ""}>Delete</button>`
+      : "";
+    return `<tr>
+      <td class="mono">${esc(i.name)}<div class="sub2">${esc(i.source)}${i.digest ? " · " + esc(i.digest.slice(0, 12)) : ""}</div></td>
+      <td><span class="tag ${cls}">${tier}</span></td>
+      <td class="num">${bytes(i.bytes || 0)}</td>
+      <td>${refs.length ? esc(refs.join(", ")) : "<span class=sub2>nothing</span>"}</td>
+      <td>${esc(i.kept_because || "would offload")}${i.last_error ? `<div class="sub2">${esc(i.last_error)}</div>` : ""}</td>
+      <td class="actions">${actions}</td></tr>`;
+  });
+  box.innerHTML = rows.length
+    ? `<table class="disks"><thead><tr><th>image</th><th>where</th><th>size</th><th>held by</th><th>offload</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`
+    : `<div class="empty">No images.</div>`;
+  box.querySelectorAll("[data-img-act]").forEach(b => b.addEventListener("click", async () => {
+    const name = b.dataset.img, act = b.dataset.imgAct;
+    if (act === "delete" && !confirm(`Delete ${name} from this host? Nothing is kept anywhere else unless it was pulled from a store.`)) return;
+    const req = act === "offload" ? api("POST", `/images/${encodeURIComponent(name)}/offload`)
+      : act === "delete" ? api("DELETE", `/images/${encodeURIComponent(name)}`)
+      : api("PATCH", `/images/${encodeURIComponent(name)}`, { pinned: b.dataset.pinned !== "1" });
+    b.disabled = true;
+    const res = await req;
+    if (!res.ok) { flash("bad", denied(res, act[0].toUpperCase() + act.slice(1))); b.disabled = false; return; }
+    flash("ok", `${name}: ${act === "pin" ? (b.dataset.pinned === "1" ? "unpinned" : "pinned") : act === "offload" ? "offloaded" : "deleted"}.`);
+    loadImages();
+  }));
+}
+
+$("images-sweep").addEventListener("click", async () => {
+  const r = await api("POST", "/images/sweep");
+  if (!r.ok) { flash("bad", denied(r, "Offloading")); return; }
+  const d = r.data || {};
+  flash(d.failed && d.failed.length ? "bad" : "ok", d.skipped
+    ? "Nothing was offloaded: " + d.skipped
+    : `${d.offloaded.length} image(s) offloaded${d.failed.length ? ", " + d.failed.length + " failed: " + d.failed.map(f => f[0] + " (" + f[1] + ")").join("; ") : ""}.`);
+  loadImages();
+});
+
 // Remember which file lists are open across a poll.
 document.addEventListener("toggle", ev => {
   const el = ev.target.closest("details.parts");
@@ -653,13 +736,15 @@ function schedule() {
 
 $("f-state").addEventListener("change", () => latest && renderDisks(latest));
 $("f-search").addEventListener("input", () => latest && renderDisks(latest));
-$("refresh").addEventListener("click", load);
+$("refresh").addEventListener("click", () => { load(); loadImages(); });
 $("auto").addEventListener("change", schedule);
 // The theme toggle lives in the shared script (/__ui/theme.js): it writes a
 // cookie scoped to the parent domain, so the choice follows a person to every
 // Heyo app instead of stopping at this origin.
 
 load();
+loadImages();
+setInterval(loadImages, 30000);
 schedule();
 </script>
 </body>
