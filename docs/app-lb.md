@@ -351,6 +351,12 @@ Builds a new rootfs with `heyvm mvm build`. On success, app-lb rewrites `vm.imag
 | `image_size_mb` | Rootfs size passed to `--size-mb`. |
 | `auth` | Secret reference: a git token for HTTPS remotes (passed through `GIT_ASKPASS`, never the URL), or the store's API key. |
 
+**The guest's PID 1.** heyvm boots every Firecracker guest with `init=/init.sh`. A Dockerfile written for Docker has none, so its kernel would panic on every boot. If the Dockerfile never mentions `/init.sh`, app-lb adds its standard guest init (`app-lb/src/guest_init.sh`). It writes the script into the build context as `heyo-guest-init.sh` and builds from a copy of the Dockerfile ending in `COPY heyo-guest-init.sh /init.sh`.
+
+The init mounts `/proc`, `/sys` and `/dev`, finishes network setup and starts `sshd` if the image has one. It then prints `HEYVM_READY` and never exits. It does **not** start the app: `vm.start_command` does that after boot, and must return (`setsid nohup … &`).
+
+The image's `CMD`, `ENTRYPOINT` and `ENV` do not survive the rootfs export, so put what they did into `start_command`. A Dockerfile that mentions `/init.sh` is built as written.
+
 ### `artifact`
 
 Pulls bytes that already exist in an [artifacts](artifacts.md) store. Nothing is built.
