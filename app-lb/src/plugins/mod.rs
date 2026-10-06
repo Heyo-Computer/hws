@@ -28,7 +28,22 @@
 //! state, so it must never carry a credential. Fields that need one take a
 //! [`crate::secrets::SecretRef`] and resolve it through the secret store when
 //! they use it — the same indirection a deployment's git credential uses.
+//!
+//! ## Installing into a namespace
+//!
+//! Most plugins are host capabilities an operator switches on for the fleet.
+//! A plugin that answers [`Plugin::per_namespace`] is also something a
+//! namespace *installs*: the operator still enables it (and holds whatever
+//! credential it needs), and then each namespace's administrator decides
+//! whether their namespace uses it. Installs live on the plugin's record, keyed
+//! by namespace, and the plugin's namespace surface is served at
+//! `/namespaces/<ns>/plugins/<id>/…` — behind the namespace wall rather than
+//! the fleet one, so a namespace token reaches its own namespace's view of the
+//! plugin and nobody else's. The plugin is told which namespace a request is
+//! for through a [`NamespaceScope`] extension; it never reads it off a path
+//! the caller wrote.
 
+pub mod obs;
 pub mod pgfc;
 pub mod vapi;
 
@@ -41,7 +56,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -89,6 +104,41 @@ pub trait Plugin: Send + Sync + 'static {
     fn crud_routes(self: Arc<Self>) -> Router {
         Router::new()
     }
+
+    /// Whether a namespace can install this plugin. See the module docs.
+    fn per_namespace(&self) -> bool {
+        false
+    }
+
+    /// Reject a namespace's install configuration before it is persisted.
+    fn validate_install(&self, _namespace: &str, _config: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The namespace surface, served at `/namespaces/<ns>/plugins/<id>/…` and
+    /// only once the plugin is enabled and installed there. Requests arrive
+    /// with that prefix stripped and a [`NamespaceScope`] extension naming the
+    /// namespace. A `GET` is admitted on the view tier and every other method
+    /// on the CRUD tier, so a route that changes something must not be a `GET`.
+    fn namespace_routes(self: Arc<Self>) -> Router {
+        Router::new()
+    }
+}
+
+/// The namespace a request to a plugin's namespace surface is for, already
+/// checked against the caller's reach by the admin gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceScope(pub String);
+
+/// One namespace's install of a plugin.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct NamespaceInstall {
+    pub installed_at: u64,
+    /// Who installed it, in the form tokens record their minter.
+    #[serde(default)]
+    pub installed_by: Option<String>,
+    #[serde(default)]
+    pub config: Value,
 }
 
 /// One plugin's persisted state.
@@ -101,6 +151,11 @@ pub struct PluginRecord {
     pub config: Value,
     #[serde(default)]
     pub updated_at: u64,
+    /// Namespaces that installed this plugin. Survives disabling, like the
+    /// configuration: switching the plugin off pauses every install rather
+    /// than forgetting them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub installs: BTreeMap<String, NamespaceInstall>,
 }
 
 // ---- the store ------------------------------------------------------------
@@ -221,6 +276,11 @@ pub fn plugin_dir(state_path: &str) -> PathBuf {
 pub struct PluginView {
     #[serde(flatten)]
     pub meta: PluginMeta,
+    /// Whether namespaces install this plugin themselves.
+    pub per_namespace: bool,
+    /// The namespaces that have, for a per-namespace plugin.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub installed_in: Vec<String>,
     pub enabled: bool,
     pub config: Value,
     pub updated_at: u64,
@@ -230,11 +290,40 @@ pub struct PluginView {
     pub status: Value,
 }
 
+/// What `GET /namespaces/<ns>/plugins` returns per installable plugin.
+#[derive(Debug, Clone, Serialize)]
+pub struct NamespacePluginView {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    /// The fleet switch. An install of a disabled plugin is kept but idle.
+    pub enabled: bool,
+    pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+/// What `GET /api/plugins/<id>/installs` returns: the fleet-wide list a
+/// collector reads to learn which namespaces opted in.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstallsView {
+    pub plugin: &'static str,
+    pub enabled: bool,
+    pub namespaces: Vec<String>,
+    pub installs: BTreeMap<String, NamespaceInstall>,
+}
+
 #[derive(Debug)]
 pub enum SetError {
     NotFound,
     Invalid(String),
     Io(std::io::Error),
+    /// The fleet switch is off, so a namespace cannot install it.
+    Disabled(&'static str),
 }
 
 impl std::fmt::Display for SetError {
@@ -243,12 +332,19 @@ impl std::fmt::Display for SetError {
             SetError::NotFound => f.write_str("no such plugin"),
             SetError::Invalid(m) => write!(f, "invalid configuration: {m}"),
             SetError::Io(e) => write!(f, "could not save the plugin record: {e}"),
+            SetError::Disabled(id) => write!(
+                f,
+                "the {id} plugin is disabled on this host; an operator enables it with \
+                 `heyctl plugins enable {id}` before a namespace can install it"
+            ),
         }
     }
 }
 
 struct Slot {
     plugin: Arc<dyn Plugin>,
+    /// The plugin's namespace surface, built once: the set is static.
+    namespace_router: Option<Router>,
     /// Held across `apply`, so two edits to one plugin cannot interleave.
     lock: tokio::sync::Mutex<()>,
     last_error: std::sync::Mutex<Option<String>>,
@@ -270,8 +366,14 @@ impl PluginHost {
                     "plugin id {:?}",
                     plugin.meta().id
                 );
+                // Not filtered on `has_routes`: a proxy is a fallback, which
+                // that does not count.
+                let namespace_router = plugin
+                    .per_namespace()
+                    .then(|| plugin.clone().namespace_routes());
                 Arc::new(Slot {
                     plugin,
+                    namespace_router,
                     lock: tokio::sync::Mutex::new(()),
                     last_error: std::sync::Mutex::new(None),
                 })
@@ -314,6 +416,8 @@ impl PluginHost {
         let last_error = slot.last_error.lock().unwrap().clone();
         let status = slot.plugin.status().await;
         PluginView {
+            per_namespace: slot.plugin.per_namespace(),
+            installed_in: record.installs.keys().cloned().collect(),
             enabled: record.enabled,
             config: record.config,
             updated_at: record.updated_at,
@@ -342,11 +446,151 @@ impl PluginHost {
             enabled,
             config: config.clone(),
             updated_at: crate::deployment::now_secs(),
+            installs: current.installs,
         };
         self.store.put(id, record).map_err(SetError::Io)?;
         self.apply_slot(&slot, enabled.then_some(config)).await;
         drop(_held);
         Ok(self.view(&slot).await)
+    }
+
+    fn installable(&self, id: &str) -> Option<&Arc<Slot>> {
+        self.slot(id).filter(|s| s.plugin.per_namespace())
+    }
+
+    fn namespace_view(&self, slot: &Slot, ns: &str) -> NamespacePluginView {
+        let meta = slot.plugin.meta();
+        let record = self.store.get(meta.id).unwrap_or_default();
+        let install = record.installs.get(ns);
+        NamespacePluginView {
+            id: meta.id,
+            name: meta.name,
+            description: meta.description,
+            enabled: record.enabled,
+            installed: install.is_some(),
+            installed_at: install.map(|i| i.installed_at),
+            installed_by: install.and_then(|i| i.installed_by.clone()),
+            config: install.map(|i| i.config.clone()),
+        }
+    }
+
+    /// Every plugin a namespace may install, and whether `ns` has.
+    pub fn namespace_plugins(&self, ns: &str) -> Vec<NamespacePluginView> {
+        self.slots
+            .iter()
+            .filter(|s| s.plugin.per_namespace())
+            .map(|s| self.namespace_view(s, ns))
+            .collect()
+    }
+
+    pub fn is_installed(&self, id: &str, ns: &str) -> bool {
+        self.store
+            .get(id)
+            .is_some_and(|r| r.installs.contains_key(ns))
+    }
+
+    /// The fleet-wide install list of one per-namespace plugin.
+    pub fn installs(&self, id: &str) -> Option<InstallsView> {
+        let slot = self.installable(id)?;
+        let meta = slot.plugin.meta();
+        let record = self.store.get(meta.id).unwrap_or_default();
+        Some(InstallsView {
+            plugin: meta.id,
+            enabled: record.enabled,
+            namespaces: record.installs.keys().cloned().collect(),
+            installs: record.installs,
+        })
+    }
+
+    /// Install `id` into `ns`, or replace that install's configuration.
+    pub async fn install(
+        &self,
+        id: &str,
+        ns: &str,
+        config: Value,
+        by: Option<String>,
+    ) -> Result<NamespacePluginView, SetError> {
+        let slot = self.installable(id).ok_or(SetError::NotFound)?.clone();
+        let _held = slot.lock.lock().await;
+        let mut record = self.store.get(id).unwrap_or_default();
+        if !record.enabled {
+            return Err(SetError::Disabled(slot.plugin.meta().id));
+        }
+        slot.plugin
+            .validate_install(ns, &config)
+            .map_err(SetError::Invalid)?;
+        let installed_at = record
+            .installs
+            .get(ns)
+            .map(|i| i.installed_at)
+            .unwrap_or_else(crate::deployment::now_secs);
+        record.installs.insert(
+            ns.to_string(),
+            NamespaceInstall {
+                installed_at,
+                installed_by: by,
+                config,
+            },
+        );
+        self.store.put(id, record).map_err(SetError::Io)?;
+        tracing::info!(plugin = id, namespace = ns, "plugin installed in namespace");
+        Ok(self.namespace_view(&slot, ns))
+    }
+
+    /// Remove `id` from `ns`. Allowed while the plugin is disabled — leaving
+    /// should never need the operator.
+    pub async fn uninstall(&self, id: &str, ns: &str) -> Result<NamespacePluginView, SetError> {
+        let slot = self.installable(id).ok_or(SetError::NotFound)?.clone();
+        let _held = slot.lock.lock().await;
+        let mut record = self.store.get(id).unwrap_or_default();
+        if record.installs.remove(ns).is_some() {
+            self.store.put(id, record).map_err(SetError::Io)?;
+            tracing::info!(
+                plugin = id,
+                namespace = ns,
+                "plugin uninstalled from namespace"
+            );
+        }
+        Ok(self.namespace_view(&slot, ns))
+    }
+
+    /// Serve one request on a plugin's namespace surface. `req`'s URI is
+    /// already relative to `/namespaces/<ns>/plugins/<id>`; the gate has
+    /// already checked the caller reaches `ns`.
+    pub async fn dispatch_namespace(&self, id: &str, ns: &str, mut req: Request) -> Response {
+        let Some(slot) = self.installable(id) else {
+            return plugin_error(
+                StatusCode::NOT_FOUND,
+                None,
+                format!("no plugin named {id:?} can be installed in a namespace"),
+            );
+        };
+        let Some(router) = slot.namespace_router.clone() else {
+            unreachable!("installable() only returns per-namespace plugins");
+        };
+        if !self.is_enabled(id) {
+            return plugin_error(
+                StatusCode::CONFLICT,
+                Some("plugin_disabled"),
+                SetError::Disabled(slot.plugin.meta().id).to_string(),
+            );
+        }
+        if !self.is_installed(id, ns) {
+            return plugin_error(
+                StatusCode::CONFLICT,
+                Some("plugin_not_installed"),
+                format!(
+                    "the {id} plugin is not installed in namespace \"{ns}\"; install it with \
+                     `heyctl plugins install {id} -n {ns}`"
+                ),
+            );
+        }
+        req.extensions_mut().insert(NamespaceScope(ns.to_string()));
+        let mut router = router;
+        match tower_service::Service::call(&mut router, req).await {
+            Ok(resp) => resp,
+            Err(never) => match never {},
+        }
     }
 
     async fn apply_slot(&self, slot: &Slot, config: Option<Value>) {
@@ -424,6 +668,14 @@ impl PluginHost {
         }
         (view, crud)
     }
+}
+
+fn plugin_error(status: StatusCode, code: Option<&str>, error: String) -> Response {
+    let mut body = serde_json::json!({ "error": error });
+    if let Some(code) = code {
+        body["code"] = Value::from(code);
+    }
+    (status, axum::Json(body)).into_response()
 }
 
 fn disabled(id: &str) -> Response {

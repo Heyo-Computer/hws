@@ -614,6 +614,7 @@ fn main() {
         vec![
             plugins::pgfc::PgFcPlugin::new(secrets.clone()),
             plugins::vapi::VapiPlugin::new(secrets.clone()),
+            plugins::obs::ObsPlugin::new(secrets.clone()),
         ],
         plugin_store,
     ));

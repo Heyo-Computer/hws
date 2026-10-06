@@ -11,6 +11,10 @@
       },
       "type": "object"
     },
+    "per_namespace": true,
+    "installed_in": [
+      "team-a"
+    ],
     "enabled": true,
     "config": {
       "url": "http://127.0.0.1:34199"
@@ -28,6 +32,7 @@
     "config_schema": {
       "type": "object"
     },
+    "per_namespace": false,
     "enabled": false,
     "config": null,
     "updated_at": 0,

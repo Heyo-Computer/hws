@@ -493,6 +493,9 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `GET /auth-providers` | Declared auth providers. |
 | `GET /feeds`, `GET /feeds/:namespace` | Namespace event feeds (RSS). |
 | `GET /plugins`, `GET /api/plugins`, `GET /api/plugins/:id` | Plugin console and records. |
+| `GET /api/plugins/:id/installs` | Namespaces that installed a per-namespace plugin (fleet scope; app-obs polls it). |
+| `GET /namespaces/:name/plugins`, `GET /namespaces/:name/plugins/:id` | What a namespace may install and whether it has (namespace wall). |
+| `GET /namespaces/:name/plugins/:id/*` | An installed plugin's namespace pages, e.g. `…/obs/ui` and `…/obs/api/fleet`. |
 
 ### CRUD tier
 
@@ -527,6 +530,8 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `POST /namespaces`, `DELETE /namespaces/:name` | Declare or remove namespaces (fleet scope). |
 | `POST /auth-providers`, `GET`/`DELETE /auth-providers/:namespace/:name` | Auth providers. |
 | `PUT /api/plugins/:id`, `POST /api/plugins/:id/enable`, `POST /api/plugins/:id/disable` | Plugin configuration. |
+| `PUT`/`DELETE /namespaces/:name/plugins/:id` | Install or uninstall a plugin in a namespace (admin of the whole namespace). |
+| `POST`/`PUT`/`PATCH`/`DELETE /namespaces/:name/plugins/:id/*` | An installed plugin's namespace actions, e.g. obs alerts. |
 
 ### Always-authenticated routes
 
@@ -727,6 +732,20 @@ Plugins are compiled in and switched on at runtime from `/plugins` or with `heyc
 | --- | --- |
 | `pgfc` | Monitors and manages [pg-fc](pg-fc.md) pools: schemas, dedicated databases, pooler settings, logs. |
 | `vapi` | Monitors vapi inference gateways and exposes their admission settings and a test prompt box. |
+| `obs` | Per-namespace observability from [app-obs](app-obs.md): installed by each namespace, it starts collection for that namespace's apps and serves their logs, metrics and alerts to the namespace's own tokens. |
+
+### Installing a plugin in a namespace
+
+Some plugins (today, `obs`) are installed per namespace. The operator enables and configures the plugin once for the host; then a namespace administrator installs it:
+
+```sh
+heyctl plugins enable obs   # operator, after `heyctl plugins set obs '{"url": "http://127.0.0.1:9600", "api_token": {"secret": "app-obs", "key": "api_token"}}'`
+heyctl plugins install obs -n team-a   # an admin token for all of team-a
+```
+
+An install is a record on the plugin, kept while the plugin is disabled. The namespace's view of the plugin is served at `/namespaces/<ns>/plugins/<id>/…`, behind the namespace wall: a namespace token reaches its own namespace's pages and no other, a `GET` needs the view tier there and anything else the admin tier. Installing needs an admin credential for the whole namespace, not a token narrowed to some of its deployments. Before the plugin is installed those routes answer `409` with `"code": "plugin_not_installed"`, and while the operator has it switched off, `"code": "plugin_disabled"`.
+
+For `obs`, `/namespaces/<ns>/plugins/obs/ui` is the app-obs dashboard narrowed to the namespace, and `…/obs/api/fleet`, `…/obs/api/deployments/<id>[/logs]` and `…/obs/api/alerts` are its JSON API. app-lb sends them to app-obs's `/ns/<ns>/…` routes with the token from the plugin's configuration; the caller's own credential never reaches app-obs. A namespace user's dashboard (`/dashboard?namespace=<ns>`) shows an **Observability** link once it is installed, or an **Install observability** button for an admin.
 
 ## Troubleshooting
 

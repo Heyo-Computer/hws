@@ -1,0 +1,19 @@
+[
+  {
+    "id": "obs",
+    "name": "Observability",
+    "description": "Logs, metrics and alerts for every app in a namespace.",
+    "enabled": true,
+    "installed": true,
+    "installed_at": 1760000000,
+    "installed_by": "token:0123456789ab",
+    "config": {}
+  },
+  {
+    "id": "other",
+    "name": "Other",
+    "description": "Installable, not installed, and off on this host.",
+    "enabled": false,
+    "installed": false
+  }
+]

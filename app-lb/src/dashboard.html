@@ -3035,6 +3035,40 @@ async function applyNamespaceTier() {
     ? "Namespace " + pinnedNamespace + " · " + (tier === "admin" ? "admin" : "read-only") + " access"
     : "This session cannot reach namespace " + pinnedNamespace + ".";
   banner.hidden = false;
+  if (tier) renderObsLink(tier);
+}
+
+// The obs plugin, when the operator has switched it on: a link to this
+// namespace's telemetry once installed, an Install button for an admin
+// before that. Nothing at all while it is off on this host.
+async function renderObsLink(tier) {
+  const ns = encodeURIComponent(pinnedNamespace);
+  const res = await api("GET", "namespaces/" + ns + "/plugins/obs").catch(() => ({ ok: false }));
+  if (!res.ok || !res.data || !res.data.enabled) return;
+  const banner = $("ns-banner");
+  const old = banner.querySelector("[data-obs]");
+  if (old) old.remove();
+  if (res.data.installed) {
+    const a = document.createElement("a");
+    a.dataset.obs = "";
+    a.href = "namespaces/" + ns + "/plugins/obs/ui";
+    a.textContent = "Observability →";
+    banner.appendChild(a);
+  } else if (tier === "admin") {
+    const b = document.createElement("button");
+    b.dataset.obs = "";
+    b.className = "btn mini";
+    b.style.marginLeft = ".5em";
+    b.textContent = "Install observability";
+    b.title = "Collect logs and metrics for every app in this namespace";
+    b.addEventListener("click", async () => {
+      const put = await api("PUT", "namespaces/" + ns + "/plugins/obs", {});
+      if (!put.ok) return toast(errMsg(put), true);
+      toast("observability installed in " + pinnedNamespace);
+      renderObsLink(tier);
+    });
+    banner.appendChild(b);
+  }
 }
 
 applyNamespaceTier();
