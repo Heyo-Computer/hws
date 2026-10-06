@@ -13,6 +13,7 @@
  * description tell the truth about what the call does, which it does.
  */
 
+import { lintVmSpec } from "./vmboot.js";
 import { z } from "zod";
 import { telemetry, telemetryRoute } from "../telemetry.js";
 import { bool, num , DESTRUCTIVE_PREFIX } from "./schema.js";
@@ -512,13 +513,17 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         // A VM whose image comes from a build or a pull runs nothing unless
         // start_command says so: the rootfs drops the image's CMD.
         const vmBlock = spec.vm as Record<string, unknown> | undefined;
+        for (const f of lintVmSpec(vmBlock)) {
+          if (f.title === "No start_command") continue;
+          sections.push({ title: f.title, body: `${f.detail} diagnose_vm_boot {id} probes the guest.` });
+        }
         if (vmBlock && (spec.build || spec.artifact) && !vmBlock.start_command) {
           sections.push({
             title: "No start_command",
             body:
               "A VM does not run the image's CMD or ENTRYPOINT, so with no `vm.start_command` the app " +
               "never starts and the pool never becomes ready. Add one that returns " +
-              "(`cd /app && setsid nohup node server.js </dev/null >/var/log/app.log 2>&1 &`); " +
+              "(`cd /app && setsid nohup node server.js </dev/null &`); " +
               "repo_deploy derives it from the Dockerfile.",
           });
         }

@@ -94,7 +94,9 @@ export function readStartInfo(dockerfile: string): StartInfo {
 
 /**
  * A `start_command` that recreates what the image config would have done,
- * backgrounded so it returns, logging to /var/log/app.log.
+ * backgrounded so it returns. Its output stays on the stdout/stderr heyvm
+ * captures (/var/log/heyvm-start.log), which is what deployment_logs and
+ * diagnose_vm_boot read; a redirect to a file of its own would hide a crash.
  */
 export function startCommand(info: StartInfo): string | undefined {
   if (!info.command) return undefined;
@@ -104,7 +106,7 @@ export function startCommand(info: StartInfo): string | undefined {
     // Keep `$` expansions (ENV PATH=/app/bin:$PATH) working.
     parts.push(`export ${k}=${v.includes("$") ? `"${v.replace(/"/g, '\\"')}"` : quote(v)}`);
   }
-  parts.push(`setsid nohup ${info.command} </dev/null >/var/log/app.log 2>&1 &`);
+  parts.push(`setsid nohup ${info.command} </dev/null &`);
   // The trailing `&` backgrounds the whole list, so it returns at once and
   // the `cd` and exports apply to the app.
   return parts.join(" && ");

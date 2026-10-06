@@ -9,7 +9,8 @@
  */
 
 import { z } from "zod";
-import { num } from "./schema.js";
+import { bool, num } from "./schema.js";
+import { foregroundScript, interpret, lintVmSpec, parseStartCommand, probeScript, type Finding } from "./vmboot.js";
 import type { Clients } from "../clients/index.js";
 import { settle } from "../clients/index.js";
 import { report, section, json, type Section } from "../format.js";
@@ -336,6 +337,127 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
           sections.push(section(`${dep}: most recent error logs`, r.errors));
         }
         return report(`Namespace ${ns} over ${window}`, sections);
+      },
+    },
+
+    {
+      name: "diagnose_vm_boot",
+      description:
+        "Why a VM deployment boots but never passes its health check (ready 0, boot " +
+        "timeouts). Lints start_command, reads the boot counters, then runs a read-only probe " +
+        "INSIDE a booting VM (waking one if needed): the start_command's captured output, any " +
+        "file it redirects to, processes, listening sockets, the health path, package.json. " +
+        "foreground: true also runs the start command for 15s to capture the crash. Names " +
+        "known causes with the fix (Node ESM/CommonJS mismatch, missing module, port in use, " +
+        "loopback bind, unwritable data path); fix the repo or spec, then redeploy.",
+      schema: {
+        id: z.string().describe("app-lb deployment id"),
+        foreground: bool()
+          .optional()
+          .describe("also run the start command in the foreground for 15s to capture its crash; default false"),
+        wake: bool().optional().describe("start a VM to probe if none is running; default true"),
+        sandbox_id: z.string().optional().describe("probe this VM of the pool"),
+      },
+      handler: async (args) => {
+        const id = String(args.id);
+        const path = `/deployments/${encodeURIComponent(id)}`;
+        const r = await settle({
+          deployment: clients.applb({ path }),
+          metrics: clients.applb({ path: "/metrics", query: { deployment: id, summary: "false" } }),
+        });
+        if (!r.deployment.ok) {
+          return report(`VM boot diagnosis for ${id}`, [section("app-lb record", r.deployment)]);
+        }
+        const record = r.deployment.value as Record<string, unknown>;
+        const spec = (record.spec ?? record) as Record<string, unknown>;
+        const vm = spec.vm as Record<string, unknown> | undefined;
+        if (!vm) {
+          return json({ error: `deployment ${JSON.stringify(id)} is not a VM deployment` });
+        }
+        const port = typeof vm.port === "number" ? vm.port : undefined;
+        const health = spec.health as { path?: string } | undefined;
+        const parts =
+          typeof vm.start_command === "string" ? parseStartCommand(vm.start_command) : undefined;
+
+        let pool: unknown = r.metrics.ok ? r.metrics.value : undefined;
+        if (r.metrics.ok) {
+          const deps = (r.metrics.value as { deployments?: Array<Record<string, unknown>> }).deployments ?? [];
+          const mine = deps.find((d) => d.id === id);
+          if (mine) {
+            pool = {
+              pool: mine.pool,
+              vms: mine.vms,
+              pending_vms: mine.pending_vms,
+              autoscale: (mine.metrics as Record<string, unknown> | undefined)?.autoscale,
+            };
+          }
+        }
+
+        const exec = (command: string, timeout_secs: number) =>
+          clients.applb({
+            method: "POST",
+            path: `${path}/exec`,
+            body: {
+              command,
+              timeout_secs,
+              wake: args.wake === undefined ? true : Boolean(args.wake),
+              ...(args.sandbox_id ? { sandbox_id: String(args.sandbox_id) } : {}),
+            },
+          });
+        const probe = await settle({
+          guest: exec(probeScript({ port, healthPath: health?.path, parts }), 25),
+        });
+        let fg: { ok: true; value: unknown } | { ok: false; error: string } | undefined;
+        if (args.foreground && parts?.foreground) {
+          const sandbox = probe.guest.ok
+            ? (probe.guest.value as { sandbox_id?: string }).sandbox_id
+            : undefined;
+          fg = (
+            await settle({
+              run: clients.applb({
+                method: "POST",
+                path: `${path}/exec`,
+                body: {
+                  command: foregroundScript(parts),
+                  timeout_secs: 25,
+                  wake: false,
+                  ...(sandbox ? { sandbox_id: sandbox } : {}),
+                },
+              }),
+            })
+          ).run;
+        }
+
+        const text = (x: typeof fg) =>
+          x && x.ok
+            ? ["output", "stdout", "stderr"]
+                .map((k) => (x.value as Record<string, unknown>)[k])
+                .filter((v): v is string => typeof v === "string")
+                .join("\n")
+            : "";
+        const findings: Finding[] = [
+          ...lintVmSpec(vm),
+          ...interpret(`${text(probe.guest)}\n${text(fg)}`, port),
+        ];
+        const seen = new Set<string>();
+        const unique = findings.filter((f) => !seen.has(f.title) && seen.add(f.title));
+
+        const sections = [
+          {
+            title: unique.length ? "Findings — fix these" : "Findings",
+            body: unique.length
+              ? unique
+              : "No known signature matched. Read the guest output below; with foreground: false, " +
+                "try foreground: true to capture the crash itself.",
+          },
+          { title: "start_command", body: vm.start_command ?? null },
+          r.metrics.ok
+            ? { title: "Pool and boot counters (app-lb /metrics)", body: pool }
+            : section("Pool and boot counters (app-lb /metrics)", r.metrics),
+          section("Inside the guest (read-only probe)", probe.guest),
+        ];
+        if (fg) sections.push(section("Foreground run (15s)", fg));
+        return report(`VM boot diagnosis for ${id}`, sections);
       },
     },
 

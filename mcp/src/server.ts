@@ -136,6 +136,7 @@ export const WORKFLOW_FIRST = [
   "diagnose_deployment",
   "deployment_logs",
   "namespace_telemetry",
+  "diagnose_vm_boot",
 ];
 
 function workflowFirst<T extends { name: string }>(tools: T[]): T[] {

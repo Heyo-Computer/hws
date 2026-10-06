@@ -30,8 +30,10 @@ export interface Guide {
 
 const DAEMONIZE =
   "`start_command` must RETURN: background the app, e.g. " +
-  "`cd /app && setsid nohup node server.js </dev/null >/var/log/app.log 2>&1 &`. " +
-  "A foreground command never lets the VM finish booting. The app must listen on 0.0.0.0:<port>.";
+  "`cd /app && setsid nohup node server.js </dev/null &`. " +
+  "A foreground command never lets the VM finish booting. The app must listen on 0.0.0.0:<port>. " +
+  "Do not redirect its output to a file: heyvm captures it, and that capture is what deployment_logs " +
+  "and diagnose_vm_boot read when the app crashes.";
 
 export const GUIDES: readonly Guide[] = [
   {
@@ -137,11 +139,13 @@ export const GUIDES: readonly Guide[] = [
   {
     id: "fix-vm-not-ready",
     title: "VM deployment never becomes ready / pool stays empty",
-    keywords: ["ready", "pool", "boot", "start", "start_command", "crash", "timeout", "unhealthy", "replicas", "port"],
+    keywords: ["ready", "pool", "boot", "start", "start_command", "crash", "timeout", "unhealthy", "replicas", "port", "health", "502", "504", "5xx", "listening"],
     steps: [
       "applb_get_deployment {id}: is there a `vm.start_command`? A VM does not run the image's CMD/ENTRYPOINT. repo_deploy (kind vm) derives one from the Dockerfile when you give none.",
       DAEMONIZE,
       "Check the port: the spec's `vm.port` (repo_deploy `port`) must be the one the app listens on, on 0.0.0.0.",
+      "diagnose_vm_boot {id} — lints the spec, then probes INSIDE a booting VM (start_command output, listening sockets, the health path) and names the cause. Add foreground: true to capture the crash itself.",
+      "The app crashes on start (a module-type mismatch, a missing dependency, an unwritable data path)? That is the repo's code: fix it with repo_write_files and repo_deploy again.",
       "An `artifact` image: `artifact.store` must be this region's store (art_publish_files' result gives it); a guessed URL fails the pull and leaves no image.",
       "diagnose_deployment {id} and applb_deployment_jobs {id} — did the image build succeed? A failed build leaves the old image (or none).",
       "Then redeploy (repo_deploy again, or applb_deploy with the corrected spec).",

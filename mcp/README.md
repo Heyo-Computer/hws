@@ -584,6 +584,7 @@ Cross-service, shaped like the question rather than the endpoint.
 | `diagnose_deployment` | read-only | Everything about one deployment at once: app-lb's record and its VM pool, app-obs's bucketed series, and the most recent error-level logs. |
 | `deployment_logs` | read-only | Log lines for one deployment, newest first, with the filters app-obs supports: time window or explicit from/to, level, backend, a substring query, and a cursor for paging. |
 | `namespace_telemetry` | read-only | One namespace's telemetry: each deployment's requests, errors, latency, CPU and memory over a window, plus one deployment's series and recent errors when `deployment` is given. fleet_overview for a namespace-confined credential — call it first for 'how are my apps doing'. |
+| `diagnose_vm_boot` |  | Why a VM deployment boots but never passes its health check (ready 0, boot timeouts). |
 | `fleet_overview` | read-only | The whole managed fleet in one call: app-obs's per-deployment rows with host CPU and memory, app-lb's current topology with health and drain state, and app-obs's ingest counters. |
 | `diagnose_empty_pool` | read-only | Why a deployment's VM pool is empty or will not fill. |
 | `diagnose_ci_job` | read-only | Why a ci job is not running. |
@@ -713,7 +714,7 @@ Everything without a dedicated tool. Prefer a named tool when one exists — a r
 | `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
 | `art_request` |  | Raw HTTP against the artifact store, for endpoints without a dedicated tool above. |
 
-_78 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+_79 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
 
 <!-- END GENERATED CATALOGUE -->
 
