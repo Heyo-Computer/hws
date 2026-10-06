@@ -135,7 +135,7 @@ pub trait Runtime: Send + Sync {
     async fn list(&self) -> Result<Vec<heyo_sdk::SandboxInfo>, String>;
     async fn create(&self, spec: &DeploymentSpec, name: &str) -> Result<String, String>;
     async fn healthy(&self, info: &heyo_sdk::SandboxInfo, spec: &DeploymentSpec) -> Option<std::net::SocketAddr>;
-    async fn stop(&self, id: &str) -> Result<(), String>;
+    async fn retire(&self, id: &str, deployment: &str) -> Result<(), String>;
     async fn reclaim(&self, id: &str, name: &str) -> Result<bool, String>;
 }
 
@@ -149,7 +149,20 @@ impl Runtime for Live {
         let addr = crate::vm::routable_addr(info, spec.vm_spec().port).ok()?;
         crate::health::probe(addr, &spec.health).await.then_some(addr)
     }
-    async fn stop(&self, id: &str) -> Result<(), String> { self.scaler.vms().suspend(id).await.map_err(|e| e.to_string()) }
+    async fn retire(&self, id: &str, deployment: &str) -> Result<(), String> {
+        let vms = self.scaler.vms();
+        // A lost delete response or record write must be recoverable without
+        // recreating the predecessor. NotFound alone cannot prove reclamation.
+        if vms.firecracker_reclaimed(id).await? { return Ok(()); }
+        let info = vms.connect(id.into()).map_err(|e| e.to_string())?.info().await.map_err(|e| e.to_string())?;
+        if info.id != id || crate::vm::owner_of(&info.name) != Some(deployment) {
+            return Err("predecessor runtime identity mismatch".into());
+        }
+        if !self.reclaim(id, &info.name).await? {
+            return Err("predecessor reclamation is not confirmed".into());
+        }
+        Ok(())
+    }
     async fn reclaim(&self, id: &str, name: &str) -> Result<bool, String> {
         let vms = self.scaler.vms();
         // Also checks capability before deletion on an older backend, and
@@ -395,7 +408,10 @@ impl Rollouts {
             if old.is_some_and(|pool| pool.iter().any(|b| b.in_flight() != 0)) && now_secs() < o.drain_deadline.unwrap_or(u64::MAX) { return Ok(()); }
             for id in &o.previous {
                 if o.stopped.contains(id) { continue; }
-                tokio::time::timeout(Duration::from_secs(30), self.runtime.stop(id)).await.map_err(|e| e.to_string())??;
+                // Stateless predecessors retain only their operation history,
+                // not disks or TAP reservations. The legacy stopped receipt is
+                // written only after the daemon confirms complete reclamation.
+                tokio::time::timeout(Duration::from_secs(30), self.runtime.retire(id, &o.deployment)).await.map_err(|e| e.to_string())??;
                 o.stopped.push(id.clone());
                 self.record(&d, index, o.clone()).await?;
             }
@@ -504,9 +520,10 @@ mod tests {
         async fn healthy(&self, _: &heyo_sdk::SandboxInfo, _: &DeploymentSpec) -> Option<std::net::SocketAddr> {
             self.healthy.load(Ordering::SeqCst).then(|| "127.0.0.1:4321".parse().unwrap())
         }
-        async fn stop(&self, id: &str) -> Result<(), String> {
-            if self.stop_failure.load(Ordering::SeqCst) { return Err("stop failed".into()); }
-            self.stopped.lock().unwrap().push(id.into()); Ok(())
+        async fn retire(&self, id: &str, deployment: &str) -> Result<(), String> {
+            assert_eq!(deployment, "svc");
+            if !self.reclaim(id, "").await? { return Err("reclamation not confirmed".into()); }
+            Ok(())
         }
         async fn reclaim(&self, id: &str, _: &str) -> Result<bool, String> {
             if self.stop_failure.load(Ordering::SeqCst) { return Err("delete or receipt failed".into()); }
@@ -586,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_first_cutover_drains_acquired_requests_and_retains_exact_vms() {
+    async fn candidate_first_cutover_drains_then_reclaims_predecessors_and_retains_records() {
         let (_dir, registry, d, runtime, e, request) = setup();
         let backend = d.backends()[0].clone(); assert!(backend.try_acquire());
         let requested_hash = fingerprint(&request.spec);
@@ -694,6 +711,27 @@ mod tests {
         assert_eq!(restarted.get("svc").unwrap().state().rollouts[0].status, "succeeded");
         e.tick().await; assert_eq!(runtime.created.lock().unwrap().len(), 1);
         assert_eq!(*runtime.stopped.lock().unwrap(), vec!["old-exact-id"]);
+    }
+
+    #[tokio::test]
+    async fn lost_predecessor_delete_response_resumes_without_recreating_either_generation() {
+        let (dir, registry, d, runtime, e, request) = setup();
+        e.admit(&d, request).unwrap(); to_verifying(&e).await;
+        runtime.healthy.store(true, Ordering::SeqCst); e.tick().await;
+        runtime.reclaim_lose_response.store(true, Ordering::SeqCst); e.tick().await;
+        let active = registry.get("svc").unwrap();
+        assert_eq!(active.state().rollouts[0].status, "running");
+        assert!(!active.state().rollouts[0].previous_stopped);
+        assert!(active.state().rollouts[0].stopped.is_empty());
+        let restarted = Arc::new(Registry::new(dir.path().join("state.json")));
+        restarted.load().unwrap();
+        let e = engine(restarted.clone(), runtime.clone()); e.tick().await;
+        let state = restarted.get("svc").unwrap().state();
+        assert_eq!(state.rollouts[0].status, "succeeded");
+        assert_eq!(state.rollouts[0].previous, vec!["old-exact-id"]);
+        assert_eq!(*runtime.stopped.lock().unwrap(), vec!["old-exact-id"]);
+        assert_eq!(runtime.created.lock().unwrap().len(), 1);
+        assert_eq!(runtime.sequence.load(Ordering::SeqCst), 1);
     }
 
     #[test]

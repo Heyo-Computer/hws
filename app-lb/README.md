@@ -278,18 +278,19 @@ The deployment's existing fsync/rename record stores the operation, unique alloc
 intents, active generation, and exact retiring VM IDs. Candidates stay unrouted until
 healthy. Cutover persists first, then fences admission on old backends and publishes
 the candidate pool. Acquired requests drain until zero or `drain_timeout_secs`; only
-then are recorded previous replicas stopped, **not destroyed**. Their records/disks
-remain claimed, and old retained VMs cannot resume into the new generation.
-Retirement relies on the daemon's stop acknowledgment: install a daemon that
-propagates termination errors and preserves live handles on failure before
-enabling rollouts. Older daemons that swallow stop errors cannot establish
-`previous_stopped` reliably. Normal ephemeral rootfs cleanup performed by the
-daemon on successful stop is unchanged; app-lb never purges the retained sandbox.
+then are recorded previous replicas **deleted**, including their disks and network
+reservations. Deployment history and immutable release artifacts, not stopped VMs,
+provide the rollback record. Retirement verifies deployment ownership and refuses
+external proxy references. It requires the daemon's `firecracker-reclamation-v1`
+receipt before setting the legacy `previous_stopped` flag. A lost delete response
+is reconciled through that receipt; a missing listing alone is not proof. Install
+a daemon supporting this receipt before enabling rollouts. This applies only to
+the stateless services accepted by this endpoint, never database/workspace VMs.
 
 Restart reconciles attempted creates by exact recorded name, never by issuing another
 create. Unknown allocations or ambiguous persistence retain both generations for
-operator reconciliation. A failed candidate leaves the source serving; failed candidate
-allocations are retained, not purged. Post-cutover stop/readiness failure is bounded by
+operator reconciliation. A failed candidate leaves the source serving; known failed
+candidates are reclaimed through the same verified deletion protocol. Post-cutover reclamation/readiness failure is bounded by
 the drain deadline plus five minutes and never reports `previous_stopped`. The record
 requires one owning app-lb process, as the existing registry does; it is not a shared
 multi-process database. Retained history requires explicit operator reconciliation
