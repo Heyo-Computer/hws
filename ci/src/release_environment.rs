@@ -590,6 +590,7 @@ mod tests {
                 crate::service_rollout::validate_target(target).unwrap();
             }
             for job in plan.jobs {
+                assert!(job.vm.build.is_some(), "promotion must not depend on an unregistered default image");
                 let step = &job.steps[0];
                 assert!(policy.service_targets.contains_key(&step.with["target"]));
                 assert!(

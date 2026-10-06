@@ -10,6 +10,14 @@ CI_RELEASE_POLICIES:
       on: release
       jobs:
         merge:
+          vm:
+            driver: firecracker
+            build:
+              dockerfile: .ci/image/ci/Dockerfile
+              context: .ci/image/ci
+              size_mb: 6144
+            size_class: small
+            disk_size_gb: 10
           steps:
             - uses: ci/merge-release
               with:
@@ -38,6 +46,14 @@ CI_RELEASE_ENVIRONMENTS:
       on: promotion
       jobs:
         first-region:
+          vm: &runner
+            driver: firecracker
+            build:
+              dockerfile: .ci/image/ci/Dockerfile
+              context: .ci/image/ci
+              size_mb: 6144
+            size_class: small
+            disk_size_gb: 10
           timeout-minutes: 60
           steps:
             - uses: ci/rollout-service
@@ -48,6 +64,7 @@ CI_RELEASE_ENVIRONMENTS:
                 artifact: orchestrator-linux
         second-region:
           needs: [first-region]
+          vm: *runner
           timeout-minutes: 60
           steps:
             - uses: ci/rollout-service

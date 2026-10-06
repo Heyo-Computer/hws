@@ -2556,13 +2556,29 @@ impl Dispatcher {
                 "the canonical repository URL must be an https:// or ssh:// URL (or scp-style SSH); local filesystem repository URLs are forbidden".into(),
             ));
         }
-        let workflow_text = descriptor.workflows.get(&run.workflow_path).ok_or_else(|| {
-            DispatchError::Checkout(format!(
-                "planned workflow {} is absent from the durable source descriptor",
-                run.workflow_path
-            ))
-        })?;
-        let workflow_hash = hex::encode(sha2::Sha256::digest(workflow_text.as_bytes()));
+        // Promotion executes the persisted operator plan, not a YAML file in
+        // Git. Authorize that distinction from the retained bundle record,
+        // never from a caller-supplied workflow name or source label. Checkout
+        // still verifies the exact original revision and complete source tree.
+        let promotion = crate::release_environment::bundle_for_run(&self.store, &msg.run_id)
+            .await.map_err(|e| DispatchError::Checkout(e.to_string()))?;
+        let workflow_hash = if let Some(bundle) = promotion {
+            if plan.release_policy.is_none()
+                || bundle["manifest"]["revision"].as_str() != Some(descriptor.base_revision.as_str())
+                || !descriptor.patch_base64.is_empty()
+            {
+                return Err(DispatchError::Checkout("promotion requires its frozen operator plan and exact retained source".into()));
+            }
+            None
+        } else {
+            let text = descriptor.workflows.get(&run.workflow_path).ok_or_else(|| {
+                DispatchError::Checkout(format!(
+                    "planned workflow {} is absent from the durable source descriptor",
+                    run.workflow_path
+                ))
+            })?;
+            Some(hex::encode(sha2::Sha256::digest(text.as_bytes())))
+        };
         let workdir = plan
             .vm
             .working_directory
@@ -2587,7 +2603,8 @@ impl Dispatcher {
 
         let result = async {
             vm.upload_bytes(&sid, &remote, &patch).await?;
-            let script = checkout_script(&workdir, &remote, &run.repo_url, &descriptor, &run.workflow_path, &workflow_hash);
+            let workflow = workflow_hash.as_deref().map(|hash| (run.workflow_path.as_str(), hash));
+            let script = checkout_script(&workdir, &remote, &run.repo_url, &descriptor, workflow);
             vm.exec(
                 &format!("{sid}.x"),
                 &script,
@@ -3445,14 +3462,17 @@ fn production_repo_url(url: &str) -> bool {
         && !path.is_empty() && !path.starts_with('-')
 }
 
-fn checkout_script(workdir: &str, patch_path: &str, repo_url: &str, source: &crate::trigger::GitPatchSource, workflow_path: &str, workflow_hash: &str) -> String {
+fn checkout_script(workdir: &str, patch_path: &str, repo_url: &str, source: &crate::trigger::GitPatchSource, workflow: Option<(&str, &str)>) -> String {
     let wd = shell_quote(workdir.trim_end_matches('/'));
     let patch = shell_quote(patch_path);
     let repo = shell_quote(repo_url);
     let base = shell_quote(&source.base_revision);
     let tree = shell_quote(&source.target_tree);
-    let workflow = shell_quote(&format!("{}/{}", workdir.trim_end_matches('/'), workflow_path));
-    let expected = shell_quote(workflow_hash);
+    let verify_workflow = workflow.map(|(path, hash)| {
+        let path = shell_quote(&format!("{}/{}", workdir.trim_end_matches('/'), path));
+        let hash = shell_quote(hash);
+        format!("test \"$(sha256sum {path} | awk '{{print $1}}')\" = {hash}")
+    }).unwrap_or_default();
     let apply = if source.patch_base64.is_empty() {
         format!("test \"$(git rev-parse HEAD^{{tree}})\" = {tree}")
     } else {
@@ -3485,7 +3505,7 @@ test "$(git -C {wd} rev-parse HEAD)" = {base}
 cd {wd}
 {apply}
 test "$(git rev-parse HEAD^{{tree}})" = {tree}
-test "$(sha256sum {workflow} | awk '{{print $1}}')" = {expected}
+{verify_workflow}
 git -c color.ui=never log --oneline -1
 "#)
 }
@@ -5413,31 +5433,37 @@ mod tests {
             changes: crate::paths::Changes::default(),
         };
         let hash = hex::encode(sha2::Sha256::digest(b"jobs: {}\n"));
-        let execute = |source: &crate::trigger::GitPatchSource, hash: &str| {
+        let execute = |source: &crate::trigger::GitPatchSource, hash: Option<&str>| {
             let path = root.join("source's patch");
             std::fs::write(&path, source.patch().unwrap()).unwrap();
             let script = checkout_script(workspace.to_str().unwrap(), path.to_str().unwrap(),
-                origin.to_str().unwrap(), source, "build.yml", hash);
+                origin.to_str().unwrap(), source, hash.map(|hash| ("build.yml", hash)));
             Command::new("sh").arg("-c").arg(script).env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap()
         };
-        let out = execute(&source, &hash);
+        let out = execute(&source, Some(&hash));
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(oid(git(&workspace, &["rev-parse", "HEAD"])), base);
         assert_eq!(oid(git(&workspace, &["describe", "--tags", "--exact-match"])), "v1");
+        // Operator promotions have no workflow file in Git. Their checkout
+        // must still select the retained revision, not the advanced branch.
+        assert!(execute(&source, None).status.success());
+        assert_eq!(oid(git(&workspace, &["rev-parse", "HEAD"])), base);
         source.target_tree = target.clone();
         source.patch_base64 = base64::engine::general_purpose::STANDARD.encode(patch);
-        let out = execute(&source, &hash);
+        let out = execute(&source, Some(&hash));
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(oid(git(&workspace, &["rev-parse", "HEAD^{tree}"])), target);
         assert_eq!(std::fs::metadata(&workspace).unwrap().ino(), inode);
         assert_eq!(std::fs::read(workspace.join("binary")).unwrap(), b"\0\xff\x01payload");
         assert!(!workspace.join("deleted").exists() && !workspace.join("not-submitted").exists());
         assert_ne!(std::fs::metadata(workspace.join("executable")).unwrap().permissions().mode() & 0o111, 0);
-        assert!(!execute(&source, &"0".repeat(64)).status.success());
+        assert!(!execute(&source, Some(&"0".repeat(64))).status.success());
         source.target_tree = "a".repeat(40);
-        assert!(!execute(&source, &hash).status.success());
+        assert!(!execute(&source, Some(&hash)).status.success());
+        assert!(!execute(&source, None).status.success());
         source.base_revision = "b".repeat(40);
-        assert!(!execute(&source, &hash).status.success());
+        assert!(!execute(&source, Some(&hash)).status.success());
+        assert!(!execute(&source, None).status.success());
         std::fs::remove_dir_all(root).unwrap();
     }
 
