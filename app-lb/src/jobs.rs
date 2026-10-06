@@ -602,6 +602,9 @@ pub struct Jobs {
     /// Mirrors step output into app-obs, so a transcript outlives this process's
     /// bounded in-memory history. `None` when log shipping is off.
     obs: Option<crate::obs::LogSink>,
+    /// Told what each pull and build put in heyvm's catalog, so the image
+    /// inventory knows where an image came from and can offload it safely.
+    images: std::sync::OnceLock<Arc<crate::images::ImageCatalog>>,
 }
 
 impl Jobs {
@@ -648,7 +651,13 @@ impl Jobs {
             durable_error,
             running: Mutex::new(HashSet::new()),
             obs,
+            images: std::sync::OnceLock::new(),
         }
+    }
+
+    /// See [`Jobs::images`]. Set once at startup.
+    pub fn set_images(&self, images: Arc<crate::images::ImageCatalog>) {
+        let _ = self.images.set(images);
     }
 
     /// Jobs newest-first, optionally for one deployment.
@@ -1280,6 +1289,9 @@ impl Jobs {
             .map_err(|e| format!("could not upload {image} to the daemon: {e}"))?;
         let _ = tokio::fs::remove_file(&built).await;
         self.log(job_id, format!("installed as {} on the daemon", installed.path));
+        if let Some(images) = self.images.get() {
+            images.note_built(&image, installed.size_bytes);
+        }
 
         // -- roll out --------------------------------------------------------
         self.roll_out(job_id, deployment_id, &image).await?;
@@ -1668,6 +1680,9 @@ impl Jobs {
             r.bytes = Some(pulled.bytes_written);
             r.reused = pulled.reused;
         });
+        if let Some(images) = self.images.get() {
+            images.note_pulled(&pulled.image, &pulled.digest, spec, pulled.size);
+        }
         self.log(
             job_id,
             format!(

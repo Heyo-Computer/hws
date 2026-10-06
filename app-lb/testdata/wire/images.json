@@ -1,0 +1,84 @@
+{
+  "generated_at": 1760090000,
+  "complete": true,
+  "delete_supported": true,
+  "offload": true,
+  "disk_used_pct": 41.3,
+  "pressure_pct": 85,
+  "local_bytes": 2684354560,
+  "images": [
+    {
+      "name": "ubuntu-24.04",
+      "source": "unknown",
+      "tier": "local",
+      "bytes": 2147483648,
+      "first_seen": 1760000000,
+      "last_used": 1760000000,
+      "pinned": true,
+      "failures": 1,
+      "next_attempt_at": 1760001800,
+      "last_error": "HEAD https://art.example/blobs/… answered 404 Not Found",
+      "present": true,
+      "references": [
+        {
+          "kind": "pinned"
+        },
+        {
+          "kind": "sandbox",
+          "id": "sb-1a2b3c4d"
+        }
+      ],
+      "kept_because": "in use by 2 reference(s)"
+    },
+    {
+      "name": "img-c74abee2ce8409f1",
+      "source": "pull",
+      "tier": "local",
+      "digest": "c74abee2ce8409f1aa00bb11cc22dd33ee44ff5566778899aabbccddeeff0011",
+      "store": "https://hub.heyo.work",
+      "ref": "heyo/alpine:3.24",
+      "bytes": 536870912,
+      "first_seen": 1760000000,
+      "last_used": 1760086400,
+      "pinned": false,
+      "failures": 0,
+      "next_attempt_at": 0,
+      "present": true,
+      "references": [
+        {
+          "kind": "deployment",
+          "id": "web"
+        },
+        {
+          "kind": "rollout",
+          "deployment": "web",
+          "operation": "op-1"
+        },
+        {
+          "kind": "job",
+          "deployment": "api",
+          "job": "job-1"
+        }
+      ],
+      "kept_because": "in use by 3 reference(s)"
+    },
+    {
+      "name": "web-0123456789ab",
+      "source": "build",
+      "tier": "offloaded",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "store": "https://art.example",
+      "bytes": 1073741824,
+      "first_seen": 1750000000,
+      "last_used": 1750000000,
+      "pinned": false,
+      "offloaded_to": "https://art.example#0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef (app-lb-offload:web-0123456789ab)",
+      "offloaded_at": 1760000000,
+      "failures": 0,
+      "next_attempt_at": 0,
+      "present": false,
+      "references": [],
+      "kept_because": "not in heyvm's catalog"
+    }
+  ]
+}

@@ -2368,3 +2368,97 @@ pub struct ObsAlert {
     #[serde(flatten)]
     pub extra: Extra,
 }
+
+// -- heyvm's image catalog ------------------------------------------------
+
+/// `GET /images`: heyvm's image catalog as app-lb manages it. Fleet scope.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ImageInventory {
+    pub generated_at: u64,
+    /// False when what references the images could not be determined; the
+    /// server then offloads and deletes nothing.
+    pub complete: bool,
+    pub error: Option<String>,
+    /// Whether heyvm can delete images; `None` until one was tried.
+    pub delete_supported: Option<bool>,
+    /// Whether automatic offload is on.
+    pub offload: bool,
+    pub disk_used_pct: Option<f64>,
+    pub pressure_pct: u8,
+    pub local_bytes: u64,
+    pub images: Vec<ImageEntry>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One image: its record, and — in an inventory — what holds it.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ImageEntry {
+    pub name: String,
+    /// `pull`, `build` or `unknown`.
+    pub source: String,
+    /// `local` or `offloaded`.
+    pub tier: String,
+    pub digest: Option<String>,
+    pub store: Option<String>,
+    #[serde(rename = "ref")]
+    pub artifact_ref: Option<String>,
+    pub grow_gb: Option<u64>,
+    pub bytes: u64,
+    pub first_seen: u64,
+    pub last_used: u64,
+    pub pinned: bool,
+    pub offloaded_to: Option<String>,
+    pub offloaded_at: Option<u64>,
+    pub failures: u32,
+    /// After a failed offload, not retried before this.
+    pub next_attempt_at: u64,
+    pub last_error: Option<String>,
+    /// The store's API key, as a secret reference — never a value.
+    pub auth: Option<Value>,
+    /// In heyvm's catalog right now. Inventory only.
+    pub present: bool,
+    /// What holds it. Inventory only.
+    pub references: Vec<ImageReference>,
+    /// Why the offload pacer would leave it alone; absent when it would not.
+    pub kept_because: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// Something that holds an image: `deployment`, `rollout`, `sandbox`, `job`
+/// or `pinned`, with the fields that kind carries.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ImageReference {
+    pub kind: String,
+    pub id: Option<String>,
+    pub deployment: Option<String>,
+    pub operation: Option<String>,
+    pub job: Option<String>,
+}
+
+impl std::fmt::Display for ImageReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.kind.as_str(), &self.id, &self.deployment) {
+            ("deployment", Some(id), _) => write!(f, "deployment/{id}"),
+            ("sandbox", Some(id), _) => write!(f, "sandbox/{id}"),
+            ("rollout", _, Some(d)) => write!(f, "rollout of {d}"),
+            ("job", _, Some(d)) => write!(f, "job {} of {d}", self.job.as_deref().unwrap_or("?")),
+            (kind, _, _) => f.write_str(kind),
+        }
+    }
+}
+
+/// `POST /images/sweep`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ImageSweep {
+    pub skipped: Option<String>,
+    pub pressure: bool,
+    pub offloaded: Vec<String>,
+    /// `(image, why)`.
+    pub failed: Vec<(String, String)>,
+}

@@ -749,6 +749,32 @@ impl Default for HealthCheck {
     }
 }
 
+/// See [`VmSpec::rootfs`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RootfsMode {
+    /// A private, writable copy of the image per boot.
+    #[default]
+    Copy,
+    /// The image itself, attached read-only; no copy.
+    Shared,
+}
+
+impl RootfsMode {
+    fn is_default(&self) -> bool {
+        *self == Self::Copy
+    }
+
+    /// The value heyvm's create body takes, `None` for the default so a
+    /// body for a copy-mode VM is byte-for-byte what it was.
+    pub fn daemon_mode(&self) -> Option<&'static str> {
+        match self {
+            Self::Copy => None,
+            Self::Shared => Some("shared"),
+        }
+    }
+}
+
 /// `heyo_sdk::SandboxSize`, mirrored for schema generation only.
 ///
 /// The real type is in another crate and cannot carry a derive from this one.
@@ -793,6 +819,19 @@ pub struct VmSpec {
     /// Defaults to `ubuntu:24.04` daemon-side when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// How the VM's root filesystem relates to its image.
+    ///
+    /// `copy` (the default) boots from a private copy of the image that heyvm
+    /// makes on every cold boot — a reflink where the filesystem can, a full
+    /// copy where it cannot (ext4). `shared` attaches the image itself
+    /// read-only, so no copy is made at all: the image must bring its own
+    /// writable layer (the hub's base images mount tmpfs over the paths that
+    /// need writing), and anything that must persist lives on the data disk or
+    /// the workspace mount. The reuse a `/workspace` VM wants.
+    ///
+    /// heyvm versions without per-sandbox `rootfs_mode` ignore it and copy.
+    #[serde(default, skip_serializing_if = "RootfsMode::is_default")]
+    pub rootfs: RootfsMode,
     /// The guest port traffic is proxied to.
     pub port: u16,
     /// Shell command that starts the workload, run once per replica after boot.
@@ -1781,13 +1820,25 @@ pub struct ArtifactSpec {
 }
 
 impl ArtifactSpec {
-    /// The image name for a given blob digest, in the same shape
-    /// [`BuildSpec::image_for`] gives a commit.
+    /// The image name for a given blob digest.
     ///
-    /// Content-addressed on purpose: the same digest always materializes to the
-    /// same filename, so a re-pull of bytes already on disk is a no-op the job
-    /// can detect by name alone, and two deployments pulling one image share it.
+    /// Content-addressed: `img-<digest[..16]>`, plus `-g<N>` when the image is
+    /// grown, because a grown image is a different file. The same bytes always
+    /// materialize to the same name whichever deployment asked, so five
+    /// deployments of one base image share one catalog entry and one pull, and
+    /// a re-pull of bytes already on disk is a no-op the job can detect by
+    /// name alone.
+    ///
+    /// An explicit `image_name` keeps the older `<name>-<digest[..12]>` shape,
+    /// and so does a digest too short to address anything: that is the
+    /// deployment-scoped name images pulled before this carry, and their
+    /// deployments keep booting from them.
     pub fn image_for(&self, deployment_id: &str, digest: &str) -> String {
+        if self.image_name.is_none()
+            && let Some(name) = content_addressed_image(digest, self.grow_gb)
+        {
+            return name;
+        }
         let base = self.image_name.as_deref().unwrap_or(deployment_id);
         let base = sanitize_image_name(base);
         let short: String = digest.chars().take(12).collect();
@@ -1916,6 +1967,21 @@ fn is_flat_tag(r: &str) -> bool {
     }
     r.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+}
+
+/// The catalog name for a blob, by content: `img-<digest[..16]>`, with
+/// `-g<N>` when grown to N GiB. `None` for anything that is not a hex digest
+/// of at least 16 characters, which callers fall back from.
+pub fn content_addressed_image(digest: &str, grow_gb: Option<u64>) -> Option<String> {
+    let short: String = digest.chars().take(16).collect();
+    if short.len() < 16 || !short.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let short = short.to_ascii_lowercase();
+    Some(match grow_gb {
+        Some(g) => format!("img-{short}-g{g}"),
+        None => format!("img-{short}"),
+    })
 }
 
 /// Keep to what a docker tag component and an ext4 filename both allow.
@@ -4924,6 +4990,10 @@ impl DeploymentSpec {
         if vm.correlated_creates {
             return Err(SpecError::NotForLxc("vm.correlated_creates"));
         }
+        // A container has no rootfs image to share read-only.
+        if vm.rootfs != RootfsMode::Copy {
+            return Err(SpecError::NotForLxc("vm.rootfs"));
+        }
         if vm.workspace_archive.is_some() {
             return Err(SpecError::NotForLxc("vm.workspace_archive"));
         }
@@ -5838,6 +5908,7 @@ mod tests {
                 image_sha256: None,
                 driver: Driver::Firecracker,
                 image: None,
+                rootfs: Default::default(),
                 port: 8080,
                 start_command: None,
                 size_class: None,
@@ -6531,11 +6602,25 @@ mod tests {
     #[test]
     fn a_pulled_image_is_named_after_the_digest_it_came_from() {
         let a = artifact_spec();
+        let digest = "c74abee2ce8409f1aa00bb11cc22dd33ee44ff5566778899aabbccddeeff0011";
         assert_eq!(
-            a.image_for("web", "c74abee2ce8409f1"),
-            "web-c74abee2ce84",
-            "the short digest is what makes a re-pull of the same bytes detectable by name",
+            a.image_for("web", digest),
+            "img-c74abee2ce8409f1",
+            "named by content, so a re-pull of the same bytes is detectable by name",
         );
+        assert_eq!(
+            a.image_for("api", digest),
+            a.image_for("web", digest),
+            "two deployments of one image share one catalog entry",
+        );
+        let grown = ArtifactSpec { grow_gb: Some(4), ..artifact_spec() };
+        assert_eq!(grown.image_for("web", digest), "img-c74abee2ce8409f1-g4", "a grown image is a different file");
+        assert_eq!(
+            a.image_for("web", "c74abee2"),
+            "web-c74abee2",
+            "a digest too short to address anything keeps the deployment-scoped name",
+        );
+        assert_eq!(content_addressed_image("not-hex-at-all-xx", None), None);
         let named = ArtifactSpec { image_name: Some("Custom Name".into()), ..artifact_spec() };
         assert_eq!(named.image_for("web", "deadbeefcafe0"), "custom-name-deadbeefcafe");
     }

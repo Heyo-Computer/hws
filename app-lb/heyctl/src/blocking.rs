@@ -498,6 +498,28 @@ impl Client {
         run!(self, self.inner.set_plugin(id, enabled, config))
     }
 
+    // -- heyvm's image catalog ------------------------------------------------
+
+    pub fn images(&self) -> Result<crate::ImageInventory> {
+        run!(self, self.inner.images())
+    }
+
+    pub fn sweep_images(&self) -> Result<crate::ImageSweep> {
+        run!(self, self.inner.sweep_images())
+    }
+
+    pub fn offload_image(&self, name: &str) -> Result<crate::ImageEntry> {
+        run!(self, self.inner.offload_image(name))
+    }
+
+    pub fn delete_image(&self, name: &str) -> Result<()> {
+        run!(self, self.inner.delete_image(name))
+    }
+
+    pub fn pin_image(&self, name: &str, pinned: bool) -> Result<crate::ImageEntry> {
+        run!(self, self.inner.pin_image(name, pinned))
+    }
+
     // -- namespace plugins and telemetry ------------------------------------
 
     pub fn namespace_plugins(&self, namespace: &str) -> Result<Vec<NamespacePlugin>> {
