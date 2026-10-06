@@ -29,7 +29,8 @@ RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
     && printf 'PermitRootLogin prohibit-password\nPermitEmptyPasswords no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' > /etc/ssh/sshd_config.d/00-heyo.conf \
     && passwd -d root \
     && ssh-keygen -A \
-    && echo ubuntu > /etc/heyo-hostname
+    && echo ubuntu > /etc/heyo-hostname \
+    && mkdir -p /workspace
 
 COPY images/base/init.sh /init.sh
 COPY images/base/smoke.sh /tmp/smoke.sh
