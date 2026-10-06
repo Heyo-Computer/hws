@@ -1727,9 +1727,12 @@ async fn metrics_snapshot(
     // `global_snapshot` also folds in *retired* deployments' counters, which a
     // scoped caller has no business receiving.
     //
-    // `host` is left alone deliberately: whole-machine CPU and memory is not an
-    // inventory of deployments, and a sandbox operator watching the load on the
-    // box their VM sits on is reasonable.
+    // A caller behind a namespace wall sees its deployments and nothing about
+    // the machines under them: not host CPU and memory, not the daemon's
+    // health, not the collector's counters. A namespace is the product; which
+    // server, and how many, is the platform's business. A deployment-list
+    // token without a namespace keeps them, as before.
+    let confined_caller = caller.as_ref().is_some_and(|c| c.0.confined());
     let (global, tracked) = match scope {
         None => (
             state.metrics.global_snapshot(),
@@ -1746,12 +1749,12 @@ async fn metrics_snapshot(
     Json(MetricsResponse {
         generated_at: now,
         uptime_secs: now.saturating_sub(state.started_at),
-        host: state.metrics.host_snapshot(),
+        host: if confined_caller { Default::default() } else { state.metrics.host_snapshot() },
         fleet,
         global,
-        obs: state.obs.as_ref().map(|o| o.snapshot()),
+        obs: if confined_caller { None } else { state.obs.as_ref().map(|o| o.snapshot()) },
         security: security_summary(&state),
-        daemon: state.metrics.daemon_snapshot(),
+        daemon: if confined_caller { Default::default() } else { state.metrics.daemon_snapshot() },
         deployments: views,
         matched,
         tracked_deployments: tracked,
@@ -3721,10 +3724,31 @@ async fn dashboard(
     headers: axum::http::HeaderMap,
     caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
+    // What the page may show, decided here rather than by the page guessing
+    // from its URL: the cross-server sections exist only where a gateway fleet
+    // is configured, and a caller behind a namespace wall gets that namespace's
+    // view whatever the URL says. The namespace is from a validated alphabet,
+    // so it is safe inside the page's JS string literal.
+    let multi_server = state
+        .views
+        .as_ref()
+        .is_some_and(|v| v.snapshot().fleet.is_some());
+    let confined_caller = caller.as_ref().is_some_and(|c| c.0.confined());
+    let scope_ns = caller
+        .as_ref()
+        .and_then(|c| c.0.sole_namespace())
+        .filter(|ns| crate::config::is_valid_namespace(ns))
+        .unwrap_or_default()
+        .to_string();
+    let html = state
+        .dashboard_html
+        .replace("{{MULTI_SERVER}}", if multi_server { "true" } else { "false" })
+        .replace("{{CONFINED}}", if confined_caller { "true" } else { "false" })
+        .replace("{{SCOPE_NAMESPACE}}", &scope_ns);
     let page = if let Some(axum::Extension(Caller::Federated(grant))) = caller {
         let name = crate::heyo_ui::escape(grant.subject.email.as_deref().unwrap_or(&grant.subject.user_id));
-        render_page(&state, &state.dashboard_html.replace("{{WHO}}", &name), &headers)
-    } else { render_page(&state, &state.dashboard_html, &headers) };
+        render_page(&state, &html.replace("{{WHO}}", &name), &headers)
+    } else { render_page(&state, &html, &headers) };
     let sign_out = if browser_login::session(&headers, &axum::http::Method::GET).ok().flatten().is_some() {
         "<form method=\"post\" action=\"/logout\"><button class=\"btn btn-sm\">Sign out</button></form>"
     } else { "" };
@@ -8287,6 +8311,51 @@ mod tests {
             f.state.plugins.set("obs", false, None).await.unwrap();
         }
 
+        /// The dashboard learns what it may show from the server, not its URL:
+        /// a namespace token gets its namespace's view even at plain
+        /// /dashboard, and nothing describes the servers underneath it.
+        #[tokio::test]
+        async fn a_namespace_caller_gets_its_view_and_no_server_details() {
+            let f = fixture(true).await;
+            let (summary, _) = f.state.tokens.mint(
+                crate::tokens::NewToken {
+                    name: "ns".into(),
+                    admin: crate::tokens::AdminScope::View,
+                    namespace: Some("team-a".into()),
+                    deployments: vec![],
+                    expires_in_secs: None,
+                    fleet: false,
+                },
+                now_secs(),
+            ).unwrap();
+            let ns_caller = Caller::Token(f.state.tokens.get(&summary.id).unwrap());
+            let body = |r: Response| async {
+                String::from_utf8(axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
+            };
+
+            let page = body(dashboard(State(f.state.clone()), axum::http::HeaderMap::new(),
+                Some(axum::Extension(ns_caller.clone()))).await.into_response()).await;
+            assert!(!page.contains("{{MULTI_SERVER}}") && !page.contains("{{CONFINED}}") && !page.contains("{{SCOPE_NAMESPACE}}"));
+            assert!(page.contains(r#"const MULTI_SERVER = "false" === "true";"#), "no gateways here");
+            assert!(page.contains(r#"const CALLER_CONFINED = "true" === "true";"#));
+            assert!(page.contains(r#"NS_RE.test("team-a")"#), "the namespace is stamped for plain /dashboard");
+
+            let op = body(dashboard(State(f.state.clone()), axum::http::HeaderMap::new(),
+                Some(axum::Extension(Caller::Operator))).await.into_response()).await;
+            assert!(op.contains(r#"const CALLER_CONFINED = "false" === "true";"#));
+            assert!(op.contains(r#"NS_RE.test("")"#));
+
+            let metrics = |c: Caller| {
+                metrics_snapshot(State(f.state.clone()), Query(MetricsQuery::default()), Some(axum::Extension(c)))
+            };
+            let ns_view: serde_json::Value = serde_json::from_str(&body(metrics(ns_caller).await.into_response()).await).unwrap();
+            assert_eq!(ns_view["host"]["available"], false, "no host usage behind a namespace wall");
+            assert_eq!(ns_view["host"]["cpu_count"], 0);
+            assert!(ns_view.get("obs").is_none());
+            let op_view: serde_json::Value = serde_json::from_str(&body(metrics(Caller::Operator).await.into_response()).await).unwrap();
+            assert!(op_view["host"].is_object());
+        }
+
         /// A namespace token watches the jobs of its own deployments — the pull
         /// it just started — and a job elsewhere answers like one that never
         /// existed.
@@ -9018,7 +9087,11 @@ mod tests {
                     .replace("{{SESSION_ACTION}}", "")
                     .replace("{{HOME_URL}}", "")
                     .replace("{{LEDE}}", "")
-                    .replace("{{CARDS}}", "");
+                    .replace("{{CARDS}}", "")
+                    // The dashboard's view facts, filled by its own handler.
+                    .replace("{{MULTI_SERVER}}", "false")
+                    .replace("{{CONFINED}}", "false")
+                    .replace("{{SCOPE_NAMESPACE}}", "");
                 assert!(!rendered.contains("{{"), "{name} left a placeholder unfilled");
             }
         }
