@@ -28,6 +28,8 @@ async fn request_inner(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &
     let (application, authority, _) = child::application_target(d).map_err(anyhow::Error::msg)?;
     let (sha, stored) = child::published_artifact(&d.store, &msg.run_id,
         d.config.controller_repository.as_deref(), artifact, workflow).await.map_err(anyhow::Error::msg)?;
+    let (_, git_ref) = crate::release::deployment_source(&d.store, &msg.run_id)
+        .await.map_err(anyhow::Error::msg)?;
     anyhow::ensure!((1..=256 * 1024 * 1024).contains(&stored.size_bytes), "CI artifact exceeds verification budget");
     let digest = stored.digest.as_deref().context("artifact omitted digest")?;
     let bytes = d.artifacts.get(&stored).await?;
@@ -41,8 +43,8 @@ async fn request_inner(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &
     let status: String = sqlx::query_scalar("SELECT status FROM ci_run WHERE id=$1 FOR UPDATE")
         .bind(&msg.run_id).fetch_one(&mut *tx).await?;
     anyhow::ensure!(!matches!(status.as_str(),"cancelled"|"failure"), "release is no longer eligible");
-    let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,s.id,r.id,j.id,$3,$4,'running','preparing',$5,rel.git_ref FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id JOIN ci_release rel ON rel.run_id=r.id AND rel.status='published' WHERE s.id=$2 AND r.id=$6 AND j.id=$7 AND j.status='running' ON CONFLICT(step_id) DO NOTHING")
-        .bind(&id).bind(step).bind(application).bind(hash(&command)).bind(&sha).bind(&msg.run_id).bind(&msg.job_id)
+    let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,s.id,r.id,j.id,$3,$4,'running','preparing',$5,$8 FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id WHERE s.id=$2 AND r.id=$6 AND j.id=$7 AND j.status='running' ON CONFLICT(step_id) DO NOTHING")
+        .bind(&id).bind(step).bind(application).bind(hash(&command)).bind(&sha).bind(&msg.run_id).bind(&msg.job_id).bind(&git_ref)
         .execute(&mut *tx).await?.rows_affected();
     if inserted == 1 {
         sqlx::query("INSERT INTO ci_regional_update(id,application_id,authority,request,artifact_name,workflow) VALUES($1,$2,$3,$4,$5,$6)")

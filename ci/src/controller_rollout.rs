@@ -222,6 +222,7 @@ pub async fn prepare(input: PreparationInputs<'_>) -> Result<PreparedRollout, St
     }
     let (sha, stored) = published_artifact(input.store, input.run_id, input.controller_repository,
         input.artifact_name, input.workflow).await?;
+    let (_, git_ref) = crate::release::deployment_source(input.store, input.run_id).await?;
     let digest = stored.digest.clone().ok_or("artifact omitted digest")?;
     let id = match input.parent_operation_id {
         Some(parent) => crate::regional_update::child_id(parent, base, target.deployment),
@@ -289,8 +290,8 @@ pub async fn prepare(input: PreparationInputs<'_>) -> Result<PreparedRollout, St
         tx.commit().await.map_err(|e| e.to_string())?;
         return Ok(PreparedRollout { id, already_recorded: false });
     }
-    let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,s.id,r.id,j.id,$3,$4,'running','pending',$5,rel.git_ref FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id JOIN ci_release rel ON rel.run_id=r.id AND rel.status='published' WHERE s.id=$2 AND r.id=$6 AND j.status='running' AND r.status<>'cancelled'")
-        .bind(&id).bind(input.step_id).bind(target.deployment).bind(hash).bind(&sha).bind(input.run_id)
+    let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,s.id,r.id,j.id,$3,$4,'running','pending',$5,$7 FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id WHERE s.id=$2 AND r.id=$6 AND j.status='running' AND r.status NOT IN ('cancelled','failure')")
+        .bind(&id).bind(input.step_id).bind(target.deployment).bind(hash).bind(&sha).bind(input.run_id).bind(&git_ref)
         .execute(&mut *tx).await.map_err(|e| e.to_string())?.rows_affected();
     if inserted != 1 { return Err("requesting job is no longer running".into()); }
     sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase,application_id) VALUES($1,$2,$3,$4)")
@@ -807,7 +808,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
     async fn request_supports_unadopted_app_lb_but_preserves_application_approval() {
-        for adopted in [false, true] {
+        for (adopted, retained) in [(false, false), (true, false), (false, true), (true, true)] {
             let f = fixture().await;
             let (base, remote, server) = remote().await;
             let mut d = dispatcher_with_application(&f, &base, adopted).await;
@@ -848,11 +849,36 @@ mod tests {
                 INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status)
                 SELECT 'other-run',request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status FROM ci_release WHERE run_id='run';")
                 .execute(f.store.pool()).await.unwrap();
-            assert!(request(&d, &msg, "other-step", "ci", None).await.unwrap_err().contains("no longer running"));
+            if retained {
+                // A daily promotion has no Git publication of its own and no
+                // artifact produced by its deployment run.
+                sqlx::raw_sql("DELETE FROM ci_release WHERE run_id='run';
+                    DELETE FROM ci_artifact WHERE id='artifact';
+                    INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,status)
+                    VALUES('daily','https://github.com/example/ci.git','daily','source','refs/heads/main','{}','test','ready');
+                    INSERT INTO ci_release_environment(name,repository)
+                    VALUES('stage','https://github.com/example/ci.git');")
+                    .execute(f.store.pool()).await.unwrap();
+                let manifest = json!({"version":2,"retained":true,"revision":"source",
+                    "repository":"https://github.com/example/ci.git","components":{"ci":{
+                        "id":"retained-artifact","run_id":"daily-build",
+                        "workflow":"ci.yml","job":"build","name":"ci","sink":"artifacts",
+                        "sha256":hex::encode(Sha256::digest(&bytes)),"size_bytes":bytes.len(),"uri":"test"
+                    }}});
+                let hash = hex::encode(Sha256::digest(serde_json::to_vec(&manifest).unwrap()));
+                sqlx::query("INSERT INTO ci_release_bundle(id,repository,name,build_id,manifest,manifest_sha256,created_by)
+                    VALUES('bundle','https://github.com/example/ci.git','daily','daily',$1,$2,'test')")
+                    .bind(manifest).bind(hash).execute(f.store.pool()).await.unwrap();
+                sqlx::raw_sql("INSERT INTO ci_release_promotion(run_id,environment,request_id,bundle_id,automatic,policy)
+                    VALUES('run','stage','request','bundle',false,'{}');")
+                    .execute(f.store.pool()).await.unwrap();
+            }
+            let workflow = retained.then_some("ci.yml");
+            assert!(request(&d, &msg, "other-step", "ci", workflow).await.unwrap_err().contains("no longer running"));
             let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_controller_rollout")
                 .fetch_one(f.store.pool()).await.unwrap();
             assert_eq!(recorded, 0, "cross-run preparation must not record or activate an update");
-            let result = request(&d, &msg, "step", "ci", None).await;
+            let result = request(&d, &msg, "step", "ci", workflow).await;
             result.unwrap();
             if adopted {
                 let parent = format!("ci-regional-{:x}", Sha256::digest(b"step"));
@@ -867,7 +893,7 @@ mod tests {
                 assert_eq!(intent["phase"],"prepared");
                 assert_eq!(crate::regional_update::prepare(&d,&id,&request).await.unwrap(),intent,"preparation is idempotent");
                 let unconfigured = dispatcher_with_application(&f, &base, false).await;
-                assert!(super::request(&unconfigured, &msg, "step", "ci", None).await.unwrap_err().contains("previously adopted"));
+                assert!(super::request(&unconfigured, &msg, "step", "ci", workflow).await.unwrap_err().contains("previously adopted"));
                 crate::regional_update::cancel_child(&d,&id,&parent).await.unwrap();
                 assert!(activate_application_update(&d,&id,intent["intentHash"].as_str().unwrap()).await.is_err());
                 assert_eq!(f.store.roll_up_run("run").await.unwrap(),RunStatus::Running,"child cannot finish aggregate receipt");
@@ -876,7 +902,7 @@ mod tests {
                 let phase: String = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id=$1")
                     .bind(&id).fetch_one(f.store.pool()).await.unwrap();
                 assert_eq!(phase, "pending");
-                request(&d, &msg, "step", "ci", None).await.unwrap();
+                request(&d, &msg, "step", "ci", workflow).await.unwrap();
                 let count: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_controller_rollout")
                     .fetch_one(f.store.pool()).await.unwrap();
                 assert_eq!(count, 1, "replay must not create a second replacement");

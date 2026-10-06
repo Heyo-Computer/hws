@@ -229,10 +229,18 @@ fn command(intent: &Intent) -> Result<String> {
 }
 
 fn launcher_spec(intent: &Intent, command: String) -> Value {
+    // app-lb stamps omitted secret namespaces on admission. Build the same
+    // normalized spec so the subsequent exact comparison accepts that result.
+    let mut env_from = intent.target.env_from.clone();
+    for reference in &mut env_from {
+        reference
+            .namespace
+            .get_or_insert_with(|| intent.target.namespace.clone());
+    }
     let mut spec = json!({"id":intent.launcher,"namespace":intent.target.namespace,"maintenance":true,
         "routes":[{"host":format!("{}.invalid",intent.launcher)}],"upstreams":["127.0.0.1:1"],
         "health":{"path":null,"timeout_secs":2},"update":{"working_dir":"/","commands":[command],
-        "timeout_secs":900,"verify_timeout_secs":0,"env_from":intent.target.env_from}});
+        "timeout_secs":900,"verify_timeout_secs":0,"env_from":env_from}});
     if intent.target.env_from.is_empty() {
         spec["update"].as_object_mut().unwrap().remove("env_from");
     }
@@ -554,6 +562,16 @@ mod tests {
         validate_target(&i.target).unwrap();
         let c = command(&i).unwrap();
         assert!(c.contains(&STANDARD.encode(RECIPE)));
+        assert_eq!(
+            i.launcher_spec["update"]["env_from"][0]["namespace"],
+            "default"
+        );
+        let mut explicit = i.clone();
+        explicit.target.env_from[0].namespace = Some("credentials".into());
+        assert_eq!(
+            launcher_spec(&explicit, c)["update"]["env_from"][0]["namespace"],
+            "credentials"
+        );
         let mut bad = i.target;
         bad.pooler.sql_url_envs = vec!["password".into()];
         assert!(validate_target(&bad).is_err());
