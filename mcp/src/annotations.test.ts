@@ -35,6 +35,9 @@ const CONFIG = {
 
 const listing = () => toolListing(buildTools(loadConfig(CONFIG)));
 
+/** Read-only tools that answer from compiled-in text and send nothing. */
+const OFFLINE = new Set(["applb_spec_schema", "heyo_guide"]);
+
 /**
  * Arguments plausible enough for each read-only tool to reach the network.
  *
@@ -122,15 +125,15 @@ test("a tool marked read-only never sends anything but a GET", async () => {
       }
       const mutating = methods.filter((m) => !m.startsWith("GET "));
       if (mutating.length > 0) offenders.push(`${listed.name}: ${mutating.join(", ")}`);
-      if (methods.length === 0 && listed.name !== "applb_spec_schema") silent.push(listed.name);
+      if (methods.length === 0 && !OFFLINE.has(listed.name)) silent.push(listed.name);
     }
   } finally {
     globalThis.fetch = original;
   }
 
   assert.deepEqual(offenders, [], "these are marked read-only and mutate");
-  // A tool that sent nothing proved nothing; only `applb_spec_schema` is
-  // legitimately offline, because it answers from the compiled-in schema.
+  // A tool that sent nothing proved nothing; only these are legitimately
+  // offline: they answer from compiled-in text (the schema, the guides).
   assert.deepEqual(silent, [], "these sent no request, so the check did not exercise them");
 });
 

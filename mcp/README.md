@@ -535,6 +535,14 @@ to infer from sixty tool names.
 
 <!-- BEGIN GENERATED CATALOGUE -->
 
+### Start here
+
+Step-by-step plans for common tasks and failures, and what this server can reach.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `heyo_guide` | read-only | START HERE for a task you have not done on Heyo, or with an error you do not understand. |
+
 ### Diagnostics
 
 Cross-service, shaped like the question rather than the endpoint.
@@ -555,7 +563,7 @@ Cross-service, shaped like the question rather than the endpoint.
 
 | Tool | | Does |
 | --- | --- | --- |
-| `applb_deploy` |  | **THE tool for 'deploy this'.** Takes a full spec and does the whole sequence: checks the rules a schema cannot express, registers or edits as appropriate, starts the job that matches the backend, waits for it, and reports what TLS will do. |
+| `applb_deploy` |  | Just files, no spec? repo_deploy fits better; see heyo_guide. |
 | `applb_spec_schema` | read-only | The deployment spec in full: every field of a named block with its complete documentation, plus the cross-field rules that apply to it. |
 | `applb_create_deployment` |  | Register a deployment from a full spec, REPLACING any deployment with the same id and recycling its VM pool. |
 | `applb_update_deployment` |  | Edit an existing deployment in place, replacing its whole spec. |
@@ -674,7 +682,7 @@ Everything without a dedicated tool. Prefer a named tool when one exists — a r
 | `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
 | `art_request` |  | Raw HTTP against the artifact store, for endpoints without a dedicated tool above. |
 
-_76 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+_77 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
 
 <!-- END GENERATED CATALOGUE -->
 

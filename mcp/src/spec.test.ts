@@ -193,42 +193,43 @@ test(
   },
 );
 
-test("the deploy tool advertises the spec instead of an untyped blob", () => {
-  // On `applb_deploy` rather than `applb_create_deployment`: exactly one tool
-  // may carry this tree, because a second copy is ~12 KB on every connect for
-  // every client. The primitives point at it instead.
-  const listed = toolListing(
-    buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" })),
-  ).find((t) => t.name === "applb_deploy");
+test("the deploy tool advertises every spec field, and the blocks are one call away", async () => {
+  // Top-level fields only: the nested tree was ~4,000 tokens on every request
+  // for the minority of sessions that hand-write a spec. Every field must
+  // still be named, and every block must still be reachable.
+  const tools = buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" }));
+  const listed = toolListing(tools).find((t) => t.name === "applb_deploy");
   assert.ok(listed);
 
   const spec = (listed.inputSchema as unknown as { properties: { spec: Record<string, unknown> } })
     .properties.spec;
-  const props = Object.keys(spec.properties as object);
-  // The fields the field report named as unlearnable from the tool surface.
-  for (const key of ["id", "routes", "vm", "scaling", "health", "build", "artifact", "site"]) {
-    assert.ok(props.includes(key), `the advertised spec never mentions \`${key}\``);
+  const props = spec.properties as Record<string, { description?: string }>;
+  assert.deepEqual(
+    Object.keys(props).sort(),
+    Object.keys(DEPLOYMENT_SPEC_SCHEMA.properties as object).sort(),
+    "the advertised spec must name every top-level field",
+  );
+  const source = DEPLOYMENT_SPEC_SCHEMA.properties as Record<string, { description?: string }>;
+  for (const [key, v] of Object.entries(props)) {
+    if (!source[key]?.description) continue; // app-lb gives none (user_id)
+    assert.ok(v.description && v.description.length > 0, `\`${key}\` lost its description`);
   }
-  const vm = (spec.$defs as Record<string, { properties: object } | undefined>).VmSpec;
-  assert.ok(vm, "the advertised spec defines no VmSpec");
+  assert.match(String(spec.description), /applb_spec_schema/);
+
+  const schema = tools.find((t) => t.name === "applb_spec_schema")!;
+  const vm = await schema.handler({ block: "VmSpec" });
   for (const key of ["size_class", "start_command", "driver", "port"]) {
-    assert.ok(key in vm.properties, `VmSpec never mentions \`${key}\``);
+    assert.ok(vm.includes(key), `applb_spec_schema VmSpec never mentions \`${key}\``);
   }
 });
 
-test("exactly one tool carries the full spec schema", () => {
-  // The budget rule, asserted rather than trusted to a comment. A tool that
-  // wants the spec points at `applb_deploy`; it does not embed a second copy.
+test("no tool embeds the nested spec tree", () => {
+  // The budget rule, asserted rather than trusted to a comment: the full tree
+  // lives behind applb_spec_schema, not in tools/list.
   const listing = toolListing(
     buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" })),
   );
-  const carriers = listing.filter((t) =>
-    JSON.stringify(t.inputSchema).includes('"$defs"') &&
-    JSON.stringify(t.inputSchema).includes("DeploymentSpec"),
-  );
-  assert.deepEqual(
-    carriers.map((t) => t.name),
-    ["applb_deploy"],
-    "more than one tool embeds the deployment spec tree",
-  );
+  const carriers = listing.filter((t) => JSON.stringify(t.inputSchema).includes('"$defs"') &&
+    JSON.stringify(t.inputSchema).includes("VmSpec"));
+  assert.deepEqual(carriers.map((t) => t.name), [], "a tool embeds the deployment spec tree");
 });

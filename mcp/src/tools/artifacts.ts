@@ -401,7 +401,9 @@ export function artifactTools(clients: Clients, config: Config): Tool[] {
           ...(pull ? { pull } : {}),
           next: pull
             ? "applb_job with the pull's id; the site serves the new files when it succeeds."
-            : "a site deployment with `artifact: {store, ref: \"" + tag + "\"}` serves this; applb_pull rolls it.",
+            : "serve it: applb_deploy a site with `artifact: " +
+              JSON.stringify({ store: config.art?.baseUrl ?? "<art store URL>", ref: tag }) +
+              "`, or call this again with `deployment` set to roll an existing site.",
         });
       },
     },

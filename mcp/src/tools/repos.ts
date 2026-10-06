@@ -32,6 +32,7 @@ import type { Tool } from "./diagnose.js";
 import { notVisible } from "./actions.js";
 import { num, bool } from "./schema.js";
 import { storeBuildCredential } from "./remote-auth.js";
+import { readStartInfo, startCommand, type StartInfo } from "./dockerfile.js";
 
 interface RepoInfo {
   name?: string;
@@ -243,15 +244,24 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
         "Redeploy after a push by calling it again, or applb_build.",
       schema: {
         repo: z.string(),
-        host: z.string().describe("hostname to route, e.g. 'my-app.us2.heyo.work'"),
+        host: z
+          .string()
+          .optional()
+          .describe("default <deployment>.<region domain>"),
         kind: z.enum(["site", "vm"]).optional().describe("default site"),
-        deployment: z.string().optional().describe("deployment id; default the repo name"),
+        deployment: z
+          .string()
+          .optional()
+          .describe("deployment id; default the repo name"),
         ref: z.string().optional().describe("branch, tag or commit; default the repo's default branch"),
         context: z.string().optional().describe("directory in the repo: the site's files, or the docker context"),
         spa: bool().optional().describe("site: serve index.html for unknown paths"),
         dockerfile: z.string().optional().describe("vm: Dockerfile path in the repo"),
         port: num().optional().describe("vm: port the app listens on; default 8080"),
-        start_command: z.string().optional().describe("vm: command that starts the app in the guest"),
+        start_command: z
+          .string()
+          .optional()
+          .describe("vm: must return (setsid nohup … &); listen on 0.0.0.0"),
         namespace: z.string().optional(),
         wait_seconds: num().optional().describe("poll the build this long; default 120"),
       },
@@ -296,19 +306,43 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           if (!(e instanceof ServiceError && notVisible(e))) throw e;
         }
 
+        // A new deployment needs a host. Without one, use app-lb's own base
+        // domain, read from its onboarding answer (the hostname it gives the
+        // namespace's starter app, minus that app's label).
+        let host = a.host as string | undefined;
+        if (!existing?.routes && !host) {
+          const ob = (await clients.applb({ path: "/onboarding", query: { namespace: ns } }).catch(() => undefined)) as
+            | { fastcar?: { url?: string | null } }
+            | undefined;
+          const starter = ob?.fastcar?.url ? new URL(ob.fastcar.url).hostname : undefined;
+          const base = starter?.split(".").slice(1).join(".");
+          if (!base) {
+            throw new Error(
+              "Pass `host`: this app-lb does not report a base domain, so no default hostname " +
+                "can be made (e.g. host: \"my-app.<region>.heyo.work\").",
+            );
+          }
+          host = `${id}.${base}`;
+          sections.push({ title: "Host", body: `no host given; using ${host}` });
+        }
+
         let spec: Record<string, unknown>;
         if (kind === "site") {
+          // No root: app-lb assigns one under its own sites dir. The caller
+          // cannot know that host's filesystem, which is the whole point. A
+          // namespace token drops an existing one too: app-lb refuses a
+          // tenant's root outside its namespace, and reassigns the right one.
+          const prev = { ...((existing?.site as Record<string, unknown> | undefined) ?? {}) };
+          if (await clients.applbNamespace().catch(() => undefined)) delete prev.root;
           const site = {
-            // No root: app-lb assigns one under its own sites dir. The caller
-            // cannot know that host's filesystem, which is the whole point.
-            ...((existing?.site as object | undefined) ?? {}),
+            ...prev,
             ...(a.spa !== undefined ? { spa: Boolean(a.spa) } : {}),
           };
           spec = {
             ...(existing ?? {}),
             id,
             namespace: ns,
-            routes: existing?.routes ?? [{ host: a.host }],
+            routes: existing?.routes ?? [{ host }],
             site,
             build,
           };
@@ -316,21 +350,66 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           delete spec.update;
         } else {
           if (a.dockerfile) build.dockerfile = a.dockerfile;
+          // A VM's rootfs drops the image's CMD, ENV and WORKDIR, so with no
+          // start_command nothing would ever run. Read them from the
+          // Dockerfile instead (and its EXPOSE for the port).
+          const prevVm = existing?.vm as Record<string, unknown> | undefined;
+          if (!a.start_command && !prevVm?.start_command) {
+            const ref = String(a.ref ?? info.default_branch ?? "main");
+            const candidates = [
+              a.dockerfile,
+              a.context ? `${String(a.context).replace(/\/$/, "")}/Dockerfile` : undefined,
+              "Dockerfile",
+            ].filter((p): p is string => typeof p === "string" && p.length > 0);
+            let derived: StartInfo | undefined;
+            for (const path of candidates) {
+              const text = (await clients
+                .remote({ path: `/${enc(ns)}/${enc(repo)}/raw/${enc(ref)}/${path.split("/").map(enc).join("/")}`, expectText: true })
+                .catch(() => undefined)) as string | undefined;
+              if (typeof text === "string" && /^\s*FROM\s/im.test(text)) {
+                derived = readStartInfo(text);
+                break;
+              }
+            }
+            const cmd = derived && startCommand(derived);
+            if (cmd) {
+              a.start_command = cmd;
+              if (a.port === undefined && !prevVm?.port && derived?.port) a.port = derived.port;
+              sections.push({
+                title: "start_command (from the Dockerfile)",
+                body:
+                  `${cmd}\nA VM does not run the image's CMD/ENTRYPOINT, so this does it. Pass start_command to override.`,
+              });
+            } else {
+              sections.push({
+                title: "No start_command",
+                body:
+                  "Nothing tells the VM what to run: no start_command was given and the Dockerfile has no " +
+                  "CMD or ENTRYPOINT. The pool will never become ready. Call again with start_command " +
+                  "(background it: setsid nohup … &).",
+              });
+            }
+          }
           spec = {
             ...(existing ?? {}),
             id,
             namespace: ns,
-            routes: existing?.routes ?? [{ host: a.host }],
+            routes: existing?.routes ?? [{ host }],
             vm: {
               driver: "firecracker",
-              port: a.port === undefined ? 8080 : Number(a.port),
+              port: 8080,
               ...((existing?.vm as object | undefined) ?? {}),
+              // Given now, it wins over the existing spec: a corrected port is
+              // the usual reason to redeploy a VM that never became ready.
+              ...(a.port !== undefined ? { port: Number(a.port) } : {}),
               ...(a.start_command ? { start_command: a.start_command } : {}),
             },
             scaling: existing?.scaling ?? { min_replicas: 1, max_replicas: 1 },
             build,
           };
           delete spec.artifact;
+          delete spec.site;
+          delete spec.update;
         }
 
         const deployed = await deployTool.handler({
