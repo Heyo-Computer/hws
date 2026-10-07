@@ -27,7 +27,7 @@ deployments, their microVM pools, and the certificates app-lb issues for their h
 ## Install
 
 ```sh
-curl -fsSL https://heyo.computer/install.sh | sh
+curl -fsSL https://heyo.computer/heyctl/install.sh | sh
 ```
 
 That is [`install.sh`](install.sh), served from the marketing site. It puts
