@@ -67,6 +67,14 @@ FROM ubuntu:24.04
 #   reaches libclang.
 # - `golang`. Only aws-lc-sys's from-scratch generation path wants it; the
 #   published crate carries the generated assembly.
+#
+# The third group is what the workflows *test* with rather than build with:
+# `python3` and the `openssl` CLI for app-lb's gateway smoke test (it mints a
+# disposable CA), and `postgresql-16` plus `libssl-dev` for
+# `regional-drain-validation.yml`. They used to be `apt-get install`ed at the
+# start of each job, which made every run depend on the Ubuntu mirrors being
+# fast that minute — a slow mirror timed the step out (exit 124) before any of
+# this repository's code ran. Baked in, a job needs no network for tools at all.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server \
         iproute2 \
@@ -79,6 +87,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         perl \
         pkg-config \
         git \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        openssl \
+        libssl-dev \
+        postgresql-16 \
     && rm -rf /var/lib/apt/lists/*
 
 # SSH access for `heyvm exec` / `heyvm sh`. Host keys are generated at build
@@ -170,6 +183,8 @@ RUN set -eu; \
     git --version; cc --version | head -1; \
     cmake --version | head -1; perl --version | sed -n 2p; \
     pkg-config --version; \
+    python3 --version; openssl version; \
+    pg_lsclusters; /usr/lib/postgresql/16/bin/postgres --version; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
     cargo init --quiet --name smoke; \
     CARGO_TARGET_DIR="$tmp/target" cargo build --quiet --release; \

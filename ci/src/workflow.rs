@@ -1667,6 +1667,34 @@ mod repo_workflow {
         }
     }
 
+    /// `app-lb.yml` is two jobs so a failed-only re-run carries a passed one
+    /// over. `release` must keep its name (the artifact tag is
+    /// `ci-app-lb-<run>-release-app-lb`) and must wait for `protocol`, and the
+    /// two must share one VM definition so they share a warm pool.
+    #[test]
+    fn app_lb_release_waits_for_the_protocol_job_and_shares_its_vm() {
+        let text = include_str!("../../.ci/workflows/app-lb.yml");
+        let wf = Workflow::parse("app-lb.yml", text).unwrap();
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        let ids: Vec<_> = plan.jobs.iter().map(|j| j.base_id.as_str()).collect();
+        assert_eq!(ids, ["protocol", "release"], "dependency order");
+        assert_eq!(plan.jobs[1].needs, ["protocol"]);
+        assert!(plan.jobs[0].needs.is_empty());
+        let job = |name: &str| &wf.jobs.iter().find(|(n, _)| n == name).expect(name).1;
+        assert_eq!(
+            format!("{:?}", job("protocol").vm),
+            format!("{:?}", job("release").vm),
+            "one warm pool"
+        );
+        let names = |name: &str| -> Vec<String> {
+            job(name).steps.iter().filter_map(|s| s.name.clone()).collect()
+        };
+        assert_eq!(names("protocol")[0], "Guard the cache disk");
+        assert!(names("protocol").iter().any(|n| n == "Verify proxy protocol compatibility"));
+        assert!(!names("release").iter().any(|n| n.contains("protocol")));
+        assert!(!text.contains("apt-get install"), "tools are baked into the image");
+    }
+
     #[test]
     fn regional_release_orders_regions_and_selects_exact_validation_artifacts() {
         let text = include_str!("../../.ci/workflows/regional-release.yml");
