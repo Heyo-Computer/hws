@@ -265,6 +265,11 @@ mod tests {
         let effect = configured.effect_permit().await.unwrap();
         assert!(configured.retire_for_configuration(configuration, configured.boot_id()).await.is_err());
         drop(effect);
+        sqlx::query("UPDATE ci_job SET executor_boot=$1 WHERE id='peer-job'")
+            .bind(configured.boot_id()).execute(&pool).await.unwrap();
+        assert!(configured.retire_for_configuration(configuration, configured.boot_id()).await.is_err());
+        sqlx::query("UPDATE ci_job SET executor_boot=$1 WHERE id='peer-job'")
+            .bind(eu.boot_id()).execute(&pool).await.unwrap();
         configured.quiesce(configuration).await.unwrap();
         assert_eq!(configured.status().await.unwrap()["safeToReplace"], false);
         sqlx::raw_sql("INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('config-step','peer-job',0,'Release','ci/deploy-controller','success');
@@ -283,6 +288,8 @@ mod tests {
         sqlx::query("UPDATE ci_controller_rollout SET phase='prepared',request=jsonb_set(request,'{deployment}','\"ci-b\"') WHERE id='config-release'")
             .execute(&pool).await.unwrap();
         configured.retire_for_configuration(configuration, configured.boot_id()).await.unwrap();
+        sqlx::query("UPDATE ci_controller_rollout SET phase='complete',request=jsonb_set(request,'{deployment}','\"ci-a\"') WHERE id='config-release'")
+            .execute(&pool).await.unwrap();
         configured.retire_for_configuration(configuration, configured.boot_id()).await.unwrap();
         assert_eq!(configured.status().await.unwrap()["safeToReplace"], true);
         assert!(configured.effect_permit().await.is_err());
