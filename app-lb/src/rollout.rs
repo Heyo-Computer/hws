@@ -113,7 +113,9 @@ pub fn validate(old: &DeploymentSpec, next: &DeploymentSpec) -> Result<(), Strin
         }
     }
     let vm = next.vm_spec();
-    if !next.artifact.as_ref().is_some_and(|a| digest(&a.artifact_ref) && a.store.starts_with("https://")) {
+    // A blank store is the global one, which `GlobalStore::new` only accepts
+    // over HTTPS (or to loopback, which is this host and attests nothing new).
+    if !next.artifact.as_ref().is_some_and(|a| digest(&a.artifact_ref) && (a.store.starts_with("https://") || a.store.trim().is_empty())) {
         return Err("pinned HTTPS rootfs artifact required; catalog name/size cannot attest preinstalled images".into());
     }
     if vm.mounts.iter().any(|m| !digest(&m.artifact_ref) || m.digest.as_deref() != Some(m.artifact_ref.as_str())) {

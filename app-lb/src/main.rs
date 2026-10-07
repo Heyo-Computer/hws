@@ -54,6 +54,7 @@ mod runtime;
 mod secrets;
 mod siem;
 mod site;
+mod store_gateway;
 mod tls;
 mod tokens;
 mod unpack;
@@ -984,6 +985,34 @@ fn main() {
     );
     image_catalog.set_jobs(&jobs);
     jobs.set_images(image_catalog.clone());
+    // One store every namespace shares, with a key only app-lb holds. A bad
+    // URL is logged and the gateway left off rather than taking the LB down:
+    // every deployment that names its own store keeps working regardless.
+    let global_store = match store_gateway::GlobalStore::from_env() {
+        Ok(Some(store)) => {
+            tracing::info!(
+                store = store.base(),
+                key = store.has_key(),
+                "global artifact store: storeless `artifact` blocks pull from it and \
+                 /namespaces/:name/artifacts fronts it"
+            );
+            if !store.has_key() {
+                tracing::warn!(
+                    "{} is unset: the global store is used anonymously, so only public \
+                     repositories pull and the artifacts API cannot write",
+                    store_gateway::KEY_ENV
+                );
+            }
+            let store = Arc::new(store);
+            jobs.set_global_store(store.clone());
+            Some(store)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(error = %e, "ignoring the global artifact store");
+            None
+        }
+    };
     autoscaler.set_images(image_catalog.clone());
 
     // ACME runs only when a contact address is configured. Its `Notify` goes to
@@ -1069,7 +1098,8 @@ fn main() {
             std::path::Path::new(&cfg.state_path).with_extension("views.json"), secrets.clone(),
             ["APP_LB_FLEET_FILE", "APP_LB_CONTROL_PLANE_FILE"].map(|key| std::env::var_os(key).map(Into::into)),
         ).unwrap_or_else(|error| panic!("invalid view configuration: {error}"))))
-        .with_images(image_catalog.clone()),
+        .with_images(image_catalog.clone())
+        .with_artifact_store(global_store),
     );
 
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {

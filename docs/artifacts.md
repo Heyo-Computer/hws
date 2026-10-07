@@ -388,6 +388,8 @@ app-lb addresses a store in one of two forms, and picks the transport from the s
 
 A local store is much faster (holes are skipped, bundles are hardlinked); a URL is what lets one store serve many hosts.
 
+**The global store.** An app-lb started with `APP_LB_ARTIFACT_STORE` (and `APP_LB_ARTIFACT_STORE_API_KEY`) has one store every namespace shares, and is the only thing that holds its key. An `artifact` block with no `store` pulls from it; app-lb sends its key for a ref under the deployment's namespace (or a digest). Customers publish through app-lb's [`/namespaces/:name/artifacts`](app-lb.md#namespace-artifacts) API with their app-lb credential (`heyctl artifact push` does this), so they never need the store's URL or `ART_API_KEY`.
+
 ### Pulling a rootfs or site (`artifact`)
 
 ```json
@@ -401,9 +403,9 @@ A local store is much faster (holes are skipped, bundles are hardlinked); a URL 
 
 | Field | Meaning |
 | --- | --- |
-| `store` | URL or absolute path, as above |
+| `store` | URL or absolute path, as above. Optional: left out, the app-lb's global store |
 | `ref` | Tag or digest. A tag is resolved at pull time; name a digest to pin (for rollbacks) |
-| `auth` | Secret reference for the API key (URL stores only) |
+| `auth` | Secret reference for the API key (URL stores only; not needed for the global store) |
 | `grow_gb` | VM images only: extend the rootfs to this size |
 | `image_name` | VM images only: base name; the image is written as `<name>-<12 hex of digest>.ext4`. Defaults to the deployment id |
 | `strip_components` | Sites only: like `tar --strip-components` when unpacking into `site.root` |

@@ -80,47 +80,44 @@ At fleet scale, expose sandboxes under one wildcard certificate
 
 ## `artifact-pull.json` — a deployment whose rootfs comes from the store
 
-The mirror image of [`artifacts.json`](#artifactsjson--managed-vm-pool-for-the-artifacts-store):
-that one *runs* a store, this one *pulls from* one. Note there is no `vm.image` —
-a pull writes it, so the spec starts without one and gains one the first time
-`heyctl pull` succeeds.
+Note there is no `vm.image`: a pull writes it, so the spec starts without one
+and gains one the first time `heyctl pull` succeeds. And there is no
+`artifact.store` either: left out, it is this app-lb's global store
+(`APP_LB_ARTIFACT_STORE`), which app-lb holds the key to.
 
 ```sh
-heyctl create secret art api_key=…          # the store's ART_API_KEY
 heyctl apply -f examples/artifact-pull.json
 heyctl pull web --wait
 ```
 
-The image it names has to exist first. Either side of the store works:
+The image it names has to exist first. Push it through app-lb with the same
+context you deploy with — no store URL, no store key:
 
 ```sh
-# On the store's host, from heyvm's own images:
-art heyvm import web-v2
-
-# Or from anywhere, over the API:
-heyctl artifact login http://127.0.0.1:8080
-heyctl artifact push --image web-v2
+heyctl artifact push --image web-v2 --tag acme/web:v2
 ```
 
 ### Notes on the spec
 
-- **`store` decides the transport.** `http://…` makes app-lb stream the blob and
-  verify its sha256 as it lands; an absolute path makes it run
-  `art heyvm materialize`, which skips the blob's holes and is far cheaper. Use
-  the path form whenever the store is on the same host as app-lb.
+- **`ref` must live under the namespace.** app-lb presents its own store key
+  only for a ref under `<namespace>/` (or a content digest). Anything else is
+  pulled anonymously, so it works only if that repository is public.
 
-- **`ref` is a tag here, so the deployment follows it.** Pushing over `web-v2`
-  and re-running `heyctl pull web` is a deploy. Put a digest here instead to
-  pin the bytes permanently, or pass one to `heyctl pull web --ref <digest>`
-  for a one-off rollback that leaves the spec alone.
+- **`ref` is a tag here, so the deployment follows it.** Pushing over
+  `acme/web:v2` and re-running `heyctl pull web` is a deploy. Put a digest here
+  instead to pin the bytes permanently, or pass one to
+  `heyctl pull web --ref <digest>` for a one-off rollback that leaves the spec
+  alone.
 
 - **`grow_gb` is sparse and is about the guest, not the store.** The image is
   built at whatever size it was built at; this extends the file so the guest has
   room to write. It costs no disk until it is used.
 
-- **`auth` is only read for the URL form.** A store root on this host is
-  protected by file permissions, and a key configured next to one is logged as
-  unused rather than silently ignored.
+- **A store of your own is still possible.** Set `store` to an `art serve` URL
+  (with `auth` naming a secret that holds its key) or to an absolute store root
+  on this host, which makes app-lb run `art heyvm materialize` and skip the
+  blob's holes. A key is never sent to a store root, and one configured next to
+  it is logged as unused rather than silently ignored.
 
 - **There is no `build` block, and there cannot be.** Both would rewrite
   `vm.image`; app-lb rejects a spec holding both.
