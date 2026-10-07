@@ -409,6 +409,8 @@ impl BuildSpec {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ArtifactSpec {
+    /// Empty (absent or `null`) means app-lb's own global artifact store.
+    #[serde(deserialize_with = "null_as_empty")]
     pub store: String,
     #[serde(rename = "ref")]
     pub artifact_ref: String,
@@ -425,6 +427,10 @@ impl ArtifactSpec {
     /// should be able to tell a repo from a store at a glance without the
     /// column changing format underneath them.
     pub fn summary(&self) -> String {
+        if self.uses_lb_store() {
+            // app-lb's own global store: the ref already carries the namespace.
+            return self.artifact_ref.clone();
+        }
         let store = self
             .store
             .trim_end_matches('/')
@@ -432,6 +438,16 @@ impl ArtifactSpec {
             .trim_start_matches("http://");
         format!("{store}/{}", self.artifact_ref)
     }
+
+    /// No `store`: the deployment pulls from app-lb's configured global store.
+    pub fn uses_lb_store(&self) -> bool {
+        self.store.trim().is_empty()
+    }
+}
+
+/// `null` and absent both read as an empty string.
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// What one guest mount's pull did.
@@ -1704,6 +1720,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(local.summary(), "/srv/artifacts/debian-hermes");
+
+        // No store: app-lb's global one, and the ref alone says where.
+        for json in [
+            r#"{"ref":"acme/web:v2"}"#,
+            r#"{"store":null,"ref":"acme/web:v2"}"#,
+            r#"{"store":"","ref":"acme/web:v2"}"#,
+        ] {
+            let a: ArtifactSpec = serde_json::from_str(json).unwrap();
+            assert!(a.uses_lb_store(), "{json}");
+            assert_eq!(a.summary(), "acme/web:v2");
+        }
     }
 
     #[test]

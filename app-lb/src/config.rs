@@ -1785,15 +1785,22 @@ pub struct ArtifactSpec {
     /// A local store is by far the faster of the two and is what a host running
     /// its own store should use; the URL form is what makes one store serve a
     /// fleet.
+    ///
+    /// Leave it out to pull from this app-lb's global store
+    /// (`APP_LB_ARTIFACT_STORE`). app-lb then authenticates with its own key
+    /// when `ref` is under the deployment's namespace (`<namespace>/…`) or is a
+    /// digest, so the spec needs no `auth` and nobody needs the store's key.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub store: String,
     /// A tag (`debian-hermes`, `marketing-live`) or a 64-hex digest. A tag is
     /// resolved at pull time, so a deployment pinned to one follows whatever the
     /// tag moves to; a digest is immutable and is what a rollback should name.
     #[serde(rename = "ref")]
     pub artifact_ref: String,
-    /// API key for a store started with `ART_API_KEY`, as a reference into the
-    /// secret store. Only meaningful for the URL form — a local store is
-    /// protected by file permissions, not a header.
+    /// API key for a store of your own, as a reference into the secret store.
+    /// Leave it out for the global store: app-lb presents its own key there
+    /// for a ref under the deployment's namespace. Only meaningful for the URL
+    /// form — a local store is protected by file permissions, not a header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<SecretRef>,
     /// Extend the materialized rootfs to this many gigabytes. Sparse, so it
@@ -1875,10 +1882,9 @@ impl ArtifactSpec {
     /// `strip_components` on a guest image is somebody expecting an unpack that
     /// never happens.
     fn validate(&self, for_site: bool) -> Result<(), SpecError> {
-        if self.store.trim().is_empty() {
-            return Err(SpecError::EmptyArtifactStore);
-        }
-        if !is_supported_store(&self.store) {
+        // Blank means the global store, resolved when a pull starts — the one
+        // place that knows whether this app-lb has one.
+        if !self.store.trim().is_empty() && !is_supported_store(&self.store) {
             return Err(SpecError::UnsupportedArtifactStore(self.store.clone()));
         }
 
@@ -4101,7 +4107,6 @@ pub enum SpecError {
     /// A field that only means something for a git checkout, set on a build
     /// whose recipe comes from a store.
     OnlyForGitBuilds(&'static str),
-    EmptyArtifactStore,
     UnsupportedArtifactStore(String),
     BadArtifactRef(String),
     ZeroGrow,
@@ -4665,7 +4670,6 @@ impl std::fmt::Display for SpecError {
                  (`Dockerfile`) and its context (`context.tar.gz`), so there is nothing left \
                  to point at"
             ),
-            Self::EmptyArtifactStore => write!(f, "artifact.store must not be empty"),
             Self::UnsupportedArtifactStore(s) => write!(
                 f,
                 "artifact.store {s:?} is not a usable store: give either an `art serve` URL \
@@ -6528,7 +6532,7 @@ mod tests {
 
         // A relative root would resolve against app-lb's working directory,
         // which nobody writing a spec can see; the rest are not stores at all.
-        for store in ["", ".artifacts", "art.example.com", "/srv/../etc", "file:///srv/art"] {
+        for store in [".artifacts", "art.example.com", "/srv/../etc", "file:///srv/art"] {
             let s = DeploymentSpec {
                 ingress: None,
                 account_id: None,
@@ -6538,6 +6542,21 @@ mod tests {
             };
             assert!(s.validate().is_err(), "{store:?} should be refused");
         }
+
+        // Left out, it is the global store — which only a pull can resolve,
+        // because only the running app-lb knows whether it has one.
+        let storeless: ArtifactSpec =
+            serde_json::from_value(serde_json::json!({"ref": "team/web:v1"})).unwrap();
+        assert_eq!(storeless.store, "");
+        assert!(!serde_json::to_value(&storeless).unwrap().as_object().unwrap().contains_key("store"));
+        let s = DeploymentSpec {
+            ingress: None,
+            account_id: None,
+            user_id: None,
+            artifact: Some(storeless),
+            ..spec()
+        };
+        assert!(s.validate().is_ok(), "{:?}", s.validate());
     }
 
     #[test]

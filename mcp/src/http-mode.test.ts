@@ -16,9 +16,9 @@ import assert from "node:assert/strict";
 
 import { loadConfig, withForwardedAuth } from "./config.js";
 import { buildTools, toolListing } from "./server.js";
-import { serveHttp, UPLOAD_TIMEOUT_MS } from "./serve-http.js";
+import { serveHttp } from "./serve-http.js";
 
-const ART = { ART_URL: "http://127.0.0.1:8080", ART_API_KEY: "k" };
+const ART = { APPLB_URL: "http://127.0.0.1:9090", APPLB_NAMESPACE: "acme" };
 const overHttp = () => buildTools(loadConfig({ ...ART, HEYO_MCP_HTTP_PORT: "9650" }));
 const overStdio = () => buildTools(loadConfig(ART));
 
@@ -66,7 +66,7 @@ test("over HTTP, a path is never read, and the error says what to send", async (
   try {
     const publish = overHttp().find((t) => t.name === "art_publish")!;
     await assert.rejects(
-      () => publish.handler({ tag: "t", path: "/etc/hostname" }),
+      () => publish.handler({ tag: "acme/t", path: "/etc/hostname" }),
       (e: Error) => {
         assert.match(e.message, /content_base64/);
         // The file-existence oracle: an HTTP caller must not be able to tell a
@@ -75,28 +75,28 @@ test("over HTTP, a path is never read, and the error says what to send", async (
         return true;
       },
     );
-    assert.equal(stub.calls.length, 0, "a refused publish still went to the store");
+    assert.equal(stub.calls.length, 0, "a refused publish still went to app-lb");
   } finally {
     stub.restore();
   }
 });
 
-test("the server lets a large upload through /art run past Node's 5-minute default", async () => {
+test("this server forwards nothing but /mcp: there is no artifact gateway", async () => {
   const server = await serveHttp(loadConfig({ ...ART, HEYO_MCP_HTTP_PORT: "1" }), 0, "127.0.0.1");
   try {
-    assert.equal(server.requestTimeout, UPLOAD_TIMEOUT_MS);
-    assert.ok(server.requestTimeout >= 60 * 60 * 1000, "a multi-GB push needs at least an hour");
-    assert.ok(server.headersTimeout <= 60_000, "slow headers are still cut off quickly");
+    const { port } = server.address() as { port: number };
+    for (const path of ["/art/blobs/" + "a".repeat(64), "/art/tags"]) {
+      assert.equal((await fetch(`http://127.0.0.1:${port}${path}`)).status, 404, path);
+    }
   } finally {
     server.close();
   }
 });
 
-// us5's shape: app-lb, the git remote and the store, but no ci and no app-obs.
+// us5's shape: app-lb and the git remote, but no ci and no app-obs.
 const HOSTED_US5 = {
   APPLB_URL: "https://admin.us5.example",
   REMOTE_URL: "https://git.us5.example",
-  ART_URL: "https://hub.example",
   HEYO_MCP_HTTP_PORT: "9650",
 };
 
@@ -127,7 +127,7 @@ test("a hosted server lists no tools for services it cannot reach; stdio keeps t
   const nothing = buildTools(loadConfig({ REMOTE_URL: "https://git.example", HEYO_MCP_HTTP_PORT: "9650" })).map(
     (t) => t.name,
   );
-  for (const n of ["obs_request", "deployment_logs", "namespace_telemetry"]) {
+  for (const n of ["obs_request", "deployment_logs", "namespace_telemetry", "art_publish", "art_list_tags"]) {
     assert.ok(!nothing.includes(n), `${n} listed with neither app-obs nor app-lb`);
   }
   assert.ok(hosted.includes("repo_create") && hosted.includes("applb_deploy"));

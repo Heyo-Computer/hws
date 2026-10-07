@@ -65,8 +65,16 @@ export const SPEC_RULES: readonly SpecRule[] = [
       "exists only where you are registers fine and 404s every request. A site's files " +
       "come from exactly one of `build` (a git repo: `repo`, `ref`, `context` and `auth` " +
       "only — the checkout's `context` is copied into the root, nothing is run), " +
-      "`artifact` (a bundle from an art store) or `update` (commands on the host). " +
+      "`artifact` (a bundle published with art_publish_files) or `update` (commands on the host). " +
       "repo_create + repo_deploy set this up from files you have.",
+  },
+  {
+    blocks: ["ArtifactSpec"],
+    rule:
+      "Give `artifact` as `{ref: \"<namespace>/name:tag\"}` (or a 64-hex digest) and leave " +
+      "`store` and `auth` out: app-lb pulls from its own artifact store and authenticates the " +
+      "pull itself for refs under the deployment's namespace. A hand-written store URL with no " +
+      "`auth` is pulled anonymously and fails with 401 for anything not public.",
   },
   {
     blocks: ["BuildSpec"],

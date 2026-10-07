@@ -1,5 +1,6 @@
 {
   "id": "web",
+  "namespace": "acme",
   "routes": [
     { "host": "web.example.com" }
   ],
@@ -14,10 +15,8 @@
     "ttl_seconds": 3600
   },
   "artifact": {
-    "store": "http://127.0.0.1:8080",
-    "ref": "web-v2",
-    "grow_gb": 4,
-    "auth": { "secret": "art", "key": "api_key" }
+    "ref": "acme/web:v2",
+    "grow_gb": 4
   },
   "scaling": {
     "min_replicas": 1,

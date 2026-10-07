@@ -598,6 +598,8 @@ Configuration is environment-only:
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
 | `APP_LB_DAEMON_URL` | *(auto: unix socket, else `http://127.0.0.1:34099`)* | heyvm daemon. Left unset, app-lb takes a unix socket when one is discoverable and alive — `HEYVM_SOCKET`, then `socket_path` in `~/.heyo/daemon.json` — and falls back to loopback TCP. Set this to name a non-default or remote daemon: an explicit address is always honoured as given, never traded for a local socket. The transport actually chosen is logged at startup |
 | `APP_LB_DAEMON_API_KEY` | `HEYO_API_KEY` | Bearer credential for an authenticated heyvm daemon; use the HeyoSecret-backed host internal API key in deployments |
+| `APP_LB_ARTIFACT_STORE` | *(unset)* | `https://` URL of the global `art serve` store. A storeless `artifact` block pulls from it, and `/namespaces/:name/artifacts` fronts it so namespaces publish with their app-lb credential. See [docs/app-lb.md](../docs/app-lb.md#namespace-artifacts) |
+| `APP_LB_ARTIFACT_STORE_API_KEY` | *(unset)* | The global store's `ART_API_KEY`, delivered from HeyoSecret. Only app-lb holds it; without it the store is read-only and anonymous |
 | `APP_LB_DISCOVERY_URL` | *(unset)* | Orchestrator base URL; setting it with the token enables service endpoint polling |
 | `APP_LB_DISCOVERY_TOKEN` | *(unset)* | Bearer credential for Orchestrator discovery; must be set together with `APP_LB_DISCOVERY_URL` |
 | `APP_LB_DISCOVERY_INTERVAL_SECS` | `5` | Positive interval between service endpoint snapshot polls |

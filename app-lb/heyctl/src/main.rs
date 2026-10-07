@@ -112,10 +112,12 @@ enum Command {
     #[command(subcommand)]
     Mounts(MountsCmd),
 
-    /// Talk to an artifact store: log in, and push guest images others can pull.
+    /// Push guest images others can pull, and list or fetch them.
     ///
-    /// A store is a separate service from app-lb, so these commands use their
-    /// own saved registries rather than the `--server` context.
+    /// Goes through app-lb's artifact gateway with the context's credential,
+    /// in the credential's namespace (tags under `<ns>/`). `--registry`,
+    /// `--registry-url` or a registry saved by `artifact login` talk to a
+    /// store directly instead — an operator's escape hatch.
     #[command(visible_aliases = ["art", "registry"])]
     Artifact {
         #[command(flatten)]
@@ -332,8 +334,10 @@ fn run(cli: &Cli) -> Result<()> {
             Ok(())
         }
 
-        // An artifact store is not an app-lb, so these build their own client
-        // from a saved registry and never touch `Ctx`.
+        // These build their own client: through app-lb's artifact gateway from
+        // the context (the default), or straight to a saved/named store. Not
+        // `Ctx::new` up front, because `login`/`registries`/`use` must work
+        // with no reachable app-lb at all.
         Command::Artifact { opts, cmd } => cmd::artifact::run(g, opts, cmd),
 
         Command::Get(args) => cmd::read::get(&Ctx::new(g)?, args),
@@ -789,6 +793,30 @@ mod tests {
             .is_err(),
             "--clear and --ref say opposite things"
         );
+    }
+
+    #[test]
+    fn the_gateway_flags_parse_anywhere_under_artifact() {
+        let cli = Cli::try_parse_from([
+            "heyctl", "artifact", "push", "/tmp/a.ext4", "--tag", "acme/web:v2", "--lb", "-n", "acme",
+        ])
+        .unwrap();
+        let Command::Artifact { opts, .. } = &cli.command else {
+            panic!("expected artifact");
+        };
+        assert!(opts.lb);
+        assert_eq!(opts.namespace.as_deref(), Some("acme"));
+
+        // And a first artifact source needs no --store.
+        let cli = Cli::try_parse_from(["heyctl", "set", "artifact", "web", "--ref", "acme/web:v2"])
+            .unwrap();
+        let Command::Set {
+            cmd: SetCmd::Artifact(args),
+        } = &cli.command
+        else {
+            panic!("expected set artifact");
+        };
+        assert!(args.store.is_none());
     }
 
     #[test]

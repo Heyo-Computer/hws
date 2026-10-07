@@ -1,34 +1,30 @@
 /**
- * The artifact store: where a deployment's bytes come from.
+ * Your namespace's artifacts, held by app-lb: where a deployment's bytes come
+ * from.
  *
- * ## Why this file exists
- *
- * Publishing a build is the most common thing anyone asks this server to do,
- * and until now it could not do it at all. `applb_*` can roll a deployment but
- * cannot get new bytes to it, so "update the `marketing` site with this build"
- * dead-ended halfway through every time — the tools covered every step except
- * the one that moves the artifact.
+ * app-lb fronts one artifact store for the whole fleet and exposes each
+ * namespace's corner of it at `/namespaces/{ns}/artifacts/…` on its admin API.
+ * Every tool here goes there, with the caller's own app-lb credential, and
+ * app-lb decides what that credential may do: reads need the view tier in the
+ * namespace, writes the admin tier over the whole namespace. This server holds
+ * no store key and enforces nothing of its own — one enforcement point.
  *
  * ## The three-step sequence, and why it is a composite tool
  *
  * A publish is three requests, not two, and the order and the digests matter:
  *
- * 1. `PUT /blobs/{sha256}` — the bytes, at their own hash.
- * 2. `PUT /manifests` — `{schema:1, kind:"generic", entries:[{name,digest,size}]}`.
+ * 1. `PUT …/blobs/{sha256}` — the bytes, at their own hash.
+ * 2. `PUT …/manifests` — `{schema:1, kind:"generic", entries:[{name,digest,size}]}`.
  *    Answers `{digest}`, which is the *manifest's* digest, not the blob's.
- * 3. `PUT /tags/{tag}` — that manifest digest, as `text/plain`.
+ * 3. `PUT …/tags/{tag}` — that manifest digest, as `text/plain`.
  *
- * **A tag names a manifest, never a blob.** The store does not check this:
- * `set_tag` writes whatever digest it is handed, so tagging a blob digest
- * succeeds, and then every reader fails to resolve it — a tag that looks
- * correct in a listing and works for nobody. It is the single easiest thing to
- * get wrong here, which is exactly why {@link publishTool} exists as one call
- * instead of three primitives with a warning in the description. A composite
- * that always uses the manifest digest cannot make the mistake.
+ * **A tag names a manifest, never a blob.** Nothing checks this: tagging a
+ * blob digest succeeds, and then every reader fails to resolve it. That is why
+ * {@link publishTool} exists as one call instead of three primitives with a
+ * warning in the description.
  *
- * The primitives are still exposed below, because the store has uses this
- * composite does not cover, and a tool set that can only do the one blessed
- * workflow is a tool set people work around.
+ * Tags live under `<namespace>/`. To deploy one, a spec names it as
+ * `artifact: {ref}` and nothing else; app-lb pulls it with its own credential.
  */
 
 import { createHash } from "node:crypto";
@@ -44,8 +40,9 @@ import { ServiceError } from "../http.js";
 import { bool, DESTRUCTIVE_PREFIX } from "./schema.js";
 
 /**
- * Inline downloads above this are refused in favour of `save_to` or the
- * gateway: a quarter MiB of base64 is already ~350k characters of context.
+ * Inline downloads above this are refused in favour of `save_to` or a direct
+ * app-lb download: a quarter MiB of base64 is already ~350k characters of
+ * context.
  */
 const INLINE_LIMIT = 256 * 1024;
 
@@ -68,7 +65,7 @@ async function resolveBlob(
   let m: Manifest | undefined;
   try {
     const asked = DIGEST.test(reference) ? bare(reference) : reference;
-    m = (await clients.art({ path: `/manifests/${encodeURIComponent(asked)}` })) as Manifest;
+    m = (await clients.artifacts({ path: `/manifests/${encodeURIComponent(asked)}` })) as Manifest;
   } catch (e) {
     if (!(e instanceof ServiceError && (e.status === 404 || e.status === 400)) || !DIGEST.test(reference)) throw e;
   }
@@ -99,7 +96,7 @@ function asText(bytes: Uint8Array): string | undefined {
 /** The manifest kind for a plain collection of files. Mirrors `KIND_GENERIC`. */
 const KIND_GENERIC = "generic";
 
-/** The schema version the store's readers accept. Mirrors `SCHEMA_VERSION`. */
+/** The manifest schema version readers accept. Mirrors `SCHEMA_VERSION`. */
 const SCHEMA_VERSION = 1;
 
 /**
@@ -163,15 +160,15 @@ async function bytesOf(args: Record<string, unknown>, http = false): Promise<Uin
 }
 
 /**
- * The store's spelling of a digest: 64 lowercase hex characters, no `sha256:`
- * prefix. The store refuses the prefixed form everywhere (`invalid digest …
+ * The canonical spelling of a digest: 64 lowercase hex characters, no
+ * `sha256:` prefix. The prefixed form is refused everywhere (`invalid digest …
  * got 71`), in blob paths and manifest entries alike.
  */
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-/** A digest as the store spells it, whichever way the caller wrote it. */
+/** A digest spelled canonically, whichever way the caller wrote it. */
 function bare(digest: string): string {
   return digest.startsWith("sha256:") ? digest.slice("sha256:".length) : digest;
 }
@@ -200,12 +197,21 @@ async function publishBytes(
   kind: string,
   annotations?: Record<string, string>,
 ): Promise<Published> {
+  // Before any bytes move: app-lb would refuse the tag at step 3, after the
+  // whole upload, and a tag outside the namespace can never be written here.
+  const ns = await clients.artifactNamespace();
+  if (!tag.startsWith(`${ns}/`) || tag.length <= ns.length + 1) {
+    throw new Error(
+      `tag ${JSON.stringify(tag)} is outside your namespace: artifact tags must start with ` +
+        `"${ns}/", e.g. "${ns}/${tag.split("/").pop() || "app"}". Nothing was uploaded.`,
+    );
+  }
   const digest = sha256(bytes);
   const entry: ManifestEntry = { name, digest, size: bytes.byteLength };
 
   // 1. The blob, at its own hash. Raw bytes: JSON-encoding the body would
   //    both corrupt it and change the digest it is being stored under.
-  await clients.art({
+  await clients.artifacts({
     method: "PUT",
     path: `/blobs/${encodeURIComponent(digest)}`,
     rawBody: bytes,
@@ -220,17 +226,17 @@ async function publishBytes(
     entries: [entry],
     ...(annotations ? { annotations } : {}),
   };
-  const created = await clients.art({ method: "PUT", path: "/manifests", body: manifest });
+  const created = await clients.artifacts({ method: "PUT", path: "/manifests", body: manifest });
   const manifestDigest =
     created && typeof created === "object" && typeof (created as { digest?: unknown }).digest === "string"
       ? (created as { digest: string }).digest
       : undefined;
   if (!manifestDigest) {
     // Refusing to continue is the whole point: the next request would
-    // otherwise be a tag pointing at *something*, and the store would
-    // accept it. Better a failed publish than a tag nothing can resolve.
+    // otherwise be a tag pointing at *something*, and it would be accepted.
+    // Better a failed publish than a tag nothing can resolve.
     throw new Error(
-      `the store accepted the manifest but did not answer with its digest ` +
+      `app-lb accepted the manifest but did not answer with its digest ` +
         `(got ${json(created, 200)}). The blob at ${digest} is stored and the tag was NOT ` +
         "moved, so nothing is pointing at a half-finished publish.",
     );
@@ -238,7 +244,7 @@ async function publishBytes(
 
   // 3. The tag, naming the MANIFEST. `text/plain`, and the manifest digest
   //    rather than the blob's — see this module's header.
-  await clients.art({
+  await clients.artifacts({
     method: "PUT",
     path: `/tags/${encodeURIComponent(tag)}`,
     rawBody: manifestDigest,
@@ -251,14 +257,14 @@ function publishTool(clients: Clients, http: boolean): Tool {
   return {
     name: "art_publish",
     description:
-      "Publish a bundle to the artifact store and point a tag at it. THE TOOL TO USE for " +
-      "'update deployment X with this build' — it is the step applb_pull cannot do, " +
-      "because app-lb rolls a deployment onto bytes that must already be in the store.\n\n" +
-      "Does the whole three-request sequence in the right order: PUT the blob at its sha256, " +
-      "PUT a manifest naming it, then point the tag at THE MANIFEST'S digest. That last part " +
-      "is the one that goes wrong by hand — a tag must name a manifest, the store does not " +
-      "check it, and a tag pointing at a blob digest is accepted and then resolves for " +
-      "nobody.\n\n" +
+      "Publish a bundle into your namespace's artifacts on app-lb and point a tag at it. THE " +
+      "TOOL TO USE for 'update deployment X with this build' — the step applb_pull cannot do, " +
+      "because app-lb rolls a deployment onto bytes that must already be published.\n\n" +
+      "The tag must start with \"<namespace>/\" (heyo_whoami shows yours), e.g. " +
+      "\"<namespace>/site:v3\". Does the whole sequence in the right order: the blob at its " +
+      "sha256, a manifest naming it, then the tag pointing at THE MANIFEST'S digest — a tag " +
+      "pointing at a blob digest is accepted and then resolves for nobody. Needs an admin-tier " +
+      "credential for the whole namespace.\n\n" +
       (http
         ? "Give the bytes as `content_base64`, which costs ~4 tokens per 3 bytes — for " +
           "bundles, not rootfs images. This server is reached over HTTP, so a file path " +
@@ -267,8 +273,9 @@ function publishTool(clients: Clients, http: boolean): Tool {
           "launched this process) or `content_base64` (right for HTTP, where the caller's " +
           "filesystem is somewhere else; costs ~4 tokens per 3 bytes, so it is for bundles, not " +
           "rootfs images).\n\n") +
-      "Idempotent: the store is content-addressed, so re-publishing identical bytes writes " +
-      "nothing new and just moves the tag. Follow with applb_pull to roll the deployment " +
+      "Idempotent: content-addressed, so re-publishing identical bytes writes nothing new and " +
+      "just moves the tag. To deploy it, a spec names it as `artifact: {ref: <tag>}` — no " +
+      "store, no auth; app-lb pulls it itself. Follow with applb_pull to roll the deployment " +
       "onto it — NOT applb_host_update, which runs a static deployment's own commands on the " +
       "app-lb host and refuses a managed one outright.",
     schema: {
@@ -279,8 +286,8 @@ function publishTool(clients: Clients, http: boolean): Tool {
         .string({ required_error: "`tag` is required — a publish nothing names is unreachable." })
         .min(1, "`tag` is required — a publish nothing names is unreachable.")
         .describe(
-          "the tag to point at this build: flat, e.g. 'marketing-site', or namespaced " +
-            "repo:tag, e.g. 'acme/site:v3' (a bare 'acme/site' means ':latest')",
+          "the tag to point at this build, under your namespace: '<namespace>/repo:tag', " +
+            "e.g. 'acme/site:v3' (a bare 'acme/site' means ':latest')",
         ),
       // Absent over HTTP rather than present-and-refused: advertising a parameter
       // that can only fail is the shape this server is organised against.
@@ -322,41 +329,52 @@ function publishTool(clients: Clients, http: boolean): Tool {
         manifest: published.manifest,
         tag_points_at: published.manifest.digest,
         // Named a tool that refuses the main case until 2026-09-10: `applb_pull`
-        // is what rolls a `vm` deployment onto bytes from a store, and the tool
+        // is what rolls a `vm` deployment onto published bytes, and the tool
         // this used to name (then `applb_start_update`) applies to static and
         // site deployments only. A composite exists to make a sequence hard to
         // get wrong, so handing back the wrong next step was the worst
         // available bug.
+        artifact: { ref: tag },
         next:
-          "applb_pull rolls a vm or site deployment onto this (applb_host_update instead for " +
-          "a static `upstreams` deployment); poll the job it returns with applb_job.",
+          "a deployment names this as `artifact: " + JSON.stringify({ ref: tag }) + "` (no store, " +
+          "no auth). applb_pull rolls a vm or site deployment onto it (applb_host_update instead " +
+          "for a static `upstreams` deployment); poll the job it returns with applb_job.",
       });
     },
   };
+}
+
+/** A repository name, from a repo, a `repo:tag` or a tag. */
+function repoOf(reference: string): string {
+  const r = reference.trim();
+  const slash = r.lastIndexOf("/");
+  const colon = r.lastIndexOf(":");
+  return colon > slash ? r.slice(0, colon) : r;
 }
 
 export function artifactTools(clients: Clients, config: Config): Tool[] {
   const enc = encodeURIComponent;
 
   const http = Boolean(config.http);
-  const gateway = config.artGatewayUrl;
   return [
     publishTool(clients, http),
 
     {
       name: "art_publish_files",
       description:
-        "Bundle files into a .tar.gz and publish it under a tag, the format a `site` " +
-        "deployment's `artifact` pull unpacks into its root. For an agent holding a built " +
-        "site with no tar at hand. " +
+        "Bundle files into a .tar.gz and publish it into your namespace's artifacts on app-lb " +
+        "under a tag (must start with \"<namespace>/\"), the format a `site` deployment's " +
+        "`artifact` pull unpacks into its root. For an agent holding a built site with no tar " +
+        "at hand. " +
         (http
           ? "Give `files` inline (utf8 or base64): this server is remote, so a local path " +
             "would name its disk, not yours. "
           : "Give `files` inline, or `directory`: a folder on this machine (e.g. `dist`), " +
             "bundled with paths relative to it. ") +
-        "Up to 64 MiB. Set `deployment` to also start applb_pull on it.",
+        "Up to 64 MiB. Serve it with `artifact: {ref: <tag>}` (no store); set `deployment` to " +
+        "also start applb_pull on an existing one.",
       schema: {
-        tag: z.string().min(1).describe("the tag to point at this bundle"),
+        tag: z.string().min(1).describe("the tag to point at this bundle: '<namespace>/name:version'"),
         files: z.array(fileSchema).optional(),
         ...(http
           ? {}
@@ -382,9 +400,14 @@ export function artifactTools(clients: Clients, config: Config): Tool[] {
               return d.entries;
             })();
         const bundle = tarGz(entries);
-        const published = await publishBytes(clients, tag, bundle, `${tag}.tar.gz`, KIND_GENERIC, a.annotations as
-          | Record<string, string>
-          | undefined);
+        const published = await publishBytes(
+          clients,
+          tag,
+          bundle,
+          `${tag.split("/").pop()!.replace(":", "-")}.tar.gz`,
+          KIND_GENERIC,
+          a.annotations as Record<string, string> | undefined,
+        );
         let pull: unknown;
         if (a.deployment) {
           pull = await clients.applb({
@@ -398,50 +421,52 @@ export function artifactTools(clients: Clients, config: Config): Tool[] {
           files: entries.length,
           bundle_bytes: bundle.byteLength,
           ...published,
+          artifact: { ref: tag },
           ...(pull ? { pull } : {}),
           next: pull
             ? "applb_job with the pull's id; the site serves the new files when it succeeds."
             : "serve it: applb_deploy a site with `artifact: " +
-              JSON.stringify({ store: config.art?.baseUrl ?? "<art store URL>", ref: tag }) +
-              "`, or call this again with `deployment` set to roll an existing site.",
+              JSON.stringify({ ref: tag }) +
+              "` (no store, no auth: app-lb pulls it itself), or call this again with " +
+              "`deployment` set to roll an existing site.",
         });
       },
     },
     {
       name: "art_fetch",
       description:
-        "Download from the store: a tag or manifest digest (its single entry, or `entry`), or " +
-        "a blob digest. The digest is verified. Text comes back as text, anything else as " +
-        "base64, up to 256 KiB inline" +
+        "Download one of your namespace's artifacts from app-lb: a tag or manifest digest (its " +
+        "single entry, or `entry`), or a blob digest. The digest is verified. Text comes back " +
+        "as text, anything else as base64, up to 256 KiB inline" +
         (http ? "" : "; `save_to` writes it to a file on this machine at any size") +
-        "." +
-        (gateway ? ` Larger blobs: GET ${gateway}/blobs/<digest> with your own bearer.` : ""),
+        ". Larger blobs: GET <app-lb>/namespaces/<namespace>/artifacts/blobs/<digest> with " +
+        "your own app-lb bearer.",
       schema: {
-        reference: z.string().describe("tag, manifest digest, or blob digest"),
+        reference: z.string().describe("tag ('<namespace>/name:tag'), manifest digest, or blob digest"),
         entry: z.string().optional().describe("entry name, for a manifest with several"),
         ...(http ? {} : { save_to: z.string().optional().describe("write the bytes to this path") }),
       },
       handler: async (a) => {
         const ref = String(a.reference).trim();
-        const target = await resolveBlob(clients, ref, a.entry as string | undefined);
         if (http && a.save_to) throw new Error("`save_to` is not accepted over HTTP.");
+        const target = await resolveBlob(clients, ref, a.entry as string | undefined);
         if (!a.save_to && target.size !== undefined && target.size > INLINE_LIMIT) {
+          const ns = await clients.artifactNamespace().catch(() => "<namespace>");
           throw new Error(
             `${ref} is ${target.size} bytes, over the ${INLINE_LIMIT >> 10} KiB inline limit. ` +
               (http
-                ? gateway
-                  ? `Download it from ${gateway}/blobs/${target.digest} with your bearer.`
-                  : "Download it from the store directly."
+                ? `Download it from app-lb: GET /namespaces/${ns}/artifacts/blobs/${target.digest} ` +
+                  "with your own app-lb bearer."
                 : "Pass `save_to`."),
           );
         }
-        const bytes = (await clients.art({
+        const bytes = (await clients.artifacts({
           path: `/blobs/${encodeURIComponent(target.digest)}`,
           expectBytes: true,
         })) as Uint8Array;
         const got = sha256(bytes);
         if (got !== target.digest) {
-          throw new Error(`the store returned bytes hashing to ${got}, not ${target.digest}; nothing was kept.`);
+          throw new Error(`app-lb returned bytes hashing to ${got}, not ${target.digest}; nothing was kept.`);
         }
         const meta = { reference: ref, digest: target.digest, name: target.name, size: bytes.byteLength };
         if (a.save_to) {
@@ -456,118 +481,68 @@ export function artifactTools(clients: Clients, config: Config): Tool[] {
       },
     },
     {
-      name: "art_list_manifests",
-      description: "Every manifest in the store: digest, kind and entries.",
-      schema: {},
-      handler: async () => json(await clients.art({ path: "/manifests" })),
-    },
-    {
       name: "art_delete_tag",
       description:
         DESTRUCTIVE_PREFIX +
-        "Remove a tag. The manifest and blobs stay until gc; a deployment whose `artifact.ref` " +
-        "names this tag can no longer pull.",
-      schema: { tag: z.string() },
+        "Remove one of your namespace's artifact tags on app-lb. The manifest and blobs stay " +
+        "until gc; a deployment whose `artifact.ref` names this tag can no longer pull.",
+      schema: { tag: z.string().describe("'<namespace>/name:tag'") },
       handler: async (a) =>
-        json(await clients.art({ method: "DELETE", path: `/tags/${encodeURIComponent(String(a.tag))}` })),
+        json(await clients.artifacts({ method: "DELETE", path: `/tags/${enc(String(a.tag))}` })),
     },
     {
       name: "art_set_public",
       description:
-        "Make a blob anonymously downloadable (`public: true`) or private again. Takes a tag, " +
-        "a single-entry manifest, or a blob digest. Anyone with the digest can then fetch it, " +
-        "so never for secrets.",
-      schema: { reference: z.string(), public: bool() },
+        "Make one of your namespace's artifact repos anonymously pullable (`public: true`) or " +
+        "private again. Takes the repo, '<namespace>/name', or a tag in it. Anyone can then " +
+        "download everything in that repo, so never for secrets. Not needed to deploy your own " +
+        "tags: app-lb pulls refs under your namespace with its own credential.",
+      schema: {
+        repo: z.string().describe("'<namespace>/name' (a '<namespace>/name:tag' is accepted)"),
+        public: bool(),
+        description: z.string().optional().describe("shown beside the repo"),
+      },
       handler: async (a) =>
         json(
-          await clients.art({
-            method: a.public ? "PUT" : "DELETE",
-            path: `/public/${encodeURIComponent(String(a.reference))}`,
+          await clients.artifacts({
+            method: "PUT",
+            path: `/repos/${enc(repoOf(String(a.repo)))}`,
+            body: {
+              public: Boolean(a.public),
+              ...(typeof a.description === "string" ? { description: a.description } : {}),
+            },
           }),
         ),
     },
-
     {
       name: "art_list_tags",
       description:
-        "Every tag in the store and the digest it points at. The listing to read before " +
-        "publishing over a tag, and after, to confirm it moved.",
+        "Every tag in your namespace's artifacts on app-lb (all under \"<namespace>/\") and the " +
+        "manifest digest each points at. The listing to read before publishing over a tag, and " +
+        "after, to confirm it moved.",
       schema: {},
-      handler: async () => json(await clients.art({ path: "/tags" })),
+      handler: async () => json(await clients.artifacts({ path: "/tags" })),
     },
     {
       name: "art_get_tag",
       description:
-        "What one tag points at. Answers a bare digest, not JSON.\n\n" +
-        "A 405 here rather than a digest means the store is running a build from before this " +
-        "route existed — the fix is to redeploy it, not to work around it. `art_list_tags` " +
-        "answers the same question on an old build.",
-      schema: { tag: z.string() },
-      handler: async (a) =>
-        json(
-          await clients.art({ path: `/tags/${enc(String(a.tag))}`, expectText: true }),
-        ),
+        "What one of your namespace's tags points at: JSON `{tag, digest}`, the digest being " +
+        "its manifest's.",
+      schema: { tag: z.string().describe("'<namespace>/name:tag'") },
+      handler: async (a) => json(await clients.artifacts({ path: `/tags/${enc(String(a.tag))}` })),
     },
     {
       name: "art_get_manifest",
       description:
-        "One manifest by digest or by tag: its kind, its entries and their digests and sizes. " +
-        "How to check what a tag actually resolves to — a tag pointing at a blob rather than " +
-        "a manifest fails HERE, which is the fastest way to confirm that diagnosis.",
-      schema: { reference: z.string().describe("a manifest digest, or a tag name") },
-      handler: async (a) =>
-        json(await clients.art({ path: `/manifests/${enc(String(a.reference))}` })),
-    },
-    {
-      name: "art_list_blobs",
-      description:
-        "Every blob with its size, its label and the tags pointing at it. Answers 'what is in " +
-        "this store' and 'what is taking up the space'.",
-      schema: {},
-      handler: async () => json(await clients.art({ path: "/blobs" })),
-    },
-    {
-      name: "art_usage",
-      description:
-        "The store's disk usage. Worth reading before a large publish: the store refuses a " +
-        "write that would take it under ART_MIN_FREE_BYTES, and that refusal at the end of " +
-        "an upload is an expensive way to find out.",
-      schema: {},
-      handler: async () => json(await clients.art({ path: "/usage" })),
-    },
-    {
-      name: "art_request",
-      description:
-        "Raw HTTP against the artifact store, for endpoints without a dedicated tool above. " +
-        "Prefer art_publish for publishing — this one can perform the three steps in the " +
-        "wrong order or tag a blob digest, both of which the store accepts and no reader can " +
-        "resolve.",
-      schema: {
-        // Upper-cased before the enum sees it, as in `actions.ts`: a lowercase
-        // `get` reached fetch and worked before arguments were parsed, and no
-        // HTTP server cares about the difference.
-        method: z
-          .preprocess(
-            (v) => (typeof v === "string" ? v.toUpperCase() : v),
-            z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
-          )
-          .default("GET"),
-        path: z.string().describe("path beginning with '/'"),
-        query: z.record(z.string()).optional(),
-        body: z.unknown().optional().describe("JSON body"),
-        text_body: z.string().optional().describe("body sent verbatim as text/plain"),
+        "One manifest from your namespace's artifacts, by digest or by tag: its kind, its " +
+        "entries and their digests and sizes. How to check what a tag actually resolves to — " +
+        "a tag pointing at a blob rather than a manifest fails HERE, which is the fastest way " +
+        "to confirm that diagnosis.",
+      schema: { reference: z.string().describe("a 64-hex manifest digest, or a '<namespace>/…' tag") },
+      handler: async (a) => {
+        const ref = String(a.reference).trim();
+        return json(await clients.artifacts({ path: `/manifests/${enc(DIGEST.test(ref) ? bare(ref) : ref)}` }));
       },
-      handler: async (a) =>
-        json(
-          await clients.art({
-            method: a.method as string,
-            path: String(a.path),
-            query: a.query as Record<string, string> | undefined,
-            body: a.body,
-            rawBody: a.text_body as string | undefined,
-            contentType: a.text_body === undefined ? undefined : "text/plain",
-          }),
-        ),
     },
   ];
 }

@@ -1,10 +1,10 @@
 /**
  * Where the services are, and what proves us to them.
  *
- * There are five: **heyo cloud** (the sandbox control plane — create a VM, run
- * a command in it, read and write its files), the three that answer operational
- * questions about a fleet — app-lb, app-obs and ci — and the artifact store,
- * which is where a deployment's bytes come from. All of them speak
+ * There are four: **heyo cloud** (the sandbox control plane — create a VM, run
+ * a command in it, read and write its files) and the three that answer
+ * operational questions about a fleet — app-lb, app-obs and ci. (A namespace's
+ * artifacts are reached through app-lb, with the same credential.) All of them speak
  * `Authorization: Bearer`, so this is mostly uniform. Three asymmetries are
  * load-bearing enough to state here rather than leave to a 401.
  *
@@ -33,10 +33,6 @@
  * submit`'s repository token in `CI_TOKEN` is enough. Without it, "did my
  * deploy work" had no answer at all for a programmatic client — a slow run and
  * a dead one were the same silence.
- *
- * **The artifact store takes two credentials at once**, one per layer. That is
- * `ART_API_KEY` plus `ART_GATE_TOKEN`, and {@link artService} explains why they
- * cannot be the same header.
  */
 
 /** Cloud's public base. The default for both cloud and the managed app-lb. */
@@ -48,15 +44,7 @@ export interface ServiceConfig {
   readonly auth?: string;
   /**
    * Headers sent with every request to this service, beside `Authorization`.
-   *
-   * One service needs this and it is the whole reason the field exists. The
-   * artifact store sits behind an app-lb gate *and* authenticates callers
-   * itself, and both layers were reached through `Authorization` — so no single
-   * request could satisfy both, and the push half of the store was unreachable
-   * from outside the network. The store also accepts `x-api-key`, which is the
-   * way out: the gate takes the `applb_…` bearer, the store takes its own key
-   * on a header the gate does not touch, and one request passes both. See
-   * {@link artService}.
+   * Never `authorization` itself, which is {@link auth}.
    */
   readonly headers?: Readonly<Record<string, string>>;
   /**
@@ -79,7 +67,6 @@ export interface Config {
   readonly applb?: ServiceConfig;
   readonly obs?: ServiceConfig;
   readonly ci?: ServiceConfig;
-  readonly art?: ServiceConfig;
   /**
    * The git remote service (`remote/`): repos on S3 that agents create and
    * push to, and that app-lb builds from. It accepts the same credentials
@@ -87,12 +74,6 @@ export interface Config {
    * `heyo_api_*` key by the Heyo auth service) plus its own `hrm_…` tokens.
    */
   readonly remote?: ServiceConfig;
-  /**
-   * Where this server's own artifact-store gateway is reachable from outside
-   * (`HEYO_MCP_PUBLIC_URL` + `/art`), for blobs too large to pass through a
-   * tool call. HTTP mode only.
-   */
-  readonly artGatewayUrl?: string;
   /** The namespace repo tools default to (`REMOTE_NAMESPACE`). */
   readonly remoteNamespace?: string;
   readonly timeoutMs: number;
@@ -106,13 +87,6 @@ export interface Config {
    * is public. Survives `withForwardedAuth`, which spreads the config it is given.
    */
   readonly http?: boolean;
-  /**
-   * What the caller of this request may do in the artifact store with this
-   * server's key, decided per request by `authorizeArtCaller` (`artscope.ts`).
-   * Unset means unconfined, which is right for stdio (the caller is the
-   * operator) and for a server without the key (the store judges the caller).
-   */
-  readonly artScope?: import("./artscope.js").ArtScope;
 }
 
 function trimUrl(raw: string): string {
@@ -201,63 +175,6 @@ export function applbService(
     ...base,
     baseUrl: `${base.baseUrl}/namespaces/${encodeURIComponent(ns)}/lb`,
     namespace: ns,
-  };
-}
-
-/**
- * Where the artifact store is, and the two credentials it takes at once.
- *
- * **This is the one service with two authenticators stacked in front of it**,
- * and the shape of that stack is why publishing a build was impossible from
- * outside the network before this existed:
- *
- * 1. app-lb's gate. `art.us2`'s spec lists `/blobs/`, `/manifests` and `/tags`
- *    in `public_paths`, which takes them out of the browser sign-in flow but
- *    not out of authorization — an unqualified entry requires an app-token with
- *    `admin` scope. That is `Authorization: Bearer applb_…`.
- * 2. the store itself, which checks `ART_API_KEY` on every write.
- *
- * Both were reached through `Authorization`, so no single request satisfied
- * both, and every attempt from outside ended in one 401 or the other. ci never
- * noticed because ci runs inside the network, where there is no gate.
- *
- * The way through is that the store accepts **`x-api-key`** as well as a
- * bearer. So the gate gets the `Authorization` header and the store gets a
- * header the gate does not read, and one request passes both layers. That is
- * what this function assembles, and it is the reason `ART_API_KEY` and the gate
- * token are separate variables rather than one: they are two credentials for
- * two different doors, and putting them in the same place is exactly the
- * mistake that made this look structural.
- *
- * `ART_GATE_TOKEN` is optional and falls back to `APPLB_TOKEN`, because in
- * practice they are the same app-token — one minted with `admin` scope covering
- * the `artifacts` deployment. Naming it separately is for the fleet where they
- * are not.
- *
- * A store reached on its own listener — inside the network, or over a tunnel —
- * has no gate in front of it and needs only `ART_API_KEY`. That works here with
- * no extra configuration: with no gate token the `Authorization` header is
- * simply absent, and the store never wanted one.
- */
-export function artService(
-  url?: string,
-  apiKey?: string,
-  gateToken?: string,
-  applbToken?: string,
-): ServiceConfig | undefined {
-  if (!url || !url.trim()) return undefined;
-  // The gate's credential, not the store's. Only an app-token means anything
-  // to an app-lb gate, so an `APPLB_BASIC` or a cloud key is deliberately not
-  // borrowed here — it would be sent, refused, and read as "the store is down".
-  const gate = gateToken?.trim() || (applbToken?.trim() ?? "");
-  const key = apiKey?.trim();
-  return {
-    baseUrl: trimUrl(url),
-    auth: gate ? authHeader(gate) : undefined,
-    // Only when there is one: an empty `x-api-key` is a header the store will
-    // compare against its configured value and refuse, which is a worse failure
-    // than sending nothing at all on a store that has no key configured.
-    headers: key ? { "x-api-key": key } : undefined,
   };
 }
 
@@ -391,20 +308,13 @@ export function withForwardedAuth(
   const needsApplb = Boolean(config.applb && (!config.applb.auth || fromApplb));
   const needsObs = gated(config.obs);
   const needsCi = gated(config.ci);
-  // The store follows the same rule for its *gate* credential and only that
-  // one. `x-api-key` is this process's own and is never traded for a caller's:
-  // it is not a scoped credential, there is nothing in it to widen or narrow,
-  // and a caller has no way to present one anyway. So the caller's app-token
-  // decides what the gate admits, and the store key stays put — which is the
-  // per-hop split `artService` exists to make.
-  const needsArt = gated(config.art);
   // The git remote resolves every kind of bearer a caller can hold (its own
   // `hrm_…`, app-lb's `applb_…`, a `heyo_api_*` key or a Heyo JWT), and each is
   // scoped. So the caller's always speaks for itself there, for the same
   // confused-deputy reason as app-lb: a narrow credential must not be traded
   // up for whatever this process was configured with.
   const needsRemote = Boolean(config.remote);
-  if (!needsCloud && !needsApplb && !needsObs && !needsCi && !needsArt && !needsRemote) {
+  if (!needsCloud && !needsApplb && !needsObs && !needsCi && !needsRemote) {
     return config;
   }
 
@@ -414,7 +324,6 @@ export function withForwardedAuth(
     applb: needsApplb ? { ...config.applb!, auth: value } : config.applb,
     obs: needsObs ? { ...config.obs!, auth: value } : config.obs,
     ci: needsCi ? { ...config.ci!, auth: value } : config.ci,
-    art: needsArt ? { ...config.art!, auth: value } : config.art,
     remote: needsRemote ? { ...config.remote!, auth: value } : config.remote,
   };
 }
@@ -433,15 +342,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ),
     obs: service(env.APP_OBS_URL, env.APP_OBS_API_TOKEN),
     ci: service(env.CI_URL, env.CI_TOKEN),
-    art: artService(env.ART_URL, env.ART_API_KEY, env.ART_GATE_TOKEN, env.APPLB_TOKEN),
     // Falls back to the app-lb token: the remote resolves `applb_…` tokens
     // through app-lb, so the credential an agent already has is enough.
     remote: service(env.REMOTE_URL, env.REMOTE_TOKEN?.trim() || env.APPLB_TOKEN || env.HEYO_API_KEY),
     remoteNamespace: env.REMOTE_NAMESPACE?.trim() || env.APPLB_NAMESPACE?.trim() || undefined,
-    artGatewayUrl:
-      Number(env.HEYO_MCP_HTTP_PORT ?? "") > 0 && env.ART_URL?.trim() && env.HEYO_MCP_PUBLIC_URL?.trim()
-        ? `${trimUrl(env.HEYO_MCP_PUBLIC_URL)}/art`
-        : undefined,
     // The same test `index.ts` uses to decide which transport to start.
     http: Number(env.HEYO_MCP_HTTP_PORT ?? "") > 0,
     // Generous, but bounded. Every call here is a diagnostic or a sandbox
@@ -455,9 +359,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 export function configured(config: Config): string[] {
   const on: string[] = [];
   if (config.cloud?.auth) {
-    // Named the way the artifact branch below names its two doors, and for the
-    // same reason: "cloud is configured" is not the useful fact when the key it
-    // is configured with is one cloud will refuse.
+    // "cloud is configured" is not the useful fact when the key it is
+    // configured with is one cloud will refuse, so that is said here.
     on.push(
       cloudUsable(config)
         ? `heyo cloud (${config.cloud.baseUrl})`
@@ -476,18 +379,6 @@ export function configured(config: Config): string[] {
   if (config.obs) on.push("app-obs");
   if (config.ci) on.push("ci");
   if (config.remote) on.push(`git remote (${config.remote.baseUrl})`);
-  if (config.art) {
-    // Both halves named, because "art is configured" is not the useful fact —
-    // which of the two doors this process can open is. A store behind a gate
-    // with no gate token answers 401 on every path, and a store with no
-    // `ART_API_KEY` answers 401 on every write while reads look fine, so the
-    // failure arrives at publish time rather than at startup.
-    const parts = [
-      config.art.headers?.["x-api-key"] ? "store key" : "NO store key (ART_API_KEY)",
-      config.art.auth ? "gate token" : "no gate token",
-    ];
-    on.push(`artifacts (${parts.join(", ")})`);
-  }
   return on;
 }
 
@@ -498,8 +389,7 @@ export function configured(config: Config): string[] {
  * every consumer treated that as "is there a *usable* credential". They are not
  * the same question, and the difference is a whole class of failure that this
  * server can detect at load and instead lets the user discover one 401 at a
- * time — the same class the artifact branch of `configured` already calls out
- * ("the failure arrives at publish time rather than at startup").
+ * time.
  *
  * `summary` is one line for a banner. `detail` explains the fix in
  * {@link NotConfigured}'s register: name the variable, then name the

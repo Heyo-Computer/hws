@@ -146,24 +146,34 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
   };
 
   /**
-   * An `artifact.store` this server does not know is almost always a guessed
-   * URL (a region with no store of its own, e.g. `art.us5` by analogy with
-   * `art.us2`); the pull then fails on every retry with nothing to fix it.
+   * The deployment's `artifact` block, as app-lb would pull it.
+   *
+   * app-lb fronts one global artifact store and pulls a ref under the
+   * deployment's namespace (or a digest) with its own credential, so the
+   * right block names only `ref`. A hand-written store URL with no `auth`
+   * bypasses that and pulls anonymously — which is a 401 for every private
+   * tag — and a guessed one fails on every retry. Warned rather than refused:
+   * a public repo on some other store is a legitimate thing to pull.
    */
-  const storeProblem = (spec: Record<string, unknown> | undefined): string | undefined => {
-    const artStore = (spec?.artifact as { store?: unknown } | undefined)?.store;
-    if (typeof artStore !== "string" || !config.art || !/^https?:\/\//.test(artStore)) return undefined;
-    const want = new URL(config.art.baseUrl).host;
-    let got = "";
-    try {
-      got = new URL(artStore).host;
-    } catch {
-      return undefined; // checkSpec reports a malformed URL
+  const artifactWarning = (spec: Record<string, unknown> | undefined, ownNs?: string): Section | undefined => {
+    const art = spec?.artifact as Record<string, unknown> | undefined;
+    if (!art || typeof art !== "object") return undefined;
+    const notes: string[] = [];
+    if (typeof art.store === "string" && art.store.trim() && !art.auth) {
+      notes.push(
+        `\`store\` is set (${art.store}) with no \`auth\`, so app-lb pulls it anonymously and a ` +
+          "private tag fails with 401. Leave `store` out: app-lb then pulls from its own artifact " +
+          "store and authenticates itself.",
+      );
     }
-    return got && got !== want
-      ? `\`artifact.store\` is ${artStore}, but this region's store is ${config.art.baseUrl}. ` +
-          "Use that URL (art_publish_files' result gives the exact block)."
-      : undefined;
+    const ref = typeof art.ref === "string" ? art.ref : "";
+    if (ownNs && ref && !/^(sha256:)?[0-9a-f]{64}$/.test(ref) && !ref.startsWith(`${ownNs}/`)) {
+      notes.push(
+        `\`ref\` ${ref} is not under "${ownNs}/", so app-lb will not authenticate the pull for it; ` +
+          `publish under "${ownNs}/<name>:<tag>" (art_publish_files) or make that repo public.`,
+      );
+    }
+    return notes.length ? { title: "Artifact access", body: notes } : undefined;
   };
 
   /**
@@ -183,8 +193,8 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
     const sections: Section[] = [];
     const ownNs = await clients.applbNamespace().catch(() => undefined);
     const problems = checkSpec(spec, { confined: Boolean(ownNs) });
-    const store = storeProblem(spec);
-    if (store) problems.push(store);
+    const artNote = artifactWarning(spec, ownNs);
+    if (artNote) sections.push(artNote);
     if (problems.length > 0) {
       return {
         sections,
@@ -445,7 +455,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "Three things it gets right that are easy to get wrong by hand. It uses PUT for an " +
         "existing deployment, which **preserves the VM pool** when the `vm` block is " +
         "unchanged, where a plain register recycles it. It picks the job by backend — " +
-        "`build` for a Dockerfile, `pull` for bytes from a store, `host_update` for a static " +
+        "`build` for a Dockerfile, `pull` for a published artifact, `host_update` for a static " +
         "deployment's own commands — where choosing wrong is refused rather than ignored. " +
         "And it tells you when a `host_suffix` route will not get its own certificate.\n\n" +
         "If your token is confined to a namespace, set `namespace` in the spec to it: " +
@@ -504,20 +514,9 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           delete site.root;
           sections.push({ title: "site.root", body: "removed: app-lb assigns a namespace's site roots itself." });
         }
-        // A tenant's tags are private and a namespace cannot hold the store's
-        // key, so a pull with no `auth` is refused unless the repo is public.
-        const art = spec?.artifact as Record<string, unknown> | undefined;
-        if (ownNs && art && !art.auth) {
-          sections.push({
-            title: "Artifact access",
-            body:
-              "app-lb pulls this tag without a credential, so it fails with 401 unless the tag's repo " +
-              "is public. To keep it private, deploy from a repo instead (heyo_guide deploy-static-site).",
-          });
-        }
+        const artNote = artifactWarning(spec, ownNs);
+        if (artNote) sections.push(artNote);
         const problems = checkSpec(spec, { confined: Boolean(ownNs) });
-        const store = storeProblem(spec);
-        if (store) problems.push(store);
         if (problems.length > 0) {
           return report(`${id || "spec"}: not sent — ${problems.length} rule(s) broken`, [
             { title: "Rules this spec breaks", body: problems },
@@ -846,7 +845,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "and does not become the deployment's default, which is what a hotfix build looks " +
         "like. It is checked against whichever source the spec names, so a git ref given to a " +
         "store-backed deployment is refused here rather than minutes into a build.\n\n" +
-        "For a deployment whose image comes from an artifact store rather than a Dockerfile, " +
+        "For a deployment whose image comes from a published artifact rather than a Dockerfile, " +
         "the tool is applb_pull. A site with a `build` block also uses this tool; " +
         "applb_host_update is only for operator `update` blocks.",
       schema: {
@@ -868,10 +867,12 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
     {
       name: "applb_pull",
       description:
-        "Materialize a `vm` or `site` deployment's bytes from an artifact store and roll it " +
-        "onto them. Returns a job; poll applb_job.\n\n" +
+        "Materialize a `vm` or `site` deployment's bytes from your namespace's artifacts and " +
+        "roll it onto them. Returns a job; poll applb_job.\n\n" +
         "**This is what rolls a managed deployment onto a new image**, and the usual next " +
-        "step after art_publish. It reads the deployment's `artifact` block; `ref` overrides " +
+        "step after art_publish. It reads the deployment's `artifact` block — `{ref: " +
+        "\"<namespace>/name:tag\"}`, with no store or auth: app-lb resolves and authenticates " +
+        "the ref itself. `ref` overrides " +
         "the reference for this pull only and does not become the default, so " +
         "`{ref: \"<digest>\"}` is what a rollback to known bytes looks like.\n\n" +
         "`force` re-fetches something already on disk. Rarely wanted — the filename IS the " +
@@ -929,7 +930,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "on this host in `update.working_dir` — `git pull && cargo build && systemctl restart` " +
         "is the shape — so what moves is the code answering on upstreams that do not change. " +
         "A deployment with no `update` block has nothing to run and is refused too.\n\n" +
-        "For a managed deployment the tool you want is applb_pull (new bytes from a store) or " +
+        "For a managed deployment the tool you want is applb_pull (new bytes from a published artifact) or " +
         "applb_build (a new image from a Dockerfile). This tool was previously named " +
         "applb_start_update and described as rolling VMs, which it has never done.",
       schema: { id: z.string() },

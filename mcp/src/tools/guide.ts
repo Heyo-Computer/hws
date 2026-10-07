@@ -49,7 +49,7 @@ export const GUIDES: readonly Guide[] = [
     ],
     pitfalls: [
       "Do NOT set `site.root`: app-lb assigns one. Do NOT use an `update` block: it runs commands on the app-lb host and is for platform operators only; a namespace credential is refused.",
-      "Prefer this repo path. Serving an artifact instead only works if app-lb can read the tag (see guide publish-files-as-artifact).",
+      "Serving a published artifact instead also works: see guide publish-files-as-artifact.",
     ],
   },
   {
@@ -86,12 +86,15 @@ export const GUIDES: readonly Guide[] = [
     title: "Publish files as an artifact (and serve them as a site)",
     keywords: ["artifact", "publish", "upload", "tarball", "bundle", "art", "tag", "files", "binary"],
     steps: [
-      "art_publish_files {tag: \"<namespace>/<name>:<version>\", files: [{path, content, encoding?: \"base64\"}]} — files are passed INLINE: this server is remote and cannot read paths on your machine. Up to 64 MiB in total.",
+      "art_publish_files {tag: \"<namespace>/<name>:<version>\", files: [{path, content, encoding?: \"base64\"}]} — files are passed INLINE: this server is remote and cannot read paths on your machine. Up to 64 MiB in total. The bundle lands in your namespace's artifacts on app-lb.",
       "A tarball you already have: art_publish {tag, content_base64}.",
-      "To serve it, app-lb must be able to read the tag. Your tags are private, and a namespace cannot hold the store's key, so a site or vm that pulls one fails with 401 — unless the repo is public (anyone can then download it). For a website that is fine; otherwise deploy from a repo (guide deploy-static-site).",
-      "Then: applb_deploy a site with `artifact: {store, ref: <tag>}` (art_publish_files' result gives the block), or for a site that already has `artifact`, pass `deployment` to art_publish_files.",
+      "Then: applb_deploy a site with `artifact: {ref: <tag>}` and nothing else in that block, or for a site that already has `artifact`, pass `deployment` to art_publish_files. app-lb pulls a tag under your namespace with its own credential, so your tags can stay private.",
     ],
-    pitfalls: ["The tag must start with \"<namespace>/\" (your token's namespace); heyo_whoami shows it."],
+    pitfalls: [
+      "The tag must start with \"<namespace>/\" (your token's namespace); heyo_whoami shows it.",
+      "In the `artifact` block, leave out `store` and `auth`: app-lb resolves the ref itself. Naming a store URL by hand gets a 401 on the pull.",
+      "Publishing needs an admin-tier credential for the whole namespace; a view-tier or deployment-scoped token can list and fetch but not publish.",
+    ],
   },
   {
     id: "redeploy",
@@ -146,7 +149,7 @@ export const GUIDES: readonly Guide[] = [
       "Check the port: the spec's `vm.port` (repo_deploy `port`) must be the one the app listens on, on 0.0.0.0.",
       "diagnose_vm_boot {id} — lints the spec, then probes INSIDE a booting VM (start_command output, listening sockets, the health path) and names the cause. Add foreground: true to capture the crash itself.",
       "The app crashes on start (a module-type mismatch, a missing dependency, an unwritable data path)? That is the repo's code: fix it with repo_write_files and repo_deploy again.",
-      "An `artifact` image: `artifact.store` must be this region's store (art_publish_files' result gives it); a guessed URL fails the pull and leaves no image.",
+      "An `artifact` image: give only `artifact: {ref: \"<namespace>/name:tag\"}` and leave out `store`; a hand-written store fails the pull and leaves no image.",
       "diagnose_deployment {id} and applb_deployment_jobs {id} — did the image build succeed? A failed build leaves the old image (or none).",
       "Then redeploy (repo_deploy again, or applb_deploy with the corrected spec).",
     ],
@@ -161,7 +164,7 @@ export const GUIDES: readonly Guide[] = [
       "• `update` block → build from a repo (repo_deploy) or pull an artifact (art_publish_files).",
       "• `site.root` → leave it out; app-lb assigns one.",
       "• `upstreams` pointing at private/loopback addresses → only public addresses; run the app as a `vm` instead.",
-      "• `build.repo` / stores that are not https:// (paths, ssh, s3://) → use the Heyo git remote (repo_create) or an https URL.",
+      "• `build.repo` that is not https:// (paths, ssh, s3://) → use the Heyo git remote (repo_create) or an https URL; for `artifact`, omit the store entirely.",
       "• `vm.image_download_url`, `gateway`, `discovery` → operator-only; use `build` or `artifact`.",
       "applb_job answering 403: pass `deployment` too — the per-job route is fleet-wide.",
     ],
@@ -218,7 +221,7 @@ const FAILURES: { pattern: RegExp; guide: string; hint: string }[] = [
   {
     pattern: /\bpull[^\n]{0,200}\b401\b|\b401\b[^\n]{0,200}\bpull/i,
     guide: "publish-files-as-artifact",
-    hint: "app-lb could not read the artifact: your tags are private and a namespace cannot hold the store key. Make the repo public, or deploy from a repo instead.",
+    hint: "app-lb could not read the artifact. Use `artifact: {ref}` with no store and a tag under \"<namespace>/\" (app-lb then authenticates the pull itself), or make that repo public with art_set_public.",
   },
   {
     pattern: /namespace credential (may not|cannot)|operators only|site\.root must be under|may only proxy to public|must be an https:\/\//i,
