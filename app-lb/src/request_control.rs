@@ -508,6 +508,10 @@ impl RequestControl {
                 AuthDecision::Answered(response) => { state.set_deployment(deployment); return RequestDecision::Respond(ResponseData::auth(response)); }
             }
         }
+        if let Some((status, location)) = matched_redirect(&deployment, host.as_deref(), &head.uri) {
+            state.set_deployment(deployment);
+            return RequestDecision::Respond(ResponseData { status, body: String::new(), content_type: "text/plain; charset=utf-8", headers: vec![(http::header::LOCATION, location)], cache_control: None });
+        }
         if let Some(expose) = deployment.spec.feed.as_ref().and_then(|f| f.expose.as_deref()) && path == expose {
             let link = match &host { Some(h) if head.secure() => format!("https://{h}{path}"), Some(h) => format!("http://{h}{path}"), None => path.clone() };
             let doc = crate::feed::rss(&deployment.spec.namespace, &link, &self.feed.recent(&deployment.spec.namespace, FEED_PAGE));
@@ -550,6 +554,23 @@ fn owned_request_info(head: &RequestHead, host: &str, path: &str, fronts_admin_a
 
 fn matched_strip_prefix(deployment: &Deployment, host: Option<&str>, path: &str) -> Option<String> {
     deployment.spec.routes.iter().filter(|r| r.strip_prefix && r.matches(host, path)).max_by_key(|r| r.specificity()).and_then(|r| r.path_prefix.clone())
+}
+
+/// The status and `Location` when the rule this request matched redirects. The
+/// rule is chosen exactly as routing chose the deployment — the most specific
+/// match — so a redirecting host on a site never shadows its serving host.
+fn matched_redirect(deployment: &Deployment, host: Option<&str>, uri: &http::Uri) -> Option<(u16, String)> {
+    let rule = deployment.spec.routes.iter().filter(|r| r.matches(host, uri.path())).max_by_key(|r| r.specificity())?;
+    let redirect = rule.redirect.as_ref()?;
+    let path = match rule.path_prefix.as_deref().filter(|_| rule.strip_prefix) {
+        Some(prefix) => match uri.path().strip_prefix(prefix).unwrap_or(uri.path()) {
+            "" => "/".to_string(),
+            s if s.starts_with('/') => s.to_string(),
+            s => format!("/{s}"),
+        },
+        None => uri.path().to_string(),
+    };
+    Some((redirect.status, redirect.location(&path, uri.query())))
 }
 
 fn strip_uri_prefix(uri: &http::Uri, prefix: &str) -> String {
@@ -765,6 +786,52 @@ mod tests {
         registry.upsert(active);
         assert!(matches!(control.decide(&head, &mut RequestState::default()).await,
             RequestDecision::Proxy));
+    }
+
+    #[tokio::test]
+    async fn a_redirecting_route_answers_while_the_sites_other_host_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new(dir.path().join("state.json")));
+        let secrets = Arc::new(crate::secrets::SecretStore::new(dir.path().join("secrets"), None));
+        let control = RequestControl::new(
+            registry.clone(), Arc::new(Metrics::new()), Arc::new(ChallengeTable::new()),
+            Arc::new(Authenticator::new(vec![7; 32], secrets.clone(), None, None)),
+            Arc::new(Guard::new(dir.path().join("guard"), true)), Arc::new(Feed::new()),
+            Arc::new(crate::auth_providers::AuthProviderStore::new(dir.path().join("providers"))),
+            secrets,
+        );
+        registry.upsert(serde_json::from_value(serde_json::json!({
+            "id":"marketing", "site":{"root":"/srv/marketing"},
+            "routes":[
+                {"host":"heyo.example"},
+                {"host":"docs.heyo.example", "redirect":{"to":"https://heyo.example/docs"}},
+                {"host":"old.heyo.example", "path_prefix":"/blog", "strip_prefix":true,
+                 "redirect":{"to":"https://blog.example/", "status":308}},
+                {"host":"gone.heyo.example", "redirect":{"to":"https://heyo.example/", "keep_path":false, "status":302}}
+            ]
+        })).unwrap());
+        let decide = |uri: &'static str| {
+            let control = &control;
+            async move {
+                let head = RequestHead { method: http::Method::GET, uri: uri.parse().unwrap(),
+                    headers: http::HeaderMap::new(), peer: None, tls_terminated: true };
+                control.decide(&head, &mut RequestState::default()).await
+            }
+        };
+        let location = |d: RequestDecision| match d {
+            RequestDecision::Respond(r) => {
+                let to = r.headers.iter().find(|(n, _)| n == http::header::LOCATION).map(|(_, v)| v.clone());
+                (r.status, to.unwrap_or_default())
+            }
+            _ => panic!("expected a redirect"),
+        };
+        assert_eq!(location(decide("https://docs.heyo.example/").await), (301, "https://heyo.example/docs/".into()));
+        assert_eq!(location(decide("https://docs.heyo.example/guide/start?x=1").await),
+            (301, "https://heyo.example/docs/guide/start?x=1".into()));
+        assert_eq!(location(decide("https://old.heyo.example/blog/post").await), (308, "https://blog.example/post".into()));
+        assert_eq!(location(decide("https://gone.heyo.example/a?b").await), (302, "https://heyo.example/".into()));
+        assert!(matches!(decide("https://heyo.example/docs/").await,
+            RequestDecision::ServeSite { path, .. } if path == "/docs/"));
     }
 
     #[test]

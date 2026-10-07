@@ -9797,6 +9797,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: path.map(str::to_string),
                 strip_prefix: false,
+                redirect: None,
             }
         }
 
@@ -9855,6 +9856,7 @@ mod tests {
                 host_suffix: Some("apps.example.com".into()),
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             };
             assert!(u.of(&suffix).is_none());
         }

@@ -75,6 +75,8 @@ pub fn parse_env(arg: &str) -> Result<EnvChange> {
 /// Either a comma-separated key list — `host=a.example.com,path=/api` — or a
 /// bare value whose shape says what it is: a leading `/` is a path prefix, a
 /// leading `*.` or `.` is a subdomain match, anything else an exact host.
+/// `redirect=URL` (with `status=` and `keep-path=false`) makes the rule answer
+/// with a redirect instead of serving.
 pub fn parse_route(arg: &str) -> Result<Value> {
     let mut rule = Map::new();
     for part in arg.split(',') {
@@ -93,11 +95,29 @@ pub fn parse_route(arg: &str) -> Result<Value> {
             bail!("route {arg:?} has an empty value for {key:?}");
         }
         let field = match key {
+            "redirect" | "redirect-to" | "to" => {
+                redirect_mut(&mut rule).insert("to".into(), Value::String(value.to_string()));
+                continue;
+            }
+            "status" | "redirect-status" => {
+                let Ok(status) = value.parse::<u16>() else {
+                    bail!("route {arg:?}: status {value:?} is not a number");
+                };
+                redirect_mut(&mut rule).insert("status".into(), Value::from(status));
+                continue;
+            }
+            "keep-path" | "keep_path" => {
+                let Ok(keep) = value.parse::<bool>() else {
+                    bail!("route {arg:?}: keep-path is true or false");
+                };
+                redirect_mut(&mut rule).insert("keep_path".into(), Value::Bool(keep));
+                continue;
+            }
             "host" => "host",
             "suffix" | "host-suffix" | "host_suffix" | "wildcard" => "host_suffix",
             "path" | "path-prefix" | "path_prefix" | "prefix" => "path_prefix",
             other => bail!(
-                "unknown route key {other:?} in {arg:?} — expected host=, suffix= or path="
+                "unknown route key {other:?} in {arg:?} — expected host=, suffix=, path= or redirect="
             ),
         };
         // `host_suffix` accepts a leading dot server-side and ignores it; strip
@@ -109,13 +129,25 @@ pub fn parse_route(arg: &str) -> Result<Value> {
         };
         rule.insert(field.to_string(), Value::String(value.to_string()));
     }
-    if rule.is_empty() {
+    if let Some(redirect) = rule.get("redirect")
+        && redirect.get("to").is_none()
+    {
+        bail!("route {arg:?} sets status= or keep-path= without redirect=URL");
+    }
+    if rule.keys().all(|k| k == "redirect") {
         bail!("route {arg:?} is empty");
     }
     if rule.contains_key("host") && rule.contains_key("host_suffix") {
         bail!("route {arg:?} sets both host= and suffix=; a rule needs one or the other");
     }
     Ok(Value::Object(rule))
+}
+
+fn redirect_mut(rule: &mut Map<String, Value>) -> &mut Map<String, Value> {
+    rule.entry("redirect")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .expect("redirect is only ever inserted as an object")
 }
 
 /// Build a route rule from the shorthand flags. All of them describe a *single*
@@ -515,6 +547,16 @@ mod tests {
     fn a_route_cannot_be_both_exact_and_wildcard() {
         assert!(parse_route("host=a.example.com,suffix=example.com").is_err());
         assert!(parse_route("nope=1").is_err());
+        assert_eq!(
+            parse_route("host=docs.example.com,redirect=https://example.com/docs").unwrap(),
+            json!({"host": "docs.example.com", "redirect": {"to": "https://example.com/docs"}})
+        );
+        assert_eq!(
+            parse_route("old.example.com,redirect=https://example.com/,status=302,keep-path=false").unwrap(),
+            json!({"host": "old.example.com", "redirect": {"to": "https://example.com/", "status": 302, "keep_path": false}})
+        );
+        assert!(parse_route("a.example.com,status=302").is_err());
+        assert!(parse_route("redirect=https://example.com/").is_err());
     }
 
     #[test]

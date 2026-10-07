@@ -1298,6 +1298,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         }]));
         let backend = Arc::new(crate::deployment::VmBackend::new(
             "sb-1".into(),
@@ -1329,6 +1330,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         }
     }
 
@@ -1338,6 +1340,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some(p.into()),
             strip_prefix: false,
+            redirect: None,
         }
     }
 
@@ -1347,6 +1350,7 @@ mod tests {
             host_suffix: Some(s.into()),
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         }
     }
 
@@ -1450,6 +1454,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
                 strip_prefix: false,
+                redirect: None,
             }],
         ));
         assert_eq!(r.route(Some("a.local"), "/").unwrap().spec.id, "site");
@@ -1485,6 +1490,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
                 strip_prefix: false,
+                redirect: None,
             }],
         ));
 
@@ -1506,6 +1512,7 @@ mod tests {
                 host_suffix: Some("example.com".into()),
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }],
         ));
         r.upsert(spec(
@@ -1515,6 +1522,7 @@ mod tests {
                 host_suffix: Some("example.com".into()),
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }],
         ));
 
@@ -1543,6 +1551,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
                 strip_prefix: false,
+                redirect: None,
             }],
             vec![suffix("apps.example.com")],
             vec![path("/legacy")],

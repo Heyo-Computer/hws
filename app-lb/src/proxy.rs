@@ -490,6 +490,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }],
             vm: Some(VmSpec {
                 correlated_creates: false,
