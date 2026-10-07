@@ -26,6 +26,11 @@ if [ ! -c /dev/null ]; then
 fi
 mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
 
+# Docker's shared-memory mount is not exported into the Firecracker rootfs.
+# PostgreSQL's POSIX shared memory needs this after /dev is mounted above.
+mkdir -p /dev/shm
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm || exit 1
+
 # Quiet the console. The firecracker serial path frames a command's output with
 # newline-delimited markers, so anything else printed there can be read as part
 # of a step's output — or worse, swallow the end marker.
