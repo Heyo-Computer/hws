@@ -31,6 +31,12 @@ FROM ubuntu:24.04
 # guest, so without git a run fails before its first step. `pkg-config` and
 # `libssl-dev` are not optional either — reqwest's default TLS is native-tls,
 # which links OpenSSL rather than bundling it.
+#
+# The third is what the workflows test against: `postgresql-16` for
+# `orchestrator.yml` and both it and `nats-server` for `ci.yml`'s claim and
+# drain check. They used to be installed at the start of each job, which made a
+# run depend on the Ubuntu mirrors and could time a step out before any of this
+# repository's code ran.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server \
         iproute2 \
@@ -46,6 +52,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libssl-dev \
         openssl \
+    && apt-get install -y --no-install-recommends \
+        postgresql-16 \
+        nats-server \
     && rm -rf /var/lib/apt/lists/*
 
 # SSH access for `heyvm exec` / `heyvm sh`. Host keys are generated at build
@@ -121,6 +130,8 @@ RUN set -eu; \
     cargo --version; rustc --version; \
     cargo clippy --version; cargo fmt --version; \
     git --version; pkg-config --modversion openssl; \
+    pg_lsclusters; /usr/lib/postgresql/16/bin/postgres --version; \
+    nats-server --version; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
     cargo init --quiet --name smoke; \
     CARGO_TARGET_DIR="$tmp/target" cargo build --quiet --release; \

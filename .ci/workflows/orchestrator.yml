@@ -33,8 +33,6 @@ jobs:
         run: |
           set -eu
           test "$(stat -c %d "$CARGO_TARGET_DIR")" != "$(stat -c %d /)"
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16
           pg_ctlcluster 16 main status >/dev/null 2>&1 || pg_ctlcluster -o '-c listen_addresses=127.0.0.1' 16 main start
           runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER ROLE postgres PASSWORD 'disposable-test-password'"
 

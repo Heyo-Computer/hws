@@ -149,23 +149,6 @@ jobs:
             rm -rf "$CARGO_TARGET_DIR"
           fi
 
-      # Fail before compiling if test dependencies cannot be installed. An
-      # incomplete apt index must not masquerade as an unavailable package.
-      - name: Prepare protocol test tools
-        run: |
-          set -eux
-          export DEBIAN_FRONTEND=noninteractive
-          export TZ=Etc/UTC
-          # The Ubuntu image defaults to HTTP; guest connections to the archive
-          # and security endpoints on port 80 fail intermittently. Use HTTPS
-          # for both, keeping certificate verification and strict index errors.
-          sed -i -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-                 -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
-                 /etc/apt/sources.list.d/ubuntu.sources
-          timeout 240 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-          timeout 240 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends python3 openssl
-        timeout-minutes: 10
-
       - name: Build
         # No `. "$HOME/.cargo/env"`: the image puts cargo on PATH through
         # /etc/profile.d, and the daemon runs every step as `sh -lc`, which is a
