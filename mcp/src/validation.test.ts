@@ -188,11 +188,12 @@ test("a valid spec is passed through untouched, unknown fields and all", async (
     const spec = {
       id: "web",
       routes: [{ host: "web.example.com" }],
-      vm: { driver: "firecracker", port: 8080 },
+      vm: { driver: "firecracker", port: 8080, start_command: "setsid nohup /srv/web </dev/null &" },
       a_field_added_after_this_client_shipped: { nested: true },
     };
     await tool("applb_create_deployment").handler({ spec });
-    assert.deepEqual(stub.calls[0]?.body, spec, "the spec did not arrive byte-for-byte");
+    const sent = stub.calls.find((c) => c.method === "POST");
+    assert.deepEqual(sent?.body, spec, "the spec did not arrive byte-for-byte");
   } finally {
     stub.restore();
   }

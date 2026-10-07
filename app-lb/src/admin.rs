@@ -1304,6 +1304,15 @@ struct PoolStatus {
     /// How long a request waits on a cold start. The dashboard reads a pending
     /// VM's age against this: past it, the boot has already cost somebody a 503.
     cold_start_timeout_secs: u64,
+    /// Failed boots in a row since the last VM that passed its health check.
+    /// `0` for a healthy pool.
+    boot_failures: u64,
+    /// Seconds until the autoscaler may create a VM again, while the
+    /// boot-failure backoff holds it off; `None` when it may create one now.
+    /// Without this, a pool held off for most of an hour reads as `pending: 0,
+    /// ready: 0` — indistinguishable from a platform that cannot boot at all.
+    /// Any spec write (even a scaling patch that changes nothing) clears it.
+    boot_backoff_secs: Option<u64>,
 }
 
 /// A VM that has been created but has not joined the pool.
@@ -1589,6 +1598,8 @@ fn pool_status_of(d: &Arc<crate::deployment::Deployment>) -> PoolStatus {
         memory_bytes,
         boot_timeout_secs: d.spec.scaling.boot_timeout_secs,
         cold_start_timeout_secs: d.spec.scaling.cold_start_timeout_secs,
+        boot_failures: d.boot_failure_streak(),
+        boot_backoff_secs: d.boot_backoff_remaining(now_secs()),
     }
 }
 

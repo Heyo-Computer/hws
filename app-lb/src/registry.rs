@@ -1350,6 +1350,26 @@ mod tests {
         }
     }
 
+    /// A spec write is how a fix ships, so it must be tried at once rather
+    /// than after whatever is left of an hour-long boot-failure backoff. That
+    /// holds because an upsert builds a fresh `Deployment`; this pins it, so
+    /// carrying runtime state across an edit cannot quietly start carrying the
+    /// embargo too.
+    #[test]
+    fn a_spec_write_clears_the_boot_failure_backoff() {
+        let r = Registry::new("unused.json");
+        let before = r.upsert(spec("web", vec![]));
+        for _ in 0..12 {
+            before.note_boot_failure(crate::deployment::now_secs());
+        }
+        assert_eq!(before.boot_failure_streak(), 12);
+        assert!(before.boot_backoff_remaining(crate::deployment::now_secs()).is_some());
+
+        let after = r.upsert(spec("web", vec![]));
+        assert_eq!(after.boot_failure_streak(), 0);
+        assert_eq!(after.boot_backoff_remaining(crate::deployment::now_secs()), None);
+    }
+
     #[test]
     fn routes_by_subdomain() {
         let r = Registry::new("unused.json");

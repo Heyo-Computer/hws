@@ -145,6 +145,95 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
     );
   };
 
+  /**
+   * An `artifact.store` this server does not know is almost always a guessed
+   * URL (a region with no store of its own, e.g. `art.us5` by analogy with
+   * `art.us2`); the pull then fails on every retry with nothing to fix it.
+   */
+  const storeProblem = (spec: Record<string, unknown> | undefined): string | undefined => {
+    const artStore = (spec?.artifact as { store?: unknown } | undefined)?.store;
+    if (typeof artStore !== "string" || !config.art || !/^https?:\/\//.test(artStore)) return undefined;
+    const want = new URL(config.art.baseUrl).host;
+    let got = "";
+    try {
+      got = new URL(artStore).host;
+    } catch {
+      return undefined; // checkSpec reports a malformed URL
+    }
+    return got && got !== want
+      ? `\`artifact.store\` is ${artStore}, but this region's store is ${config.art.baseUrl}. ` +
+          "Use that URL (art_publish_files' result gives the exact block)."
+      : undefined;
+  };
+
+  /**
+   * What applb_deploy checks before it sends a spec, for the two primitives
+   * underneath it. Without this they sent anything: us5's newsfeed-api went in
+   * with no start_command and farm-rsvp with a store that does not exist, both
+   * through applb_update/create_deployment, and both then failed every boot or
+   * pull with nothing saying why. Refuses what applb_deploy refuses; keeps,
+   * derives or demands a start_command the same way; and returns the lint's
+   * warnings to show beside app-lb's answer.
+   */
+  const preflightRaw = async (
+    spec: Record<string, unknown>,
+    id: string,
+    acknowledged: boolean,
+  ): Promise<{ refusal?: string; sections: Section[] }> => {
+    const sections: Section[] = [];
+    const ownNs = await clients.applbNamespace().catch(() => undefined);
+    const problems = checkSpec(spec, { confined: Boolean(ownNs) });
+    const store = storeProblem(spec);
+    if (store) problems.push(store);
+    if (problems.length > 0) {
+      return {
+        sections,
+        refusal: report(`${id || "spec"}: not sent — ${problems.length} rule(s) broken`, [
+          { title: "Rules this spec breaks", body: problems },
+          {
+            title: "Next",
+            body:
+              "Fix these and call again. applb_spec_schema returns the full schema for any block; " +
+              "applb_deploy runs these checks too and fills in what it can.",
+          },
+        ]),
+      };
+    }
+    let previousVm: unknown;
+    if (id) {
+      try {
+        const current = (await clients.applb({ path: `/deployments/${enc(id)}` })) as {
+          spec?: { vm?: unknown };
+          vm?: unknown;
+        };
+        previousVm = current?.spec?.vm ?? current?.vm;
+      } catch (e) {
+        if (!(e instanceof ServiceError && notVisible(e))) throw e;
+      }
+    }
+    const startProblem = await settleStartCommand(spec, previousVm, acknowledged, sections);
+    if (startProblem) {
+      return {
+        sections,
+        refusal: report(`${id || "spec"}: not sent — no start_command`, [
+          ...sections,
+          { title: "Why", body: startProblem },
+        ]),
+      };
+    }
+    for (const f of lintVmSpec(spec.vm as Record<string, unknown> | undefined)) {
+      if (f.title === "No start_command") continue;
+      sections.push({ title: f.title, body: `${f.detail} diagnose_vm_boot {id} probes the guest.` });
+    }
+    return { sections };
+  };
+
+  /** app-lb's answer, alone when there is nothing to add to it. */
+  const withNotes = (id: string, verb: string, sections: Section[], answer: unknown): string =>
+    sections.length === 0
+      ? json(answer)
+      : report(`${id}: ${verb}`, [...sections, { title: "app-lb's answer", body: answer }]);
+
   return [
     // ---- app-lb reads -------------------------------------------------
     {
@@ -275,16 +364,29 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "firecracker driver. **applb_spec_schema returns every such rule**, plus the full " +
         "detail of any block this tool summarises. TLS for an exact `host` route is " +
         "automatic and needs no second call; a `host_suffix` route never gets its own " +
-        "certificate.",
+        "certificate. Runs applb_deploy's checks first (rules, store, start_command).",
       // Deliberately permissive, and deliberately *not* a transcription of the
       // schema above. app-lb accepts unknown fields — `DeploymentSpec` has no
       // `deny_unknown_fields`, and heyctl edits specs as untyped JSON so a field
       // it has never heard of survives the trip. A client that validated
       // strictly here would reject specs the server would happily take, which is
       // a worse failure than an under-described one.
-      schema: { spec: z.record(z.unknown()).describe("the deployment spec; see inputSchema") },
-      handler: async (a) =>
-        json(await clients.applb({ method: "POST", path: "/deployments", body: a.spec })),
+      schema: {
+        spec: z.record(z.unknown()).describe("the deployment spec; see inputSchema"),
+        no_start_command: bool()
+          .optional()
+          .describe(
+            "send a VM with no start_command on purpose (image starts via /init.sh)",
+          ),
+      },
+      handler: async (a) => {
+        const spec = a.spec as Record<string, unknown>;
+        const id = String(spec?.id ?? "");
+        const pre = await preflightRaw(spec, id, a.no_start_command === true);
+        if (pre.refusal) return pre.refusal;
+        const answer = await clients.applb({ method: "POST", path: "/deployments", body: spec });
+        return withNotes(id, "registered (POST)", pre.sections, answer);
+      },
     },
     {
       name: "applb_spec_schema",
@@ -414,25 +516,8 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           });
         }
         const problems = checkSpec(spec, { confined: Boolean(ownNs) });
-        // An artifact store this server does not know is almost always a
-        // guessed URL (a region with no store of its own); the pull fails
-        // with nothing to retry.
-        const artStore = (spec?.artifact as { store?: unknown } | undefined)?.store;
-        if (typeof artStore === "string" && config.art && /^https?:\/\//.test(artStore)) {
-          const want = new URL(config.art.baseUrl).host;
-          let got = "";
-          try {
-            got = new URL(artStore).host;
-          } catch {
-            /* checkSpec reports a malformed URL */
-          }
-          if (got && got !== want) {
-            problems.push(
-              `\`artifact.store\` is ${artStore}, but this region's store is ${config.art.baseUrl}. ` +
-                "Use that URL (art_publish_files' result gives the exact block).",
-            );
-          }
-        }
+        const store = storeProblem(spec);
+        if (store) problems.push(store);
         if (problems.length > 0) {
           return report(`${id || "spec"}: not sent — ${problems.length} rule(s) broken`, [
             { title: "Rules this spec breaks", body: problems },
@@ -690,7 +775,8 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         "for an edit this is the tool and that one is not.\n\n" +
         "The whole spec is replaced, not merged — read applb_get_deployment first and send it " +
         "back changed. The path id wins, so the body cannot retarget another deployment. The " +
-        "spec's schema is on applb_deploy; applb_spec_schema has it in full.",
+        "spec's schema is on applb_deploy; applb_spec_schema has it in full. Runs " +
+        "applb_deploy's checks first; an omitted start_command keeps the current one.",
       schema: {
         id: z.string(),
         spec: z
@@ -699,15 +785,20 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
             "the complete replacement spec — see applb_deploy's schema, or " +
               "applb_spec_schema for any block in full",
           ),
+        no_start_command: bool()
+          .optional()
+          .describe(
+            "send a VM with no start_command on purpose (image starts via /init.sh)",
+          ),
       },
-      handler: async (a) =>
-        json(
-          await clients.applb({
-            method: "PUT",
-            path: `/deployments/${enc(String(a.id))}`,
-            body: a.spec,
-          }),
-        ),
+      handler: async (a) => {
+        const id = String(a.id);
+        const spec = a.spec as Record<string, unknown>;
+        const pre = await preflightRaw(spec, id, a.no_start_command === true);
+        if (pre.refusal) return pre.refusal;
+        const answer = await clients.applb({ method: "PUT", path: `/deployments/${enc(id)}`, body: spec });
+        return withNotes(id, "edited (PUT)", pre.sections, answer);
+      },
     },
     {
       name: "applb_scale",

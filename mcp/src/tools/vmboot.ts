@@ -146,16 +146,88 @@ export function foregroundScript(parts: StartCommandParts, secs = 15): string {
 }
 
 /** What an exec refusal means for a pool that cannot hold a VM. */
-export function noVmFinding(error: string): Finding | undefined {
-  if (!/has no VM|no running VM|none became available/.test(error)) return undefined;
+/** The pool fields app-lb reports about its boot-failure backoff. */
+export interface BackoffState {
+  boot_failures?: number;
+  boot_backoff_secs?: number | null;
+}
+
+function minutes(secs: number): string {
+  return secs < 90 ? `${Math.round(secs)}s` : `${Math.round(secs / 60)} min`;
+}
+
+/**
+ * The autoscaler holding off after failed boots. app-lb doubles the wait from
+ * 30 seconds to an hour; any spec write builds a fresh deployment and clears
+ * it. Without saying so, a held-off pool reads as `pending: 0, ready: 0` with
+ * nothing booting — which an agent on us5 reported as a platform-wide outage.
+ */
+export function backoffFinding(pool: BackoffState | undefined): Finding | undefined {
+  const wait = pool?.boot_backoff_secs;
+  if (typeof wait !== "number" || wait <= 0) return undefined;
+  return {
+    severity: "warning",
+    title: "Boot backoff — no VM is booting by design",
+    detail:
+      `${pool?.boot_failures ?? "Several"} boots in a row failed their health check, so app-lb ` +
+      `waits ${minutes(wait)} before creating the next VM. Nothing is wrong with the platform ` +
+      "because of this. Any spec write clears it at once — applb_scale with the current values " +
+      "is enough — and the write that ships your fix does too.",
+  };
+}
+
+export function noVmFinding(error: string, pool?: BackoffState): Finding | undefined {
+  if (!/has no VM|no running VM|none became available|cold-start|cold start/.test(error)) return undefined;
+  const held = typeof pool?.boot_backoff_secs === "number" && pool.boot_backoff_secs > 0;
   return {
     severity: "warning",
     title: "No VM to probe right now",
     detail:
-      "A pool whose VMs keep failing their health check backs off creating new ones (up to " +
-      "~16 minutes) so it does not churn. Call this again after the backoff, or redeploy " +
-      "(repo_deploy / applb_deploy), which starts a fresh VM at once. The spec lint above " +
-      "still applies.",
+      (held
+        ? `The pool is in its boot-failure backoff (next VM in ${minutes(pool!.boot_backoff_secs!)}). `
+        : "A pool whose VMs keep failing their health check backs off creating new ones, " +
+          "doubling from 30 seconds up to an hour, so there may be none to probe. ") +
+      "To get one now, make any spec write — applb_scale with the current values clears the " +
+      "backoff and boots a VM at once — then call this again while it boots. The spec lint " +
+      "above still applies.",
+  };
+}
+
+/**
+ * VM deployments that have a VM in their pool — every pool VM passed its
+ * health check to get there — out of whatever `/metrics` returned.
+ *
+ * The caller passes the `/metrics` it read with its own credential, which
+ * app-lb narrows to the deployments that credential may view (and the
+ * managed door pins to its namespace), so this never names a deployment the
+ * caller could not already see. It deliberately takes no wider view.
+ */
+export function healthyPeers(metrics: unknown, exceptId: string): string[] {
+  const deps = (metrics as { deployments?: Array<Record<string, unknown>> } | undefined)?.deployments ?? [];
+  return deps
+    .filter((d) => d.id !== exceptId && d.kind === "vm")
+    .filter((d) => {
+      const pool = d.pool as { ready?: number; draining?: number } | undefined;
+      return (pool?.ready ?? 0) - (pool?.draining ?? 0) > 0;
+    })
+    .map((d) => String(d.id));
+}
+
+/**
+ * Other VMs booting fine is the fastest way to rule out the platform: the
+ * same host, daemon and network boot them, so a failure that spares them is
+ * in this deployment's image, spec or code.
+ */
+export function peerFinding(peers: string[]): Finding | undefined {
+  if (peers.length === 0) return undefined;
+  const shown = peers.slice(0, 5).join(", ") + (peers.length > 5 ? `, +${peers.length - 5} more` : "");
+  return {
+    severity: "warning",
+    title: "Other VM deployments are healthy",
+    detail:
+      `${shown} ${peers.length === 1 ? "has" : "have"} VMs that passed their health check, among ` +
+      "the deployments you can see. The platform boots VMs; look at this deployment's " +
+      "start_command, image and app before concluding otherwise.",
   };
 }
 

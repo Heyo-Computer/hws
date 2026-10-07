@@ -1259,6 +1259,12 @@ pub struct PoolStatus {
     /// How long a request waits on a cold start. A pending VM older than this
     /// has already cost somebody a 503.
     pub cold_start_timeout_secs: u64,
+    /// Failed boots in a row since the last VM that passed its health check.
+    pub boot_failures: u64,
+    /// Seconds until the autoscaler may create a VM again while the
+    /// boot-failure backoff holds it off; `None` when it may create one now.
+    /// Any spec write clears it.
+    pub boot_backoff_secs: Option<u64>,
     #[serde(flatten)]
     pub extra: Extra,
 }
