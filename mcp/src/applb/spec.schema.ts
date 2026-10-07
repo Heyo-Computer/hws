@@ -202,7 +202,7 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "type": "object",
       "properties": {
         "auth": {
-          "description": "API key for a store started with `ART_API_KEY`, as a reference into the secret store.",
+          "description": "API key for a store of your own, as a reference into the secret store.",
           "anyOf": [
             {
               "$ref": "#/$defs/SecretRef"
@@ -247,7 +247,6 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
         }
       },
       "required": [
-        "store",
         "ref"
       ]
     },
@@ -884,7 +883,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       "type": "object",
       "properties": {
         "auth": {
-          "description": "API key for a store started with `ART_API_KEY`, as a reference into the\nsecret store. Only meaningful for the URL form — a local store is\nprotected by file permissions, not a header.",
+          "description": "API key for a store of your own, as a reference into the secret store.\nLeave it out for the global store: app-lb presents its own key there\nfor a ref under the deployment's namespace. Only meaningful for the URL\nform — a local store is protected by file permissions, not a header.",
           "anyOf": [
             {
               "$ref": "#/$defs/SecretRef"
@@ -915,7 +914,7 @@ export const DEPLOYMENT_SPEC_FULL = {
           "type": "string"
         },
         "store": {
-          "description": "The store to pull from, in one of two forms:\n\n* `http://host:port` — a remote `art serve`. app-lb resolves and streams\n  the blob itself, verifying the digest as the bytes land.\n* `/abs/path` — a store root (`ART_ROOT`) on this host. app-lb shells out\n  to the `art` CLI: `art heyvm materialize` for a rootfs, which skips the\n  blob's holes instead of copying its zeros, and `art get` for a site\n  bundle, which hardlinks it and copies nothing at all.\n\nA local store is by far the faster of the two and is what a host running\nits own store should use; the URL form is what makes one store serve a\nfleet.",
+          "description": "The store to pull from, in one of two forms:\n\n* `http://host:port` — a remote `art serve`. app-lb resolves and streams\n  the blob itself, verifying the digest as the bytes land.\n* `/abs/path` — a store root (`ART_ROOT`) on this host. app-lb shells out\n  to the `art` CLI: `art heyvm materialize` for a rootfs, which skips the\n  blob's holes instead of copying its zeros, and `art get` for a site\n  bundle, which hardlinks it and copies nothing at all.\n\nA local store is by far the faster of the two and is what a host running\nits own store should use; the URL form is what makes one store serve a\nfleet.\n\nLeave it out to pull from this app-lb's global store\n(`APP_LB_ARTIFACT_STORE`). app-lb then authenticates with its own key\nwhen `ref` is under the deployment's namespace (`<namespace>/…`) or is a\ndigest, so the spec needs no `auth` and nobody needs the store's key.",
           "type": "string"
         },
         "strip_components": {
@@ -929,7 +928,6 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       },
       "required": [
-        "store",
         "ref"
       ]
     },

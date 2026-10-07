@@ -53,7 +53,7 @@ export interface RequestOptions {
   body?: unknown;
   /**
    * Sent verbatim instead of `body`, for an API that takes bytes rather than
-   * JSON. The artifact store's `PUT /blobs/{digest}` is the case: the body is
+   * JSON. app-lb's `PUT …/artifacts/blobs/{digest}` is the case: the body is
    * the blob, and JSON-encoding it would both corrupt it and change its digest
    * — which is its name.
    */
@@ -63,14 +63,13 @@ export interface RequestOptions {
   /**
    * Return the response body as text rather than parsing it.
    *
-   * For the endpoints whose success answer is not JSON and must not be guessed
-   * at — `PUT /manifests` answers JSON, but `GET /manifests/{ref}` answers the
-   * manifest document and `GET /tags/{name}` answers a bare digest.
+   * For an endpoint whose success answer is not JSON and must not be guessed
+   * at.
    */
   expectText?: boolean;
   /**
-   * Return the response body as raw bytes. For downloads from the artifact
-   * store, whose blobs are arbitrary binary and would be corrupted by a text
+   * Return the response body as raw bytes. For artifact blob downloads,
+   * which are arbitrary binary and would be corrupted by a text
    * decode.
    */
   expectBytes?: boolean;

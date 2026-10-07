@@ -7,7 +7,6 @@
  */
 
 import { bind, request, ServiceError, type Requester, type ServiceSource } from "../http.js";
-import { checkArtRequest, filterTags, type ArtScope } from "../artscope.js";
 import { cloudUsable, credentialFaults, type Config, type ServiceConfig } from "../config.js";
 
 export interface Clients {
@@ -16,8 +15,19 @@ export interface Clients {
   applb: Requester;
   obs: Requester;
   ci: Requester;
-  /** The artifact store — the bytes a `site` or `vm` deployment runs from. */
-  art: Requester;
+  /**
+   * The caller's namespace's artifacts, through app-lb: paths here are
+   * relative to `/namespaces/{ns}/artifacts` on the app-lb admin API, and the
+   * caller's own app-lb credential is what app-lb checks. The bytes a `site`
+   * or `vm` deployment runs from.
+   */
+  artifacts: Requester;
+  /**
+   * The namespace {@link artifacts} addresses: the managed namespace when
+   * there is one, else the namespace app-lb's `GET /whoami` puts the
+   * credential in. Throws when neither names one.
+   */
+  artifactNamespace: () => Promise<string>;
   /** The git remote — repos agents push to and app-lb builds from. */
   remote: Requester;
   /**
@@ -41,29 +51,74 @@ export function makeClients(config: Config): Clients {
   // one wrong variable look like a total outage.
   const cloud = cloudUsable(config) ? config.cloud : undefined;
   const applb = applbSource(config);
+  const applbRequest = bind("app-lb", applb, "APPLB_URL or APPLB_TOKEN", config);
+  const applbNamespace = async () =>
+    typeof applb === "function" ? (await applb()).namespace : applb?.namespace;
+  const artifactNamespace = artifactNamespaceOf(applbRequest, applbNamespace);
   return {
     cloud: bind(CLOUD_SERVICE, cloud, "HEYO_API_KEY", config),
-    applb: bind("app-lb", applb, "APPLB_URL or APPLB_TOKEN", config),
+    applb: applbRequest,
     obs: bind("app-obs", config.obs, "APP_OBS_URL", config),
     ci: bind("ci", config.ci, "CI_URL", config),
-    art: confineArt(bind("artifacts", config.art, "ART_URL (plus ART_API_KEY)", config), config.artScope),
+    artifacts: artifactsRequester(applbRequest, artifactNamespace),
+    artifactNamespace,
     remote: bind("git remote", config.remote, "REMOTE_URL", config),
-    applbNamespace: async () =>
-      typeof applb === "function" ? (await applb()).namespace : applb?.namespace,
+    applbNamespace,
   };
 }
 
 /**
- * The store requester held to the caller's scope. Every art tool, `art_request`
- * included, goes through here, so this is the one place the rule is enforced.
+ * Which namespace's artifacts the caller means. Memoized on success only: a
+ * namespace that does not resolve now may after the operator names one.
  */
-function confineArt(art: Requester, scope: ArtScope | undefined): Requester {
-  if (!scope) return art;
+function artifactNamespaceOf(
+  applb: Requester,
+  applbNamespace: () => Promise<string | undefined>,
+): () => Promise<string> {
+  let pending: Promise<string> | undefined;
+  return () => {
+    pending ??= (async () => {
+      const managed = await applbNamespace();
+      if (managed) return managed;
+      const who = (await applb({ path: "/whoami" })) as { namespace?: unknown } | null;
+      if (typeof who?.namespace === "string" && who.namespace.trim()) return who.namespace.trim();
+      throw new Error(
+        "artifacts are per namespace, and this credential names none (app-lb's /whoami " +
+          "reports no namespace). Set APPLB_NAMESPACE, or use a namespace's app-lb token.",
+      );
+    })().catch((e) => {
+      pending = undefined;
+      throw e;
+    });
+    return pending;
+  };
+}
+
+/**
+ * app-lb's namespace-scoped artifact API. app-lb enforces who may read and
+ * write; this only builds the path and turns the two statuses whose meaning
+ * is not obvious from app-lb's body into a sentence.
+ */
+function artifactsRequester(applb: Requester, namespace: () => Promise<string>): Requester {
   return async (opts) => {
-    const verdict = checkArtRequest(scope, opts.method ?? "GET", opts.path);
-    if (verdict.refused) throw new Error(verdict.refused);
-    const out = await art(opts);
-    return verdict.filterTagsTo === undefined ? out : filterTags(out, verdict.filterTagsTo);
+    const ns = await namespace();
+    try {
+      return await applb({ ...opts, path: `/namespaces/${encodeURIComponent(ns)}/artifacts${opts.path}` });
+    } catch (e) {
+      if (!(e instanceof ServiceError)) throw e;
+      const extra =
+        e.status === 503
+          ? "This app-lb has no artifact store configured, so there are no artifacts to reach here."
+          : e.status === 403
+            ? `app-lb refused this credential for namespace ${ns}'s artifacts: tags must start with ` +
+              `"${ns}/", reads need the view tier there and writes the admin tier over the whole ` +
+              "namespace (not a token narrowed to particular deployments). heyo_whoami shows yours."
+            : e.status === 502
+              ? "app-lb could not reach its artifact store; retry later."
+              : undefined;
+      if (!extra) throw e;
+      throw new ServiceError(e.service, e.status, e.path, e.body, extra);
+    }
   };
 }
 

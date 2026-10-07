@@ -28,8 +28,6 @@ const CONFIG = {
   APP_OBS_API_TOKEN: "t",
   CI_URL: "http://127.0.0.1:9555",
   CI_TOKEN: "t",
-  ART_URL: "http://127.0.0.1:8080",
-  ART_API_KEY: "k",
   REMOTE_URL: "http://127.0.0.1:9700",
 };
 

@@ -140,20 +140,19 @@ test("applb_create_deployment derives start_command, and warns about a redirect"
   assert.match(warned.out, /start_command hides the app's output/);
 });
 
-test("applb_create_deployment refuses an artifact store that is not this region's — the farm-rsvp shape", async () => {
+test("applb_create_deployment warns about a hand-written artifact store — the farm-rsvp shape", async () => {
   const config = loadConfig({
     APPLB_URL: "http://127.0.0.1:9090",
     APPLB_TOKEN: "applb_x",
     APPLB_NAMESPACE: "us5",
-    ART_URL: "https://hub.example.com",
-    ART_API_KEY: "k",
   });
   const tool = buildTools(config).find((t) => t.name === "applb_create_deployment")!;
   const original = globalThis.fetch;
   const sent: string[] = [];
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     sent.push(`${init?.method ?? "GET"} ${String(input)}`);
-    return new Response("{}", { status: 404, headers: { "content-type": "application/json" } });
+    const missing = (init?.method ?? "GET") === "GET";
+    return new Response("{}", { status: missing ? 404 : 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   try {
     const out = await tool.handler({
@@ -165,8 +164,11 @@ test("applb_create_deployment refuses an artifact store that is not this region'
         artifact: { store: "https://art.us5.example.com", ref: "us5/farm-rsvp" },
       },
     });
-    assert.match(out, /this region's store is https:\/\/hub\.example\.com/);
-    assert.ok(!sent.some((r) => r.startsWith("POST") || r.startsWith("PUT")), "an unknown store was still registered");
+    assert.match(out, /Artifact access/);
+    assert.match(out, /no `auth`, so app-lb pulls it anonymously and a private tag fails with 401/);
+    assert.match(out, /Leave `store` out/);
+    // Warned, not refused: a public repo on another store is legitimate.
+    assert.ok(sent.some((r) => r.startsWith("POST") || r.startsWith("PUT")), "the spec was not sent");
   } finally {
     globalThis.fetch = original;
   }

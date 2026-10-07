@@ -182,7 +182,7 @@ test("applb_scale advertises the policy fields instead of an untyped body", () =
 
 test("art_publish's next step names a tool that will accept it", async () => {
   const tools = buildTools(
-    loadConfig({ APPLB_URL: "http://127.0.0.1:9090", ART_URL: "http://127.0.0.1:8080" }),
+    loadConfig({ APPLB_URL: "http://127.0.0.1:9090" }),
   );
   const publish = tools.find((t) => t.name === "art_publish");
   assert.ok(publish);

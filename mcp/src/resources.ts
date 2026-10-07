@@ -58,8 +58,10 @@ Two backends is an error, and so is none.
 
 ## 2. For a \`vm\`, decide where the image comes from
 
-- **\`build\`** — a Dockerfile, from a git repo or a store manifest. app-lb builds it.
-- **\`artifact\`** — a rootfs already in an artifact store. app-lb pulls it.
+- **\`build\`** — a Dockerfile, from a git repo. app-lb builds it.
+- **\`artifact\`** — a rootfs already published to your namespace's artifacts
+  (\`art_publish\`). Give only \`{ref: "<namespace>/name:tag"}\`; app-lb pulls it
+  and authenticates the pull itself.
 - **neither** — \`vm.image\` names something the daemon already has.
 
 \`build\` and \`artifact\` are mutually exclusive: both rewrite \`vm.image\`, and a
@@ -92,8 +94,9 @@ than ignored:
 All four answer as soon as the work is *scheduled*. Poll \`applb_job\` with the id
 they return.
 
-Publishing new bytes to a store first is \`art_publish\`, which does the
-three-request sequence in the order that works. Follow it with \`applb_pull\`.
+Publishing new bytes into your namespace's artifacts first is \`art_publish\`,
+which does the three-request sequence in the order that works. Follow it with
+\`applb_pull\`.
 
 ## 5. Change how much of it runs
 
@@ -212,7 +215,7 @@ function deployPlan(kind: string, id: string, host?: string): string {
       `   - \`id\`, \`routes: [${route}]\``,
       "   - `vm`: `driver` (`firecracker`), `port`, and usually `start_command` and `size_class`;",
       "     `start_command` must background itself (`setsid nohup … &`) and the app must listen on 0.0.0.0",
-      "   - `build` (a Dockerfile) **or** `artifact` (bytes already in a store) — never both",
+      "   - `build` (a Dockerfile) **or** `artifact: {ref}` (bytes you published with `art_publish`) — never both",
       "   - `scaling` if the defaults (max 5, scale to zero after 300s) are wrong",
       "2. `applb_deploy` with that spec. It checks the cross-field rules, registers, and",
       "   starts the right job for whichever image source you chose.",
@@ -226,7 +229,7 @@ function deployPlan(kind: string, id: string, host?: string): string {
       ...shared,
       "1. Files you have (built): `repo_create` → `repo_write_files` → `repo_deploy` with",
       "   `kind: \"site\"` and a host. Or `art_publish_files`, then `applb_deploy` a `site`",
-      "   with `artifact: {store, ref}`. Leave `site.root` out (app-lb assigns it) and never",
+      "   with `artifact: {ref}` (no store). Leave `site.root` out (app-lb assigns it) and never",
       "   use `update` (operator-only). `spa: true` serves `index.html` for unknown paths.",
       "2. To ship new files: `repo_deploy` again, or `art_publish_files` with `deployment`.",
       "   `heyo_guide` topic deploy-static-site has the full plan.",

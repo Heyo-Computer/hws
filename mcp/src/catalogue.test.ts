@@ -84,7 +84,6 @@ test("every tool appears in the catalogue exactly once", { skip }, async () => {
       APPLB_TOKEN: "heyo_api_lb",
       APP_OBS_URL: "http://o",
       CI_URL: "http://c",
-      ART_URL: "http://a",
     }),
   );
   for (const t of tools) {

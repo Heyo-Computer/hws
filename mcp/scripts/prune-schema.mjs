@@ -249,6 +249,24 @@ const walkExamples = (dir) => {
 walkExamples(examplesDir);
 exampleFiles.sort();
 
+// Specs for *running* an artifact store. That is the operator's
+// infrastructure: a namespace publishes through app-lb's
+// `/namespaces/:name/artifacts` with its own credential and never deploys,
+// addresses or holds the key to a store, so an agent shown these would be
+// steered toward exactly the thing it should not touch.
+const OPERATOR_ONLY = new Set([
+  "artifacts.json",
+  "artifacts-gated.json",
+  "artifacts-hub.json",
+  // Heyo's own release site, which names the store and a secret holding its key.
+  "releases-site.json",
+]);
+exampleFiles.splice(
+  0,
+  exampleFiles.length,
+  ...exampleFiles.filter((f) => !OPERATOR_ONLY.has(f.split("/").pop())),
+);
+
 // `examples/README.md` documents most of them under `## \`name.json\` — title`.
 // Pairing the prose with the spec is the whole value: the JSON says what to
 // send and the section says why it is shaped that way.
