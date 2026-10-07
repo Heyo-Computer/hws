@@ -130,6 +130,24 @@ impl ExecutorInstance {
         Ok(local)
     }
 
+    /// Operator configuration replacement has no release receipt. Fence this
+    /// boot permanently, but never take over an unfinished regional release.
+    pub async fn retire_for_configuration(&self, id: Uuid, expected_boot: Uuid) -> Result<(), String> {
+        if expected_boot != self.boot_id { return Err("configuration retirement targets another boot".into()); }
+        let _local = self.local.clone().try_write_owned().map_err(|_| "this CI instance has work in flight".to_owned())?;
+        if self.has_work().await? { return Err("this CI instance still owns job or cleanup work".into()); }
+        // Preparation and activation also acquire a local effect permit. Keep
+        // the write guard through the check and retirement so neither can race
+        // us. Reconciliation can bypass retirement for an existing receipt.
+        let rollout: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_controller_rollout WHERE phase<>'complete' AND (request->>'base_url')||'/deployments/'||(request->>'deployment')=$1)")
+            .bind(&self.deployment_id).fetch_one(&self.pool).await.map_err(db)?;
+        if rollout { return Err("regional release must finish before configuration replacement".into()); }
+        let changed = sqlx::query("UPDATE ci_executor_boot SET retired=TRUE WHERE boot_id=$1 AND draining AND maintenance_operation=$2")
+            .bind(self.boot_id).bind(id).execute(&self.pool).await.map_err(db)?.rows_affected();
+        if changed != 1 { return Err("configuration replacement does not own this instance drain".into()); }
+        Ok(())
+    }
+
     pub async fn status(&self) -> Result<serde_json::Value, String> {
         let (draining, retired, operation): (bool, bool, Option<Uuid>) = sqlx::query_as(
             "SELECT draining,retired,maintenance_operation FROM ci_executor_boot WHERE boot_id=$1")
@@ -238,6 +256,41 @@ mod tests {
         sqlx::query("UPDATE ci_job SET executor_boot=$1 WHERE id='peer-job'")
             .bind(eu.boot_id()).execute(&pool).await.unwrap();
         eu.mark_ready().await.unwrap();
+
+        let configured = ExecutorInstance::register(pool.clone(), "https://admin.example/deployments/ci-a").await.unwrap();
+        let configuration = Uuid::new_v4();
+        configured.pause(configuration).await.unwrap();
+        assert!(configured.retire_for_configuration(configuration, eu.boot_id()).await.is_err());
+        assert!(configured.retire_for_configuration(Uuid::new_v4(), configured.boot_id()).await.is_err());
+        let effect = configured.effect_permit().await.unwrap();
+        assert!(configured.retire_for_configuration(configuration, configured.boot_id()).await.is_err());
+        drop(effect);
+        configured.quiesce(configuration).await.unwrap();
+        assert_eq!(configured.status().await.unwrap()["safeToReplace"], false);
+        sqlx::raw_sql("INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('config-step','peer-job',0,'Release','ci/deploy-controller','success');
+            INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref)
+            VALUES('config-release','config-step','peer-run','peer-job','ci','hash','running','source','refs/heads/main');
+            INSERT INTO ci_controller_rollout(id,request,phase) VALUES('config-release','{\"base_url\":\"https://admin.example\",\"deployment\":\"ci-a\"}','prepared');")
+            .execute(&pool).await.unwrap();
+        for phase in ["prepared", "pending", "draining", "quiesced", "submitting", "verifying"] {
+            sqlx::query("UPDATE ci_controller_rollout SET phase=$1 WHERE id='config-release'")
+                .bind(phase).execute(&pool).await.unwrap();
+            assert!(configured.retire_for_configuration(configuration, configured.boot_id()).await.is_err(), "{phase}");
+            configured.effect_permit().await.unwrap();
+        }
+        // A different regional rollout and the peer's running job do not fence
+        // this idle boot. Matching authority alone is not deployment identity.
+        sqlx::query("UPDATE ci_controller_rollout SET phase='prepared',request=jsonb_set(request,'{deployment}','\"ci-b\"') WHERE id='config-release'")
+            .execute(&pool).await.unwrap();
+        configured.retire_for_configuration(configuration, configured.boot_id()).await.unwrap();
+        configured.retire_for_configuration(configuration, configured.boot_id()).await.unwrap();
+        assert_eq!(configured.status().await.unwrap()["safeToReplace"], true);
+        assert!(configured.effect_permit().await.is_err());
+        assert!(configured.resume(configuration).await.is_err());
+        eu.admission_permit().await.unwrap();
+        ExecutorInstance::register(pool.clone(), "https://admin.example/deployments/ci-a").await.unwrap()
+            .admission_permit().await.unwrap();
+
         let instance = |boot_id, region: &str| crate::application_lifecycle::Instance {
             boot_id, region: region.into(), deployment_id: region.into(),
             backend_server_id: format!("host-{region}"), backend_sandbox_id: format!("sb-{region}"),

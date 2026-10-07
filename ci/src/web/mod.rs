@@ -300,6 +300,17 @@ async fn maintenance_action(State(state): State<AppState>, Path((id, action)): P
             "pause" => state.dispatcher.executor.pause(id).await,
             "quiesce" => state.dispatcher.executor.quiesce(id).await,
             "resume" => state.dispatcher.executor.resume(id).await,
+            "retire" => {
+                if state.config.managed_deployment.is_some() || state.config.controller_deployment.is_none()
+                    || state.config.controller_app_lb_url.is_none() {
+                    Err("operator configuration retirement requires an app-lb CI deployment".into())
+                } else if let Some(boot) = headers.get("x-ci-target-boot").and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<uuid::Uuid>().ok()) {
+                    state.dispatcher.executor.retire_for_configuration(id, boot).await
+                } else {
+                    Err("configuration retirement requires x-ci-target-boot".into())
+                }
+            }
             _ => Err("unknown maintenance action".into()),
         }
     };

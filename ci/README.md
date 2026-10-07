@@ -122,6 +122,20 @@ that reaches another boot. Keep `/maintenance` out of app-lb `public_paths`.
 4. `POST /maintenance/{uuid}/resume` reopens this boot for the matching operation,
    unless platform retirement is pending. It cannot resume another operation.
 
+For an operator configuration-only replacement of an app-lb CI deployment,
+keep a healthy peer serving, journal the original and desired specs, and drain
+the target as above. Then `POST /maintenance/{uuid}/retire` with the mandatory
+`x-ci-target-boot` header permanently fences that exact boot's effects. It refuses
+unfinished regional release receipts (including prepared ones), local effects,
+and owned job/cleanup work. Managed deployments use their platform lifecycle
+instead. Confirm the same boot and operation report `safeToReplace: true` before
+an ETag-conditional deployment update. Preserve binary and lifecycle identities.
+Retirement is irreversible; on a lost response, read status and retry the same
+operation, never resume or pause again. Observe an uncertain deployment PUT
+before retrying, and verify the replacement's new boot, policies, and reopened
+admission before changing the peer. Binary releases still use the existing
+regional release workflow; this action does not publish or deploy a release.
+
 ### Runner drain across regions
 
 Instance pause does not drain a server: the other CI instance can still place
