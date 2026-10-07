@@ -537,8 +537,8 @@ pulls, and the HWS services themselves. The spec reference is in
 To manage an app-lb from your own machine, install only `heyctl`:
 
 ```sh
-curl -fsSL https://heyo.computer/install.sh | sh
-curl -fsSL https://heyo.computer/install.sh | sh -s -- --prefix /usr/local
+curl -fsSL https://heyo.computer/heyctl/install.sh | sh
+curl -fsSL https://heyo.computer/heyctl/install.sh | sh -s -- --prefix /usr/local
 ```
 
 | Option / variable | Default | Meaning |

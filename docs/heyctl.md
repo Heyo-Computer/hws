@@ -29,7 +29,7 @@ When the server rejects a command for a deployment kind, heyctl passes the serve
 ### Installer
 
 ```sh
-curl -fsSL https://heyo.computer/install.sh | sh
+curl -fsSL https://heyo.computer/heyctl/install.sh | sh
 ```
 
 The script is [`app-lb/heyctl/install.sh`](../app-lb/heyctl/install.sh). It reads a version manifest (`<site>/heyctl/versions.json`), downloads the matching blob anonymously from the artifact store, verifies it against its sha256 digest and against the `SHA256SUMS` inside the tarball, and installs `heyctl` into `~/.local/bin`.
@@ -37,9 +37,9 @@ The script is [`app-lb/heyctl/install.sh`](../app-lb/heyctl/install.sh). It read
 Pass flags through the pipe with `sh -s --`. Without the `-s --`, `sh` reads the flags as its own:
 
 ```sh
-curl -fsSL https://heyo.computer/install.sh | sh -s -- --prefix /usr/local
-curl -fsSL https://heyo.computer/install.sh | sh -s -- --list
-curl -fsSL https://heyo.computer/install.sh | HEYCTL_VERSION=0.1.7 sh
+curl -fsSL https://heyo.computer/heyctl/install.sh | sh -s -- --prefix /usr/local
+curl -fsSL https://heyo.computer/heyctl/install.sh | sh -s -- --list
+curl -fsSL https://heyo.computer/heyctl/install.sh | HEYCTL_VERSION=0.2.0 sh
 ```
 
 | Flag | Meaning |
