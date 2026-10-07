@@ -59,8 +59,8 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
     {
       name: "heyo_status",
       description:
-        "Which of heyo cloud, app-lb, app-obs, ci and the artifact store this server can " +
-        "reach, and what each says about itself. Start here when a tool fails with a " +
+        "Which of heyo cloud, app-lb, app-obs and ci this server can reach, whether your " +
+        "namespace's artifacts on app-lb are available, and what each says about itself. Start here when a tool fails with a " +
         "connection or auth error — it distinguishes 'not configured' from 'configured and " +
         "refusing'. The cloud probe doubles as an API-key check, and the app-lb one resolves " +
         "the managed namespace, so a namespace that cannot be worked out surfaces here rather " +
@@ -73,11 +73,10 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
           applb: clients.applb({ path: "/metrics" }),
           obs: clients.obs({ path: "/healthz" }),
           ci: clients.ci({ path: "/healthz" }),
-          // `/usage` rather than `/healthz`: the store leaves `/healthz` outside
-          // its own auth layer, so it answers `ok` whether or not either
-          // credential is right — a green probe that proves nothing about the
-          // thing that actually fails. `/usage` goes through both doors.
-          art: clients.art({ path: "/usage" }),
+          // Through app-lb with the caller's credential, the same door every
+          // art_* tool uses: answers `available: false` when app-lb has no
+          // artifact store, and 403 when the credential cannot read here.
+          art: clients.artifacts({ path: "" }),
         });
         // Above every probe, because a credential that cannot work explains
         // all of them at once. Without it the reader has to infer one cause
@@ -101,10 +100,10 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
           section("app-obs /healthz", r.obs),
           section("ci /healthz", r.ci),
           section(
-            "artifacts /usage — passes the gate AND the store's own key",
+            "artifacts (app-lb /namespaces/<namespace>/artifacts)",
             r.art,
-            "artifacts /usage — FAILED at the gate or at the store's own key; " +
-              "the Configured line above says which credential is missing.",
+            "artifacts — FAILED. app-lb refused or could not answer for your namespace's " +
+              "artifacts; the error says which.",
           ),
         ]);
       },

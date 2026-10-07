@@ -182,6 +182,13 @@ HTTP-01 validation needs the proxy on port 80. To bind 80/443 as a non-root user
 | `APP_LB_IMAGE_OFFLOAD_STORE` | unset | `art serve` URL or store root a **built** image is pushed to (tag `app-lb-offload:<name>`) before it is deleted. Unset: built images are never offloaded. |
 | `APP_LB_IMAGE_OFFLOAD_STORE_KEY` | unset | That store's API key, as a secret id: `<secret>` or `<secret>/<key>`. |
 
+### Global artifact store
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `APP_LB_ARTIFACT_STORE` | unset | `https://` URL of the `art serve` every namespace shares (`http://` only to loopback). An `artifact` block with no `store` pulls from it, and [`/namespaces/:name/artifacts`](#namespace-artifacts) fronts it. Unset: no global store; the API answers 503 and `artifact.store` is required. An invalid URL is logged and ignored. |
+| `APP_LB_ARTIFACT_STORE_API_KEY` | unset | That store's `ART_API_KEY`. Deliver it from HeyoSecret, like `APP_LB_DAEMON_API_KEY`. Only app-lb holds it: it goes with a pull of a ref under the deployment's namespace (or a digest) and with every forwarded API request. Unset: the store is used anonymously (public repositories only) and the API is read-only. |
+
 ### Discovery, fleet views and host updates
 
 | Variable | Default | Meaning |
@@ -377,9 +384,9 @@ Pulls bytes that already exist in an [artifacts](artifacts.md) store. Nothing is
 
 | Field | Meaning |
 | --- | --- |
-| `store` | `http(s)://` URL of an `art serve` (app-lb streams and verifies the blob), or an absolute store root on this host (app-lb shells out to `APP_LB_ART_BIN`). |
-| `ref` | Tag or 64-hex digest. A tag follows moves. A digest is immutable and is what a rollback names. |
-| `auth` | Secret reference for a store started with `ART_API_KEY`. URL form only. |
+| `store` | Optional. Left out, the [global artifact store](#global-artifact-store). Otherwise the `http(s)://` URL of an `art serve` (app-lb streams and verifies the blob), or an absolute store root on this host (app-lb shells out to `APP_LB_ART_BIN`). |
+| `ref` | Tag or 64-hex digest. A tag follows moves. A digest is immutable and is what a rollback names. From the global store, a ref under `<namespace>/` (or a digest) is pulled with app-lb's key; any other ref is pulled anonymously and works only if its repository is public. |
+| `auth` | Secret reference for a store of your own started with `ART_API_KEY`. Not needed for the global store. URL form only. |
 | `grow_gb` | Managed only. Extends the materialized rootfs (sparse). |
 | `image_name` | Managed only. Base name for the materialized image (`<name>-<digest[..12]>`). Unset, the image is named by content, `img-<digest[..16]>` (`-g<N>` when grown), and every deployment pulling the same bytes shares it. |
 | `strip_components` | Sites only. Leading path components to drop while unpacking (`1` for a `tar czf dist.tgz dist` bundle). |
@@ -512,6 +519,7 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `GET /api/plugins/:id/installs` | Namespaces that installed a per-namespace plugin (fleet scope; app-obs polls it). |
 | `GET /namespaces/:name/plugins`, `GET /namespaces/:name/plugins/:id` | What a namespace may install and whether it has (namespace wall). |
 | `GET /namespaces/:name/plugins/:id/*` | An installed plugin's namespace pages, e.g. `…/obs/ui` and `…/obs/api/fleet`. |
+| `GET /namespaces/:name/artifacts`, `GET`/`HEAD /namespaces/:name/artifacts/*` | The namespace's artifacts in the global store. See [Namespace artifacts](#namespace-artifacts). |
 
 ### CRUD tier
 
@@ -549,6 +557,24 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `PUT /api/plugins/:id`, `POST /api/plugins/:id/enable`, `POST /api/plugins/:id/disable` | Plugin configuration. |
 | `PUT`/`DELETE /namespaces/:name/plugins/:id` | Install or uninstall a plugin in a namespace (admin of the whole namespace). |
 | `POST`/`PUT`/`PATCH`/`DELETE /namespaces/:name/plugins/:id/*` | An installed plugin's namespace actions, e.g. obs alerts. |
+| `PUT`/`DELETE /namespaces/:name/artifacts/*` | Publish to the namespace's artifacts (admin of the whole namespace). See [Namespace artifacts](#namespace-artifacts). |
+
+### Namespace artifacts
+
+app-lb fronts the [global artifact store](#global-artifact-store) so that nobody but app-lb holds the store's key. Each namespace reaches its own corner of it with its normal app-lb credential. The paths mirror `art serve`'s own, under `/namespaces/:name/artifacts`:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /namespaces/:name/artifacts` | `{"namespace", "available", "writable", "prefix"}`. Names no URL. |
+| `GET …/tags` | `[{"tag", "digest"}]`, only tags under `<namespace>/`. |
+| `GET`/`PUT`/`DELETE …/tags/<namespace>/<repo>:<tag>` | Read, point (body: the manifest digest as text) or remove a tag. |
+| `GET …/manifests/<digest or ref>`, `PUT …/manifests` | Read a manifest by digest or by a ref the namespace owns; create one (JSON). |
+| `GET`/`HEAD`/`PUT …/blobs/<digest>` | Download or upload content by sha256. Streamed both ways, no size cap. |
+| `GET`/`PUT …/repos/<namespace>/<repo>` | A repository's `{"public", "description"}`. `public: true` makes it anonymously pullable. |
+
+Reads need the view tier in the namespace; writes need an admin credential for the whole namespace (a token narrowed to particular deployments is read-only). Store-wide routes (`/usage`, blob and manifest listings) do not exist here. A tag or repository outside `<namespace>/` is a 403 before anything reaches the store. A tag may be sent as one percent-encoded segment (`tags/acme%2Fweb%3Av2`). Errors: 503 when there is no global store (or no key for a write), 502 when the store is unreachable or refuses app-lb's key, otherwise the store's own status.
+
+`heyctl artifact` and the MCP server's `art_*` tools use these routes.
 
 ### Always-authenticated routes
 

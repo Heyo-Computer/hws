@@ -98,6 +98,8 @@ const OBS_ONLY = new Set(["deployment_logs", "namespace_telemetry", "obs_request
 function reachable(name: string, config: Config): boolean {
   if (CI_ONLY.has(name)) return Boolean(config.ci);
   if (OBS_ONLY.has(name)) return Boolean(config.obs || config.applb);
+  // A namespace's artifacts are reached through app-lb and nowhere else.
+  if (name.startsWith("art_")) return Boolean(config.applb);
   return true;
 }
 
@@ -172,7 +174,7 @@ Your token confines you to one namespace. Pass that namespace to repo_* tools; a
 Static site (HTML/JS/CSS, already built):
   1. repo_create  2. repo_write_files with the BUILT files  3. repo_deploy with kind "site" and a host.
   To update it, repo_write_files again, then repo_deploy again. Nothing in the repo is run.
-  Alternative: art_publish_files (tag "<namespace>/<name>:<version>"), then applb_deploy a site whose artifact is {store, ref}.
+  Alternative: art_publish_files (tag "<namespace>/<name>:<version>") puts the files in your namespace's artifacts on app-lb; then applb_deploy a site whose artifact is {ref: <tag>} (no store, no auth: app-lb pulls it itself).
 
 App with a Dockerfile: repo_create, repo_write_files including the Dockerfile, then repo_deploy with kind "vm", port and start_command. start_command must background itself (setsid nohup ... &) and the app must listen on 0.0.0.0:<port>.
 
@@ -318,9 +320,6 @@ const READ_ONLY = new Set([
   "art_list_tags",
   "art_get_tag",
   "art_get_manifest",
-  "art_list_blobs",
-  "art_usage",
-  "art_list_manifests",
   "repo_list",
   "repo_get",
 ]);

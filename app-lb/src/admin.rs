@@ -16,7 +16,7 @@ use crate::siem::AuthAction;
 use crate::tls::CertStore;
 use async_trait::async_trait;
 use axum::extract::{ConnectInfo, MatchedPath, Path, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{AppendHeaders, Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
@@ -167,6 +167,9 @@ struct AdminState {
     token_sync: Arc<std::sync::Mutex<TokenSyncStatus>>,
     /// heyvm's image catalog as app-lb manages it; `None` in tests.
     images: Option<Arc<crate::images::ImageCatalog>>,
+    /// The global artifact store `/namespaces/:name/artifacts` fronts, with
+    /// the key only app-lb holds. `None` when `APP_LB_ARTIFACT_STORE` is unset.
+    artifact_store: Option<Arc<crate::store_gateway::GlobalStore>>,
     rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
@@ -375,6 +378,7 @@ impl AdminApi {
                 views: None,
                 token_sync: Default::default(),
                 images: None,
+                artifact_store: None,
                 rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
@@ -426,6 +430,14 @@ impl AdminApi {
 
     pub fn with_images(mut self, images: Arc<crate::images::ImageCatalog>) -> Self {
         self.state.images = Some(images);
+        self
+    }
+
+    pub fn with_artifact_store(
+        mut self,
+        store: Option<Arc<crate::store_gateway::GlobalStore>>,
+    ) -> Self {
+        self.state.artifact_store = store;
         self
     }
 }
@@ -863,6 +875,18 @@ fn decide_access(
             Some(id) if !caller.may_touch(id, req.target_namespace) => {
                 return Verdict::Forbidden(out_of_scope(id));
             }
+            None if namespace_artifact_target(matched, req.path).is_some() => {
+                // The global artifact store, walled the same way: a namespace
+                // token reaches its own namespace's artifacts and no other, and
+                // the handler keeps every request under `<ns>/`. Writes also
+                // need the whole namespace, which the handler checks.
+                let ns = namespace_artifact_target(matched, req.path).unwrap_or_default();
+                if !caller.reaches_namespace(ns) {
+                    return Verdict::Forbidden(format!(
+                        "this token cannot reach the \"{ns}\" namespace's artifacts"
+                    ));
+                }
+            }
             None if namespace_plugin_target(matched, req.path).is_some() => {
                 // Walled by the namespace in the path, like the feed below: a
                 // namespace token reaches its own namespace's plugins and no
@@ -982,7 +1006,9 @@ async fn authorize(
         .or_else(|| {
             matched
                 .as_deref()
-                .and_then(|m| namespace_plugin_target(m, &path))
+                .and_then(|m| {
+                    namespace_plugin_target(m, &path).or_else(|| namespace_artifact_target(m, &path))
+                })
                 .map(str::to_owned)
         });
 
@@ -2428,6 +2454,103 @@ fn namespace_plugin_target<'a>(matched: &str, path: &'a str) -> Option<&'a str> 
         return None;
     }
     path.split('/').nth(2).filter(|s| !s.is_empty())
+}
+
+/// The namespace a `/namespaces/:name/artifacts…` route acts on.
+fn namespace_artifact_target<'a>(matched: &str, path: &'a str) -> Option<&'a str> {
+    if matched != "/namespaces/:name/artifacts" && !matched.starts_with("/namespaces/:name/artifacts/") {
+        return None;
+    }
+    path.split('/').nth(2).filter(|s| !s.is_empty())
+}
+
+/// `GET /namespaces/:name/artifacts` — whether this app-lb fronts a global
+/// store, and the prefix the namespace's tags must carry. Names no URL: the
+/// store is app-lb's business, not the caller's.
+async fn namespace_artifacts(State(state): State<AdminState>, Path(ns): Path<String>) -> Response {
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    Json(serde_json::json!({
+        "namespace": ns,
+        "available": state.artifact_store.is_some(),
+        "writable": state.artifact_store.as_ref().is_some_and(|s| s.has_key()),
+        "prefix": format!("{ns}/"),
+    }))
+    .into_response()
+}
+
+/// `GET|HEAD /namespaces/:name/artifacts/*rest` — a read of the namespace's
+/// tags, manifests, blobs or repositories. The gate checked reach and tier.
+async fn read_namespace_artifact(
+    State(state): State<AdminState>,
+    Path((ns, rest)): Path<(String, String)>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+) -> Response {
+    forward_namespace_artifact(&state, &ns, &rest, method, headers, None).await
+}
+
+/// `PUT|DELETE /namespaces/:name/artifacts/*rest` — publish a blob, manifest,
+/// tag or repository setting, or remove a tag. Changing what a namespace's
+/// deployments will pull is the namespace administrator's call, so a token
+/// narrowed to a few of its deployments is read-only here.
+async fn write_namespace_artifact(
+    State(state): State<AdminState>,
+    Path((ns, rest)): Path<(String, String)>,
+    method: axum::http::Method,
+    caller: Option<axum::Extension<Caller>>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    if let Some(c) = caller.as_deref()
+        && !c.administers_namespace(&ns)
+    {
+        return err(
+            StatusCode::FORBIDDEN,
+            format!("publishing artifacts needs an admin credential for all of namespace \"{ns}\""),
+        )
+        .into_response();
+    }
+    forward_namespace_artifact(&state, &ns, &rest, method, headers, Some(body)).await
+}
+
+async fn forward_namespace_artifact(
+    state: &AdminState,
+    ns: &str,
+    rest: &str,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    body: Option<axum::body::Body>,
+) -> Response {
+    use crate::store_gateway::{Route, classify};
+    if let Some(r) = bad_namespace(ns) {
+        return r;
+    }
+    let Some(store) = state.artifact_store.as_ref() else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this app-lb has no global artifact store configured (APP_LB_ARTIFACT_STORE)",
+        )
+        .into_response();
+    };
+    let Ok(method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
+        return err(StatusCode::METHOD_NOT_ALLOWED, "unsupported method").into_response();
+    };
+    match classify(ns, &method, rest) {
+        Err(why) => err(StatusCode::FORBIDDEN, why).into_response(),
+        Ok(Route::TagList) => store.namespace_tags(ns).await,
+        Ok(Route::Forward(path)) => {
+            if method != reqwest::Method::GET && method != reqwest::Method::HEAD && !store.has_key() {
+                return err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "this app-lb's global artifact store is read-only: it holds no store key",
+                )
+                .into_response();
+            }
+            store.forward(method, &path, &headers, body).await
+        }
+    }
 }
 
 fn bad_namespace(ns: &str) -> Option<Response> {
@@ -6653,6 +6776,14 @@ fn router(state: AdminState) -> Router {
         .route("/namespaces/:name/plugins", get(namespace_plugins))
         .route("/namespaces/:name/plugins/:id", get(namespace_plugin))
         .route("/namespaces/:name/plugins/:id/*rest", get(namespace_plugin_surface))
+        // The namespace's corner of the global artifact store. Reads are view
+        // tier, walled by the namespace in the path; the writes are on the
+        // CRUD side below and also need the whole namespace.
+        .route("/namespaces/:name/artifacts", get(namespace_artifacts))
+        .route(
+            "/namespaces/:name/artifacts/*rest",
+            get(read_namespace_artifact).head(read_namespace_artifact),
+        )
         // The network topology console. View tier, like the dashboard it sits
         // beside: it renders `/metrics` and `/ingress`, so it must work with
         // the browser's cached view credentials.
@@ -6766,6 +6897,10 @@ fn router(state: AdminState) -> Router {
                 .put(namespace_plugin_surface)
                 .patch(namespace_plugin_surface)
                 .delete(namespace_plugin_surface),
+        )
+        .route(
+            "/namespaces/:name/artifacts/*rest",
+            put(write_namespace_artifact).delete(write_namespace_artifact),
         )
         .route("/tokens", post(mint_token).get(list_tokens))
         .route(
@@ -7828,6 +7963,194 @@ mod tests {
 
         /// The token routes for a namespace-confined caller, end to end through
         /// the handlers: what it may mint, see, re-scope and revoke.
+        /// `/namespaces/:name/artifacts`, end to end through the real router and
+        /// gate, against a fake `art serve` that records what reached it.
+        mod artifact_gateway {
+            use super::*;
+            use crate::store_gateway::GlobalStore;
+            use crate::tokens::{AdminScope, NewToken};
+
+            const D: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            const KEY: &str = "the-store-key";
+
+            #[derive(Default)]
+            struct Seen {
+                requests: std::sync::Mutex<Vec<(String, String, Option<String>, Vec<u8>)>>,
+            }
+
+            /// A store that answers only to `KEY`, like `art serve` with `ART_API_KEY`.
+            async fn fake_store() -> (String, Arc<Seen>) {
+                let seen = Arc::new(Seen::default());
+                let rec = seen.clone();
+                let app = Router::new().fallback(move |req: Request<Body>| {
+                    let rec = rec.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let auth = parts.headers.get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok()).map(str::to_string);
+                        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec();
+                        let path = parts.uri.path().to_string();
+                        rec.requests.lock().unwrap().push((parts.method.to_string(), path.clone(), auth.clone(), bytes));
+                        if auth.as_deref() != Some(&format!("Bearer {KEY}")) {
+                            return (StatusCode::UNAUTHORIZED, "bad key").into_response();
+                        }
+                        match (parts.method.as_str(), path.as_str()) {
+                            ("GET", "/tags") => Json(serde_json::json!([
+                                {"tag": "us5/app:v1", "digest": D},
+                                {"tag": "us50/app:v1", "digest": D},
+                                {"tag": "team-b/secret:v1", "digest": D},
+                            ])).into_response(),
+                            ("PUT", p) if p.starts_with("/blobs/") => StatusCode::CREATED.into_response(),
+                            ("GET", p) if p.starts_with("/blobs/") => "hello".into_response(),
+                            ("PUT", p) if p.starts_with("/tags/") => {
+                                Json(serde_json::json!({"tag": &p[6..], "digest": D})).into_response()
+                            }
+                            _ => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (url, seen)
+            }
+
+            async fn gated(store: Option<GlobalStore>) -> Fixture {
+                let mut f = fixture(true).await;
+                f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
+                f.state.gate_admin = true;
+                f.state.gate_view = true;
+                f.state.artifact_store = store.map(Arc::new);
+                f
+            }
+
+            fn token(f: &Fixture, ns: &str, admin: AdminScope, deployments: &[&str]) -> String {
+                f.state.tokens.mint(NewToken {
+                    fleet: false,
+                    name: "artifact test".into(),
+                    admin,
+                    namespace: Some(ns.into()),
+                    deployments: deployments.iter().map(|d| d.to_string()).collect(),
+                    expires_in_secs: None,
+                }, now_secs()).unwrap().1
+            }
+
+            async fn send(f: &Fixture, method: &str, path: &str, bearer: &str, body: &'static [u8]) -> (StatusCode, Vec<u8>) {
+                let req = Request::builder().method(method).uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(Body::from(body)).unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+                let response = app.call(req).await.unwrap();
+                let status = response.status();
+                (status, axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
+            }
+
+            #[tokio::test]
+            async fn a_namespace_publishes_and_reads_its_own_artifacts_with_app_lbs_key() {
+                let (url, seen) = fake_store().await;
+                let f = gated(Some(GlobalStore::new(&url, Some(KEY.into())).unwrap())).await;
+                let admin = token(&f, "us5", AdminScope::Admin, &[]);
+
+                let (status, body) = send(&f, "GET", "/namespaces/us5/artifacts", &admin, b"").await;
+                assert_eq!(status, StatusCode::OK);
+                let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(summary["available"], true);
+                assert_eq!(summary["prefix"], "us5/");
+                assert!(!String::from_utf8_lossy(&body).contains(&url), "the store's URL is app-lb's business");
+
+                let (status, _) = send(&f, "PUT", &format!("/namespaces/us5/artifacts/blobs/{D}"), &admin, b"hello").await;
+                assert_eq!(status, StatusCode::CREATED);
+                let (status, _) = send(&f, "PUT", "/namespaces/us5/artifacts/tags/us5/app:v2", &admin, D.as_bytes()).await;
+                assert_eq!(status, StatusCode::OK);
+                // One percent-encoded segment, as the MCP server sends it,
+                // reaches the same store path as the spelled-out form.
+                let (status, _) = send(&f, "PUT", "/namespaces/us5/artifacts/tags/us5%2Fapp%3Av3", &admin, D.as_bytes()).await;
+                assert_eq!(status, StatusCode::OK);
+                let (status, _) = send(&f, "PUT", "/namespaces/us5/artifacts/tags/team-b%2Fsecret%3Av1", &admin, D.as_bytes()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "encoding does not smuggle a ref past the wall");
+                let (status, bytes) = send(&f, "GET", &format!("/namespaces/us5/artifacts/blobs/{D}"), &admin, b"").await;
+                assert_eq!((status, bytes.as_slice()), (StatusCode::OK, &b"hello"[..]));
+
+                let (status, body) = send(&f, "GET", "/namespaces/us5/artifacts/tags", &admin, b"").await;
+                assert_eq!(status, StatusCode::OK);
+                let tags: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+                assert_eq!(tags.len(), 1, "only us5/ survives: {tags:?}");
+                assert_eq!(tags[0]["tag"], "us5/app:v1");
+
+                let reqs = seen.requests.lock().unwrap();
+                assert!(reqs.iter().all(|(_, _, auth, _)| auth.as_deref() == Some(&format!("Bearer {KEY}")[..])),
+                    "every forwarded request carries app-lb's key, never the caller's token");
+                assert!(reqs.iter().any(|(m, p, _, b)| m == "PUT" && p == &format!("/blobs/{D}") && b == b"hello"));
+                assert!(reqs.iter().any(|(m, p, _, b)| m == "PUT" && p == "/tags/us5/app:v2" && b == D.as_bytes()));
+                assert!(reqs.iter().any(|(m, p, _, _)| m == "PUT" && p == "/tags/us5/app:v3"));
+                assert!(!reqs.iter().any(|(_, p, _, _)| p.contains("team-b")));
+            }
+
+            #[tokio::test]
+            async fn nothing_outside_the_namespace_reaches_the_store() {
+                let (url, seen) = fake_store().await;
+                let f = gated(Some(GlobalStore::new(&url, Some(KEY.into())).unwrap())).await;
+                let us5_admin = token(&f, "us5", AdminScope::Admin, &[]);
+                let us5_view = token(&f, "us5", AdminScope::View, &[]);
+                let us5_narrow = token(&f, "us5", AdminScope::Admin, &["web"]);
+                let team_b = token(&f, "team-b", AdminScope::Admin, &[]);
+
+                for (who, method, path, want) in [
+                    // Another namespace's tag, named from inside this one.
+                    (&us5_admin, "PUT", "/namespaces/us5/artifacts/tags/team-b/secret:v1", StatusCode::FORBIDDEN),
+                    (&us5_admin, "GET", "/namespaces/us5/artifacts/manifests/team-b/secret:v1", StatusCode::FORBIDDEN),
+                    // Store-wide routes do not exist here.
+                    (&us5_admin, "GET", "/namespaces/us5/artifacts/usage", StatusCode::FORBIDDEN),
+                    (&us5_admin, "GET", "/namespaces/us5/artifacts/blobs", StatusCode::FORBIDDEN),
+                    // Another namespace's path entirely.
+                    (&us5_admin, "GET", "/namespaces/team-b/artifacts/tags", StatusCode::FORBIDDEN),
+                    (&team_b, "PUT", "/namespaces/us5/artifacts/tags/us5/app:v1", StatusCode::FORBIDDEN),
+                    // Read-only callers: a view token, and one narrowed to some deployments.
+                    (&us5_view, "PUT", "/namespaces/us5/artifacts/tags/us5/app:v1", StatusCode::FORBIDDEN),
+                    (&us5_narrow, "PUT", "/namespaces/us5/artifacts/tags/us5/app:v1", StatusCode::FORBIDDEN),
+                    (&us5_narrow, "DELETE", "/namespaces/us5/artifacts/tags/us5/app:v1", StatusCode::FORBIDDEN),
+                ] {
+                    let (status, body) = send(&f, method, path, who, D.as_bytes()).await;
+                    assert_eq!(status, want, "{method} {path}: {}", String::from_utf8_lossy(&body));
+                }
+                assert!(seen.requests.lock().unwrap().is_empty(), "every refusal happened before the store");
+
+                // Both read-only callers may still read.
+                for who in [&us5_view, &us5_narrow] {
+                    assert_eq!(send(&f, "GET", "/namespaces/us5/artifacts/tags", who, b"").await.0, StatusCode::OK);
+                }
+                // And no credential at all is a 401, as on every gated route.
+                let req = Request::builder().uri("/namespaces/us5/artifacts/tags").body(Body::empty()).unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+                assert_eq!(app.call(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+            }
+
+            #[tokio::test]
+            async fn a_missing_or_misconfigured_store_is_app_lbs_problem_not_the_callers() {
+                let f = gated(None).await;
+                let admin = token(&f, "us5", AdminScope::Admin, &[]);
+                assert_eq!(send(&f, "GET", "/namespaces/us5/artifacts/tags", &admin, b"").await.0, StatusCode::SERVICE_UNAVAILABLE);
+                let (_, body) = send(&f, "GET", "/namespaces/us5/artifacts", &admin, b"").await;
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["available"], false);
+
+                // The store refuses app-lb's key: a 502, so the caller does not
+                // go chasing their own (perfectly good) token.
+                let (url, _) = fake_store().await;
+                let f = gated(Some(GlobalStore::new(&url, Some("wrong".into())).unwrap())).await;
+                let admin = token(&f, "us5", AdminScope::Admin, &[]);
+                for (method, path) in [("GET", "/namespaces/us5/artifacts/tags"), ("PUT", "/namespaces/us5/artifacts/tags/us5/app:v1")] {
+                    assert_eq!(send(&f, method, path, &admin, D.as_bytes()).await.0, StatusCode::BAD_GATEWAY, "{method} {path}");
+                }
+
+                // No key at all: reads go anonymously, writes are refused here.
+                let f = gated(Some(GlobalStore::new(&url, None).unwrap())).await;
+                let admin = token(&f, "us5", AdminScope::Admin, &[]);
+                assert_eq!(send(&f, "PUT", "/namespaces/us5/artifacts/tags/us5/app:v1", &admin, D.as_bytes()).await.0, StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
+
         mod tenant_tokens {
             use super::*;
             use crate::tokens::{AdminScope, NewToken, TokenPatch};

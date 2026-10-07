@@ -1,12 +1,18 @@
-//! `heyctl artifact` — authenticate against an artifact store and push guest
-//! images to it.
+//! `heyctl artifact` — push guest images others can pull, and read them back.
 //!
-//! The store is a separate service from app-lb (`art serve`), so these commands
-//! resolve a *registry* rather than a context and never touch `--server`. A
-//! `login` here has nothing to do with a `login` there: one saves HTTP Basic
-//! credentials for a load balancer, the other saves a shared key for a content
-//! store, and conflating them would mean a `--context` switch silently
-//! retargeted a push.
+//! Two routes to the same store routes (`/tags`, `/manifests`, `/blobs`,
+//! `/repos`):
+//!
+//! - **Through app-lb** (the default, and the customer path): app-lb fronts its
+//!   configured global artifact store under `/namespaces/{ns}/artifacts` on the
+//!   admin API. These commands then use the context — `--context`, `--server`,
+//!   `--token` — like every other heyctl command, the namespace is the
+//!   credential's own (or `-n`), and every tag lives under `<ns>/`. Nobody
+//!   holds the store's shared key but app-lb.
+//! - **Directly to a store** (the operator escape hatch): `--registry`,
+//!   `--registry-url`/`HEYCTL_ART_URL`, or a registry saved by
+//!   `heyctl artifact login`. That talks to `art serve` with its `ART_API_KEY`,
+//!   exactly as before. `--lb` goes through app-lb even with a registry saved.
 //!
 //! The point of a push is the pull on the other end: an image in a store is what
 //! a deployment's `artifact` block names, so `heyctl artifact push` and
@@ -14,9 +20,10 @@
 //! why a push writes a manifest and moves a tag rather than just uploading
 //! bytes — see [`crate::artifact`].
 
-use crate::cmd::GlobalOpts;
+use crate::cmd::{Ctx, GlobalOpts};
 use crate::artifact::{self, RegistryClient};
-use crate::config::{Config, PasswordSource, RegistryEntry, resolve_registry_endpoint};
+use crate::config::{Config, Endpoint, RegistryEntry, resolve_registry_endpoint};
+use crate::transport::Auth;
 use crate::output::{self, Table};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
@@ -68,7 +75,8 @@ pub enum ArtifactCmd {
     /// Show what one tag or digest resolves to.
     Describe(DescribeArgs),
 
-    /// Logical size, physical size and free space on the store.
+    /// Logical size, physical size and free space on the store. Direct stores
+    /// only — app-lb does not expose store-wide figures.
     Usage,
 
     /// Remove a tag. The blob it named stays until the store's `art gc` runs.
@@ -77,19 +85,31 @@ pub enum ArtifactCmd {
 }
 
 /// Flags shared by every command that has to reach a store.
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, Default)]
 pub struct RegistryOpts {
-    /// Which stored registry to use.
+    /// Go through app-lb's artifact gateway with the context's credential, even
+    /// when a registry is saved or named. This is already the default when no
+    /// registry is configured.
+    #[arg(long, global = true)]
+    pub lb: bool,
+
+    /// Namespace whose artifacts to use through app-lb. Defaults to the one the
+    /// context's credential is confined to. Ignored for a direct store.
+    #[arg(long, short = 'n', global = true, value_name = "NAME")]
+    pub namespace: Option<String>,
+
+    /// Talk to this stored registry directly instead of going through app-lb.
     #[arg(long, global = true, env = "HEYCTL_REGISTRY", value_name = "NAME")]
     pub registry: Option<String>,
 
-    /// Store URL, overriding the stored registry. `host:port` is accepted and
-    /// assumed to be http.
+    /// Talk to the store at this URL directly instead of going through app-lb,
+    /// overriding the stored registry. `host:port` is accepted and assumed to
+    /// be http.
     #[arg(long, global = true, env = "HEYCTL_ART_URL", value_name = "URL")]
     pub registry_url: Option<String>,
 
-    /// API key, overriding the stored one. Prefer `heyctl artifact login` —
-    /// an argument is visible in `ps`.
+    /// A direct store's API key, overriding the stored one. Prefer `heyctl
+    /// artifact login` — an argument is visible in `ps`. Never sent to app-lb.
     #[arg(
         long,
         global = true,
@@ -183,7 +203,8 @@ pub struct PushArgs {
 
     /// Make the tag's repository public afterwards: listed on the hub and
     /// pullable by anyone without a key. Needs a namespaced tag
-    /// (`heyo/postgres:16`) and the store's API key.
+    /// (`heyo/postgres:16`), and write access — admin on the namespace through
+    /// app-lb, or the store's API key directly.
     #[arg(long, requires = "tag")]
     pub public: bool,
 }
@@ -281,10 +302,61 @@ pub fn run(globals: &GlobalOpts, opts: &RegistryOpts, cmd: &ArtifactCmd) -> Resu
     }
 }
 
-/// Build a client for whichever store this invocation resolves to.
-fn client(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<(RegistryClient, String, PasswordSource)> {
+/// Which way an artifact command reaches the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// app-lb's `/namespaces/{ns}/artifacts`, with the context's credential.
+    Gateway,
+    /// A store's own API, with its shared key.
+    Direct,
+}
+
+/// Through app-lb unless a direct store was picked deliberately: `--lb` always
+/// wins; then `--registry` or `--registry-url` (or `HEYCTL_REGISTRY` /
+/// `HEYCTL_ART_URL`) mean direct; then a saved registry — the current one, or
+/// the only one — means direct, which keeps operators who already log in to a
+/// store where they were. With nothing configured at all the gateway is used,
+/// because that is the customer path and needs no setup beyond `heyctl login`.
+pub fn route(opts: &RegistryOpts, config: &Config) -> Result<Route> {
+    if opts.lb {
+        return Ok(Route::Gateway);
+    }
+    if opts.registry.is_some() || opts.registry_url.is_some() {
+        return Ok(Route::Direct);
+    }
+    Ok(match config.resolve_registry(None)? {
+        Some(_) => Route::Direct,
+        None => Route::Gateway,
+    })
+}
+
+fn route_for(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<Route> {
+    let path = Config::path(globals.config.as_deref())?;
+    route(opts, &Config::load(&path)?)
+}
+
+/// The `Authorization` a context would send: a bearer outranks the Basic pair,
+/// and a user without a password is no credential — the same rule
+/// [`crate::blocking::Client::connect`] applies.
+pub fn context_auth(ep: &Endpoint) -> Auth {
+    match (&ep.token, &ep.user, &ep.password) {
+        (Some(t), _, _) => Auth::Token(t.clone()),
+        (None, Some(u), Some(p)) => Auth::Basic {
+            user: u.clone(),
+            password: p.clone(),
+        },
+        _ => Auth::None,
+    }
+}
+
+/// Build a client for whichever store this invocation resolves to, and a label
+/// for it (the registry's name, or `app-lb (namespace …)`).
+fn client(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<(RegistryClient, String)> {
     let path = Config::path(globals.config.as_deref())?;
     let config = Config::load(&path)?;
+    if route(opts, &config)? == Route::Gateway {
+        return gateway_client(globals, opts);
+    }
     let ep = resolve_registry_endpoint(
         &config,
         opts.registry.as_deref(),
@@ -298,7 +370,22 @@ fn client(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<(RegistryClient, 
         ep.insecure_skip_tls_verify,
         Duration::from_secs(globals.request_timeout),
     )?;
-    Ok((c, ep.name, ep.api_key_source))
+    Ok((c, ep.name))
+}
+
+/// The gateway client: the context's server, credential and TLS setting, and
+/// the namespace named with `-n` or else the one the credential is confined to.
+fn gateway_client(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<(RegistryClient, String)> {
+    let ctx = Ctx::new(globals)?;
+    let ns = ctx.namespace(opts.namespace.as_deref())?;
+    let c = RegistryClient::gateway(
+        &ctx.endpoint.server,
+        &ns,
+        context_auth(&ctx.endpoint).header(),
+        ctx.endpoint.insecure_skip_tls_verify,
+        Duration::from_secs(globals.request_timeout),
+    )?;
+    Ok((c, format!("app-lb (namespace {ns})")))
 }
 
 // -- auth ------------------------------------------------------------------
@@ -522,6 +609,9 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
         bail!("{} is not a file", path.display());
     }
 
+    let (c, registry) = client(globals, opts)?;
+    let ns = c.gateway_namespace().map(str::to_string);
+
     // Resolve the tag before uploading anything. A name the store would refuse
     // should not cost a multi-gigabyte transfer first.
     let tag = if args.no_tag {
@@ -529,14 +619,24 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
     } else {
         let t = match &args.tag {
             Some(t) => t.clone(),
-            None => artifact::default_tag_for(&path).with_context(|| {
-                format!(
-                    "cannot derive a tag from {} — pass --tag, or --no-tag to push \
-                     without one",
-                    path.display()
-                )
-            })?,
+            None => artifact::default_tag_for(&path)
+                // Through app-lb a derived default goes under the namespace:
+                // nobody typed it, so there is no spelling to second-guess.
+                .map(|t| match &ns {
+                    Some(ns) => format!("{ns}/{t}"),
+                    None => t,
+                })
+                .with_context(|| {
+                    format!(
+                        "cannot derive a tag from {} — pass --tag, or --no-tag to push \
+                         without one",
+                        path.display()
+                    )
+                })?,
         };
+        if let Some(ns) = &ns {
+            artifact::check_namespaced(&t, ns, false)?;
+        }
         if !artifact::is_valid_tag(&t) {
             bail!(
                 "{t:?} is not a usable tag: tags are [A-Za-z0-9._-] and may not start with \
@@ -549,7 +649,6 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
         bail!("--public needs a namespaced tag (`team/name:tag`): only repositories are public");
     }
 
-    let (c, registry, _) = client(globals, opts)?;
     let quiet = globals.output.is_machine();
 
     // 1. Hash. The digest is the blob's name, so it has to exist before the
@@ -633,7 +732,11 @@ fn push(globals: &GlobalOpts, opts: &RegistryOpts, args: &PushArgs) -> Result<()
     println!();
     let reference = tag.as_deref().unwrap_or(&manifest_digest);
     println!("Pull it with:");
-    println!("  heyctl set artifact <deployment> --store {} --ref {reference}", c.url());
+    match &ns {
+        // app-lb's own store is what a deployment with no `artifact.store` uses.
+        Some(_) => println!("  heyctl set artifact <deployment> --ref {reference}"),
+        None => println!("  heyctl set artifact <deployment> --store {} --ref {reference}", c.url()),
+    }
     println!("  heyctl pull <deployment> --wait");
     Ok(())
 }
@@ -656,6 +759,11 @@ fn pull(globals: &GlobalOpts, opts: &RegistryOpts, args: &PullArgs) -> Result<()
         )?,
         None => client(globals, opts)?.0,
     };
+    if store.is_none()
+        && let Some(ns) = c.gateway_namespace()
+    {
+        artifact::check_namespaced(&reference, ns, true)?;
+    }
     let quiet = globals.output.is_machine();
 
     let Some(resolved) = c.resolve(&reference)? else {
@@ -749,6 +857,9 @@ fn push_dockerfile(
     }
     artifact::check_dockerfile_size(&args.file, meta.len())?;
 
+    let (c, registry) = client(globals, opts)?;
+    let ns = c.gateway_namespace().map(str::to_string);
+
     // Resolved before anything is packed or uploaded. A name the store would
     // refuse should not cost a context pack first.
     let tag = if args.no_tag {
@@ -756,13 +867,22 @@ fn push_dockerfile(
     } else {
         let t = match &args.tag {
             Some(t) => t.clone(),
-            None => default_recipe_tag(&args.file).with_context(|| {
-                format!(
-                    "cannot derive a tag from {} — pass --tag, or --no-tag to push without one",
-                    args.file.display()
-                )
-            })?,
+            None => default_recipe_tag(&args.file)
+                .map(|t| match &ns {
+                    Some(ns) => format!("{ns}/{t}"),
+                    None => t,
+                })
+                .with_context(|| {
+                    format!(
+                        "cannot derive a tag from {} — pass --tag, or --no-tag to push \
+                         without one",
+                        args.file.display()
+                    )
+                })?,
         };
+        if let Some(ns) = &ns {
+            artifact::check_namespaced(&t, ns, false)?;
+        }
         if !artifact::is_valid_tag(&t) {
             bail!(
                 "{t:?} is not a usable tag: tags are [A-Za-z0-9._-] and may not start with \
@@ -798,8 +918,6 @@ fn push_dockerfile(
         (None, Some(c)) => Some(c.as_path()),
         (None, None) => None,
     };
-
-    let (c, registry, _) = client(globals, opts)?;
 
     // Both blobs go up the same way `push` sends a rootfs: hash, ask, upload.
     // The recipe is kilobytes and the context is usually not, so the "ask" is
@@ -862,10 +980,18 @@ fn push_dockerfile(
     println!();
     let reference = tag.as_deref().unwrap_or(&manifest_digest);
     println!("Build it with:");
-    println!(
-        "  heyctl set build <deployment> --store {} --ref {reference}",
-        c.url()
-    );
+    match &ns {
+        // A `build` block still names its store; only `artifact.store` defaults
+        // to app-lb's own. Say so rather than print a command that cannot run.
+        Some(_) => println!(
+            "  (not yet through app-lb: `build.store` must still name a store, and only the \
+             operator knows its address — ask them to build ref {reference})"
+        ),
+        None => println!(
+            "  heyctl set build <deployment> --store {} --ref {reference}",
+            c.url()
+        ),
+    }
     println!("  heyctl build <deployment> --wait");
     Ok(())
 }
@@ -973,7 +1099,7 @@ fn clear_progress() {
 // -- reads -----------------------------------------------------------------
 
 fn ls(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<()> {
-    let (c, _, _) = client(globals, opts)?;
+    let (c, _) = client(globals, opts)?;
     let tags = c.tags()?;
     if globals.output.is_machine() {
         return output::emit(&tags, globals.output, &[]);
@@ -981,7 +1107,10 @@ fn ls(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<()> {
 
     let rows = tags.as_array().map(Vec::as_slice).unwrap_or_default();
     if rows.is_empty() {
-        println!("No tags in {}.", c.url());
+        match c.gateway_namespace() {
+            Some(ns) => println!("No tags under {ns}/ yet."),
+            None => println!("No tags in {}.", c.url()),
+        }
         return Ok(());
     }
     let mut table = Table::new(["TAG", "DIGEST"]);
@@ -996,7 +1125,10 @@ fn ls(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<()> {
 }
 
 fn describe(globals: &GlobalOpts, opts: &RegistryOpts, args: &DescribeArgs) -> Result<()> {
-    let (c, _, _) = client(globals, opts)?;
+    let (c, _) = client(globals, opts)?;
+    if let Some(ns) = c.gateway_namespace() {
+        artifact::check_namespaced(&args.reference, ns, true)?;
+    }
     let manifest = c.manifest(&args.reference)?;
     if globals.output.is_machine() {
         return output::emit(&manifest, globals.output, &[]);
@@ -1032,7 +1164,14 @@ fn describe(globals: &GlobalOpts, opts: &RegistryOpts, args: &DescribeArgs) -> R
 }
 
 fn usage(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<()> {
-    let (c, _, _) = client(globals, opts)?;
+    if route_for(globals, opts)? == Route::Gateway {
+        bail!(
+            "`heyctl artifact usage` is not available through app-lb — the store behind it is \
+             shared, and app-lb reports no store-wide figures. `heyctl artifact ls` lists \
+             your namespace's tags; an operator can ask a store directly with --registry-url"
+        );
+    }
+    let (c, _) = client(globals, opts)?;
     let u = c.usage()?;
     if globals.output.is_machine() {
         return output::emit(&u, globals.output, &[]);
@@ -1079,12 +1218,14 @@ fn usage(globals: &GlobalOpts, opts: &RegistryOpts) -> Result<()> {
 }
 
 fn untag(globals: &GlobalOpts, opts: &RegistryOpts, args: &UntagArgs) -> Result<()> {
-    let (c, _, _) = client(globals, opts)?;
+    let (c, registry) = client(globals, opts)?;
+    if let Some(ns) = c.gateway_namespace() {
+        artifact::check_namespaced(&args.name, ns, false)?;
+    }
     c.delete_tag(&args.name)?;
     println!(
-        "Tag {:?} removed from {}. The blob it named stays until the store's `art gc` runs.",
+        "Tag {:?} removed from {registry}. The blob it named stays until the store's `art gc` runs.",
         args.name,
-        c.url()
     );
     Ok(())
 }
@@ -1127,6 +1268,302 @@ mod tests {
         std::fs::write(&df, b"FROM debian\n").unwrap();
         assert_eq!(default_recipe_tag(&df), None);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn opts() -> RegistryOpts {
+        RegistryOpts::default()
+    }
+
+    fn with_registry(current: bool) -> Config {
+        let mut cfg = Config::default();
+        cfg.registries.insert(
+            "store".into(),
+            RegistryEntry {
+                url: "http://art:8080".into(),
+                api_key: Some("k".into()),
+                ..Default::default()
+            },
+        );
+        cfg.registries.insert("other".into(), RegistryEntry {
+            url: "http://other:8080".into(),
+            ..Default::default()
+        });
+        if current {
+            cfg.current_registry = Some("store".into());
+        }
+        cfg
+    }
+
+    #[test]
+    fn nothing_configured_means_the_gateway() {
+        // The customer path: `heyctl login`, then `heyctl artifact push`.
+        assert_eq!(route(&opts(), &Config::default()).unwrap(), Route::Gateway);
+    }
+
+    #[test]
+    fn a_direct_store_is_used_only_when_picked() {
+        let explicit_url = RegistryOpts {
+            registry_url: Some("http://art:8080".into()),
+            ..opts()
+        };
+        assert_eq!(route(&explicit_url, &Config::default()).unwrap(), Route::Direct);
+
+        let named = RegistryOpts {
+            registry: Some("store".into()),
+            ..opts()
+        };
+        assert_eq!(route(&named, &with_registry(false)).unwrap(), Route::Direct);
+
+        // A current registry keeps an operator where they were.
+        assert_eq!(route(&opts(), &with_registry(true)).unwrap(), Route::Direct);
+        // Two saved, neither current: nothing was picked.
+        assert_eq!(route(&opts(), &with_registry(false)).unwrap(), Route::Gateway);
+
+        // An API key alone picks nothing — it is never sent to app-lb.
+        let key_only = RegistryOpts {
+            api_key: Some("k".into()),
+            ..opts()
+        };
+        assert_eq!(route(&key_only, &Config::default()).unwrap(), Route::Gateway);
+    }
+
+    #[test]
+    fn lb_wins_over_every_registry_choice() {
+        let lb = RegistryOpts {
+            lb: true,
+            registry: Some("store".into()),
+            registry_url: Some("http://art:8080".into()),
+            ..opts()
+        };
+        assert_eq!(route(&lb, &with_registry(true)).unwrap(), Route::Gateway);
+    }
+
+    #[test]
+    fn the_gateway_sends_the_contexts_own_credential() {
+        let ep = |token: Option<&str>, user: Option<&str>, password: Option<&str>| Endpoint {
+            name: "ctx".into(),
+            server: "http://lb:9090".into(),
+            user: user.map(str::to_string),
+            password: password.map(str::to_string),
+            password_source: crate::config::PasswordSource::None,
+            token: token.map(str::to_string),
+            token_source: crate::config::PasswordSource::None,
+            insecure_skip_tls_verify: false,
+        };
+        assert_eq!(
+            context_auth(&ep(Some("applb_t"), Some("admin"), Some("pw"))).header().as_deref(),
+            Some("Bearer applb_t")
+        );
+        assert_eq!(
+            context_auth(&ep(None, Some("admin"), Some("pw"))).header().as_deref(),
+            Some("Basic YWRtaW46cHc=")
+        );
+        assert!(context_auth(&ep(None, Some("admin"), None)).header().is_none());
+    }
+
+    /// One request a [`FakeLb`] saw.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        body_len: usize,
+    }
+
+    /// A tiny HTTP/1.1 server standing in for app-lb: answers `/whoami` and the
+    /// gateway routes, closing every connection after one exchange.
+    struct FakeLb {
+        url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Seen>>>,
+    }
+
+    impl FakeLb {
+        fn start() -> Self {
+            use std::io::{BufRead, BufReader, Read};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let log = log.clone();
+                    std::thread::spawn(move || {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut parts = line.split_whitespace();
+                        let method = parts.next().unwrap_or_default().to_string();
+                        let path = parts.next().unwrap_or_default().to_string();
+                        let (mut len, mut authorization) = (0usize, None);
+                        loop {
+                            let mut h = String::new();
+                            reader.read_line(&mut h).unwrap();
+                            let h = h.trim_end();
+                            if h.is_empty() {
+                                break;
+                            }
+                            let (k, v) = h.split_once(':').unwrap();
+                            match k.to_ascii_lowercase().as_str() {
+                                "content-length" => len = v.trim().parse().unwrap(),
+                                "authorization" => authorization = Some(v.trim().to_string()),
+                                _ => {}
+                            }
+                        }
+                        let mut body = vec![0u8; len];
+                        reader.read_exact(&mut body).unwrap();
+                        log.lock().unwrap().push(Seen {
+                            method: method.clone(),
+                            path: path.clone(),
+                            authorization,
+                            body_len: len,
+                        });
+
+                        let manifest = "ab".repeat(32);
+                        let (status, body) = match (method.as_str(), path.as_str()) {
+                            ("GET", "/whoami") => (
+                                "200 OK",
+                                r#"{"caller":"token","confined":true,"namespace":"acme"}"#
+                                    .to_string(),
+                            ),
+                            ("HEAD", p) if p.contains("/blobs/") => ("404 Not Found", String::new()),
+                            ("PUT", p) if p.contains("/blobs/") => ("201 Created", "{}".into()),
+                            ("PUT", p) if p.ends_with("/manifests") => {
+                                ("200 OK", format!(r#"{{"digest":"{manifest}"}}"#))
+                            }
+                            ("PUT", p) if p.contains("/tags/") => ("200 OK", "{}".into()),
+                            _ => ("404 Not Found", r#"{"error":"no such route"}"#.into()),
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+                    });
+                }
+            });
+            FakeLb { url, seen }
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn globals_for(server: &str, dir: &std::path::Path) -> GlobalOpts {
+        GlobalOpts {
+            output: crate::output::OutputFormat::Json,
+            // An empty config: no contexts, no registries — the customer case.
+            config: Some(dir.join("config.json")),
+            context: None,
+            server: Some(server.to_string()),
+            user: None,
+            password: None,
+            token: Some("applb_secret".into()),
+            insecure_skip_tls_verify: false,
+            request_timeout: 10,
+        }
+    }
+
+    fn rootfs(dir: &std::path::Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let file = dir.join("web.ext4");
+        std::fs::write(&file, vec![7u8; 4096]).unwrap();
+        file
+    }
+
+    fn push_args(file: PathBuf, tag: Option<&str>) -> PushArgs {
+        PushArgs {
+            file: Some(file),
+            image: None,
+            tag: tag.map(str::to_string),
+            no_tag: false,
+            force: false,
+            public: false,
+        }
+    }
+
+    #[test]
+    fn a_push_goes_through_the_namespaces_gateway_with_the_contexts_bearer() {
+        let lb = FakeLb::start();
+        let dir = std::env::temp_dir().join(format!("heyctl-gw-push-{}", std::process::id()));
+        let file = rootfs(&dir);
+        let globals = globals_for(&lb.url, &dir);
+
+        // No -n: the namespace comes from the credential's /whoami.
+        run(
+            &globals,
+            &opts(),
+            &ArtifactCmd::Push(push_args(file.clone(), Some("acme/web:v2"))),
+        )
+        .unwrap();
+
+        let seen = lb.seen();
+        let paths: Vec<String> = seen.iter().map(|s| format!("{} {}", s.method, s.path)).collect();
+        let (digest, _) = artifact::hash_file(&file, |_, _| {}).unwrap();
+        let blob = format!("/namespaces/acme/artifacts/blobs/{digest}");
+        assert_eq!(
+            paths,
+            vec![
+                "GET /whoami".to_string(),
+                format!("HEAD {blob}"),
+                format!("PUT {blob}"),
+                "PUT /namespaces/acme/artifacts/manifests".to_string(),
+                "PUT /namespaces/acme/artifacts/tags/acme/web:v2".to_string(),
+            ],
+        );
+        // Every request carried the context's bearer — never a store key.
+        assert!(
+            seen.iter().all(|s| s.authorization.as_deref() == Some("Bearer applb_secret")),
+            "{seen:?}"
+        );
+        // The blob went up whole, streamed with a Content-Length.
+        assert_eq!(seen[2].body_len, 4096);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_bare_tag_is_refused_before_anything_is_uploaded() {
+        let lb = FakeLb::start();
+        let dir = std::env::temp_dir().join(format!("heyctl-gw-bare-{}", std::process::id()));
+        let file = rootfs(&dir);
+        let globals = globals_for(&lb.url, &dir);
+        let named = RegistryOpts {
+            namespace: Some("acme".into()),
+            ..opts()
+        };
+
+        let e = run(&globals, &named, &ArtifactCmd::Push(push_args(file.clone(), Some("web:v2"))))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("acme/web:v2"), "{e}");
+        // -n named the namespace, so not even /whoami was asked.
+        assert!(lb.seen().is_empty(), "{:?}", lb.seen());
+
+        // A derived default lands under the namespace instead of being refused.
+        run(&globals, &named, &ArtifactCmd::Push(push_args(file, None))).unwrap();
+        assert!(
+            lb.seen().iter().any(|s| s.path == "/namespaces/acme/artifacts/tags/acme/web"),
+            "{:?}",
+            lb.seen()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn usage_is_not_offered_through_the_gateway() {
+        let dir = std::env::temp_dir().join(format!("heyctl-gw-usage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Nothing listens here; the refusal must come before any request.
+        let globals = globals_for("http://127.0.0.1:9", &dir);
+        let e = run(&globals, &opts(), &ArtifactCmd::Usage).unwrap_err().to_string();
+        assert!(e.contains("not available through app-lb"), "{e}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

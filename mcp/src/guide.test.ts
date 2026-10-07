@@ -213,19 +213,18 @@ test("repo_deploy kind vm with no start_command derives it from the Dockerfile",
   assert.match(none.out, /not sent — no start_command/);
 });
 
-test("applb_deploy refuses an artifact store that is not this region's", async () => {
+test("applb_deploy warns that a hand-written artifact store with no auth will 401, and says to omit it", async () => {
   const config = loadConfig({
     APPLB_URL: "http://127.0.0.1:9090",
     APPLB_TOKEN: "applb_x",
-    ART_URL: "https://hub.example.com",
-    ART_API_KEY: "k",
   });
   const deploy = buildTools(config).find((t) => t.name === "applb_deploy")!;
   const original = globalThis.fetch;
   const sent: string[] = [];
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     sent.push(`${init?.method ?? "GET"} ${String(input)}`);
-    return new Response("{}", { status: 404, headers: { "content-type": "application/json" } });
+    const missing = (init?.method ?? "GET") === "GET";
+    return new Response("{}", { status: missing ? 404 : 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   try {
     const out = await deploy.handler({
@@ -236,8 +235,11 @@ test("applb_deploy refuses an artifact store that is not this region's", async (
         artifact: { store: "https://art.us5.example.com", ref: "us5/farm-rsvp" },
       },
     });
-    assert.match(out, /this region's store is https:\/\/hub\.example\.com/);
-    assert.ok(!sent.some((r) => r.startsWith("POST") || r.startsWith("PUT")), "an unknown store was still registered");
+    assert.match(out, /Artifact access/);
+    assert.match(out, /no `auth`, so app-lb pulls it anonymously and a private tag fails with 401/);
+    assert.match(out, /Leave `store` out/);
+    // Warned, not refused: a public repo on another store is legitimate.
+    assert.ok(sent.some((r) => r.startsWith("POST") || r.startsWith("PUT")), "the spec was not sent");
   } finally {
     globalThis.fetch = original;
   }

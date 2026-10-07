@@ -3,8 +3,8 @@
 An MCP server over heyo: **heyo cloud** for sandboxes — boot a microVM, run a
 command in it, get files in and out — and the three services that answer
 operational questions about a fleet, [app-lb](../app-lb) (deployments and VM
-pools), [app-obs](../app-obs) (logs and metrics), [ci](../ci) (builds) and the
-[artifact store](../artifacts) (the bytes a deployment runs from).
+pools, and your namespace's artifacts — the bytes a deployment runs from),
+[app-obs](../app-obs) (logs and metrics) and [ci](../ci) (builds).
 
 The sandbox half is the API an agent runs work on. The operational half exists
 because its questions span three services: "why is nothing running" is app-lb's
@@ -44,13 +44,9 @@ ci, or a cloud that is not the public one.
 | `APP_OBS_API_TOKEN` | bearer for its query routes (`/healthz` stays open) |
 | `CI_URL` | ci's **own** listener for the pages — see below; the read API works either way |
 | `CI_TOKEN` | a repository submit token (`git config ci.token`) — what `ci_run_status` and `ci_run_logs` present |
-| `ART_URL` | artifact store base URL |
-| `ART_API_KEY` | the store's own key, sent as `x-api-key` |
-| `ART_GATE_TOKEN` | app-token for the gate in front of the store; defaults to `APPLB_TOKEN` |
 | `REMOTE_URL` | the Heyo git remote (`remote/`) — the `repo_*` tools |
 | `REMOTE_TOKEN` | its credential; defaults to `APPLB_TOKEN` (the remote resolves `applb_…` tokens through app-lb), then `HEYO_API_KEY`. Over HTTP the caller's own bearer is always used |
 | `REMOTE_NAMESPACE` | the namespace repo tools default to; falls back to `APPLB_NAMESPACE`, then app-lb's discovered namespace |
-| `HEYO_MCP_PUBLIC_URL` | HTTP mode: this server's public base, so tools can point at the `/art` gateway for blobs too large to pass inline |
 | `HEYO_MCP_TIMEOUT_MS` | per-request bound, default 30000 |
 
 Each service is independent: configure one and its tools work while the others
@@ -73,41 +69,65 @@ An agent with files and no repo:
    `build` points at the repo, and runs the build. app-lb picks the site's root
    on its own host; never name a path on your machine as `site.root`.
 
-## The artifact-store gateway
+## Artifacts: your namespace's, on app-lb
 
-Beyond `art_publish`: `art_publish_files` bundles files (or a local directory)
-into the `.tar.gz` a site pull unpacks; `art_fetch` downloads a tag, manifest
-entry or blob with its digest verified; `art_list_manifests`, `art_delete_tag`
-and `art_set_public` cover the rest. Over HTTP, `/art/{blobs,manifests,tags,
-labels,public,usage}…` is forwarded to the store with this server's store key
-and the caller's own bearer, so `curl -T bundle.tgz` works for anything too
-large for a tool call.
+app-lb fronts one artifact store for the fleet and serves each namespace's
+corner of it on its admin API at `/namespaces/{ns}/artifacts/…`. Every `art_*`
+tool goes there with **the caller's own app-lb credential** — the same base the
+`applb_*` tools use, including the managed `…/namespaces/{ns}/lb` door — and
+app-lb is the single enforcement point: reads need the view tier in the
+namespace, writes need the admin tier over the whole namespace (not a token
+narrowed to particular deployments), and tags must start with `<namespace>/`.
+This server holds no store key and has no gateway of its own; the namespace
+comes from the managed door, or from app-lb's `GET /whoami` for a self-hosted
+app-lb.
+
+| Route (under `/namespaces/{ns}/artifacts`) | Tool |
+|---|---|
+| `GET` | `heyo_status` probe: `{namespace, available, prefix}` |
+| `GET /tags`, `GET\|PUT\|DELETE /tags/{tag}` | `art_list_tags`, `art_get_tag`, `art_delete_tag` |
+| `GET /manifests/{ref}`, `PUT /manifests` | `art_get_manifest`, `art_publish*` |
+| `HEAD\|GET\|PUT /blobs/{digest}` | `art_fetch`, `art_publish*` |
+| `PUT /repos/{repo}` `{public}` | `art_set_public` |
+
+`art_publish_files` bundles files (or a local directory) into the `.tar.gz` a
+site pull unpacks; `art_fetch` downloads a tag, manifest entry or blob with its
+digest verified. A blob too large to pass inline is one `curl` against app-lb
+itself — `GET <app-lb>/namespaces/<ns>/artifacts/blobs/<digest>` with your own
+bearer — and the same route takes a `PUT` of raw bytes with no size cap.
+
+app-lb answers `503` when it has no artifact store configured, `502` when the
+store is unreachable, and `403` outside the namespace or below the needed tier;
+the tools add a sentence saying which.
 
 ## Publishing a build
 
 `art_publish` is the tool for "update deployment X with this build". It is the
 step `applb_pull` cannot do: app-lb rolls a deployment onto bytes that must
-already be in the store, so without this the workflow dead-ends halfway.
+already be published, so without this the workflow dead-ends halfway.
 
 A publish is **three** requests and the order and the digests matter:
 
 ```
-PUT /blobs/{sha256}     the bytes, at their own hash
-PUT /manifests          {schema:1, kind:"generic", entries:[{name,digest,size}]}
+PUT …/blobs/{sha256}    the bytes, at their own hash
+PUT …/manifests         {schema:1, kind:"generic", entries:[{name,digest,size}]}
                         → answers {digest} — the MANIFEST's digest
-PUT /tags/{tag}         that manifest digest, as text/plain
+PUT …/tags/{tag}        that manifest digest, as text/plain
 ```
 
-**A tag names a manifest, never a blob.** The store does not check this: it
-writes whatever digest it is handed, so tagging a blob digest succeeds and then
-resolves for no reader — a tag that looks right in a listing and works for
-nobody. That is why publishing is one composite tool rather than three
-primitives with a warning: a composite that always uses the manifest digest
-cannot make the mistake. The primitives are still there (`art_request`) for
-everything else.
+**A tag names a manifest, never a blob.** Nothing checks this: tagging a blob
+digest succeeds and then resolves for no reader — a tag that looks right in a
+listing and works for nobody. That is why publishing is one composite tool
+rather than three primitives with a warning: a composite that always uses the
+manifest digest cannot make the mistake.
 
-Then `applb_pull` to roll the deployment onto it, and `applb_job` to watch the
-job it returns.
+To deploy it, the spec names only the ref — `"artifact": {"ref":
+"<ns>/site:v3"}`, no `store`, no `auth`. app-lb pulls from its own store and
+authenticates the pull itself for a ref under the deployment's namespace (or a
+digest). A hand-written store URL with no `auth` is pulled anonymously and
+401s for anything not public; `applb_deploy` warns about exactly that. Then
+`applb_pull` to roll the deployment onto it, and `applb_job` to watch the job
+it returns.
 
 **Not `applb_host_update`.** That runs a *static* deployment's own
 `update.commands` on the app-lb host and refuses a managed (`vm`) deployment
@@ -116,25 +136,6 @@ only. Until 2026-09-10 both this page and `art_publish`'s own result named it as
 the next step, which was wrong for the main case; `applb_pull` is what rolls a
 managed deployment onto new bytes, and `applb_build` is what rebuilds an image
 from a Dockerfile.
-
-### Two credentials, one request
-
-The store is the only service here with **two authenticators stacked in front of
-it**, and until both were used it could not be written to from outside the
-network at all:
-
-| Layer | Credential | Header |
-|---|---|---|
-| app-lb's gate | app-token with `admin` scope over the `artifacts` deployment | `Authorization: Bearer applb_…` |
-| the store itself | `ART_API_KEY` | `x-api-key` |
-
-Both are ordinarily presented as `Authorization`, which is why this reads as
-unsatisfiable: whichever one you send, the other layer refuses it. The way
-through is that the store also accepts `x-api-key`, so one request passes both
-doors. ci never hits this because ci runs inside the network, where there is no
-gate.
-
-Reached on its own listener there is no gate, and `ART_API_KEY` alone is enough.
 
 ## ci: the pages need a direct URL, the read API does not
 
@@ -511,8 +512,8 @@ Three of those steps exist because each was easy to get wrong by hand:
   its VM pool; `PUT` preserves the pool whenever the `vm` block is unchanged.
   Only the first was exposed, so every scaling or route edit cost a full roll.
 - **Which job.** app-lb's job kinds each apply to a subset of backends. `build`
-  is for a `vm` with a Dockerfile, `pull` rolls a `vm` or `site` onto bytes from
-  a store, and `host_update` runs a *static* deployment's own commands on the
+  is for a `vm` with a Dockerfile, `pull` rolls a `vm` or `site` onto published
+  artifact bytes, and `host_update` runs a *static* deployment's own commands on the
   app-lb host and refuses a managed one. Picking wrong is refused, not ignored.
 - **TLS.** An exact `host` route is issued automatically within seconds. A
   `host_suffix` route never gets its own certificate and needs a fleet wildcard;
@@ -579,7 +580,7 @@ Cross-service, shaped like the question rather than the endpoint.
 
 | Tool | | Does |
 | --- | --- | --- |
-| `heyo_status` | read-only | Which of heyo cloud, app-lb, app-obs, ci and the artifact store this server can reach, and what each says about itself. |
+| `heyo_status` | read-only | Which of heyo cloud, app-lb, app-obs and ci this server can reach, whether your namespace's artifacts on app-lb are available, and what each says about itself. |
 | `heyo_whoami` | read-only | What this server's credential is and what it may do: admin scope, namespace, deployment scope and expiry. |
 | `diagnose_deployment` | read-only | Everything about one deployment at once: app-lb's record and its VM pool, app-obs's bucketed series, and the most recent error-level logs. |
 | `deployment_logs` | read-only | Log lines for one deployment, newest first, with the filters app-obs supports: time window or explicit from/to, level, backend, a substring query, and a cursor for paging. |
@@ -602,7 +603,7 @@ Cross-service, shaped like the question rather than the endpoint.
 | `applb_delete_deployment` | **destructive** | Deregisters a deployment from app-lb and tears down its backends. |
 | `applb_scale` |  | Change a deployment's scaling parameters. |
 | `applb_build` |  | Build a managed (`vm`) deployment's image from its `build` block and roll the pool onto it. |
-| `applb_pull` |  | Materialize a `vm` or `site` deployment's bytes from an artifact store and roll it onto them. |
+| `applb_pull` |  | Materialize a `vm` or `site` deployment's bytes from your namespace's artifacts and roll it onto them. |
 | `applb_pull_mounts` |  | Re-unpack the guest mounts a `vm` deployment declares, from their artifact stores. |
 | `applb_host_update` |  | Run a STATIC (`upstreams`) or `site` deployment's own `update.commands` on the app-lb host, then re-probe its upstreams. |
 | `applb_job` | read-only | One job by its id — what applb_build, applb_pull, applb_pull_mounts and applb_host_update each return. |
@@ -672,23 +673,20 @@ Repos on the Heyo git remote: somewhere a generated project can live, and what a
 | `repo_get` | read-only | One repo: its clone URL, HEAD, every ref and its commit, and whether it is still empty. |
 | `repo_token` |  | Mint a repo token: `read` to clone or let app-lb build, `write` to push. |
 
-### The artifact store
+### Artifacts
 
-Where a deployment's bytes come from.
+Your namespace's artifacts, held by app-lb (`/namespaces/{ns}/artifacts` on its admin API, with your own app-lb credential): where a deployment's bytes come from.
 
 | Tool | | Does |
 | --- | --- | --- |
-| `art_publish_files` |  | Bundle files into a .tar.gz and publish it under a tag, the format a `site` deployment's `artifact` pull unpacks into its root. |
-| `art_publish` |  | Publish a bundle to the artifact store and point a tag at it. |
-| `art_fetch` |  | Download from the store: a tag or manifest digest (its single entry, or `entry`), or a blob digest. |
-| `art_list_tags` | read-only | Every tag in the store and the digest it points at. |
-| `art_list_manifests` | read-only | Every manifest in the store: digest, kind and entries. |
-| `art_delete_tag` | **destructive** | Remove a tag. |
-| `art_set_public` |  | Make a blob anonymously downloadable (`public: true`) or private again. |
-| `art_get_tag` | read-only | What one tag points at. |
-| `art_get_manifest` | read-only | One manifest by digest or by tag: its kind, its entries and their digests and sizes. |
-| `art_list_blobs` | read-only | Every blob with its size, its label and the tags pointing at it. |
-| `art_usage` | read-only | The store's disk usage. |
+| `art_publish_files` |  | Bundle files into a .tar.gz and publish it into your namespace's artifacts on app-lb under a tag (must start with "<namespace>/"), the format a `site` deployment's `artifact` pull unpacks into its root. |
+| `art_publish` |  | Publish a bundle into your namespace's artifacts on app-lb and point a tag at it. |
+| `art_fetch` |  | Download one of your namespace's artifacts from app-lb: a tag or manifest digest (its single entry, or `entry`), or a blob digest. |
+| `art_list_tags` | read-only | Every tag in your namespace's artifacts on app-lb (all under "<namespace>/") and the manifest digest each points at. |
+| `art_delete_tag` | **destructive** | Remove one of your namespace's artifact tags on app-lb. |
+| `art_set_public` |  | Make one of your namespace's artifact repos anonymously pullable (`public: true`) or private again. |
+| `art_get_tag` | read-only | What one of your namespace's tags points at: JSON `{tag, digest}`, the digest being its manifest's. |
+| `art_get_manifest` | read-only | One manifest from your namespace's artifacts, by digest or by tag: its kind, its entries and their digests and sizes. |
 
 ### ci
 
@@ -712,9 +710,8 @@ Everything without a dedicated tool. Prefer a named tool when one exists — a r
 | `applb_request` |  | Raw HTTP against app-lb, for endpoints without a dedicated tool above. |
 | `obs_request` |  | Raw HTTP against app-obs, for endpoints without a dedicated tool above. |
 | `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
-| `art_request` |  | Raw HTTP against the artifact store, for endpoints without a dedicated tool above. |
 
-_79 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+_75 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
 
 <!-- END GENERATED CATALOGUE -->
 
@@ -732,8 +729,8 @@ The prose is the part that matters: the SDK is explicit that clients should
 never make tool-use decisions from annotations, so the sentence the model reads
 carries the warning and `destructiveHint` is derived from it.
 
-The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request` /
-`art_request` tools reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
+The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request`
+tools reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
 the raw one's intent cannot be read without reading its arguments.
 
 `applb_purge_orphan_disks` deserves particular care: *orphaned* is app-lb's

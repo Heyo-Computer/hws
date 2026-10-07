@@ -329,7 +329,7 @@ Every `set` command is a read-modify-write of the whole spec (`PUT /deployments/
 | `set upstreams RESOURCE ADDR...` | | Replace a static deployment's upstream list |
 | `set route RESOURCE` (`routes`) | `--host`, `--host-suffix`, `--path-prefix`, `--route`, `--add`, `--none` | Replace or extend route rules; `--none` withdraws a managed deployment from the proxy |
 | `set build RESOURCE` | `--repo` or `--store`, `--ref`, `--dockerfile`, `--build-context`, `--image-name`, `--size-mb`, `--secret NAME[/KEY]` (default key `token`), `--username`, `--no-auth`, `--clear` | Record where `build` gets its Dockerfile |
-| `set artifact RESOURCE` (`art`) | `--store URL\|PATH`, `--ref`, `--image-name`, `--grow-gb`, `--secret`, `--no-auth`, `--clear` | Record where `pull` gets a rootfs |
+| `set artifact RESOURCE` (`art`) | `--ref`, `--store URL\|PATH` (omit for app-lb's own store; `''` switches back to it), `--image-name`, `--grow-gb`, `--secret`, `--no-auth`, `--clear` | Record where `pull` gets a rootfs |
 | `set update RESOURCE` | `--workdir` (absolute, on the app-lb host), `-c/--command` (repeatable), `-e/--env`, `--secret-env [ENV=]NAME/KEY`, `--secret`, `--no-auth`, `--command-timeout`, `--verify-timeout`, `--clear` | Record how `update` redeploys a static deployment or site |
 | `set auth RESOURCE` | `--provider-ref` or `--client-id`/`--secret`/`--allow-domain`/`--allow-email`; `--public-path`, `--base-path`, `--session-ttl`, `--cookie-name`, `--no-forward-identity`, `--clear` | Put a deployment behind a sign-in gate; see [app-lb auth](app-lb-auth.md#google) |
 | `set secret RESOURCE [KEY=VALUE\|KEY-]...` (`sec`) | `-n`, `--from-file`, `--from-env`, `--from-stdin`, `--description` | Rotate keys; unmentioned keys keep their values |
@@ -429,30 +429,42 @@ A token scoped to specific deployments cannot mint tokens, so it cannot widen it
 
 Both read app-obs through app-lb's `obs` plugin, so they need it installed in the namespace (`heyctl plugins install obs -n NS`) and nothing beyond a namespace token. `top` without `-n` still shows the LB's live counters.
 
-### Artifact stores
+### Artifacts
 
-An [artifact store](artifacts.md) (`art serve`) is a separate service from app-lb, so `heyctl artifact` (aliases `art`, `registry`) keeps its own saved **registries** in the same config file. `--context` never retargets an artifact command.
+`heyctl artifact` (aliases `art`, `registry`) pushes guest images and Dockerfiles that deployments pull or build, and lists or fetches them. By default it goes **through app-lb**: the load balancer fronts its configured global [artifact store](artifacts.md) under `/namespaces/<ns>/artifacts`, and heyctl reaches it with the same context as every other command (`--context`, `--server`, `--token`, Cloud's `/namespaces/<ns>/lb` door included). You never hold the store's key or need its address.
 
-| Registry option | Env var | Meaning |
+- The namespace is the one your credential is confined to; pass `-n NS` when it reaches several.
+- Every tag lives under that namespace: `acme/web:v2`, not `web:v2`. A bare tag is refused with the namespaced spelling suggested; a tag heyctl derives for you (from the file or directory name) is put under `<ns>/` automatically.
+- Reads (`ls`, `describe`, `pull`) need `view` on the namespace; writes (`push`, `push-dockerfile`, `untag`, `--public`) need `admin`. `usage` is not available through app-lb.
+- A `503` means the app-lb has no global store configured; a `502` means it cannot reach it.
+
+| Artifact option | Env var | Meaning |
 | --- | --- | --- |
-| `--registry NAME` | `HEYCTL_REGISTRY` | Which saved registry |
-| `--registry-url URL` | `HEYCTL_ART_URL` | Store URL override (`host:port` means http) |
-| `--api-key KEY` | `HEYCTL_ART_API_KEY` | Store API key override |
+| `-n NS`, `--namespace NS` | | Namespace whose artifacts to use (default: the credential's own) |
+| `--lb` | | Go through app-lb even when a registry is saved or named |
+| `--registry NAME` | `HEYCTL_REGISTRY` | Talk to this saved registry directly |
+| `--registry-url URL` | `HEYCTL_ART_URL` | Talk to this store directly (`host:port` means http) |
+| `--api-key KEY` | `HEYCTL_ART_API_KEY` | A direct store's key override; never sent to app-lb |
 
 | Command | Main flags | Does |
 | --- | --- | --- |
-| `artifact login URL` | `--api-key`, `--api-key-stdin`, `--api-key-command`, `--no-store-key`, `--name`, `--no-switch`, `--insecure-skip-tls-verify` | Verify a store key and save a registry |
+| `artifact push [FILE]` | `--image NAME`, `--tag`, `--no-tag`, `--force`, `--public` | Upload an ext4 rootfs and tag it |
+| `artifact push-dockerfile FILE` (`push-df`) | `--build-context PATH`, `--tag`, `--no-tag`, `--image-name`, `--size-mb`, `--source`, `--force` | Upload a Dockerfile and context as a `heyvm.dockerfile.v1` manifest |
+| `artifact pull REF` | `--dest PATH` | Download a tag or digest, verifying every byte; `host/repo:tag` reads a named store (the hub) anonymously |
+| `artifact ls` (`tags`) | | List tags (through app-lb: your namespace's) |
+| `artifact describe REF` | | What a tag or digest resolves to |
+| `artifact untag NAME` (`rm-tag`) | | Remove a tag; the blob stays until the store's `art gc` |
+| `artifact usage` | | Logical size, physical size, free space (direct stores only) |
+| `artifact login URL` | `--api-key`, `--api-key-stdin`, `--api-key-command`, `--no-store-key`, `--name`, `--no-switch`, `--insecure-skip-tls-verify` | Verify a store key and save a registry (operators) |
 | `artifact logout [NAME]` | `--key-only` | Forget a registry, or just its key |
 | `artifact registries` (`contexts`) | | List saved registries |
 | `artifact use NAME` (`use-registry`) | | Switch registry |
-| `artifact push [FILE]` | `--image NAME`, `--tag`, `--no-tag`, `--force` | Upload an ext4 rootfs and tag it |
-| `artifact push-dockerfile FILE` (`push-df`) | `--build-context PATH`, `--tag`, `--no-tag`, `--image-name`, `--size-mb`, `--source`, `--force` | Upload a Dockerfile and context as a `heyvm.dockerfile.v1` manifest |
-| `artifact ls` (`tags`) | | List tags |
-| `artifact describe REF` | | What a tag or digest resolves to |
-| `artifact usage` | | Logical size, physical size, free space |
-| `artifact untag NAME` (`rm-tag`) | | Remove a tag; the blob stays until `art gc` |
 
 `push --image NAME` resolves `~/.heyo/images/firecracker/<name>.ext4` (or under `$MVM_DATA_DIR`), where `heyvm mvm build` writes images. The tag defaults to the file name without `.ext4`. `push-dockerfile`'s tag defaults to the Dockerfile's directory name. The build context is packed as-is, with no `.dockerignore` handling, so point it at a clean directory.
+
+#### Talking to a store directly (operators)
+
+Saved **registries** are the escape hatch for someone who runs a store and holds its `ART_API_KEY`: `heyctl artifact login URL` verifies the key and saves a registry in the same config file. A command goes straight to a store, skipping app-lb, when you pass `--registry` or `--registry-url` (or set `HEYCTL_REGISTRY` / `HEYCTL_ART_URL`), or when a registry is saved and current (or is the only one). `--lb` overrides all of that. In direct mode there is no namespace rule (flat tags work), `usage` works, and `--context` does not change which store is used. `heyctl whoami` says which route the next artifact command takes.
 
 ### Shell completion
 
@@ -512,16 +524,24 @@ Each build produces an image named `<deployment>-<short sha>`, so `describe` and
 
 ### Push and pull an image
 
-Build the image once, push it to a store, and let each app-lb host pull it:
+Build the image once, push it through app-lb, and let the deployment pull it. Your context is all you need; tags go under your namespace (`acme` here):
+
+```sh
+heyctl artifact push --image web-v2 --tag acme/web:v2
+heyctl set artifact web --ref acme/web:v2
+heyctl pull web --wait
+heyctl get jobs -d web
+```
+
+With no `--store`, the deployment pulls from app-lb's own global store, and app-lb authenticates with its own key, so no `--secret` is needed. The ref must be under the deployment's namespace, or a digest.
+
+An operator pointing a deployment at some other store still names it, with a key held as a secret:
 
 ```sh
 heyctl artifact login https://art.us2.heyo.work --api-key-stdin < ~/.art-key
 heyctl artifact push --image web-v2
-
 heyctl create secret art --from-stdin api_key < ~/.art-key
 heyctl set artifact web --store https://art.us2.heyo.work --ref web-v2 --secret art/api_key
-heyctl pull web --wait
-heyctl get jobs -d web
 ```
 
 A store root on the app-lb host (`--store /srv/artifacts`) is much cheaper than a URL: the image is materialised locally and sparse regions are skipped. Re-pulling unchanged bytes skips the transfer but still rolls the pool.
@@ -609,7 +629,9 @@ A token minted with `--namespace` and no `--deployment` reaches every deployment
 | 403 `insufficient_scope` | Your token is valid but its deployment or namespace scope does not cover the target. A higher admin tier will not help; re-scope with `token set` |
 | A scoped token cannot `create deployment` or `token mint` | Fleet-wide routes are refused to deployment-scoped tokens by design |
 | `heyo_api_…` key refused against app-lb directly | A namespace key belongs at Cloud's `https://<cloud>/namespaces/<ns>/lb` door, or app-lb needs `APP_LB_AUTH_URL` set to resolve it |
-| Artifact push 401 while everything else works | Artifact commands use the registry key, not the context. Check `heyctl whoami` and `heyctl artifact registries` |
+| Artifact push 401 while everything else works | A saved registry sends artifact commands straight to a store with its key, not the context. `heyctl whoami` shows the route; pass `--lb` or `heyctl artifact logout` to go through app-lb |
+| Artifact push refused: tag outside namespace | Through app-lb every tag starts with `<ns>/`. Use `--tag <ns>/web:v2` |
+| Artifact command 503 | This app-lb has no global artifact store configured. Ask its operator |
 | `build`/`pull` refused with a conflict | A job is already running for that deployment. Wait for it (`get jobs -d NAME`) |
 | `set artifact` refused | The deployment has a `build` source. Clear it with `set build NAME --clear` first (and vice versa) |
 | `scale`, `exec` or `restart` refused | The command does not apply to this deployment kind; see the table at the top |

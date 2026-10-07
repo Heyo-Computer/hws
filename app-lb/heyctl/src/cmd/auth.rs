@@ -430,19 +430,23 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
         output::field("TLS", "certificate verification disabled");
     }
 
-    // The artifact store is a second identity against a second service, and a
-    // `403` on a push has nothing to do with the credentials above. Reported
-    // only when one is configured — most LBs have no store.
+    // A saved registry sends `heyctl artifact` straight to a store — a second
+    // identity against a second service, where a `403` on a push has nothing
+    // to do with the credentials above. Without one, artifact commands go
+    // through app-lb with this context, reported after the server section.
     // `None` for the name: whoami reports what the *next* command would reach
     // for by default, and `--registry` is scoped to `heyctl artifact`.
-    if let Ok(reg) = crate::config::resolve_registry_endpoint(
+    let direct_registry = crate::config::resolve_registry_endpoint(
         &config,
         None,
         None,
         None,
         globals.insecure_skip_tls_verify,
-    ) {
+    );
+    let artifacts_via_lb = direct_registry.is_err();
+    if let Ok(reg) = direct_registry {
         output::section("Artifact store");
+        output::field("Route", "direct (saved registry); `heyctl artifact --lb` uses app-lb");
         output::field("Registry", &reg.name);
         output::field("URL", &reg.url);
         output::field("API key", reg.api_key_source.describe_api_key());
@@ -491,6 +495,9 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
                 200 => {
                     output::field("Reachable", "yes (GET /deployments)");
                     output::field("Deployment API", "allowed");
+                    if artifacts_via_lb {
+                        artifacts_section(&client);
+                    }
                     Ok(())
                 }
                 code => {
@@ -520,7 +527,33 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
     };
     output::field("Deployment API", access("/deployments"));
     output::field("Metrics", access("/metrics"));
+    if artifacts_via_lb {
+        artifacts_section(&client);
+    }
     Ok(())
+}
+
+/// Where `heyctl artifact` goes when no registry is saved: app-lb's gateway,
+/// in this credential's namespace. One `/whoami` to name the namespace; no
+/// probe of the gateway itself, which would cost a store round trip to say
+/// what the first `artifact ls` will say anyway.
+fn artifacts_section(client: &Client) {
+    output::section("Artifacts");
+    let ns = client
+        .whoami()
+        .ok()
+        .and_then(|me| me.sole_namespace().map(str::to_string));
+    output::field(
+        "Route",
+        match ns {
+            Some(ns) => format!(
+                "through app-lb (namespace {ns}, tags under {ns}/) with this context's credential"
+            ),
+            None => "through app-lb with this context's credential (pass -n to `heyctl \
+                     artifact` — this credential is not confined to one namespace)"
+                .to_string(),
+        },
+    );
 }
 
 #[derive(Subcommand, Debug)]

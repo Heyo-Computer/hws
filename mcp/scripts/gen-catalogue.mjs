@@ -51,7 +51,6 @@ function everyTool() {
         APPLB_TOKEN: "heyo_api_lb",
         APP_OBS_URL: "http://app-obs",
         CI_URL: "http://ci",
-        ART_URL: "http://art",
       }),
     ),
   );
@@ -124,9 +123,10 @@ const GROUPS = [
     match: (n) => n.startsWith("repo_"),
   },
   {
-    title: "The artifact store",
-    blurb: "Where a deployment's bytes come from.",
-    match: (n) => n.startsWith("art_") && n !== "art_request",
+    title: "Artifacts",
+    blurb:
+      "Your namespace's artifacts, held by app-lb (`/namespaces/{ns}/artifacts` on its admin API, with your own app-lb credential): where a deployment's bytes come from.",
+    match: (n) => n.startsWith("art_"),
   },
   {
     title: "ci",

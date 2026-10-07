@@ -605,6 +605,10 @@ pub struct Jobs {
     /// Told what each pull and build put in heyvm's catalog, so the image
     /// inventory knows where an image came from and can offload it safely.
     images: std::sync::OnceLock<Arc<crate::images::ImageCatalog>>,
+    /// The store an `artifact` block with no `store` pulls from, and the key
+    /// app-lb presents there for a namespace's own refs. Unset when
+    /// `APP_LB_ARTIFACT_STORE` is.
+    global_store: std::sync::OnceLock<Arc<crate::store_gateway::GlobalStore>>,
 }
 
 impl Jobs {
@@ -652,6 +656,45 @@ impl Jobs {
             running: Mutex::new(HashSet::new()),
             obs,
             images: std::sync::OnceLock::new(),
+            global_store: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// See [`Jobs::global_store`]. Set once at startup.
+    pub fn set_global_store(&self, store: Arc<crate::store_gateway::GlobalStore>) {
+        let _ = self.global_store.set(store);
+    }
+
+    /// The store a pull of `spec` runs against and the key it presents.
+    ///
+    /// `artifact.auth` wins when it is set: it is the deployment naming its own
+    /// credential. Otherwise the global store's key goes with a ref the
+    /// namespace owns (or a digest), and nothing goes with anything else — a
+    /// spec naming another namespace's tag gets an anonymous pull.
+    fn artifact_source(
+        &self,
+        spec: &ArtifactSpec,
+        namespace: &str,
+    ) -> Result<(ArtifactSpec, Option<String>), String> {
+        let global = self.global_store.get().map(Arc::as_ref);
+        let spec = crate::store_gateway::effective(spec, global)?;
+        let key = match spec.auth.as_ref() {
+            Some(r) => self.store_key(Some(r))?,
+            None => global
+                .filter(|g| g.is_this(&spec.store))
+                .and_then(|g| g.key_for(namespace, &spec.artifact_ref))
+                .map(str::to_owned),
+        };
+        Ok((spec, key))
+    }
+
+    /// What a job record should say it pulls from: the global store's URL for a
+    /// block that names none, so a job list never shows a blank source.
+    fn display_store(&self, spec: &ArtifactSpec) -> String {
+        if spec.store.trim().is_empty() {
+            self.global_store.get().map(|g| g.base().to_string()).unwrap_or_default()
+        } else {
+            spec.store.clone()
         }
     }
 
@@ -784,7 +827,7 @@ impl Jobs {
             probe.validate().map_err(|e| StartError::BadRef(e.to_string()))?;
         }
 
-        let store = spec.store.clone();
+        let store = self.display_store(&spec);
         let reference = spec.artifact_ref.clone();
         self.spawn(
             deployment_id,
@@ -856,7 +899,7 @@ impl Jobs {
         record.intent_fingerprint = Some(intent_fingerprint);
         record.config_fingerprint = Some(config_fingerprint.clone());
         record.source_spec_fingerprint = Some(fingerprint(&deployment.spec));
-        record.store = Some(artifact.store.clone());
+        record.store = Some(self.display_store(&artifact));
         record.artifact_ref = Some(digest.clone());
         history.push_back(record.clone());
         trim_history(&mut history, deployment_id);
@@ -979,10 +1022,10 @@ impl Jobs {
         let mut puller = self.puller.for_candidate()?;
         puller.preparation_progress = Some(progress.clone());
         let mut prepared = spec.clone();
-        let mut artifact = spec.artifact.clone().ok_or("pinned rootfs artifact required")?;
-        artifact.image_name = Some(format!("rollout-{}", generation));
+        let artifact = spec.artifact.clone().ok_or("pinned rootfs artifact required")?;
         progress.send_replace("rootfs_credentials".into());
-        let key = self.store_key(artifact.auth.as_ref())?;
+        let (mut artifact, key) = self.artifact_source(&artifact, &spec.namespace)?;
+        artifact.image_name = Some(format!("rollout-{}", generation));
         progress.send_replace("rootfs_manifest".into());
         artifact.artifact_ref = puller.pinned_rootfs(&artifact, key.as_deref()).await?;
         let mut log = |_: String| {};
@@ -1659,7 +1702,13 @@ impl Jobs {
     ) -> Result<String, String> {
         // Resolved here rather than inside the puller, so the one place that
         // reads secrets is the one place that already does for a build.
-        let api_key = self.store_key(spec.auth.as_ref())?;
+        let namespace = self
+            .registry
+            .get(deployment_id)
+            .map(|d| d.spec.namespace.clone())
+            .ok_or_else(|| format!("deployment {deployment_id:?} is no longer registered"))?;
+        let (resolved, api_key) = self.artifact_source(spec, &namespace)?;
+        let spec = &resolved;
 
         // A site's artifact is a directory tree rather than a guest rootfs, and
         // everything after the resolve differs: where the bytes land, what
@@ -2847,6 +2896,37 @@ mod tests {
         later.set_backends(vec![first, second]);
         let error = jobs.verify_correlated_readiness("job", "web", &replacement).await.unwrap_err();
         assert!(error.contains("replaced again"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_storeless_artifact_pulls_from_the_global_store_with_app_lbs_key_only_for_its_own_refs() {
+        let dir = scratch("global-store");
+        let jobs = jobs_at(&dir);
+        let spec = |r: &str| -> ArtifactSpec {
+            serde_json::from_value(serde_json::json!({ "ref": r })).unwrap()
+        };
+
+        let err = jobs.artifact_source(&spec("ci/web:v1"), "ci").unwrap_err();
+        assert!(err.contains("APP_LB_ARTIFACT_STORE"), "{err}");
+
+        jobs.set_global_store(Arc::new(
+            crate::store_gateway::GlobalStore::new("https://art.example.com/", Some("k".into())).unwrap(),
+        ));
+        let (resolved, key) = jobs.artifact_source(&spec("ci/web:v1"), "ci").unwrap();
+        assert_eq!(resolved.store, "https://art.example.com");
+        assert_eq!(key.as_deref(), Some("k"));
+
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(jobs.artifact_source(&spec(digest), "ci").unwrap().1.as_deref(), Some("k"));
+        assert_eq!(jobs.artifact_source(&spec("other/web:v1"), "ci").unwrap().1, None, "anonymous outside the namespace");
+
+        // Naming the global store explicitly is the same as leaving it out.
+        let named = ArtifactSpec { store: "https://art.example.com".into(), ..spec("ci/web:v1") };
+        assert_eq!(jobs.artifact_source(&named, "ci").unwrap().1.as_deref(), Some("k"));
+        // Any other store gets nothing of app-lb's.
+        let other = ArtifactSpec { store: "https://art.other.com".into(), ..spec("ci/web:v1") };
+        assert_eq!(jobs.artifact_source(&other, "ci").unwrap().1, None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

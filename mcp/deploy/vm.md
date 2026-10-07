@@ -53,29 +53,22 @@ was working.
 
 This is also what makes the VM's `0.0.0.0` bind acceptable. See below.
 
-## The one credential it may hold: the artifact store's key
+## No artifact-store credential
 
-The store answers to a single key (`ART_API_KEY`), not to the caller's token.
-So the shared global store is reachable through this server only if the server
-holds that key, delivered with `env_from` from the `artifacts` secret. With
-`/mcp` public, that key would otherwise act for anyone. `src/artscope.ts`
-decides, per request, who it acts for:
+This server used to hold the store's key (`ART_API_KEY`) and decide, per
+request, whom it acted for. It no longer does. app-lb fronts the single global
+artifact store and serves each namespace's corner of it at
+`/namespaces/{ns}/artifacts/…` on its admin API, holding the store key itself.
+The `art_*` tools call that route with the **caller's own app-lb credential**,
+so app-lb is the one place that decides access: reads need the view tier in the
+namespace, writes the admin tier over the whole namespace, and tags must start
+with `<ns>/`. There is no `/art` gateway on this server any more, and no
+`artifacts` secret to deliver with `env_from` — remove one left over from an
+older manifest.
 
-- **Nobody anonymous.** A request without an `applb_…` bearer is sent to the
-  store *without* the key, which leaves it the store's anonymous reads of
-  public blobs.
-- **Nobody app-lb does not vouch for.** The bearer is checked with app-lb's
-  `GET /whoami` (`APPLB_URL`), and the answer is cached for 30s. Anything that
-  is not a verified app-token with an admin tier gets no key.
-- **A fleet token** gets the whole store, read-only at the `view` tier.
-- **A namespace token** gets its own corner of the store: refs under `<ns>/`,
-  content-addressed blobs and manifests by digest, and a tag listing filtered
-  to `<ns>/`. Nothing store-wide (`/usage`, `/blobs`, `/manifests`,
-  `/repos` listings) and nothing else's tags. A view-tier token, or one
-  confined to particular deployments, is read-only.
-
-The check sits on the one requester every art tool uses and on the `/art`
-gateway, so `art_request`'s raw HTTP is held to it too.
+A deployment that runs a published artifact names only `artifact: {ref:
+"<ns>/name:tag"}`; app-lb pulls it from its own store and authenticates the
+pull itself.
 
 ## Preconditions (not in this manifest — apply separately)
 

@@ -1,6 +1,5 @@
 /**
- * The git remote tools, the artifact-store gateway tools, and the `/art`
- * HTTP gateway.
+ * The git remote tools, and the artifact tools that bundle and fetch files.
  *
  * Asserted on the requests this server builds, as `artifacts.test.ts` does,
  * because the mistakes worth catching are ones the services accept: a deploy
@@ -12,14 +11,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { loadConfig, withForwardedAuth } from "./config.js";
 import { buildTools } from "./server.js";
-import { serveHttp } from "./serve-http.js";
 import { tarGz, validPath, readDirectory } from "./files.js";
 import type { Tool } from "./tools/diagnose.js";
 
@@ -66,8 +63,6 @@ const tools = (env: Record<string, string> = {}) =>
       APPLB_TOKEN: "applb_1_agent",
       REMOTE_URL: "http://remote:9700",
       REMOTE_NAMESPACE: "team-a",
-      ART_URL: "http://art:8080",
-      ART_API_KEY: "art-key",
       ...env,
     }),
   );
@@ -199,8 +194,8 @@ test("art_publish_files publishes a tar.gz that tar itself can read", async () =
   try {
     const long = `${"d".repeat(60)}/${"e".repeat(60)}/page.html`;
     const out = parse(
-      await tool(tools(), "art_publish_files").handler({
-        tag: "site-live",
+      await tool(tools({ APPLB_NAMESPACE: "team-a" }), "art_publish_files").handler({
+        tag: "team-a/site-live",
         files: [
           { path: "index.html", content: "<h1>hi</h1>" },
           { path: long, content: "deep" },
@@ -209,6 +204,8 @@ test("art_publish_files publishes a tar.gz that tar itself can read", async () =
       }),
     );
     assert.equal(out.files, 3);
+    assert.deepEqual(out.artifact, { ref: "team-a/site-live" });
+    assert.doesNotMatch(String(out.next), /store"?\s*:|https?:\/\//, "the next step names no store");
     const dir = mkdtempSync(join(tmpdir(), "mcp-tar-"));
     writeFileSync(join(dir, "b.tgz"), blob!);
     const listing = execFileSync("tar", ["-tzvf", join(dir, "b.tgz")]).toString();
@@ -216,7 +213,7 @@ test("art_publish_files publishes a tar.gz that tar itself can read", async () =
     assert.match(listing, /-rwxr-xr-x.*run\.sh/);
     execFileSync("tar", ["-xzf", join(dir, "b.tgz"), "-C", dir]);
     assert.equal(readFileSync(join(dir, long), "utf8"), "deep");
-    const tag = stub.calls.find((c) => c.url.endsWith("/tags/site-live"))!;
+    const tag = stub.calls.find((c) => c.url.endsWith(`/namespaces/team-a/artifacts/tags/${encodeURIComponent("team-a/site-live")}`))!;
     assert.equal(tag.body, "sha256:" + "m".repeat(64), "the tag names the manifest");
   } finally {
     stub.restore();
@@ -233,11 +230,11 @@ test("art_fetch resolves a tag to its entry, verifies the digest, and returns te
     return {};
   });
   try {
-    const out = parse(await tool(tools(), "art_fetch").handler({ reference: "my-tag" }));
+    const out = parse(await tool(tools({ APPLB_NAMESPACE: "team-a" }), "art_fetch").handler({ reference: "team-a/my-tag" }));
     assert.equal(out.text, "hello world");
     assert.equal(out.digest, digest);
     serve = new TextEncoder().encode("tampered!!!");
-    await assert.rejects(tool(tools(), "art_fetch").handler({ reference: "my-tag" }), /hashing to [0-9a-f]{64}, not [0-9a-f]{64}; nothing was kept/);
+    await assert.rejects(tool(tools({ APPLB_NAMESPACE: "team-a" }), "art_fetch").handler({ reference: "team-a/my-tag" }), /hashing to [0-9a-f]{64}, not [0-9a-f]{64}; nothing was kept/);
   } finally {
     stub.restore();
   }
@@ -257,76 +254,4 @@ test("the remote is reached as the caller, whatever kind of credential they hold
     assert.equal(withForwardedAuth(base, { authorization: header }).remote?.auth, header);
   }
   assert.equal(withForwardedAuth(base, {}).remote?.auth, "Bearer hrm_operator_x");
-});
-
-test("the /art gateway forwards the store API, with the store key only for a caller app-lb vouches for", async () => {
-  const seen: { method: string; url: string; key?: string; auth?: string; body: string }[] = [];
-  const store = createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      seen.push({
-        method: req.method!,
-        url: req.url!,
-        key: req.headers["x-api-key"] as string,
-        auth: req.headers.authorization,
-        body,
-      });
-      res.writeHead(200, { "content-type": "text/plain", etag: '"e1"' });
-      res.end(req.method === "GET" ? "blob-bytes" : "ok");
-    });
-  });
-  await new Promise<void>((r) => store.listen(0, "127.0.0.1", r));
-  const storePort = (store.address() as { port: number }).port;
-  // app-lb's /whoami, which is what lets the gateway hand this caller the key.
-  const applb = createServer((req, res) => {
-    const ok = req.url === "/whoami" && req.headers.authorization === "Bearer applb_1_caller";
-    res.writeHead(ok ? 200 : 401, { "content-type": "application/json" });
-    res.end(JSON.stringify(ok ? { caller: "app-token", admin_scope: "admin", fleet: true } : { error: "no" }));
-  });
-  await new Promise<void>((r) => applb.listen(0, "127.0.0.1", r));
-  const applbPort = (applb.address() as { port: number }).port;
-  const gwPort = 19_000 + Math.floor(Math.random() * 1000);
-  const prev = process.env.HEYO_MCP_REQUIRE_IDENTITY;
-  process.env.HEYO_MCP_REQUIRE_IDENTITY = "0";
-  const gateway = await serveHttp(
-    loadConfig({
-      ART_URL: `http://127.0.0.1:${storePort}`,
-      ART_API_KEY: "store-key",
-      APPLB_URL: `http://127.0.0.1:${applbPort}`,
-      HEYO_MCP_HTTP_PORT: String(gwPort),
-    }),
-    gwPort,
-    "127.0.0.1",
-  );
-  try {
-    const base = `http://127.0.0.1:${gwPort}`;
-    const put = await fetch(`${base}/art/blobs/sha256:${"a".repeat(64)}`, {
-      method: "PUT",
-      headers: { authorization: "Bearer applb_1_caller", "content-type": "application/octet-stream" },
-      body: "payload",
-    });
-    assert.equal(put.status, 200);
-    const got = await fetch(`${base}/art/blobs/sha256:${"a".repeat(64)}`);
-    assert.equal(await got.text(), "blob-bytes");
-    assert.equal(got.headers.get("etag"), '"e1"');
-
-    assert.equal(seen[0]!.method, "PUT");
-    assert.equal(seen[0]!.body, "payload");
-    assert.equal(seen[0]!.key, "store-key");
-    assert.equal(seen[0]!.auth, "Bearer applb_1_caller", "the caller's app-token goes to the gate");
-    // The anonymous GET went without the key: the store decides what an
-    // anonymous caller may read (public blobs), not this server's key.
-    assert.equal(seen[1]!.key, undefined, "an anonymous caller was sent with the store key");
-
-    assert.equal((await fetch(`${base}/art/dashboard`)).status, 404, "the dashboard is not forwarded");
-    assert.equal((await fetch(`${base}/art/tags/x`, { method: "POST" })).status, 405);
-    assert.equal(seen.length, 2, "refused requests never reached the store");
-  } finally {
-    if (prev === undefined) delete process.env.HEYO_MCP_REQUIRE_IDENTITY;
-    else process.env.HEYO_MCP_REQUIRE_IDENTITY = prev;
-    store.close();
-    applb.close();
-    gateway.close();
-  }
 });

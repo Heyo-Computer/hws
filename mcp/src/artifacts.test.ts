@@ -1,18 +1,16 @@
 /**
- * The publish sequence, and the two credentials that reach the store.
+ * The publish sequence, and where it goes: the caller's namespace's artifacts
+ * on app-lb, with the caller's own app-lb credential.
  *
- * These exist because both are things a caller gets wrong by hand and neither
- * fails loudly. A tag pointing at a blob digest is *accepted* by the store and
- * then resolves for nobody; a request carrying one of the two credentials is
- * refused by whichever layer it missed, with a 401 that names the other one.
- * Asserting on the requests this server builds is the only place either can be
- * pinned, since the store agrees with both mistakes at the time they are made.
+ * A tag pointing at a blob digest is *accepted* and then resolves for nobody,
+ * so asserting on the requests this server builds is the only place that
+ * mistake can be pinned.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { loadConfig, withForwardedAuth, artService } from "./config.js";
+import { loadConfig, withForwardedAuth } from "./config.js";
 import { buildTools } from "./server.js";
 import type { Tool } from "./tools/diagnose.js";
 
@@ -72,62 +70,61 @@ function tool(tools: Tool[], name: string): Tool {
   return found;
 }
 
-const withArt = () =>
-  buildTools(
-    loadConfig({
-      HEYO_API_KEY: "heyo_api_x",
-      ART_URL: "https://art.us2.heyo.work",
-      ART_API_KEY: "art-secret",
-      ART_GATE_TOKEN: "applb_1_gate",
-    }),
-  );
+/** The managed app-lb door for namespace `acme`, as `loadConfig` builds it. */
+const LB = "https://server.heyo.computer/namespaces/acme/lb";
+/** Where `acme`'s artifacts live on that app-lb. */
+const ART = `${LB}/namespaces/acme/artifacts`;
 
-/** A store that answers a manifest PUT the way the real one does. */
-const storeResponder = (manifestDigest = "sha256:" + "m".repeat(64)) =>
+const withArt = () =>
+  buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_NAMESPACE: "acme" }));
+
+/** app-lb answering a manifest PUT the way it does. */
+const storeResponder = (manifestDigest = "m".repeat(64)) =>
   stubFetch((c) => (c.method === "PUT" && c.url.endsWith("/manifests") ? { body: { digest: manifestDigest } } : {}));
 
-test("a publish is three requests, and the tag names the manifest, never the blob", async () => {
-  const manifest = "sha256:" + "m".repeat(64);
+test("a publish is three requests to app-lb, and the tag names the manifest, never the blob", async () => {
+  const manifest = "m".repeat(64);
   const stub = storeResponder(manifest);
   try {
-    await tool(withArt(), "art_publish").handler({
-      tag: "marketing-site",
-      content_base64: HELLO_B64,
-    });
+    const out = String(
+      await tool(withArt(), "art_publish").handler({ tag: "acme/marketing-site", content_base64: HELLO_B64 }),
+    );
 
     assert.deepEqual(
       stub.calls.map((c) => `${c.method} ${c.url}`),
       [
         // The blob at its own hash, then the manifest, then the tag. Any other
         // order publishes a tag pointing at bytes that are not there yet.
-        `PUT https://art.us2.heyo.work/blobs/${encodeURIComponent(HELLO_SHA)}`,
-        "PUT https://art.us2.heyo.work/manifests",
-        "PUT https://art.us2.heyo.work/tags/marketing-site",
+        `PUT ${ART}/blobs/${HELLO_SHA}`,
+        `PUT ${ART}/manifests`,
+        `PUT ${ART}/tags/${encodeURIComponent("acme/marketing-site")}`,
       ],
     );
 
     // The whole reason this is one tool: the tag body is the digest the
-    // *manifest* PUT answered with, not the blob's. Tagging the blob digest is
-    // accepted by the store and resolves for no reader.
+    // *manifest* PUT answered with, not the blob's.
     assert.equal(stub.calls[2]?.body, manifest);
     assert.notEqual(stub.calls[2]?.body, HELLO_SHA);
     assert.equal(stub.calls[2]?.headers["content-type"], "text/plain");
+    // What to deploy is the ref alone.
+    assert.match(out, /"artifact":\s*\{\s*"ref":\s*"acme\/marketing-site"\s*\}/);
+    assert.doesNotMatch(out, /store"?\s*:/);
   } finally {
     stub.restore();
   }
 });
 
-test("the blob goes to the store as bytes, at the digest that names it", async () => {
+test("the blob goes to app-lb as bytes, at the digest that names it", async () => {
   const stub = storeResponder();
   try {
-    await tool(withArt(), "art_publish").handler({ tag: "t", content_base64: HELLO_B64 });
+    await tool(withArt(), "art_publish").handler({ tag: "acme/t", content_base64: HELLO_B64 });
 
     const blob = stub.calls[0]!;
     // Not JSON-wrapped: encoding the body would change the bytes and therefore
     // the digest they are being stored under.
     assert.equal(blob.body, "hello");
     assert.equal(blob.headers["content-type"], "application/octet-stream");
-    assert.ok(blob.url.includes(encodeURIComponent(HELLO_SHA)), blob.url);
+    assert.ok(blob.url.endsWith(`/blobs/${HELLO_SHA}`), blob.url);
 
     // And the manifest entry describes those same bytes.
     const manifest = JSON.parse(stub.calls[1]!.body!);
@@ -139,62 +136,88 @@ test("the blob goes to the store as bytes, at the digest that names it", async (
   }
 });
 
-/**
- * The finding that read as structural: two authenticators stacked in front of
- * one service, both reached through `Authorization`. They are not — the store
- * takes `x-api-key` too, so one request satisfies both doors.
- */
-test("one request carries the gate's bearer and the store's own key", async () => {
+test("every artifact request carries the caller's own app-lb bearer and no store key", async () => {
+  const base = loadConfig({ APPLB_URL: "https://lb.example", APPLB_NAMESPACE: "acme", HEYO_MCP_HTTP_PORT: "8090" });
+  const cfg = withForwardedAuth(base, { authorization: "Bearer applb_2_caller" });
   const stub = storeResponder();
   try {
-    await tool(withArt(), "art_publish").handler({ tag: "t", content_base64: HELLO_B64 });
-
+    await tool(buildTools(cfg), "art_publish").handler({ tag: "acme/t", content_base64: HELLO_B64 });
+    await tool(buildTools(cfg), "art_list_tags").handler({});
+    assert.equal(stub.calls.length, 4);
     for (const call of stub.calls) {
-      assert.equal(call.headers.authorization, "Bearer applb_1_gate", `gate: ${call.url}`);
-      assert.equal(call.headers["x-api-key"], "art-secret", `store: ${call.url}`);
+      assert.ok(call.url.startsWith("https://lb.example/namespaces/acme/lb/namespaces/acme/artifacts/"), call.url);
+      assert.equal(call.headers.authorization, "Bearer applb_2_caller", call.url);
+      assert.equal(call.headers["x-api-key"], undefined, call.url);
     }
   } finally {
     stub.restore();
   }
 });
 
-test("the gate token falls back to APPLB_TOKEN, and an absent store key sends no header", () => {
-  const shared = artService("https://art.example", "k", undefined, "applb_1_shared");
-  assert.equal(shared?.auth, "Bearer applb_1_shared");
-
-  // No key configured: no header at all. An empty `x-api-key` is a value the
-  // store compares and refuses, which is worse than not sending one to a store
-  // that has none configured.
-  const keyless = artService("https://art.example", "", undefined, "applb_1_shared");
-  assert.equal(keyless?.headers, undefined);
-
-  // On its own listener, inside the network: no gate, so no bearer, and the
-  // store key is the only credential. This shape needs no extra configuration.
-  const direct = artService("http://127.0.0.1:8080", "k");
-  assert.equal(direct?.auth, undefined);
-  assert.deepEqual(direct?.headers, { "x-api-key": "k" });
+test("each art tool hits its app-lb route under /namespaces/<ns>/artifacts", async () => {
+  const digest = "a".repeat(64);
+  const stub = stubFetch((c) =>
+    c.url.includes("/manifests/") ? { body: { kind: "generic", entries: [{ name: "x", digest, size: 1 }] } } : { body: {} },
+  );
+  try {
+    const tools = withArt();
+    await tool(tools, "art_list_tags").handler({});
+    await tool(tools, "art_get_tag").handler({ tag: "acme/site:v1" });
+    await tool(tools, "art_get_manifest").handler({ reference: `sha256:${digest}` });
+    await tool(tools, "art_delete_tag").handler({ tag: "acme/site:v1" });
+    await tool(tools, "art_set_public").handler({ repo: "acme/site:v1", public: true });
+    assert.deepEqual(
+      stub.calls.map((c) => `${c.method} ${c.url.slice(ART.length)}`),
+      [
+        "GET /tags",
+        `GET /tags/${encodeURIComponent("acme/site:v1")}`,
+        `GET /manifests/${digest}`,
+        `DELETE /tags/${encodeURIComponent("acme/site:v1")}`,
+        `PUT /repos/${encodeURIComponent("acme/site")}`,
+      ],
+    );
+    assert.deepEqual(JSON.parse(stub.calls[4]!.body!), { public: true });
+  } finally {
+    stub.restore();
+  }
 });
 
-/**
- * A hosted instance acts as its caller at the gate — and only at the gate. The
- * store key is this process's own: it carries no scope, so there is nothing in
- * it to widen, and a caller has no way to present one.
- */
-test("a caller's app-token replaces the gate credential but never the store key", () => {
-  const base = loadConfig({
-    ART_URL: "https://art.us2.heyo.work",
-    ART_API_KEY: "art-secret",
-    ART_GATE_TOKEN: "applb_1_server",
-  });
-  const forwarded = withForwardedAuth(base, { authorization: "Bearer applb_2_caller" });
+test("a tag outside the namespace is refused before any bytes move", async () => {
+  const stub = storeResponder();
+  try {
+    await assert.rejects(
+      () => tool(withArt(), "art_publish").handler({ tag: "other/site:v1", content_base64: HELLO_B64 }),
+      /must start with "acme\/"/,
+    );
+    assert.equal(stub.calls.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
 
-  assert.equal(forwarded.art?.auth, "Bearer applb_2_caller");
-  assert.deepEqual(forwarded.art?.headers, { "x-api-key": "art-secret" });
+test("app-lb's 503 and 403 on artifacts are explained", async () => {
+  let status = 503;
+  const stub = stubFetch(() => ({ status, body: { error: "nope" } }));
+  try {
+    await assert.rejects(() => tool(withArt(), "art_list_tags").handler({}), /no artifact store configured/);
+    status = 403;
+    await assert.rejects(() => tool(withArt(), "art_list_tags").handler({}), /admin tier over the whole namespace/);
+  } finally {
+    stub.restore();
+  }
+});
 
-  // A cloud key means nothing to an app-lb gate, so it is not substituted —
-  // sending it would produce a 401 that reads as "the store is down".
-  const cloudKey = withForwardedAuth(base, { authorization: "Bearer heyo_api_x" });
-  assert.equal(cloudKey.art?.auth, "Bearer applb_1_server");
+test("with no managed namespace, the artifact namespace comes from app-lb's /whoami", async () => {
+  const stub = stubFetch((c) => (c.url.endsWith("/whoami") ? { body: { namespace: "team" } } : { body: [] }));
+  try {
+    await tool(buildTools(loadConfig({ APPLB_URL: "https://lb.example", APPLB_TOKEN: "applb_1_x" })), "art_list_tags").handler({});
+    assert.deepEqual(
+      stub.calls.map((c) => c.url),
+      ["https://lb.example/whoami", "https://lb.example/namespaces/team/artifacts/tags"],
+    );
+  } finally {
+    stub.restore();
+  }
 });
 
 test("a manifest answer with no digest aborts before anything is tagged", async () => {
@@ -203,7 +226,7 @@ test("a manifest answer with no digest aborts before anything is tagged", async 
   );
   try {
     await assert.rejects(
-      () => tool(withArt(), "art_publish").handler({ tag: "t", content_base64: HELLO_B64 }),
+      () => tool(withArt(), "art_publish").handler({ tag: "acme/t", content_base64: HELLO_B64 }),
       /did not answer with its digest/,
     );
     // Two requests, not three: refusing beats moving a tag onto "something".
@@ -218,7 +241,7 @@ test("content that is not base64 is refused before anything is stored", async ()
   const stub = storeResponder();
   try {
     await assert.rejects(
-      () => tool(withArt(), "art_publish").handler({ tag: "t", content_base64: "not base64!!" }),
+      () => tool(withArt(), "art_publish").handler({ tag: "acme/t", content_base64: "not base64!!" }),
       /not valid base64/,
     );
     // `Buffer.from` drops what it cannot decode rather than throwing, so
@@ -237,9 +260,9 @@ test("a publish with no tag and a publish with no bytes are both refused locally
       () => tool(withArt(), "art_publish").handler({ content_base64: HELLO_B64 }),
       /`tag` is required/,
     );
-    await assert.rejects(() => tool(withArt(), "art_publish").handler({ tag: "t" }), /no bytes/);
+    await assert.rejects(() => tool(withArt(), "art_publish").handler({ tag: "acme/t" }), /no bytes/);
     await assert.rejects(
-      () => tool(withArt(), "art_publish").handler({ tag: "t", path: "/x", content_base64: HELLO_B64 }),
+      () => tool(withArt(), "art_publish").handler({ tag: "acme/t", path: "/x", content_base64: HELLO_B64 }),
       /not both/,
     );
     assert.equal(stub.calls.length, 0);
@@ -248,14 +271,34 @@ test("a publish with no tag and a publish with no bytes are both refused locally
   }
 });
 
-test("an unconfigured store names both variables rather than failing at the first door", async () => {
-  await assert.rejects(
-    () => tool(buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x" })), "art_publish").handler({
-      tag: "t",
-      content_base64: HELLO_B64,
-    }),
-    /ART_URL.*ART_API_KEY/s,
-  );
+/**
+ * Nothing an agent reads may steer it at the artifact store itself: no store
+ * URL, no store key, no gateway on this server. Artifacts are the namespace's,
+ * on app-lb.
+ */
+test("no tool, instruction or guide text points an agent at the artifact store", async () => {
+  const { INSTRUCTIONS } = await import("./server.js");
+  const { GUIDES } = await import("./tools/guide.js");
+  const banned = [/ART_API_KEY/, /ART_URL/, /ART_GATE_TOKEN/, /art\.us\d/, /artifact\.store/, /\/art\b(?!ifact)/, /x-api-key/i, /art_request|art_usage|art_list_blobs|art_list_manifests/];
+  for (const http of [false, true]) {
+    const tools = buildTools(
+      loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_NAMESPACE: "acme", ...(http ? { HEYO_MCP_HTTP_PORT: "8090" } : {}) }),
+    );
+    for (const t of tools) {
+      const schemaText = JSON.stringify(
+        Object.fromEntries(Object.entries(t.schema).map(([k, v]) => [k, (v as { description?: string }).description ?? ""])),
+      );
+      for (const re of banned) {
+        assert.doesNotMatch(t.description, re, `${t.name} description`);
+        assert.doesNotMatch(schemaText, re, `${t.name} parameter descriptions`);
+      }
+    }
+  }
+  const guideText = GUIDES.map((g) => [...g.steps, ...(g.pitfalls ?? [])].join("\n")).join("\n");
+  for (const re of banned) {
+    assert.doesNotMatch(INSTRUCTIONS, re, "INSTRUCTIONS");
+    assert.doesNotMatch(guideText, re, "guides");
+  }
 });
 
 test("ci_run_status and ci_run_logs go to the public read API", async () => {
