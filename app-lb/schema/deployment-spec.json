@@ -950,6 +950,32 @@
         }
       ]
     },
+    "RouteRedirect": {
+      "description": "Where a redirecting route sends its requests.",
+      "type": "object",
+      "properties": {
+        "keep_path": {
+          "description": "Append the request path and query to `to`. Off sends every request to\n`to` exactly.",
+          "type": "boolean",
+          "default": true
+        },
+        "status": {
+          "description": "`301` (default), `302`, `303`, `307` or `308`.",
+          "type": "integer",
+          "format": "uint16",
+          "default": 301,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "to": {
+          "description": "Absolute `http`/`https` URL. With `keep_path` the request path (after\n`strip_prefix`, if the rule strips) and query are appended to it, so\n`https://example.com/docs` sends `/a/b?q` to `https://example.com/docs/a/b?q`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "to"
+      ]
+    },
     "RouteRule": {
       "description": "How a request is matched to a deployment.\n\nA rule matches when *every* populated field matches. An empty rule matches\nnothing (rejected at registration) rather than everything, so a typo can't\nsilently swallow all traffic.",
       "type": "object",
@@ -973,6 +999,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "redirect": {
+          "description": "Answer every request this rule matches with a redirect instead of\nserving it, so one deployment can capture a host (an old subdomain, a\nvanity name) and send it elsewhere while its other routes serve as usual.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RouteRedirect"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "strip_prefix": {
