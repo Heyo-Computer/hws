@@ -10,7 +10,17 @@ import assert from "node:assert/strict";
 
 import { loadConfig } from "./config.js";
 import { buildTools } from "./server.js";
-import { interpret, lintVmSpec, noVmFinding, parseStartCommand, probeScript, foregroundScript } from "./tools/vmboot.js";
+import {
+  backoffFinding,
+  foregroundScript,
+  healthyPeers,
+  interpret,
+  lintVmSpec,
+  noVmFinding,
+  parseStartCommand,
+  peerFinding,
+  probeScript,
+} from "./tools/vmboot.js";
 
 const FARM =
   "cd /app && export NODE_ENV=production && export PORT=3001 && export HOST=0.0.0.0 && " +
@@ -137,4 +147,39 @@ test("diagnose_vm_boot probes a booting VM and names the farm-backend crash", as
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// us5, 2026-10-06: newsfeed-api and farm-backend sat at the hour-long backoff
+// ceiling with `pending: 0`, and the agent reported a platform-wide outage while
+// newsfeed-app, heyo-mcp and remote served from the same host.
+test("a held-off pool says so, with the wait and the way out", () => {
+  const held = backoffFinding({ boot_failures: 24, boot_backoff_secs: 3120 });
+  assert.match(held?.title ?? "", /Boot backoff/);
+  assert.match(held?.detail ?? "", /24 boots in a row/);
+  assert.match(held?.detail ?? "", /52 min/);
+  assert.match(held?.detail ?? "", /applb_scale/);
+  assert.equal(backoffFinding({ boot_failures: 0, boot_backoff_secs: null }), undefined);
+  assert.equal(backoffFinding(undefined), undefined, "an app-lb that predates the fields says nothing");
+
+  const noVm = noVmFinding("deployment \"x\" had no VM ready within its cold-start timeout", { boot_backoff_secs: 600 });
+  assert.match(noVm?.detail ?? "", /next VM in 10 min/);
+  assert.doesNotMatch(noVmFinding("x has no VM")?.detail ?? "", /16 minutes/, "the ceiling is an hour");
+  assert.match(noVmFinding("x has no VM")?.detail ?? "", /up to an hour/);
+});
+
+test("healthy peers come only from the /metrics the caller was given", () => {
+  const metrics = {
+    deployments: [
+      { id: "newsfeed-api", kind: "vm", pool: { ready: 0, draining: 0 } },
+      { id: "newsfeed-app", kind: "vm", pool: { ready: 1, draining: 0 } },
+      { id: "heyo-mcp", kind: "vm", pool: { ready: 1, draining: 0 } },
+      { id: "draining-out", kind: "vm", pool: { ready: 1, draining: 1 } },
+      { id: "app-lb-admin", kind: "static", pool: { ready: 1, draining: 0 } },
+    ],
+  };
+  assert.deepEqual(healthyPeers(metrics, "newsfeed-api"), ["newsfeed-app", "heyo-mcp"]);
+  assert.deepEqual(healthyPeers({ deployments: [] }, "x"), [], "a caller who sees nothing else is told nothing");
+  assert.match(peerFinding(["newsfeed-app", "heyo-mcp"])?.detail ?? "", /newsfeed-app, heyo-mcp have VMs/);
+  assert.match(peerFinding(["newsfeed-app"])?.detail ?? "", /the deployments you can see/);
+  assert.equal(peerFinding([]), undefined);
 });

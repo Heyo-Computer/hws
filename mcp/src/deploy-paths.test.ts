@@ -119,9 +119,11 @@ test("editing a deployment uses PUT, which preserves the pool", async () => {
     // full roll.
     const spec = { id: "web", routes: [{ host: "web.example.com" }], upstreams: ["127.0.0.1:3000"] };
     await tool("applb_update_deployment").handler({ id: "web", spec });
-    assert.equal(stub.calls[0]?.method, "PUT");
-    assert.match(stub.calls[0]?.url ?? "", /\/deployments\/web$/);
-    assert.deepEqual(stub.calls[0]?.body, spec);
+    const writes = stub.calls.filter((c) => c.method !== "GET");
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0]?.method, "PUT");
+    assert.match(writes[0]?.url ?? "", /\/deployments\/web$/);
+    assert.deepEqual(writes[0]?.body, spec);
   } finally {
     stub.restore();
   }

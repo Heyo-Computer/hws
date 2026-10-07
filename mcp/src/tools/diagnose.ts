@@ -10,7 +10,19 @@
 
 import { z } from "zod";
 import { bool, num } from "./schema.js";
-import { foregroundScript, interpret, lintVmSpec, noVmFinding, parseStartCommand, probeScript, type Finding } from "./vmboot.js";
+import {
+  backoffFinding,
+  foregroundScript,
+  healthyPeers,
+  interpret,
+  lintVmSpec,
+  noVmFinding,
+  parseStartCommand,
+  peerFinding,
+  probeScript,
+  type BackoffState,
+  type Finding,
+} from "./vmboot.js";
 import type { Clients } from "../clients/index.js";
 import { settle } from "../clients/index.js";
 import { report, section, json, type Section } from "../format.js";
@@ -364,6 +376,10 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         const r = await settle({
           deployment: clients.applb({ path }),
           metrics: clients.applb({ path: "/metrics", query: { deployment: id, summary: "false" } }),
+          // Every deployment this credential may view, summarised: app-lb
+          // narrows /metrics to the caller's reach, so the comparison below
+          // can only name deployments the caller can already see.
+          visible: clients.applb({ path: "/metrics", query: { summary: "true" } }),
         });
         if (!r.deployment.ok) {
           return report(`VM boot diagnosis for ${id}`, [section("app-lb record", r.deployment)]);
@@ -380,9 +396,11 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
           typeof vm.start_command === "string" ? parseStartCommand(vm.start_command) : undefined;
 
         let pool: unknown = r.metrics.ok ? r.metrics.value : undefined;
+        let backoff: BackoffState | undefined;
         if (r.metrics.ok) {
           const deps = (r.metrics.value as { deployments?: Array<Record<string, unknown>> }).deployments ?? [];
           const mine = deps.find((d) => d.id === id);
+          backoff = mine?.pool as BackoffState | undefined;
           if (mine) {
             pool = {
               pool: mine.pool,
@@ -439,8 +457,12 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
           ...lintVmSpec(vm),
           ...interpret(`${text(probe.guest)}\n${text(fg)}`, port),
         ];
-        const noVm = probe.guest.ok ? undefined : noVmFinding(probe.guest.error);
+        const noVm = probe.guest.ok ? undefined : noVmFinding(probe.guest.error, backoff);
         if (noVm) findings.push(noVm);
+        const held = backoffFinding(backoff);
+        if (held && !noVm) findings.push(held);
+        const peers = peerFinding(r.visible.ok ? healthyPeers(r.visible.value, id) : []);
+        if (peers) findings.push(peers);
         const seen = new Set<string>();
         const unique = findings.filter((f) => !seen.has(f.title) && seen.add(f.title));
 
@@ -473,8 +495,8 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         "because a full disk is one of the two common causes, the other being scale-to-zero " +
         "churn.\n\n" +
         "If the counters show creates attempted and zero booted, the failure is inside the " +
-        "guest and app-obs will not have it: a start_command that exits non-zero writes to the " +
-        "guest's /var/log/heyvm-start.log, which needs a shell on the VM to read.",
+        "guest: diagnose_vm_boot reads it. `boot_backoff_secs` set means a boot-failure " +
+        "backoff: nothing boots until it ends or the spec is written.",
       schema: { id: z.string().optional().describe("deployment id; omitted shows every pool") },
       handler: async (args) => {
         const id = args.id ? String(args.id) : undefined;
@@ -485,7 +507,19 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
             ? clients.applb({ path: `/deployments/${encodeURIComponent(id)}` })
             : Promise.resolve(null),
         });
+        // Read off the same /metrics, which app-lb has already narrowed to what
+        // this credential may view: the backoff that explains an empty pool,
+        // and whether the deployments around it boot fine.
+        const findings: Finding[] = [];
+        if (id && r.metrics.ok) {
+          const deps = (r.metrics.value as { deployments?: Array<Record<string, unknown>> }).deployments ?? [];
+          const held = backoffFinding(deps.find((d) => d.id === id)?.pool as BackoffState | undefined);
+          if (held) findings.push(held);
+          const peers = peerFinding(healthyPeers(r.metrics.value, id));
+          if (peers) findings.push(peers);
+        }
         return report(id ? `Pool diagnosis for ${id}` : "Pool diagnosis (all deployments)", [
+          ...(findings.length ? [{ title: "Findings", body: findings }] : []),
           section("app-lb /metrics — the pool counters that answer this", r.metrics),
           section("app-lb /disks — storage, for the full-disk case only", r.disks),
           section("Deployment record", r.deployment),

@@ -108,6 +108,70 @@ test("applb_deploy accepts no start_command when the image owns /init.sh, or whe
   assert.match(told.out, /no_start_command/);
 });
 
+// The primitives under applb_deploy used to send anything. newsfeed-api went
+// in through them with no start_command, and farm-rsvp with a guessed store;
+// both then failed every boot or pull with nothing saying why (us5,
+// 2026-10-06).
+test("applb_update_deployment refuses a VM spec with no start_command it cannot keep", async () => {
+  const { out, spec } = await run(
+    "applb_update_deployment",
+    { id: "newsfeed-api", spec: buildSpec() },
+    { existing: buildSpec(), dockerfile: "FROM node:18-alpine\nRUN true\n" },
+  );
+  assert.equal(spec, undefined, "nothing was sent");
+  assert.match(out, /not sent — no start_command/);
+});
+
+test("applb_update_deployment keeps the current start_command and says so", async () => {
+  const existing = buildSpec({ start_command: "cd /app && setsid nohup node server.js </dev/null &" });
+  const { out, spec } = await run("applb_update_deployment", { id: "newsfeed-api", spec: buildSpec() }, { existing });
+  assert.equal(spec?.vm?.start_command, "cd /app && setsid nohup node server.js </dev/null &");
+  assert.match(out, /start_command \(kept\)/);
+  assert.match(out, /app-lb's answer/);
+});
+
+test("applb_create_deployment derives start_command, and warns about a redirect", async () => {
+  const { out, spec } = await run("applb_create_deployment", { spec: buildSpec() }, { dockerfile: DOCKERFILE });
+  assert.equal(spec?.vm?.start_command, "cd /app && setsid nohup node server.js </dev/null &");
+
+  const hidden = buildSpec({ start_command: "cd /app && setsid nohup node server.js </dev/null >/var/log/app.log 2>&1 &" });
+  const warned = await run("applb_create_deployment", { spec: hidden });
+  assert.ok(warned.spec, "a redirect is warned about, not refused");
+  assert.match(warned.out, /start_command hides the app's output/);
+});
+
+test("applb_create_deployment refuses an artifact store that is not this region's — the farm-rsvp shape", async () => {
+  const config = loadConfig({
+    APPLB_URL: "http://127.0.0.1:9090",
+    APPLB_TOKEN: "applb_x",
+    APPLB_NAMESPACE: "us5",
+    ART_URL: "https://hub.example.com",
+    ART_API_KEY: "k",
+  });
+  const tool = buildTools(config).find((t) => t.name === "applb_create_deployment")!;
+  const original = globalThis.fetch;
+  const sent: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    sent.push(`${init?.method ?? "GET"} ${String(input)}`);
+    return new Response("{}", { status: 404, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    const out = await tool.handler({
+      spec: {
+        id: "farm-rsvp",
+        namespace: "us5",
+        routes: [{ host: "farm-rsvp.example.com" }],
+        vm: { driver: "firecracker", port: 8080, start_command: "x &" },
+        artifact: { store: "https://art.us5.example.com", ref: "us5/farm-rsvp" },
+      },
+    });
+    assert.match(out, /this region's store is https:\/\/hub\.example\.com/);
+    assert.ok(!sent.some((r) => r.startsWith("POST") || r.startsWith("PUT")), "an unknown store was still registered");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test("repo_deploy says when a kept start_command no longer matches the Dockerfile's CMD", async () => {
   const existing = buildSpec({ start_command: "cd /app && setsid nohup npm start </dev/null &" });
   const { out, spec } = await run(
