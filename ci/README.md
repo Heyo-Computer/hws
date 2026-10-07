@@ -1797,7 +1797,10 @@ https://github.com/Heyo-Computer/hws.git:
 ```
 
 An admin can `POST /release-builds` with
-`{"repository":"https://github.com/Heyo-Computer/hws.git","name":"2026-10-05.1","revision":"<full merged SHA>"}`.
+`{"repository":"https://github.com/Heyo-Computer/hws.git","service":"ci","name":"ci-2026-10-05.1","revision":"<full merged SHA>"}`.
+Each request selects one configured component/service. Omitting `service` is
+accepted only when the repository has a single configured service. Each service
+has independent candidates; a platform-wide bundle is not a deployment unit.
 Omit `revision` to freeze the configured branch tip observed at admission.
 The SHA must be an ancestor of that branch, not an unmerged PR. Repeating a name
 returns the same build; a name cannot select a different revision. Retry a failed
@@ -1805,7 +1808,7 @@ build under a new name. `GET /release-builds` returns recent builds, errors and
 the existing CI run IDs. Both routes require dashboard admin identity and origin
 checks, just like `/releases`; they must remain behind app-lb authentication.
 
-The daily scheduler admits at most one `daily-YYYY-MM-DD` build per repository
+The daily scheduler uses one date-and-service-specific build name per repository
 after its UTC cutoff. Multiple CI instances use the same unique database row;
 there is no global CI execution lock. After downtime it admits today's build
 using the branch tip at recovery, not a fabricated historical midnight revision.
@@ -1813,9 +1816,19 @@ It does not backfill missed dates. Configure every instance with the same policy
 
 Admission atomically stores the exact source descriptor, policy, run membership
 and expanded job plans. Existing CI scheduling and recovery execute those jobs.
-Submit path filters do not reduce the build: every configured workflow runs,
+Only the selected service's workflow runs,
 with `changed()` evaluating against an unknown/full change set. Other job and
 step conditions still apply; a skipped required producer cannot seal a release.
+Before building, CI fingerprints the selected workflow definition and its
+declared `on.submit.paths` inputs, including Git file modes and object IDs.
+An unchanged fingerprint and identical selected policy reuse a retained ready
+candidate without rebuilding. The response identifies the original artifact
+revision and adds `reused`, `requested_revision`, and `requested_name`; it does
+not relabel old bytes as a new source revision. Missing or unsupported path
+filters conservatively use the whole repository. Shared dependencies and build
+inputs must be covered by the workflow's declared paths. Reuse does not create
+a new candidate name. Changes in other services do not force a rebuild when
+their files are outside those declared inputs.
 These workflows may run build/test shell and `ci/upload-artifact`, but not
 deployment/publication builtins. Build admission strips upload aliases so it
 cannot move `latest`. Explicit public download flags are preserved because host
@@ -1862,8 +1875,9 @@ example, verification commands, supported scope and staged activation procedure.
 
 `CI_RELEASE_ENVIRONMENTS` is an optional operator-owned YAML map keyed by named
 environment. Each entry contains `repository`, `workflow_id`, `mode` (`manual`
-by default, or `automatic`), optional `network`, `workflow`, `service_targets`
-and `placements`. Targets and placements use the existing mappings described
+by default, or `automatic`), optional `network`, and `services`. Each service
+entry owns its `workflow`, target maps and `placements`, optionally overriding
+`workflow_id`. Targets and placements use the existing mappings described
 below. Environment names are installation-wide and each belongs to one repository;
 use distinct names such as `hws-stage` and `retail-stage`. This is not an atomic
 multi-repository release.
@@ -1883,23 +1897,25 @@ bootstrap actions are refused. Artifact actions specify literal `workflow` and
 workflow, not hardcoded region names or submitted repository changes.
 
 Admin `POST /release-promotions` accepts
-`{"environment":"hws-stage","bundle_id":"<catalog ID>","request_id":"<unique request>"}`.
+`{"environment":"hws-stage","service":"ci","bundle_id":"<catalog ID>","request_id":"<unique request>"}`.
 Admission validates the retained version-2 manifest and artifact selection,
 freezes the operator plan, and creates ordinary persisted CI jobs. Repeating the
 request returns the same run; reusing its ID for a different bundle is refused.
-One environment permits one promotion at a time; unrelated environments and CI
-jobs are not locked. `GET /release-environments` shows policy mode, current and
-previous successful bundles, active run, automation hold and recent history.
+One service in one environment permits one promotion at a time; other services,
+environments and CI jobs are not locked. A candidate must contain exactly the
+selected service. `GET /release-environments` returns `services[]`, each with its
+own current/previous release, active run, automation hold and recent history.
+Unattributed historical state is under `legacy`; it is not a live service version.
 These endpoints use the same admin identity and origin checks as release builds.
 
-Automatic mode selects the latest ready build by **build admission time**, not
+Automatic mode selects this service's latest ready build by **build admission time**, not
 completion time. An older slow build cannot displace a newer completed build.
 Manual promotion holds automation, including in automatic environments. Failure
 also holds automation and leaves the last successful bundle unchanged. A failed
 partial rollout may leave mixed service revisions: inspect its deployment records;
 the current bundle is the last complete success, not a live inventory claim.
 Existing managed rollout recovery must settle before the active run is cleared.
-Admin `POST /release-automation` takes `{"environment":"hws-stage","held":true}`
+Admin `POST /release-automation` takes `{"environment":"hws-stage","service":"ci","held":true}`
 to hold future promotions. `held:false` resumes automatic policy only when no
 promotion is active; it does not convert manual policy into automatic policy.
 An active rollout finishes normally while held. Retrying a failed promotion uses
@@ -1918,6 +1934,39 @@ manual requests cannot bypass prerequisites. With no successful release recorded
 recovery is unavailable. Recovery is another managed deployment, not interruption
 of a running rollout. `GET /release-environments` includes `requires`,
 `recovery_required` and `recovery_bundle` for the panel.
+
+#### Upgrading from environment-wide promotion
+
+Migration 052 adds separate service-scoped tables; legacy tables and keys remain
+usable by old binaries. New binaries recognize and settle legacy jobs without
+copying their history into a service's current/previous state.
+`CI_RELEASE_SERVICE_ENVIRONMENTS_ENABLED` defaults to `false`: new service
+promotion and automation admission are refused until activation. Upgrade all
+CI executors sharing the queue before enabling it. An old executor cannot
+execute a new service promotion merely because HTTP admission went to a new
+region. Keep legacy policies readable during that overlap. After retiring all
+old executors, install the service policies consistently and enable the flag.
+Active legacy rollouts must settle before service promotion in that environment.
+Do not roll back to a binary lacking scoped promotion provenance after activation.
+This flag is an upgrade compatibility switch, not an execution lock.
+
+```yaml
+hws-stage:
+  repository: https://github.com/Heyo-Computer/hws.git
+  workflow_id: public
+  mode: automatic
+  services:
+    ci:
+      workflow: | # existing region-by-region on: promotion DAG for CI only
+        on: promotion
+        jobs: {} # replace with the configured regional rollout jobs
+      service_targets: {} # CI targets only
+    orchestrator:
+      workflow: | # independent DAG and state for orchestrator
+        on: promotion
+        jobs: {} # replace before activation; empty workflows are rejected
+      service_targets: {} # orchestrator targets only
+```
 
 ### Release target resolution
 

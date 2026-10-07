@@ -20,6 +20,7 @@ pub enum Mode {
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub repository: String,
+    #[serde(default)]
     pub workflow_id: String,
     /// The same bundle must have completed successfully in these environments.
     #[serde(default)]
@@ -27,6 +28,28 @@ pub struct Policy {
     #[serde(default)]
     pub mode: Mode,
     pub network: Option<String>,
+    #[serde(default)]
+    pub workflow: String,
+    #[serde(default)]
+    pub services: BTreeMap<String, Rollout>,
+    #[serde(default)]
+    pub service_targets: BTreeMap<String, crate::service_rollout::Target>,
+    #[serde(default)]
+    pub pooler_targets: BTreeMap<String, crate::pooler_rollout::Target>,
+    #[serde(default)]
+    pub site_targets: BTreeMap<String, crate::site_rollout::Target>,
+    #[serde(default)]
+    pub stateful_targets: BTreeMap<String, crate::stateful_rollout::Target>,
+    #[serde(default)]
+    pub placements: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rollout {
+    /// Existing CI secrets scope; inherits the environment's legacy scope.
+    #[serde(default)]
+    pub workflow_id: String,
     pub workflow: String,
     #[serde(default)]
     pub service_targets: BTreeMap<String, crate::service_rollout::Target>,
@@ -40,10 +63,79 @@ pub struct Policy {
     pub placements: BTreeMap<String, String>,
 }
 
+fn select(policy: &Policy, service: Option<&str>) -> Result<(String, Policy)> {
+    if policy.services.is_empty() {
+        // Legacy workflows are safe only if every deployment consumes the same
+        // artifact. The manifest supplies its actual component name at admission.
+        let p = plan("legacy", policy)?;
+        let mut inputs = std::collections::BTreeSet::new();
+        for step in p.jobs.iter().flat_map(|j| &j.steps) {
+            if step.uses.as_deref() != Some("ci/host-heyvm-maintenance") {
+                inputs.insert((
+                    step.with.get("workflow"),
+                    step.with.get("artifact"),
+                    step.with.get("job"),
+                ));
+            }
+        }
+        ensure!(
+            inputs.len() == 1,
+            "legacy policy must select one service artifact"
+        );
+        return Ok((service.unwrap_or("").to_owned(), policy.clone()));
+    }
+    let service = match service {
+        Some(s) => s,
+        None if policy.services.len() == 1 => policy.services.keys().next().unwrap(),
+        None => anyhow::bail!("service is required for a multi-service environment"),
+    };
+    let rollout = policy
+        .services
+        .get(service)
+        .ok_or_else(|| anyhow::anyhow!("unknown environment service"))?;
+    let mut resolved = policy.clone();
+    resolved.services.clear();
+    if !rollout.workflow_id.is_empty() {
+        resolved.workflow_id = rollout.workflow_id.clone();
+    }
+    resolved.workflow = rollout.workflow.clone();
+    resolved.service_targets = rollout.service_targets.clone();
+    resolved.pooler_targets = rollout.pooler_targets.clone();
+    resolved.site_targets = rollout.site_targets.clone();
+    resolved.stateful_targets = rollout.stateful_targets.clone();
+    resolved.placements = rollout.placements.clone();
+    Ok((service.to_owned(), resolved))
+}
+
+fn candidate_service(manifest: &Value, selected: Option<&str>) -> Result<String> {
+    let components = manifest["components"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("release has no components"))?;
+    ensure!(
+        components.len() == 1,
+        "promotion requires a singleton service release"
+    );
+    let service = components.keys().next().unwrap();
+    ensure!(!service.is_empty(), "release service is empty");
+    ensure!(
+        manifest
+            .get("service")
+            .is_none_or(|s| s.as_str() == Some(service.as_str())),
+        "release service identity mismatch"
+    );
+    ensure!(
+        selected.is_none_or(|s| s == service),
+        "release belongs to another service"
+    );
+    Ok(service.clone())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub environment: String,
+    #[serde(default)]
+    pub service: Option<String>,
     pub bundle_id: String,
     pub request_id: String,
     #[serde(default)]
@@ -65,10 +157,40 @@ pub fn policies(raw: Option<&str>) -> Result<BTreeMap<String, Policy>> {
             "environment name requires ASCII letters, digits, '-' or '_'"
         );
         ensure!(
-            !policy.repository.is_empty() && !policy.workflow_id.is_empty(),
-            "environment requires repository and workflow scope"
+            !policy.repository.is_empty(),
+            "environment requires repository"
         );
-        plan(name, policy)?;
+        if policy.services.is_empty() {
+            ensure!(
+                !policy.workflow_id.is_empty(),
+                "environment requires workflow scope"
+            );
+            // Historical workflows may deploy several components. Singleton
+            // selection is an admission rule, not a startup/history rule.
+            plan(name, policy)?;
+        } else {
+            ensure!(
+                policy.workflow.is_empty()
+                    && policy.service_targets.is_empty()
+                    && policy.pooler_targets.is_empty()
+                    && policy.site_targets.is_empty()
+                    && policy.stateful_targets.is_empty()
+                    && policy.placements.is_empty(),
+                "do not mix legacy rollout and services"
+            );
+            for service in policy.services.keys() {
+                ensure!(
+                    !service.is_empty() && service.len() <= 128,
+                    "invalid service name"
+                );
+                let (_, resolved) = select(policy, Some(service))?;
+                ensure!(
+                    !resolved.workflow_id.is_empty(),
+                    "service requires workflow scope"
+                );
+                plan(name, &resolved)?;
+            }
+        }
         let mut pending = policy.requires.clone();
         let mut visited = std::collections::BTreeSet::new();
         while let Some(dependency) = pending.pop() {
@@ -170,13 +292,20 @@ async fn bundle(store: &Store, id: &str) -> Result<Value> {
 
 /// An admitted promotion is its own provenance, never a fabricated Git receipt.
 pub async fn bundle_for_run(store: &Store, run_id: &str) -> Result<Option<Value>> {
-    let id: Option<String> =
-        sqlx::query_scalar("SELECT bundle_id FROM ci_release_promotion WHERE run_id=$1")
+    let promotion =
+        sqlx::query("SELECT bundle_id,service FROM ci_release_service_promotion WHERE run_id=$1 UNION ALL SELECT bundle_id,'' AS service FROM ci_release_promotion WHERE run_id=$1")
             .bind(run_id)
             .fetch_optional(store.pool())
             .await?;
-    let Some(id) = id else { return Ok(None) };
+    let Some(promotion) = promotion else {
+        return Ok(None);
+    };
+    let id: String = promotion.get("bundle_id");
     let value = bundle(store, &id).await?;
+    let service: &str = promotion.get("service");
+    if !service.is_empty() {
+        candidate_service(&value["manifest"], Some(service))?;
+    }
     let run = store
         .get_run(run_id)
         .await?
@@ -229,10 +358,18 @@ pub fn artifact(
 
 pub async fn admit(
     d: &Dispatcher,
-    request: Request,
+    mut request: Request,
     actor: &str,
     automatic: bool,
 ) -> Result<Value> {
+    ensure!(
+        d.config.release_service_environments_enabled,
+        "service promotions are disabled until all original executors are retired"
+    );
+    ensure!(
+        request.service.is_some(),
+        "service is required; unscoped legacy retries must use the original API"
+    );
     let _admission = d
         .executor
         .admission_permit()
@@ -250,7 +387,22 @@ pub async fn admit(
         !automatic || policy.mode == Mode::Automatic,
         "environment requires manual promotion"
     );
+    let (selected, policy) = select(policy, request.service.as_deref())?;
+    let selected = if configured[&request.environment].services.is_empty() {
+        let names = service_names(d, &policy)?;
+        ensure!(
+            selected.is_empty() || selected == names[0],
+            "unknown legacy environment service"
+        );
+        names[0].clone()
+    } else {
+        selected
+    };
     let bundle = bundle(&d.store, &request.bundle_id).await?;
+    request.service = Some(candidate_service(
+        &bundle["manifest"],
+        (!selected.is_empty()).then_some(selected.as_str()),
+    )?);
     ensure!(
         crate::repos::same_repo(
             &policy.repository,
@@ -258,7 +410,7 @@ pub async fn admit(
         ),
         "release repository does not own this environment"
     );
-    let mut plan = plan(&request.environment, policy)?;
+    let mut plan = plan(&request.environment, &policy)?;
     // Prove every input exists before admitting any deployment job.
     for job in &plan.jobs {
         for step in &job.steps {
@@ -302,7 +454,7 @@ pub async fn admit(
     .fetch_one(d.store.pool())
     .await?;
     let value = persist(
-        &d.store, &request, policy, &bundle, &plan, &source, actor, automatic,
+        &d.store, &request, &policy, &bundle, &plan, &source, actor, automatic,
     )
     .await?;
     if let Err(error) = d.advance_run(value["run_id"].as_str().unwrap()).await {
@@ -321,24 +473,33 @@ async fn persist(
     actor: &str,
     automatic: bool,
 ) -> Result<Value> {
+    ensure!(
+        request.service.is_some(),
+        "service is required; refusing an unscoped legacy retry"
+    );
+    let service = candidate_service(&bundle["manifest"], request.service.as_deref())?;
     let mut tx = store.pool().begin().await?;
     let repository = bundle["manifest"]["repository"].as_str().unwrap();
-    sqlx::query("INSERT INTO ci_release_environment(name,repository) VALUES($1,$2) ON CONFLICT(name) DO NOTHING")
-        .bind(&request.environment).bind(repository).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO ci_release_service_environment(name,repository,service) VALUES($1,$2,$3) ON CONFLICT(name,service) DO NOTHING")
+        .bind(&request.environment).bind(repository).bind(&service).execute(&mut *tx).await?;
     // Serialize changes to one environment, not CI execution across regions.
-    let env = sqlx::query("SELECT * FROM ci_release_environment WHERE name=$1 FOR UPDATE")
-        .bind(&request.environment)
-        .fetch_one(&mut *tx)
-        .await?;
+    let env = sqlx::query(
+        "SELECT * FROM ci_release_service_environment WHERE name=$1 AND service=$2 FOR UPDATE",
+    )
+    .bind(&request.environment)
+    .bind(&service)
+    .fetch_one(&mut *tx)
+    .await?;
     ensure!(
         env.get::<&str, _>("repository") == repository,
         "environment repository changed"
     );
     if let Some(saved) = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(p) FROM ci_release_promotion p WHERE environment=$1 AND request_id=$2",
+        "SELECT to_jsonb(p) FROM ci_release_service_promotion p WHERE environment=$1 AND request_id=$2 AND service=$3",
     )
     .bind(&request.environment)
     .bind(&request.request_id)
+    .bind(&service)
     .fetch_optional(&mut *tx)
     .await?
     {
@@ -346,8 +507,21 @@ async fn persist(
             saved["bundle_id"] == request.bundle_id,
             "request_id already selects another release"
         );
-        return Ok(saved);
+        return Ok(json!({"run_id":saved["run_id"],"environment":request.environment,
+            "service":service,"bundle_id":request.bundle_id,"request_id":request.request_id}));
     }
+    // Historical unscoped work must settle before a new service-scoped run
+    // can safely begin. Do not attribute its current/previous/hold to a service.
+    let legacy_active: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT active_run FROM ci_release_environment WHERE name=$1 FOR UPDATE",
+    )
+    .bind(&request.environment)
+    .fetch_optional(&mut *tx)
+    .await?;
+    ensure!(
+        legacy_active.flatten().is_none(),
+        "legacy environment deployment must settle first"
+    );
     ensure!(
         env.get::<Option<String>, _>("active_run").is_none(),
         "environment already has a deployment in progress"
@@ -363,13 +537,13 @@ async fn persist(
                 == Some(request.bundle_id.as_str()),
             "recovery must restore the last complete successful release"
         );
-        let failed: bool = sqlx::query_scalar("SELECT coalesce((SELECT r.status IN ('failure','cancelled') FROM ci_release_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 ORDER BY p.created_at DESC,p.run_id DESC LIMIT 1),false)")
-            .bind(&request.environment).fetch_one(&mut *tx).await?;
+        let failed: bool = sqlx::query_scalar("SELECT coalesce((SELECT r.status IN ('failure','cancelled') FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.service=$2 AND p.completed_at IS NOT NULL ORDER BY p.created_at DESC,p.run_id DESC LIMIT 1),false)")
+            .bind(&request.environment).bind(&service).fetch_one(&mut *tx).await?;
         ensure!(failed, "recovery requires a settled failed promotion");
     } else {
         for prerequisite in &policy.requires {
-            let passed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.bundle_id=$2 AND p.completed_at IS NOT NULL AND r.status='success')")
-                .bind(prerequisite).bind(&request.bundle_id).fetch_one(&mut *tx).await?;
+            let passed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.bundle_id=$2 AND p.service=$3 AND p.completed_at IS NOT NULL AND r.status='success')")
+                .bind(prerequisite).bind(&request.bundle_id).bind(&service).fetch_one(&mut *tx).await?;
             ensure!(
                 passed,
                 "release must first succeed in prerequisite {prerequisite}"
@@ -390,8 +564,8 @@ async fn persist(
     Store::create_run_in(&mut tx, &run_id, &run, plan).await?;
     Store::record_source_in(&mut tx, &run_id, source).await?;
     sqlx::query(
-        "INSERT INTO ci_release_promotion(run_id,environment,request_id,bundle_id,automatic,policy)
-        VALUES($1,$2,$3,$4,$5,$6)",
+        "INSERT INTO ci_release_service_promotion(run_id,environment,request_id,bundle_id,automatic,policy,service)
+        VALUES($1,$2,$3,$4,$5,$6,$7)",
     )
     .bind(&run_id)
     .bind(&request.environment)
@@ -399,13 +573,92 @@ async fn persist(
     .bind(&request.bundle_id)
     .bind(automatic)
     .bind(serde_json::to_value(policy)?)
+    .bind(&service)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE ci_release_environment SET active_run=$2,automation_held=automation_held OR $3,updated_at=now() WHERE name=$1")
-        .bind(&request.environment).bind(&run_id).bind(!automatic).execute(&mut *tx).await?;
+    sqlx::query("UPDATE ci_release_service_environment SET active_run=$2,automation_held=automation_held OR $3,updated_at=now() WHERE name=$1 AND service=$4")
+        .bind(&request.environment).bind(&run_id).bind(!automatic).bind(&service).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(
-        json!({"run_id":run_id,"environment":request.environment,"bundle_id":request.bundle_id,"request_id":request.request_id}),
+        json!({"run_id":run_id,"environment":request.environment,"service":service,"bundle_id":request.bundle_id,"request_id":request.request_id}),
+    )
+}
+
+fn service_names(d: &Dispatcher, policy: &Policy) -> Result<Vec<String>> {
+    if !policy.services.is_empty() {
+        return Ok(policy.services.keys().cloned().collect());
+    }
+    let (_, resolved) = select(policy, None)?;
+    let p = plan("legacy", &resolved)?;
+    let builds = crate::release_build::policies(d.config.release_builds.as_deref())?;
+    let mut names = std::collections::BTreeSet::new();
+    for (repository, build) in builds {
+        if !crate::repos::same_repo(&repository, &policy.repository) {
+            continue;
+        }
+        for (name, component) in build.components {
+            if p.jobs
+                .iter()
+                .flat_map(|j| &j.steps)
+                .filter(|s| s.uses.as_deref() != Some("ci/host-heyvm-maintenance"))
+                .all(|s| {
+                    s.with.get("workflow") == Some(&component.workflow)
+                        && s.with.get("artifact") == Some(&component.artifact)
+                        && s.with.get("job").is_none_or(|job| job == &component.job)
+                })
+            {
+                names.insert(name);
+            }
+        }
+    }
+    ensure!(
+        names.len() == 1,
+        "legacy environment needs one configured service build selection"
+    );
+    Ok(names.into_iter().collect())
+}
+
+async fn service_view(store: &Store, name: &str, service: &str) -> Result<Value> {
+    let (environment_table, promotion_table, predicate) = if service.is_empty() {
+        (
+            "ci_release_environment",
+            "ci_release_promotion",
+            "$2::text=''",
+        )
+    } else {
+        (
+            "ci_release_service_environment",
+            "ci_release_service_promotion",
+            "service=$2",
+        )
+    };
+    let state_sql =
+        format!("SELECT to_jsonb(e) FROM {environment_table} e WHERE name=$1 AND {predicate}");
+    let state: Option<Value> = sqlx::query_scalar(&state_sql)
+        .bind(name)
+        .bind(service)
+        .fetch_optional(store.pool())
+        .await?;
+    let history_sql = format!("SELECT to_jsonb(p) || jsonb_build_object('status',r.status,'error',r.error,
+            'deployments',(SELECT coalesce(jsonb_agg(jsonb_build_object('service',d.service_id,'revision',d.sha,'status',d.status)),'[]')
+            FROM ci_service_deployment d WHERE d.run_id=p.run_id)) FROM {promotion_table} p JOIN ci_run r ON r.id=p.run_id
+            WHERE p.environment=$1 AND {predicate} ORDER BY p.created_at DESC,p.run_id DESC LIMIT 20");
+    let history: Vec<Value> = sqlx::query_scalar(&history_sql)
+        .bind(name)
+        .bind(service)
+        .fetch_all(store.pool())
+        .await?;
+    let recovery_required = history.first().is_some_and(|p| {
+        !p["completed_at"].is_null()
+            && matches!(p["status"].as_str(), Some("failure" | "cancelled"))
+    });
+    let recovery_bundle = if recovery_required {
+        state.as_ref().and_then(|s| s["current_bundle"].as_str())
+    } else {
+        None
+    };
+    Ok(
+        json!({"service":service,"state":state,"history":history,"recovery_required":recovery_required,"recovery_bundle":recovery_bundle}),
     )
 }
 
@@ -413,25 +666,25 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
     let configured = policies(d.config.release_environments.as_deref())?;
     let mut environments = Vec::new();
     for (name, policy) in configured {
-        let state: Option<Value> =
-            sqlx::query_scalar("SELECT to_jsonb(e) FROM ci_release_environment e WHERE name=$1")
-                .bind(&name)
-                .fetch_optional(d.store.pool())
-                .await?;
-        let history: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(p) || jsonb_build_object('status',r.status,'error',r.error,
-            'deployments',(SELECT coalesce(jsonb_agg(jsonb_build_object('service',d.service_id,'revision',d.sha,'status',d.status)),'[]')
-            FROM ci_service_deployment d WHERE d.run_id=p.run_id)) FROM ci_release_promotion p JOIN ci_run r ON r.id=p.run_id
-            WHERE p.environment=$1 ORDER BY p.created_at DESC,p.run_id DESC LIMIT 20").bind(&name).fetch_all(d.store.pool()).await?;
-        let recovery_required = history
-            .first()
-            .is_some_and(|p| matches!(p["status"].as_str(), Some("failure" | "cancelled")));
-        let recovery_bundle = if recovery_required {
-            state.as_ref().and_then(|s| s["current_bundle"].as_str())
-        } else {
-            None
-        };
+        let mut services = Vec::new();
+        let mut names: std::collections::BTreeSet<String> =
+            policy.services.keys().cloned().collect();
+        // Also show already admitted scoped state for a legacy singleton policy,
+        // without requiring historical multi-component policies to be singleton.
+        names.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT service FROM ci_release_service_environment WHERE name=$1",
+            )
+            .bind(&name)
+            .fetch_all(d.store.pool())
+            .await?,
+        );
+        for service in names {
+            services.push(service_view(&d.store, &name, &service).await?);
+        }
+        let legacy = service_view(&d.store, &name, "").await?;
         environments.push(json!({"name":name,"mode":policy.mode,"repository":policy.repository,"requires":policy.requires,
-            "state":state,"history":history,"recovery_required":recovery_required,"recovery_bundle":recovery_bundle}));
+            "services":services,"legacy":legacy}));
     }
     Ok(json!({"environments":environments}))
 }
@@ -440,14 +693,32 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
 #[serde(deny_unknown_fields)]
 pub struct AutomationRequest {
     pub environment: String,
+    #[serde(default)]
+    pub service: Option<String>,
     pub held: bool,
 }
 
-pub async fn automation(d: &Dispatcher, request: AutomationRequest) -> Result<Value> {
+pub async fn automation(d: &Dispatcher, mut request: AutomationRequest) -> Result<Value> {
+    ensure!(
+        d.config.release_service_environments_enabled,
+        "service automation is disabled until all original executors are retired"
+    );
+    ensure!(
+        request.service.is_some(),
+        "service is required for automation mutation"
+    );
     let configured = policies(d.config.release_environments.as_deref())?;
     let policy = configured
         .get(&request.environment)
         .ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
+    if policy.services.is_empty() {
+        let names = service_names(d, policy)?;
+        ensure!(
+            request.service.as_deref().is_none_or(|s| s == names[0]),
+            "unknown legacy environment service"
+        );
+        request.service = Some(names[0].clone());
+    }
     set_automation(&d.store, policy, request).await
 }
 
@@ -457,16 +728,26 @@ async fn set_automation(
     request: AutomationRequest,
 ) -> Result<Value> {
     ensure!(
+        request.service.is_some(),
+        "service is required for automation mutation"
+    );
+    let (service, _) = select(policy, request.service.as_deref())?;
+    ensure!(
+        !service.is_empty(),
+        "service is required for automation mutation"
+    );
+    ensure!(
         request.held || policy.mode == Mode::Automatic,
         "environment policy is manual"
     );
     let mut tx = store.pool().begin().await?;
-    sqlx::query("INSERT INTO ci_release_environment(name,repository) VALUES($1,$2) ON CONFLICT(name) DO NOTHING")
-        .bind(&request.environment).bind(&policy.repository).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO ci_release_service_environment(name,repository,service) VALUES($1,$2,$3) ON CONFLICT(name,service) DO NOTHING")
+        .bind(&request.environment).bind(&policy.repository).bind(&service).execute(&mut *tx).await?;
     let row = sqlx::query(
-        "SELECT repository,active_run FROM ci_release_environment WHERE name=$1 FOR UPDATE",
+        "SELECT repository,active_run FROM ci_release_service_environment WHERE name=$1 AND service=$2 FOR UPDATE",
     )
     .bind(&request.environment)
+    .bind(&service)
     .fetch_one(&mut *tx)
     .await?;
     ensure!(
@@ -478,33 +759,62 @@ async fn set_automation(
         "wait for the active promotion before resuming automation"
     );
     sqlx::query(
-        "UPDATE ci_release_environment SET automation_held=$2,updated_at=now() WHERE name=$1",
+        "UPDATE ci_release_service_environment SET automation_held=$2,updated_at=now() WHERE name=$1 AND service=$3",
     )
     .bind(&request.environment)
     .bind(request.held)
+    .bind(&service)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(json!({"environment":request.environment,"automation_held":request.held}))
+    Ok(json!({"environment":request.environment,"service":service,"automation_held":request.held}))
 }
 
 async fn finish(store: &Store) -> Result<()> {
     let mut tx = store.pool().begin().await?;
-    let rows = sqlx::query("SELECT e.name,p.run_id,p.bundle_id,r.status FROM ci_release_environment e
-        JOIN ci_release_promotion p ON p.run_id=e.active_run JOIN ci_run r ON r.id=p.run_id
+    // Both formats settle in their own original state; no inferred attribution.
+    for (environment_table, promotion_table, service_column, service_join, service_filter) in [
+        (
+            "ci_release_environment",
+            "ci_release_promotion",
+            "''::text",
+            "",
+            "$4::text=''",
+        ),
+        (
+            "ci_release_service_environment",
+            "ci_release_service_promotion",
+            "e.service",
+            "AND p.service=e.service",
+            "service=$4",
+        ),
+    ] {
+        let rows_sql = format!("SELECT e.name,{service_column} AS service,p.run_id,p.bundle_id,r.status FROM {environment_table} e
+        JOIN {promotion_table} p ON p.run_id=e.active_run AND p.environment=e.name {service_join}
+        JOIN ci_run r ON r.id=p.run_id
         WHERE r.status IN ('success','failure','cancelled')
         AND NOT EXISTS(SELECT 1 FROM ci_service_deployment d WHERE d.run_id=r.id AND d.status NOT IN ('passed','failed'))
-        FOR UPDATE OF e SKIP LOCKED").fetch_all(&mut *tx).await?;
-    for row in rows {
-        let success = row.get::<&str, _>("status") == "success";
-        sqlx::query("UPDATE ci_release_environment SET previous_bundle=CASE WHEN $2 AND current_bundle IS DISTINCT FROM $3 THEN current_bundle ELSE previous_bundle END,
+        FOR UPDATE OF e SKIP LOCKED");
+        let rows = sqlx::query(&rows_sql).fetch_all(&mut *tx).await?;
+        for row in rows {
+            let success = row.get::<&str, _>("status") == "success";
+            let update_sql = format!("UPDATE {environment_table} SET previous_bundle=CASE WHEN $2 AND current_bundle IS DISTINCT FROM $3 THEN current_bundle ELSE previous_bundle END,
             current_bundle=CASE WHEN $2 THEN $3 ELSE current_bundle END,active_run=NULL,
-            automation_held=automation_held OR NOT $2,updated_at=now() WHERE name=$1")
-            .bind(row.get::<&str,_>("name")).bind(success).bind(row.get::<&str,_>("bundle_id")).execute(&mut *tx).await?;
-        sqlx::query("UPDATE ci_release_promotion SET completed_at=now() WHERE run_id=$1")
+            automation_held=automation_held OR NOT $2,updated_at=now() WHERE name=$1 AND {service_filter}");
+            sqlx::query(&update_sql)
+                .bind(row.get::<&str, _>("name"))
+                .bind(success)
+                .bind(row.get::<&str, _>("bundle_id"))
+                .bind(row.get::<&str, _>("service"))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(&format!(
+                "UPDATE {promotion_table} SET completed_at=now() WHERE run_id=$1"
+            ))
             .bind(row.get::<&str, _>("run_id"))
             .execute(&mut *tx)
             .await?;
+        }
     }
     tx.commit().await?;
     Ok(())
@@ -524,49 +834,61 @@ pub fn spawn(d: Arc<Dispatcher>) {
     });
 }
 
-async fn latest_ready(store: &Store, repository: &str) -> Result<Option<String>> {
+async fn latest_ready(store: &Store, repository: &str, service: &str) -> Result<Option<String>> {
     Ok(sqlx::query_scalar(
         "SELECT c.id FROM ci_release_bundle c JOIN ci_release_build b ON b.id=c.build_id
         WHERE c.repository=$1 AND b.status='ready' AND c.manifest->>'retained'='true'
+        AND c.manifest->>'version'='2'
+        AND jsonb_typeof(c.manifest->'components')='object'
+        AND (SELECT count(*) FROM jsonb_object_keys(CASE WHEN jsonb_typeof(c.manifest->'components')='object' THEN c.manifest->'components' ELSE '{}'::jsonb END))=1
+        AND c.manifest->'components' ? $2
+        AND (NOT c.manifest ? 'service' OR c.manifest->>'service'=$2)
         ORDER BY b.created_at DESC,b.id DESC LIMIT 1",
     )
     .bind(repository)
+    .bind(service)
     .fetch_optional(store.pool())
     .await?)
 }
 
 async fn reconcile(d: &Dispatcher) -> Result<()> {
     finish(&d.store).await?;
+    if !d.config.release_service_environments_enabled {
+        return Ok(());
+    }
     for (environment, policy) in policies(d.config.release_environments.as_deref())? {
         if policy.mode != Mode::Automatic {
             continue;
         }
-        let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_environment WHERE name=$1 AND (automation_held OR active_run IS NOT NULL))")
-            .bind(&environment).fetch_one(d.store.pool()).await?;
-        if held {
-            continue;
-        }
-        let id = latest_ready(&d.store, &policy.repository).await?;
-        let Some(id) = id else { continue };
-        let attempted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_promotion WHERE environment=$1 AND bundle_id=$2)")
-            .bind(&environment).bind(&id).fetch_one(d.store.pool()).await?;
-        if attempted {
-            continue;
-        }
-        if let Err(error) = admit(
-            d,
-            Request {
-                environment,
-                bundle_id: id.clone(),
-                request_id: format!("auto-{id}"),
-                recover: false,
-            },
-            "environment-policy",
-            true,
-        )
-        .await
-        {
-            tracing::warn!(%error,"automatic promotion deferred");
+        for service in service_names(d, &policy)? {
+            let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_environment WHERE name=$1 AND service=$2 AND (automation_held OR active_run IS NOT NULL))")
+            .bind(&environment).bind(&service).fetch_one(d.store.pool()).await?;
+            if held {
+                continue;
+            }
+            let id = latest_ready(&d.store, &policy.repository, &service).await?;
+            let Some(id) = id else { continue };
+            let attempted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_promotion WHERE environment=$1 AND bundle_id=$2 AND service=$3)")
+            .bind(&environment).bind(&id).bind(&service).fetch_one(d.store.pool()).await?;
+            if attempted {
+                continue;
+            }
+            if let Err(error) = admit(
+                d,
+                Request {
+                    environment: environment.clone(),
+                    service: Some(service),
+                    bundle_id: id.clone(),
+                    request_id: format!("auto-{id}"),
+                    recover: false,
+                },
+                "environment-policy",
+                true,
+            )
+            .await
+            {
+                tracing::warn!(%error,"automatic promotion deferred");
+            }
         }
     }
     Ok(())
@@ -575,6 +897,68 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_selection_is_explicit_and_rejects_cross_service_bundles() {
+        let rollout = Rollout {
+            workflow_id: "scope".into(),
+            workflow: policy().workflow,
+            service_targets: BTreeMap::new(),
+            pooler_targets: BTreeMap::new(),
+            site_targets: BTreeMap::new(),
+            stateful_targets: BTreeMap::new(),
+            placements: BTreeMap::new(),
+        };
+        let mut configured = policy();
+        configured.workflow.clear();
+        configured.services = BTreeMap::from([("api".into(), rollout.clone())]);
+        assert_eq!(select(&configured, None).unwrap().0, "api");
+        configured.services.insert("worker".into(), rollout);
+        assert!(select(&configured, None).is_err());
+        assert!(select(&configured, Some("missing")).is_err());
+        assert_eq!(
+            select(&configured, Some("worker")).unwrap().1.workflow_id,
+            "scope"
+        );
+        assert!(
+            policies(Some(
+                &serde_yaml::to_string(&BTreeMap::from([("stage", configured)])).unwrap()
+            ))
+            .is_ok()
+        );
+        let singleton = json!({"components":{"api":{}}});
+        assert_eq!(candidate_service(&singleton, None).unwrap(), "api");
+        assert!(candidate_service(&singleton, Some("worker")).is_err());
+        assert!(candidate_service(&singleton, Some("")).is_err());
+        assert!(
+            candidate_service(
+                &json!({"service":"worker","components":{"api":{}}}),
+                Some("api")
+            )
+            .is_err()
+        );
+        assert!(
+            candidate_service(&json!({"components":{"api":{},"worker":{}}}), Some("api")).is_err()
+        );
+        assert!(candidate_service(&json!({"components":{}}), None).is_err());
+        let mut legacy = policy();
+        legacy.workflow = legacy.workflow.replace(
+            "uses: ci/rollout-service",
+            "uses: ci/rollout-service, with: {workflow: api.yml, artifact: api}",
+        );
+        assert!(select(&legacy, None).is_ok());
+        legacy.workflow = legacy
+            .workflow
+            .replacen("artifact: api", "artifact: worker", 1);
+        assert!(select(&legacy, None).is_err());
+        assert!(
+            policies(Some(
+                &serde_yaml::to_string(&BTreeMap::from([("historical", legacy)])).unwrap()
+            ))
+            .is_ok(),
+            "multi-component historical policy must not prevent startup or settlement"
+        );
+    }
 
     #[test]
     fn example_separates_submission_build_and_environment_policy() {
@@ -597,22 +981,33 @@ mod tests {
         assert_eq!(environments["hws-production"].mode, Mode::Manual);
         assert_eq!(environments["hws-production"].requires, ["hws-stage"]);
         for (name, policy) in environments {
-            let plan = plan(&name, &policy).unwrap();
-            assert_eq!(plan.jobs[1].needs, [plan.jobs[0].base_id.clone()]);
-            for target in policy.service_targets.values() {
-                crate::service_rollout::validate_target(target).unwrap();
-            }
-            for job in plan.jobs {
-                assert!(job.vm.build.is_some(), "promotion must not depend on an unregistered default image");
-                let step = &job.steps[0];
-                assert!(policy.service_targets.contains_key(&step.with["target"]));
-                assert!(
-                    builds[repository]
-                        .components
-                        .values()
-                        .any(|selection| selection.workflow == step.with["workflow"]
-                            && selection.artifact == step.with["artifact"])
-                );
+            let selections: Vec<Option<&str>> = if policy.services.is_empty() {
+                vec![None]
+            } else {
+                policy.services.keys().map(|s| Some(s.as_str())).collect()
+            };
+            for service in selections {
+                let (_, policy) = select(&policy, service).unwrap();
+                let plan = plan(&name, &policy).unwrap();
+                assert_eq!(plan.jobs[1].needs, [plan.jobs[0].base_id.clone()]);
+                for target in policy.service_targets.values() {
+                    crate::service_rollout::validate_target(target).unwrap();
+                }
+                for job in plan.jobs {
+                    assert!(
+                        job.vm.build.is_some(),
+                        "promotion must not depend on an unregistered default image"
+                    );
+                    let step = &job.steps[0];
+                    assert!(policy.service_targets.contains_key(&step.with["target"]));
+                    assert!(
+                        builds[repository]
+                            .components
+                            .values()
+                            .any(|selection| selection.workflow == step.with["workflow"]
+                                && selection.artifact == step.with["artifact"])
+                    );
+                }
             }
         }
     }
@@ -620,6 +1015,7 @@ mod tests {
     fn policy() -> Policy {
         Policy {
             repository: "repo".into(),
+            services: BTreeMap::new(),
             workflow_id: "platform".into(),
             requires: Vec::new(),
             mode: Mode::Manual,
@@ -683,10 +1079,17 @@ mod tests {
         };
         assert_eq!(plan("stage", &daemon).unwrap().jobs.len(), 2);
         let bootstrap = Policy {
-            workflow: daemon.workflow.replace("ci/rollout-host-heyvmd", "ci/bootstrap-host-heyvm"),
+            workflow: daemon
+                .workflow
+                .replace("ci/rollout-host-heyvmd", "ci/bootstrap-host-heyvm"),
             ..valid.clone()
         };
-        assert!(plan("stage", &bootstrap).unwrap_err().to_string().contains("merge, build and bootstrap are not allowed"));
+        assert!(
+            plan("stage", &bootstrap)
+                .unwrap_err()
+                .to_string()
+                .contains("merge, build and bootstrap are not allowed")
+        );
         for workflow in [
             valid.workflow.replace("    needs: [first]\n", ""),
             valid
@@ -760,8 +1163,63 @@ mod tests {
         )
         .await
         .unwrap();
+        // Exercise an upgrade from the original environment schema, not only a
+        // fresh database. Historical rows remain explicitly unattributed.
+        for migration in crate::store::embedded_migrations()
+            .into_iter()
+            .filter(|m| m.name.as_str() < "052")
+        {
+            sqlx::raw_sql(&migration.sql)
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO ci_release_environment(name,repository,automation_held) VALUES('legacy','repo',true)")
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_release_bundle(id,repository,name,manifest,manifest_sha256,created_by) VALUES('legacy-bundle','repo','legacy','{}','legacy-digest','test')")
+            .execute(store.pool()).await.unwrap();
+        let legacy_policy = policy();
+        let legacy_plan = plan("legacy", &legacy_policy).unwrap();
+        let mut tx = store.pool().begin().await.unwrap();
+        Store::create_run_in(
+            &mut tx,
+            "legacy-run",
+            &crate::store::RunRequest {
+                workflow_id: "platform".into(),
+                repo_url: "repo".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: "a".repeat(40),
+                ..Default::default()
+            },
+            &legacy_plan,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO ci_release_promotion(run_id,environment,request_id,bundle_id,automatic,policy) VALUES('legacy-run','legacy','legacy-request','legacy-bundle',false,'{}')")
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE ci_release_environment SET current_bundle='legacy-bundle',previous_bundle='legacy-bundle',active_run='legacy-run' WHERE name='legacy'")
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
         store.migrate().await.unwrap();
         store.migrate().await.unwrap();
+        let old_retry = sqlx::query("INSERT INTO ci_release_promotion(run_id,environment,request_id,bundle_id,automatic,policy) VALUES('legacy-run','legacy','legacy-request','legacy-bundle',false,'{}') ON CONFLICT(environment,request_id) DO NOTHING")
+            .execute(store.pool()).await.unwrap();
+        assert_eq!(old_retry.rows_affected(), 0);
+        let legacy: Value = sqlx::query_scalar(
+            "SELECT to_jsonb(e) FROM ci_release_environment e WHERE name='legacy'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(legacy.get("service").is_none());
+        assert_eq!(legacy["automation_held"], true);
+        assert_eq!(legacy["current_bundle"], "legacy-bundle");
+        assert_eq!(legacy["previous_bundle"], "legacy-bundle");
+        assert_eq!(legacy["active_run"], "legacy-run");
+        let legacy_history = service_view(&store, "legacy", "").await.unwrap();
+        assert!(legacy_history["history"][0].get("service").is_none());
+        assert_eq!(legacy_history["history"][0]["request_id"], "legacy-request");
+        assert!(service_view(&store, "legacy", "api").await.unwrap()["state"].is_null());
         let policy = policy();
         let plan = plan("stage", &policy).unwrap();
         for id in ["old", "new", "candidate"] {
@@ -785,13 +1243,17 @@ mod tests {
         sqlx::query("UPDATE ci_release_bundle SET created_at=CASE WHEN id='old' THEN now() ELSE now()-interval '30 minutes' END")
             .execute(store.pool()).await.unwrap();
         assert_eq!(
-            latest_ready(&store, "repo").await.unwrap().as_deref(),
+            latest_ready(&store, "repo", "api")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("new"),
             "a slow old build must not displace a newer build"
         );
         let mut bundle = super::bundle(&store, "old").await.unwrap();
         let mut request = Request {
             environment: "stage".into(),
+            service: Some("api".into()),
             bundle_id: "old".into(),
             request_id: "first".into(),
             recover: false,
@@ -825,6 +1287,30 @@ mod tests {
         );
         let run = a.unwrap()["run_id"].as_str().unwrap().to_owned();
         assert_eq!(b.unwrap()["run_id"], run);
+        let conflicting = Request {
+            environment: request.environment.clone(),
+            service: request.service.clone(),
+            bundle_id: "new".into(),
+            request_id: request.request_id.clone(),
+            recover: false,
+        };
+        let different = super::bundle(&store, "new").await.unwrap();
+        assert!(
+            persist(
+                &store,
+                &conflicting,
+                &policy,
+                &different,
+                &plan,
+                &source,
+                "operator",
+                false
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("request_id already selects another release")
+        );
         assert_eq!(
             crate::release::deployment_source(&store, &run)
                 .await
@@ -893,7 +1379,7 @@ mod tests {
             .bind(&run).bind(&job).execute(store.pool()).await.unwrap();
         finish(&store).await.unwrap();
         let active: Option<String> =
-            sqlx::query_scalar("SELECT active_run FROM ci_release_environment WHERE name='stage'")
+            sqlx::query_scalar("SELECT active_run FROM ci_release_service_environment WHERE name='stage' AND service='api'")
                 .fetch_one(store.pool())
                 .await
                 .unwrap();
@@ -908,6 +1394,7 @@ mod tests {
         };
         let waiting_request = Request {
             environment: "waiting-production".into(),
+            service: Some("api".into()),
             bundle_id: "old".into(),
             request_id: "waiting".into(),
             recover: false,
@@ -933,10 +1420,12 @@ mod tests {
             .await
             .unwrap();
         finish(&store).await.unwrap();
-        let state = sqlx::query("SELECT * FROM ci_release_environment WHERE name='stage'")
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
+        let state = sqlx::query(
+            "SELECT * FROM ci_release_service_environment WHERE name='stage' AND service='api'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
         assert_eq!(state.get::<String, _>("current_bundle"), "old");
         assert!(state.get::<Option<String>, _>("previous_bundle").is_none());
         assert!(state.get::<bool, _>("automation_held"));
@@ -962,7 +1451,7 @@ mod tests {
             .unwrap();
         finish(&store).await.unwrap();
         let current: String = sqlx::query_scalar(
-            "SELECT current_bundle FROM ci_release_environment WHERE name='stage'",
+            "SELECT current_bundle FROM ci_release_service_environment WHERE name='stage' AND service='api'",
         )
         .fetch_one(store.pool())
         .await
@@ -983,14 +1472,17 @@ mod tests {
             .await
             .unwrap();
         finish(&store).await.unwrap();
-        let state = sqlx::query("SELECT * FROM ci_release_environment WHERE name='stage'")
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
+        let state = sqlx::query(
+            "SELECT * FROM ci_release_service_environment WHERE name='stage' AND service='api'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
         assert_eq!(state.get::<String, _>("current_bundle"), "new");
         assert_eq!(state.get::<String, _>("previous_bundle"), "old");
         let toggle = |held| AutomationRequest {
             environment: "stage".into(),
+            service: Some("api".into()),
             held,
         };
         assert!(
@@ -1027,7 +1519,7 @@ mod tests {
             .unwrap();
         finish(&store).await.unwrap();
         let previous: String = sqlx::query_scalar(
-            "SELECT previous_bundle FROM ci_release_environment WHERE name='stage'",
+            "SELECT previous_bundle FROM ci_release_service_environment WHERE name='stage' AND service='api'",
         )
         .fetch_one(store.pool())
         .await
@@ -1046,6 +1538,7 @@ mod tests {
         };
         let mut gated_request = Request {
             environment: "gated-production".into(),
+            service: Some("api".into()),
             bundle_id: "candidate".into(),
             request_id: "gated".into(),
             recover: false,
@@ -1141,10 +1634,12 @@ mod tests {
             .await
             .unwrap();
         finish(&store).await.unwrap();
-        let state = sqlx::query("SELECT * FROM ci_release_environment WHERE name='stage'")
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
+        let state = sqlx::query(
+            "SELECT * FROM ci_release_service_environment WHERE name='stage' AND service='api'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
         assert_eq!(state.get::<String, _>("current_bundle"), "new");
         assert_eq!(state.get::<String, _>("previous_bundle"), "old");
         assert!(state.get::<bool, _>("automation_held"));
@@ -1158,5 +1653,262 @@ mod tests {
             .to_string()
             .contains("settled failed")
         );
+
+        let api_before = service_view(&store, "stage", "api").await.unwrap();
+        let mut worker_manifest = candidate["manifest"].clone();
+        let component = worker_manifest["components"]["api"].clone();
+        worker_manifest["components"] = json!({"worker":component});
+        worker_manifest["build_id"] = json!("worker");
+        sqlx::query("INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,status) VALUES('worker','repo','worker',$1,'refs/heads/main','{}','test','ready')")
+            .bind(worker_manifest["revision"].as_str()).execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_release_bundle(id,repository,name,manifest,manifest_sha256,created_by,build_id) VALUES('worker','repo','worker',$1,$2,'test','worker')")
+            .bind(&worker_manifest).bind(hex::encode(Sha256::digest(serde_json::to_vec(&worker_manifest).unwrap())))
+            .execute(store.pool()).await.unwrap();
+        let worker = super::bundle(&store, "worker").await.unwrap();
+        let mut worker_request = Request {
+            environment: "stage".into(),
+            service: Some("worker".into()),
+            bundle_id: "worker".into(),
+            request_id: "first".into(),
+            recover: false,
+        };
+        // Same request ID is independent across services. Cross-service input
+        // is rejected before a database identity or run can be created.
+        assert!(
+            persist(
+                &store,
+                &worker_request,
+                &policy,
+                &bundle,
+                &plan,
+                &source,
+                "operator",
+                false
+            )
+            .await
+            .is_err()
+        );
+        let admitted = persist(
+            &store,
+            &worker_request,
+            &policy,
+            &worker,
+            &plan,
+            &source,
+            "operator",
+            false,
+        )
+        .await
+        .unwrap();
+        let duplicate = persist(
+            &store,
+            &worker_request,
+            &policy,
+            &worker,
+            &plan,
+            &source,
+            "operator",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(admitted["run_id"], duplicate["run_id"]);
+        assert_eq!(admitted, duplicate);
+        assert_eq!(
+            api_before,
+            service_view(&store, "stage", "api").await.unwrap()
+        );
+        assert_eq!(
+            latest_ready(&store, "repo", "api")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            latest_ready(&store, "repo", "worker")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("worker")
+        );
+        // Worker is active while API admits and settles a failed candidate.
+        request.recover = false;
+        request.bundle_id = "candidate".into();
+        request.request_id = "isolated-failure".into();
+        let api_failed = persist(
+            &store, &request, &policy, &candidate, &plan, &source, "operator", false,
+        )
+        .await
+        .unwrap();
+        let worker_before = service_view(&store, "stage", "worker").await.unwrap();
+        set_automation(
+            &store,
+            &automatic,
+            AutomationRequest {
+                environment: "stage".into(),
+                service: Some("api".into()),
+                held: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            worker_before,
+            service_view(&store, "stage", "worker").await.unwrap()
+        );
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1")
+            .bind(api_failed["run_id"].as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        finish(&store).await.unwrap();
+        assert_eq!(
+            worker_before,
+            service_view(&store, "stage", "worker").await.unwrap()
+        );
+        request.recover = true;
+        request.bundle_id = "new".into();
+        request.request_id = "isolated-recovery".into();
+        let rollback = persist(
+            &store, &request, &policy, &bundle, &plan, &source, "operator", false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id=$1")
+            .bind(rollback["run_id"].as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        finish(&store).await.unwrap();
+        assert_eq!(
+            worker_before,
+            service_view(&store, "stage", "worker").await.unwrap()
+        );
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1")
+            .bind(admitted["run_id"].as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        finish(&store).await.unwrap();
+        let api_after = service_view(&store, "stage", "api").await.unwrap();
+        worker_request.request_id = "retry-worker".into();
+        let retried = persist(
+            &store,
+            &worker_request,
+            &policy,
+            &worker,
+            &plan,
+            &source,
+            "operator",
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id=$1")
+            .bind(retried["run_id"].as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        finish(&store).await.unwrap();
+        assert_eq!(
+            api_after,
+            service_view(&store, "stage", "api").await.unwrap()
+        );
+        // Re-running the whole embedded migration set preserves both histories
+        // and the legacy namespace without fabricating service state.
+        let worker_after = service_view(&store, "stage", "worker").await.unwrap();
+        store.migrate().await.unwrap();
+        assert_eq!(
+            api_after,
+            service_view(&store, "stage", "api").await.unwrap()
+        );
+        assert_eq!(
+            worker_after,
+            service_view(&store, "stage", "worker").await.unwrap()
+        );
+        let legacy_view = service_view(&store, "legacy", "").await.unwrap();
+        assert_eq!(legacy_view["state"], legacy);
+        // Old admission/upsert and name-only updates remain usable even when
+        // two scoped services already occupy the same environment name.
+        let old_insert = sqlx::query(
+            "INSERT INTO ci_release_environment(name,repository) VALUES('stage','repo') ON CONFLICT(name) DO NOTHING",
+        );
+        old_insert.execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_release_environment(name,repository) VALUES('stage','repo') ON CONFLICT(name) DO NOTHING")
+            .execute(store.pool()).await.unwrap();
+        let updated = sqlx::query(
+            "UPDATE ci_release_environment SET automation_held=true WHERE name='stage'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+        assert_eq!(
+            api_after,
+            service_view(&store, "stage", "api").await.unwrap()
+        );
+        assert_eq!(
+            worker_after,
+            service_view(&store, "stage", "worker").await.unwrap()
+        );
+
+        // Legacy provenance may contain multiple components; singleton checks
+        // are exclusively for newly admitted scoped runs.
+        let mut historical_manifest =
+            super::bundle(&store, "old").await.unwrap()["manifest"].clone();
+        historical_manifest["build_id"] = json!("legacy-build");
+        historical_manifest["components"]["worker"] =
+            historical_manifest["components"]["api"].clone();
+        sqlx::query("INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,status) SELECT 'legacy-build',repository,'legacy-build',revision,git_ref,policy,created_by,status FROM ci_release_build WHERE id='old'")
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_release_bundle SET manifest=$1,manifest_sha256=$2,build_id='legacy-build' WHERE id='legacy-bundle'")
+            .bind(&historical_manifest)
+            .bind(hex::encode(Sha256::digest(serde_json::to_vec(&historical_manifest).unwrap())))
+            .execute(store.pool()).await.unwrap();
+        assert_eq!(
+            bundle_for_run(&store, "legacy-run").await.unwrap().unwrap()["manifest"],
+            historical_manifest
+        );
+        let legacy_request = Request {
+            environment: "legacy".into(),
+            service: Some("api".into()),
+            bundle_id: "old".into(),
+            request_id: "scoped".into(),
+            recover: false,
+        };
+        let old_bundle = super::bundle(&store, "old").await.unwrap();
+        assert!(
+            persist(
+                &store,
+                &legacy_request,
+                &policy,
+                &old_bundle,
+                &plan,
+                &source,
+                "operator",
+                false
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("legacy environment deployment must settle first")
+        );
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id='legacy-run'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        finish(&store).await.unwrap();
+        let settled = service_view(&store, "legacy", "").await.unwrap();
+        assert!(settled["state"]["active_run"].is_null());
+        assert!(!settled["history"][0]["completed_at"].is_null());
+        assert!(service_view(&store, "legacy", "api").await.unwrap()["state"].is_null());
+        store.pool().close().await;
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
     }
 }

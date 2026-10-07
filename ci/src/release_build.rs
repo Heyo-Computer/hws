@@ -1,4 +1,4 @@
-//! Full-revision build admission. Existing CI jobs do the work; this module
+//! Service-scoped build admission. Existing CI jobs do the work; this module
 //! freezes their membership and publishes a retained bundle after they succeed.
 use crate::{
     dispatch::Dispatcher, plan::Plan, release_catalog::Selection, store::Store,
@@ -26,6 +26,9 @@ pub struct Policy {
     pub network: Option<String>,
     /// Minutes after midnight UTC. None means manual builds only.
     pub daily_utc_minute: Option<u16>,
+    /// Frozen at admission, never trusted from operator configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_identity: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +38,47 @@ pub struct Request {
     pub name: String,
     /// Full merged SHA. None freezes the configured branch tip at admission.
     pub revision: Option<String>,
+    /// May be omitted only for a repository configured with one service.
+    pub service: Option<String>,
+}
+
+fn select(policy: &Policy, service: Option<&str>) -> Result<Policy> {
+    let service = match service {
+        Some(service) => service,
+        None if policy.components.len() == 1 => policy.components.keys().next().unwrap(),
+        None => anyhow::bail!("service is required for a multi-service repository"),
+    };
+    let selection = policy
+        .components
+        .get(service)
+        .ok_or_else(|| anyhow::anyhow!("service has no release build policy"))?;
+    let mut selected = policy.clone();
+    selected.components = BTreeMap::from([(service.to_string(), selection.clone())]);
+    selected.input_identity = None;
+    Ok(selected)
+}
+
+fn check_service(value: &Value, policy: &Policy) -> Result<()> {
+    let mut saved: Policy = serde_json::from_value(value["policy"].clone())?;
+    ensure!(
+        saved.components.keys().eq(policy.components.keys()),
+        "release build name already identifies another service"
+    );
+    let mut requested = policy.clone();
+    saved.input_identity = None;
+    requested.input_identity = None;
+    ensure!(
+        serde_json::to_value(saved)? == serde_json::to_value(requested)?,
+        "release build name already identifies another selected policy"
+    );
+    Ok(())
+}
+
+fn service_daily_name(service: &str, day: &str) -> String {
+    // The maximum service name plus a date exceeds the admission limit.
+    // Hashing the full name also avoids truncation collisions.
+    let digest = hex::encode(Sha256::digest(service.as_bytes()));
+    format!("{day}-{digest}")
 }
 
 pub fn policies(raw: Option<&str>) -> Result<BTreeMap<String, Policy>> {
@@ -44,6 +88,10 @@ pub fn policies(raw: Option<&str>) -> Result<BTreeMap<String, Policy>> {
     };
     let mut seen = Vec::new();
     for (repository, policy) in &policies {
+        ensure!(
+            policy.input_identity.is_none(),
+            "input_identity is admission-owned evidence"
+        );
         ensure!(
             !seen
                 .iter()
@@ -168,6 +216,21 @@ async fn existing(
     Ok(value)
 }
 
+async fn reusable(store: &Store, repository: &str, policy: &Policy) -> Result<Option<Value>> {
+    if policy.input_identity.is_none() {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT to_jsonb(b) FROM ci_release_build b JOIN ci_release_bundle c ON c.build_id=b.id
+         WHERE b.repository=$1 AND b.status='ready' AND b.policy=$2
+         AND c.manifest->>'retained'='true' ORDER BY b.created_at DESC LIMIT 1",
+    )
+    .bind(repository)
+    .bind(serde_json::to_value(policy)?)
+    .fetch_optional(store.pool())
+    .await?)
+}
+
 pub async fn admit(d: &Dispatcher, request: Request, actor: &str) -> Result<Value> {
     let _admission = d
         .executor
@@ -184,6 +247,7 @@ pub async fn admit(d: &Dispatcher, request: Request, actor: &str) -> Result<Valu
         .iter()
         .find(|(repo, _)| crate::repos::same_repo(repo, &request.repository))
         .ok_or_else(|| anyhow::anyhow!("repository has no operator release build policy"))?;
+    let mut policy = select(policy, request.service.as_deref())?;
     if let Some(value) = existing(
         &d.store,
         repository,
@@ -192,6 +256,7 @@ pub async fn admit(d: &Dispatcher, request: Request, actor: &str) -> Result<Valu
     )
     .await?
     {
+        check_service(&value, &policy)?;
         return Ok(value);
     }
     let resolved = d
@@ -214,7 +279,7 @@ pub async fn admit(d: &Dispatcher, request: Request, actor: &str) -> Result<Valu
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let source = crate::release_git::build_source(
+    let (source, identity) = crate::release_git::build_source_scoped(
         repository,
         &policy.git_ref,
         request.revision.as_deref(),
@@ -224,7 +289,17 @@ pub async fn admit(d: &Dispatcher, request: Request, actor: &str) -> Result<Valu
     )
     .await
     .map_err(anyhow::Error::msg)?;
-    let mut plans = plans(policy, &source)?;
+    policy.input_identity = Some(identity);
+    // Only retained catalog candidates with exactly the frozen selected policy
+    // and verified input identity can be reused. Old builds lack this evidence.
+    let reused = reusable(&d.store, repository, &policy).await?;
+    if let Some(mut value) = reused {
+        value["reused"] = json!(true);
+        value["requested_revision"] = json!(source.base_revision);
+        value["requested_name"] = json!(request.name);
+        return Ok(value);
+    }
+    let mut plans = plans(&policy, &source)?;
     for plan in &mut plans {
         d.assign_network(plan, policy.network.as_deref(), &mut Vec::new())?;
     }
@@ -232,7 +307,7 @@ pub async fn admit(d: &Dispatcher, request: Request, actor: &str) -> Result<Valu
         &d.store,
         repository,
         &request.name,
-        policy,
+        &policy,
         &source,
         &plans,
         actor,
@@ -290,6 +365,7 @@ async fn persist(
         saved["revision"].as_str() == Some(&source.base_revision),
         "release build name already identifies another revision"
     );
+    check_service(&saved, policy)?;
     if inserted {
         let bytes = serde_json::to_vec(source)?;
         for plan in plans {
@@ -504,18 +580,21 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
         let Some(name) = daily_name(&policy, Utc::now()) else {
             continue;
         };
-        if let Err(error) = admit(
-            d,
-            Request {
-                repository,
-                name,
-                revision: None,
-            },
-            "daily-scheduler",
-        )
-        .await
-        {
-            tracing::warn!(%error, "daily release build admission deferred");
+        for service in policy.components.keys() {
+            if let Err(error) = admit(
+                d,
+                Request {
+                    repository: repository.clone(),
+                    name: service_daily_name(service, &name),
+                    revision: None,
+                    service: Some(service.clone()),
+                },
+                "daily-scheduler",
+            )
+            .await
+            {
+                tracing::warn!(%error, "daily release build admission deferred");
+            }
         }
     }
     Ok(())
@@ -525,12 +604,44 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn service_selection_policy_identity_and_daily_names_are_independent() {
+        let configured = policy();
+        assert!(select(&configured, None).is_err());
+        assert!(select(&configured, Some("absent")).is_err());
+        let api = select(&configured, Some("api")).unwrap();
+        let worker = select(&configured, Some("worker")).unwrap();
+        assert_eq!(api.components.len(), 1);
+        assert_eq!(plans(&api, &source()).unwrap().len(), 1);
+        assert!(select(&api, None).is_ok());
+        let saved = json!({"policy":api});
+        assert!(check_service(&saved, &worker).is_err());
+        assert!(check_service(&saved, &api).is_ok());
+        let mut changed = api.clone();
+        changed.components.get_mut("api").unwrap().artifact = "other".into();
+        assert!(check_service(&saved, &changed).is_err());
+        assert_ne!(
+            serde_json::to_value(&api).unwrap(),
+            serde_json::to_value(&changed).unwrap()
+        );
+        let day = daily_name(&configured, "2026-10-05T02:00:00Z".parse().unwrap()).unwrap();
+        assert_ne!(
+            service_daily_name("api", &day),
+            service_daily_name("worker", &day)
+        );
+        assert!(valid_name(&service_daily_name(&"s".repeat(128), &day)));
+        let request: Request =
+            serde_json::from_value(json!({"repository":"repo","name":"build"})).unwrap();
+        assert!(request.service.is_none());
+    }
+
     fn policy() -> Policy {
         Policy {
             workflow_id: "platform".into(),
             git_ref: "refs/heads/main".into(),
             network: None,
             daily_utc_minute: Some(90),
+            input_identity: None,
             components: BTreeMap::from([
                 (
                     "api".into(),
@@ -673,6 +784,107 @@ mod tests {
                 ..stored.clone()
             })
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn services_build_independently_and_reuse_only_verified_retained_policy() {
+        let (store, _dir) = database().await;
+        let configured = policy();
+        let mut api = select(&configured, Some("api")).unwrap();
+        api.input_identity = Some("a".repeat(64));
+        let mut worker = select(&configured, Some("worker")).unwrap();
+        worker.input_identity = Some("b".repeat(64));
+        let source = source();
+        let api_plans = plans(&api, &source).unwrap();
+        let worker_plans = plans(&worker, &source).unwrap();
+        let day = "daily-2026-10-05";
+        let a = persist(
+            &store,
+            "repo",
+            &service_daily_name("api", day),
+            &api,
+            &source,
+            &api_plans,
+            "scheduler",
+        )
+        .await
+        .unwrap();
+        let w = persist(
+            &store,
+            "repo",
+            &service_daily_name("worker", day),
+            &worker,
+            &source,
+            &worker_plans,
+            "scheduler",
+        )
+        .await
+        .unwrap();
+        assert_ne!(a["id"], w["id"]);
+        assert!(
+            persist(
+                &store,
+                "repo",
+                &service_daily_name("api", day),
+                &worker,
+                &source,
+                &worker_plans,
+                "scheduler"
+            )
+            .await
+            .is_err()
+        );
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id IN (SELECT run_id FROM ci_release_build_run WHERE build_id=$1)")
+            .bind(a["id"].as_str()).execute(store.pool()).await.unwrap();
+        assert!(collect(&store, &a).await.is_err());
+        let run: String =
+            sqlx::query_scalar("SELECT run_id FROM ci_release_build_run WHERE build_id=$1")
+                .bind(w["id"].as_str())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id=$1")
+            .bind(&run)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ci_job SET status='success' WHERE run_id=$1")
+            .bind(&run)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri) VALUES($1,$1,$2,'binary','artifacts',$3,5,'build-tag')")
+            .bind(&run).bind(crate::store::job_id(&run, "build")).bind("d".repeat(64)).execute(store.pool()).await.unwrap();
+        let manifest = collect(&store, &w).await.unwrap().unwrap();
+        assert_eq!(manifest["components"].as_object().unwrap().len(), 1);
+        assert!(manifest["components"].get("worker").is_some());
+        assert!(reusable(&store, "repo", &worker).await.unwrap().is_none());
+        finalize(&store, &Retention { fail: false }, &w, manifest)
+            .await
+            .unwrap();
+        let reused = reusable(&store, "repo", &worker).await.unwrap().unwrap();
+        assert_eq!(reused["revision"], source.base_revision);
+        assert_eq!(reused["id"], w["id"]);
+        for field in ["inputs", "artifact", "network", "evidence"] {
+            let mut different = worker.clone();
+            match field {
+                "inputs" => different.input_identity = Some("c".repeat(64)),
+                "artifact" => {
+                    different.components.get_mut("worker").unwrap().artifact = "new".into()
+                }
+                "network" => different.network = Some("new-network".into()),
+                _ => different.input_identity = None,
+            }
+            assert!(
+                reusable(&store, "repo", &different)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{field}"
+            );
+        }
+        assert!(reusable(&store, "repo", &api).await.unwrap().is_none());
     }
 
     #[tokio::test]

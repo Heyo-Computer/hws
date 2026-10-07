@@ -5,20 +5,46 @@
   <title>Releases · Heyo control panel</title>
   <link rel="stylesheet" href="/__ui/heyo.css"><script src="/__ui/theme.js" defer></script>
   <style>
-    main { max-width: 1120px; margin: 24px auto; padding: 0 20px; }
-    section { margin: 24px 0; } .card { padding: 20px; margin: 12px 0; }
-    .row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
-    label { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 160px; }
-    input,select { width: 100%; padding: 10px; } button { cursor: pointer; }
-    .muted { opacity: .75; } code,td { overflow-wrap: anywhere; }
-    table { width: 100%; border-collapse: collapse; } th,td { padding: 10px; text-align: left; }
-    .scroll { overflow-x: auto; } #message { white-space: pre-wrap; }
-    h1 { font-size: 26px; } h2 { font-size: 19px; } h3 { font-size: 16px; }
-    @media (max-width: 860px) {
-      .topbar { position: static; height: auto; flex-wrap: wrap; gap: 12px; padding: 12px; }
-      .topbar-nav { display: flex; position: static; flex-direction: row; width: 100%; box-shadow: none; }
-      .topbar-right { width: 100%; flex-wrap: wrap; margin-left: 0; }
-    }
+    main { max-width: 1440px; margin: 32px auto; padding: 0 28px 60px; }
+    .page-head,.section-head,.toolbar,.actions { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+    .page-head { margin:32px 0 24px; } h1 { font-size:30px; letter-spacing:-1px; margin:4px 0; }
+    h2 { font-size:17px; margin:0; } h3 { font-size:15px; margin:0; }
+    p { margin:8px 0; } .muted,.sub { color:var(--text-secondary); } .sub { display:block; font-size:12px; margin-top:5px; }
+    .eyebrow { font-size:11px; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-secondary); }
+    .workspace { display:grid; grid-template-columns:minmax(0,1fr) 380px; gap:20px; align-items:start; margin-top:20px; }
+    .workspace > * { min-width:0; } #candidate { width:100%; }
+    .panel { background:var(--bg-panel); border:1px solid var(--border-color); border-radius:12px; overflow:hidden; margin-bottom:20px; }
+    .section-head,.panel-body { padding:20px; } .section-head { border-bottom:1px solid var(--border-color); }
+    .toolbar { padding:16px 20px; background:var(--bg-panel); border:1px solid var(--border-color); border-radius:12px; }
+    label { display:flex; flex-direction:column; gap:7px; font-size:12px; color:var(--text-secondary); }
+    input,select { color:var(--text-primary); background:var(--bg-elevated); border:1px solid var(--border-color); border-radius:7px; padding:10px 12px; min-width:0; }
+    select { max-width:100%; } #environment { min-width:220px; } #search { width:240px; }
+    button { cursor:pointer; } button:disabled { cursor:not-allowed; opacity:.45; }
+    .btn { border-radius:7px; padding:10px 14px; } .primary { background:var(--accent); color:var(--bg-dark); border-color:var(--accent); }
+    .tag { display:inline-block; padding:3px 8px; border:1px solid var(--border-color); border-radius:5px; font-size:11px; margin:2px 4px 2px 0; color:var(--text-secondary); }
+    .good { color:var(--success); } .warn { color:var(--warning); } .bad { color:var(--danger); }
+    .notice { border:1px solid var(--warning); border-radius:8px; padding:13px; margin:16px 0; font-size:13px; }
+    .notice strong { color:var(--warning); display:block; margin-bottom:4px; }
+    .scroll { overflow-x:auto; } table { width:100%; border-collapse:collapse; font-size:13px; }
+    #inventory { max-height:560px; overflow:auto; } #inventory th { position:sticky; top:0; background:var(--bg-panel); }
+    th { color:var(--text-secondary); font-size:11px; font-weight:500; text-transform:uppercase; letter-spacing:.5px; }
+    th,td { padding:14px 20px; text-align:left; border-bottom:1px solid var(--border-color); vertical-align:top; }
+    tr:last-child td { border-bottom:0; } code { font-size:12px; overflow-wrap:anywhere; }
+    .release-name { display:block; font-weight:600; color:var(--text-primary); margin-bottom:5px; }
+    .empty { padding:24px 20px; color:var(--text-secondary); } .stack { display:grid; gap:14px; }
+    .facts { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:20px 0; }
+    .facts div { min-width:0; } .facts strong { display:block; overflow-wrap:anywhere; font-size:13px; margin-top:6px; }
+    .actions { justify-content:flex-start; } .actions .btn { flex:1; white-space:normal; }
+    #message { font-size:13px; white-space:pre-wrap; margin:14px 0; min-height:20px; }
+    details summary { cursor:pointer; padding:16px 20px; } .build-form { display:grid; gap:12px; padding:0 20px 20px; }
+    .history-item { padding:16px 20px; border-bottom:1px solid var(--border-color); }
+    .history-item:last-child { border:0; } .history-item .sub { overflow-wrap:anywhere; }
+    dialog { width:min(540px,calc(100vw - 32px)); padding:24px; color:var(--text-primary); background:var(--bg-panel); border:1px solid var(--border-accent); border-radius:12px; }
+    dialog::backdrop { background:#0009; } dialog .actions { margin-top:24px; } dialog h2 { font-size:21px; }
+    a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+    @media(max-width:1000px) { .workspace { grid-template-columns:1fr; } .release-sidebar { grid-row:1; } }
+    @media(max-width:650px) { .actions { flex-direction:column; align-items:stretch; } #service-releases table { min-width:560px; } #inventory { max-height:360px; } .section-head label { width:100%; } #search { box-sizing:border-box; } }
+    @media(max-width:650px) { main { padding:0 14px 32px; } .topbar { position:static; height:auto; flex-wrap:wrap; padding:12px; gap:12px; } .topbar-nav { display:flex; position:static; width:auto; } .topbar-right { margin-left:0; } .toolbar>*,#environment,#search { width:100%; } th,td { padding:12px; } .facts { grid-template-columns:1fr; } }
   </style>
 </head>
 <body><main>
@@ -27,104 +53,169 @@
     <nav class="topbar-nav"><a href="/dashboard">Dashboard</a><a href="/releases" aria-current="page">Releases</a></nav>
     <div class="topbar-right"><span>{{WHO}}</span><button class="theme-toggle" data-theme-toggle>Theme</button></div>
   </header>
-  <h1>Releases</h1>
-  <p class="muted">Build once. Select a retained release for each environment. Manual deployment pauses automation until you resume it.</p>
-  <button id="refresh" class="btn">Refresh status</button>
-  <p id="message" role="status" aria-live="polite">Loading…</p>
-  <section aria-labelledby="build-title" class="card">
-    <h2 id="build-title">Build a release</h2>
-    <form id="build" class="row">
-      <label>Repository<input name="repository" required placeholder="Configured repository URL"></label>
-      <label>Release name<input name="name" required maxlength="128" placeholder="2026-10-05.1"></label>
-      <label>Merged revision (optional)<input name="revision" placeholder="Full SHA; blank uses branch tip"></label>
-      <button class="btn" type="submit">Build</button>
-    </form>
-    <p class="muted">Uses the configured build policy. Building does not deploy in manual environments.</p>
-    <div id="builds" class="scroll"></div>
-  </section>
-  <section aria-labelledby="environments-title"><h2 id="environments-title">Environments</h2><div id="environments"></div></section>
-  <section aria-labelledby="catalog-title"><h2 id="catalog-title">Available releases</h2>
-    <p class="muted">Only retained, complete builds can be deployed. Last complete success is not a live service inventory.</p>
-    <div id="catalog" class="card scroll"></div>
-  </section>
+  <div class="page-head"><div><span class="eyebrow">Deployment workspace</span><h1>Releases</h1><p class="muted">Know what is running. See exactly what a release will change.</p></div><button id="refresh" class="btn">Refresh status</button></div>
+  <div class="toolbar"><label>Deployment environment<select id="environment" aria-label="Deployment environment"></select></label><label>Service<select id="service" aria-label="Service"></select></label><div id="policy"></div><span id="updated" class="sub">Not refreshed</span></div>
+  <p id="message" role="status" aria-live="polite">Loading release catalog…</p>
+  <div class="workspace">
+    <div>
+      <section class="panel" aria-labelledby="services-title"><div class="section-head"><div><h2 id="services-title">Service releases</h2><p class="sub">Independent candidates, deployment history and rollback for each service</p></div></div><div id="service-releases" class="scroll"></div></section>
+      <section class="panel" aria-labelledby="inventory-title"><div class="section-head"><div><h2 id="inventory-title">Regional inventory</h2><p class="sub">All gateway deployments · observations across the configured fleet, not an environment membership list</p></div><label>Filter deployments<input id="search" type="search" placeholder="Service or namespace…"></label></div><div id="inventory" class="scroll"></div></section>
+      <section class="panel" aria-labelledby="catalog-title"><div class="section-head"><div><h2 id="catalog-title">Available releases</h2><p class="sub">Explicit bundle contents. Retained does not mean full-platform coverage.</p></div><span id="release-count" class="tag"></span></div><div id="catalog" class="scroll"></div></section>
+      <section class="panel" aria-labelledby="history-title"><div class="section-head"><div><h2 id="history-title">Deployment history</h2><p class="sub">Recorded rollout outcomes—not a live version inventory</p></div></div><div id="history"></div></section>
+    </div>
+    <aside class="release-sidebar">
+      <section class="panel" aria-labelledby="selection-title"><div class="section-head"><h2 id="selection-title">Deploy a release</h2></div><div class="panel-body"><label>Release candidate<select id="candidate"></select></label><div id="selection"></div></div></section>
+      <details class="panel"><summary>Build a candidate for the selected service</summary><form id="build" class="build-form"><label>Repository<input name="repository" readonly required placeholder="Select an environment"></label><label>Candidate name<input name="name" required maxlength="128" placeholder="2026-10-07.1"></label><label>Merged revision (optional)<input name="revision" placeholder="Full SHA; blank uses branch tip"></label><button class="btn" type="submit">Build service candidate</button><p class="sub">Unchanged declared inputs reuse a retained candidate. Other services are not rebuilt.</p></form><div id="builds"></div></details>
+    </aside>
+  </div>
+  <dialog id="confirmation" aria-labelledby="confirm-title"><h2 id="confirm-title"></h2><div id="confirm-body"></div><div class="actions"><button id="cancel" class="btn">Cancel</button><button id="confirm" class="btn primary">Confirm deployment</button></div></dialog>
 </main>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
   const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  let releases = [], environments = [], busy = false;
+  let releases = [], environments = [], builds = [], fleet = null, services = [], inventoryError = '', serviceError = '', busy = false, confirmation = null;
   const pending = new Map();
-  async function api(resource, data) {
-    const response = await fetch('/api/releases/' + resource, {method: data ? 'POST' : 'GET',
-      headers: {'Content-Type':'application/json'}, body: data ? JSON.stringify(data) : undefined});
+  const components = r => Object.keys(r?.manifest?.components || {}).sort();
+  const scope = r => components(r).length === 1 ? `${components(r)[0]} only` : components(r).length ? `${components(r).length} components` : 'Contents unknown';
+  const chips = r => components(r).map(c => `<span class="tag">${esc(c)}</span>`).join('') || '<span class="bad">No component manifest</span>';
+  const release = id => releases.find(r => r.id === id);
+  const label = id => release(id)?.name || id || 'None recorded';
+  const selectedEnv = () => environments.find(e => e.name === $('environment').value);
+  const selectedService = () => selectedEnv()?.services?.find(s => s.service === $('service').value);
+  const candidates = service => releases.filter(r => r.repository === selectedEnv()?.repository && r.manifest.retained === true && components(r).length === 1 && components(r)[0] === service);
+  const selectedRelease = () => release($('candidate').value);
+  const revision = r => r?.manifest?.revision || 'Not recorded';
+  const short = v => v ? String(v).slice(0,12) : 'Not reported';
+  const date = value => value ? new Date(value).toLocaleString() : 'Not recorded';
+  async function get(path, data) {
+    const response = await fetch(path, {method:data ? 'POST' : 'GET',headers:{'Content-Type':'application/json'},body:data ? JSON.stringify(data) : undefined});
     const value = await response.json();
     if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
     return value;
   }
-  const label = id => { const r = releases.find(r => r.id === id); return r ? `${r.name} · ${r.manifest.revision.slice(0,12)}` : id || 'None'; };
+  const api = (resource,data) => get('/api/releases/' + resource,data);
   async function catalog() {
     const result = []; let before = '';
     for (;;) {
       const page = (await api('releases' + (before ? '?before=' + encodeURIComponent(before) : ''))).releases;
       result.push(...page);
       if (page.length < 100) return result;
-      const next = page[page.length - 1].id;
+      const next = page[page.length-1].id;
       if (next === before) throw new Error('Release catalog cursor did not advance');
       before = next;
     }
   }
+  async function observations() {
+    const result = []; const seen = new Set(); let after = '';
+    for (;;) {
+      const page = await get('/services' + (after ? '?after=' + encodeURIComponent(after) : ''));
+      if (!page.configured) throw new Error('Version discovery is not configured.');
+      result.push(...page.inventory.services);
+      after = page.inventory.nextCursor;
+      if (!after) return result;
+      if (seen.has(after)) throw new Error('Service inventory cursor did not advance');
+      seen.add(after);
+    }
+  }
+  function renderInventory() {
+    if (!fleet?.configured) { $('inventory').innerHTML = `<p class="empty bad">${esc(inventoryError || 'Fleet inventory is not configured.')}</p>`; return; }
+    const gateways = fleet.gateways || [], query = $('search').value.toLowerCase();
+    const rows = (fleet.rows || []).filter(r => `${r.id} ${r.namespace}`.toLowerCase().includes(query));
+    // Only an explicit service/deployment identity can supply a live revision.
+    // Never derive versions from release history or strip regional name suffixes.
+    const cell = (row,gateway) => {
+      if (gateway.error) return `<span class="bad">Unavailable</span><span class="sub">${esc(gateway.error)}</span>`;
+      const c = row.cells.find(c => c.gateway === gateway.id);
+      if (!c) return '<span class="sub">Not observed</span>';
+      const matches = row.namespace === 'default' ? services.filter(s => s.external?.deploymentId === row.id && s.external.region === gateway.region) : [];
+      const versions = [...new Set(matches.flatMap(s => (s.endpoints || []).filter(p => p.region === gateway.region).map(p => p.revision).filter(Boolean)))];
+      return `${versions.length ? versions.map(v => `<code title="${esc(v)}">${esc(short(v))}</code>`).join('<br>') : '<span class="sub">Version not reported</span>'}<span class="sub ${c.error ? 'bad' : ''}">${esc(c.error || `${c.ready ?? '—'} ready · ${c.health || 'unknown'}`)}</span>`;
+    };
+    $('inventory').innerHTML = `<p class="panel-body sub">${rows.length} of ${(fleet.rows || []).length} deployments. ${esc(serviceError || 'Versions appear only when discovery reports them; unknown is not up to date.')}${gateways.some(g => g.truncated) ? ' Gateway inventory is truncated.' : ''}</p><table><thead><tr><th>Deployment / namespace</th>${gateways.map(g => `<th>${esc(g.id)}<span class="sub">${esc(g.region)}</span></th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr><td><strong>${esc(r.id)}</strong><span class="sub">${esc(r.namespace)} · ${esc(r.kind)}</span></td>${gateways.map(g => `<td>${cell(r,g)}</td>`).join('')}</tr>`).join('')}</tbody></table>${rows.length ? '' : '<p class="empty">No matching deployments.</p>'}`;
+  }
+  function renderSelection() {
+    const e = selectedEnv(), service = selectedService(), r = selectedRelease();
+    if (!e || !service) { $('selection').innerHTML = '<p class="empty">No service release policy available. Configure service-scoped releases before deploying.</p>'; return; }
+    const s = service.state || {}, previous = release(s.previous_bundle), current = release(s.current_bundle);
+    $('selection').innerHTML = `${r ? `<p class="release-name" style="overflow-wrap:anywhere">${esc(r.name)}</p><div class="notice"><strong>Scoped release · ${esc(scope(r))}</strong>Only the components listed below are in this bundle. This is not a declaration of full-platform coverage.</div>${chips(r)}<p class="sub">Candidate source revision</p><code>${esc(revision(r))}</code>` : '<p class="empty">No retained release available for this repository.</p>'}
+      <div class="facts"><div><span class="eyebrow">Last successful release</span><strong>${esc(label(s.current_bundle))}</strong><span class="sub">${esc(current ? scope(current) : 'Scope not available')}</span><code>${esc(short(current?.manifest?.revision))}</code></div><div><span class="eyebrow">Rollback target</span><strong>${esc(label(s.previous_bundle))}</strong><span class="sub">${esc(previous ? scope(previous) : 'Scope not available')}</span><code>${esc(short(previous?.manifest?.revision))}</code></div></div>
+      <p class="sub">These are rollout records, not observed running versions.</p>
+      ${(e.requires || []).length ? `<p class="sub">Requires this release to pass: ${e.requires.map(esc).join(', ')}</p>` : ''}
+      ${service.recovery_required ? '<div class="notice"><strong>Recovery required</strong>This service deployment failed. Regions may contain different versions. Other services retain their own release state.</div>' : ''}
+      ${s.active_run ? `<p class="warn">Deployment in progress</p><code>${esc(s.active_run)}</code>` : ''}
+      <div class="actions" style="margin-top:20px"><button class="btn primary" data-action="deploy" ${s.active_run || !r || !components(r).length ? 'disabled' : ''}>Deploy ${esc(service.service)}</button><button class="btn" data-action="rollback" ${s.active_run || service.recovery_required || !previous || !candidates(service.service).some(r => r.id === previous.id) ? 'disabled' : ''}>Roll back ${esc(service.service)}…</button></div>
+      ${service.recovery_required ? `<button class="btn" data-action="recover" ${s.active_run || !candidates(service.service).some(r => r.id === service.recovery_bundle) ? 'disabled' : ''}>Recover ${esc(service.service)}…</button>` : ''}
+      <p class="sub">Manual deployment holds automation until explicitly resumed.</p>
+      <button class="btn" data-action="automation" ${e.mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button>`;
+  }
+  function renderService() {
+    const e = selectedEnv(), selected = $('candidate').value;
+    const service = selectedService(), choices = candidates(service?.service);
+    $('candidate').innerHTML = choices.map(r => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    if (choices.some(r => r.id === selected)) $('candidate').value = selected;
+    $('candidate').disabled = !choices.length;
+    $('policy').innerHTML = e ? `<span class="tag">${esc(e.mode)} policy</span><span class="tag">Service automation ${service?.state?.automation_held ? 'held' : e.mode === 'automatic' ? 'enabled' : 'off'}</span><span class="sub">${esc(e.repository)}</span>` : 'No environments configured';
+    $('build').elements.repository.value = e?.repository || '';
+    $('build').querySelector('button').disabled = !service;
+    $('history-title').textContent = service ? `${service.service} deployment history` : 'Deployment history';
+    $('history').innerHTML = (service?.history || []).map(p => `<div class="history-item"><div class="section-head" style="padding:0;border:0"><strong>${esc(label(p.bundle_id))}</strong><span class="tag ${p.status === 'success' ? 'good' : ['failure','cancelled'].includes(p.status) ? 'bad' : ''}">${esc(p.status)}</span></div><span class="sub">${esc(date(p.created_at))} · ${p.automatic ? 'Automatic' : 'Manual'}</span>${(p.deployments || []).map(d => `<p><code>${esc(d.service)}</code> · ${esc(d.status)}<span class="sub"><code>${esc(d.revision)}</code></span></p>`).join('')}<span class="sub">Run ${esc(p.run_id)}</span>${p.error ? `<p class="bad">${esc(p.error)}</p>` : ''}</div>`).join('') || '<p class="empty">No deployment recorded for this service.</p>';
+    if (e?.legacy?.state || e?.legacy?.history?.length) $('history').innerHTML += '<p class="empty">Legacy environment-wide history is retained separately. It is not attributed to this service.</p>';
+    renderSelection();
+  }
+  function renderEnvironment() {
+    const e = selectedEnv(), selected = $('service').value;
+    $('service').innerHTML = (e?.services || []).map(s => `<option>${esc(s.service)}</option>`).join('');
+    if (e?.services?.some(s => s.service === selected)) $('service').value = selected;
+    $('service').disabled = !e?.services?.length;
+    $('service-releases').innerHTML = e?.services?.length ? `<table><thead><tr><th>Service</th><th>Last successful release</th><th>Previous release</th><th>Candidates / status</th></tr></thead><tbody>${e.services.map(s => `<tr><td><button class="btn" data-service="${esc(s.service)}">${esc(s.service)}</button></td><td>${esc(label(s.state?.current_bundle))}<span class="sub">${esc(short(release(s.state?.current_bundle)?.manifest?.revision))}</span></td><td>${esc(label(s.state?.previous_bundle))}</td><td>${candidates(s.service).length} candidates<span class="sub">${s.state?.active_run ? 'Deploying' : s.recovery_required ? 'Recovery required' : 'No active rollout'}</span></td></tr>`).join('')}</tbody></table>` : '<p class="empty">No service-scoped release policies reported. The regional inventory below remains visible.</p>';
+    renderService();
+  }
   async function refresh() {
-    const [available, env, builds] = await Promise.all([catalog(), api('release-environments'), api('release-builds')]);
-    releases = available; environments = env.environments;
-    $('catalog').innerHTML = releases.length ? `<table><thead><tr><th>Release</th><th>Revision</th><th>Repository</th><th>Retention</th></tr></thead><tbody>${releases.map(r => `<tr><td>${esc(r.name)}</td><td><code>${esc(r.manifest.revision)}</code></td><td>${esc(r.repository)}</td><td>${r.manifest.retained === true ? 'Retained' : 'Not deployable'}</td></tr>`).join('')}</tbody></table>` : 'No releases yet.';
-    $('builds').innerHTML = builds.builds.length ? `<table><thead><tr><th>Build</th><th>Revision</th><th>Status</th></tr></thead><tbody>${builds.builds.map(b => `<tr><td>${esc(b.name)}</td><td><code>${esc(b.revision)}</code></td><td>${esc(b.status)} ${esc(b.error || '')}</td></tr>`).join('')}</tbody></table>` : '<p>No builds yet.</p>';
-    $('environments').innerHTML = environments.map((e,i) => {
-      const s = e.state || {}, choices = releases.filter(r => r.repository === e.repository && r.manifest.retained === true);
-      return `<article class="card" data-env="${i}"><h3>${esc(e.name)}</h3>
-        <p>${esc(e.mode)} policy · automation ${s.automation_held ? 'held' : e.mode === 'automatic' ? 'enabled' : 'off'}</p>
-        <p>Last complete success: <strong>${esc(label(s.current_bundle))}</strong><br>Previous: ${esc(label(s.previous_bundle))}</p>
-        ${(e.requires || []).length ? `<p>Requires this release to have passed: ${e.requires.map(esc).join(', ')}</p>` : ''}
-        ${e.recovery_required ? `<p>Deployment failed; regions may have mixed versions. ${e.recovery_bundle ? `Recover to ${esc(label(e.recovery_bundle))}.` : 'No successful release is recorded; select a known-good release manually.'} ${s.active_run ? 'Waiting for rollout settlement before recovery.' : ''}</p>` : ''}
-        ${s.active_run ? `<p>Deployment in progress: <code>${esc(s.active_run)}</code></p>` : ''}
-        <div class="row"><label>Release<select class="selection" ${!choices.length ? 'disabled' : ''}>${choices.map(r => `<option value="${esc(r.id)}">${esc(label(r.id))}</option>`).join('')}</select></label>
-        <button class="btn" data-action="deploy" ${s.active_run || !choices.length ? 'disabled' : ''}>Deploy selected</button>
-        <button class="btn" data-action="rollback" ${s.active_run || e.recovery_required || !s.previous_bundle ? 'disabled' : ''}>Roll back</button>
-        ${e.recovery_required ? `<button class="btn" data-action="recover" ${s.active_run || !e.recovery_bundle ? 'disabled' : ''}>Recover failed deployment</button>` : ''}
-        <button class="btn" data-action="automation" ${e.mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button></div>
-        <details><summary>Deployment history</summary>${(e.history || []).map(p => `<p><code>${esc(p.run_id)}</code> · ${esc(label(p.bundle_id))} · ${esc(p.status)} ${esc(p.error || '')}<br>${(p.deployments || []).map(d => `${esc(d.service)}: ${esc(d.status)} (${esc(d.revision)})`).join('<br>')}</p>`).join('') || '<p>No deployments.</p>'}</details></article>`;
-    }).join('') || '<p>No environments configured. Set CI_RELEASE_ENVIRONMENTS before deploying.</p>';
+    const [available, env, buildResult, fleetResult, serviceResult] = await Promise.all([catalog(),api('release-environments'),api('release-builds'),get('/fleet/deployments').then(value => ({value}),error => ({error})),observations().then(value => ({value}),error => ({error}))]);
+    releases = available; environments = env.environments; builds = buildResult.builds;
+    fleet = fleetResult.value; services = serviceResult.value || []; inventoryError = fleetResult.error?.message || ''; serviceError = serviceResult.error?.message || '';
+    const selected = $('environment').value;
+    $('environment').innerHTML = environments.map(e => `<option>${esc(e.name)}</option>`).join('');
+    if (environments.some(e => e.name === selected)) $('environment').value = selected;
+    $('release-count').textContent = `${releases.length} releases`;
+    $('catalog').innerHTML = releases.length ? `<table><thead><tr><th>Release / source revision</th><th>Included components</th><th>Artifact state</th></tr></thead><tbody>${releases.map(r => `<tr><td><span class="release-name">${esc(r.name)}</span><code title="${esc(revision(r))}">${esc(short(revision(r)))}</code><span class="sub">${esc(date(r.created_at))}</span></td><td><strong class="warn">${esc(scope(r))}</strong><div>${chips(r)}</div></td><td><span class="tag">${r.manifest.retained === true ? 'Retained' : 'Not deployable'}</span></td></tr>`).join('')}</tbody></table>` : '<p class="empty">No releases built yet.</p>';
+    $('builds').innerHTML = builds.map(b => `<div class="history-item"><strong>${esc(b.name)}</strong><span class="sub">${esc(b.status)} · ${esc(short(b.revision))}</span>${b.error ? `<p class="bad">${esc(b.error)}</p>` : ''}</div>`).join('');
+    renderEnvironment(); renderInventory(); $('updated').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
   }
   async function perform(operation) {
     if (busy) return;
-    busy = true; $('message').textContent = 'Working…';
-    try { await operation(); await refresh(); $('message').textContent = 'Status updated.'; }
-    catch (error) { $('message').textContent = error.message + '\nRefresh status before retrying an interrupted operation.'; }
-    finally { busy = false; }
+    busy = true; $('refresh').disabled = true; $('message').textContent = 'Working…';
+    try { await operation(); await refresh(); $('message').textContent = 'Status updated. Release scope is shown beside each action.'; }
+    catch (error) { $('message').textContent = error.message + '\nDisplayed data may be stale. Refresh before retrying an interrupted operation.'; }
+    finally { busy = false; $('refresh').disabled = false; }
   }
   $('refresh').onclick = () => perform(async () => {});
-  $('build').onsubmit = event => {
-    event.preventDefault();
-    const data = Object.fromEntries(new FormData(event.target));
-    if (!data.revision.trim()) delete data.revision;
-    perform(() => api('release-builds', data));
-  };
-  $('environments').onclick = event => {
+  $('environment').onchange = renderEnvironment; $('service').onchange = renderService; $('candidate').onchange = renderSelection; $('search').oninput = renderInventory;
+  $('service-releases').onclick = event => { const button = event.target.closest('[data-service]'); if (button) { $('service').value = button.dataset.service; renderService(); } };
+  $('build').onsubmit = event => { event.preventDefault(); if (!selectedService()) return; const data = Object.fromEntries(new FormData(event.target)); data.service = selectedService().service; if (!data.revision.trim()) delete data.revision; perform(() => api('release-builds',data)); };
+  $('selection').onclick = event => {
     const button = event.target.closest('button[data-action]'); if (!button || button.disabled || busy) return;
-    const card = button.closest('[data-env]'), e = environments[Number(card.dataset.env)], s = e.state || {};
-    if (button.dataset.action === 'automation') {
-      if (!s.automation_held || confirm(`Resume automatic deployment of the latest ready release to ${e.name}?`))
-        perform(() => api('release-automation', {environment:e.name,held:!s.automation_held}));
+    const e = selectedEnv(), service = selectedService(), s = service.state || {}, action = button.dataset.action;
+    if (action === 'automation') {
+      if (!s.automation_held || confirm(`Resume automatic deployment of ${service.service} to ${e.name}?`)) perform(() => api('release-automation',{environment:e.name,service:service.service,held:!s.automation_held}));
       return;
     }
-    const recover = button.dataset.action === 'recover';
-    const bundle = recover ? e.recovery_bundle : button.dataset.action === 'rollback' ? s.previous_bundle : card.querySelector('select').value;
-    if (!confirm(`Deploy ${label(bundle)} to ${e.name}? Automation will remain held. Running services will be changed.`)) return;
-    const key = `${e.name}:${bundle}:${recover}`;
-    if (!pending.has(key)) pending.set(key, crypto.randomUUID());
-    perform(async () => {
-      await api('release-promotions', {environment:e.name,bundle_id:bundle,request_id:pending.get(key),recover});
-      pending.delete(key);
-    });
+    const recover = action === 'recover', bundle = recover ? service.recovery_bundle : action === 'rollback' ? s.previous_bundle : $('candidate').value, r = release(bundle);
+    if (!r) return;
+    confirmation = {environment:e.name,service:service.service,bundle,recover};
+    $('confirm-title').textContent = action === 'rollback' ? 'Roll back this service?' : recover ? 'Recover this service?' : 'Deploy this service release?';
+    $('confirm-body').innerHTML = `<p>Environment: <strong>${esc(e.name)}</strong></p><p>Service: <strong>${esc(service.service)}</strong></p><p>Release: <strong>${esc(r.name)}</strong></p><div class="notice"><strong>${esc(scope(r))}</strong>${chips(r)}</div><code>${esc(revision(r))}</code><p class="sub">Only this service's configured targets will change. Other services retain their versions. Automation for this service will remain held.</p>`;
+    $('confirmation').showModal();
+  };
+  $('cancel').onclick = () => $('confirmation').close();
+  $('confirm').onclick = () => {
+    if (!confirmation || busy) return;
+    const {environment,service,bundle,recover} = confirmation;
+    $('confirmation').close(); confirmation = null;
+    const key = `${environment}:${service}:${bundle}:${recover}`;
+    if (!pending.has(key)) pending.set(key,crypto.randomUUID());
+    perform(async () => { await api('release-promotions',{environment,service,bundle_id:bundle,request_id:pending.get(key),recover}); pending.delete(key); });
   };
   perform(async () => {});
 })();

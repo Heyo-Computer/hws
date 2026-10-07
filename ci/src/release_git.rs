@@ -23,6 +23,15 @@ pub async fn build_source(
     repository: &str, git_ref: &str, revision: Option<&str>, paths: &[String],
     token: &str, max_bytes: usize,
 ) -> Result<crate::trigger::GitPatchSource, String> {
+    Ok(build_source_scoped(repository, git_ref, revision, paths, token, max_bytes).await?.0)
+}
+
+/// Identity includes Git modes, object IDs and names, including deletions and
+/// symlink/submodule changes. Unsupported filters deliberately use the full tree.
+pub async fn build_source_scoped(
+    repository: &str, git_ref: &str, revision: Option<&str>, paths: &[String],
+    token: &str, max_bytes: usize,
+) -> Result<(crate::trigger::GitPatchSource, String), String> {
     validate_repository(repository)?;
     validate_ref(git_ref)?;
     if let Some(sha) = revision { validate_sha(sha)?; }
@@ -59,9 +68,37 @@ pub async fn build_source(
         if size > max_bytes { return Err("release build definitions exceed source limit".into()); }
         workflows.insert(path.clone(), text);
     }
-    Ok(crate::trigger::GitPatchSource { base_revision: sha, target_tree: tree.trim().into(),
+    let entries = git(dir.path(), &env, &["ls-tree", "-r", "-z", &sha], None).await.map_err(safe)?;
+    let identity = input_identity(&workflows, &entries);
+    Ok((crate::trigger::GitPatchSource { base_revision: sha, target_tree: tree.trim().into(),
         patch_base64: String::new(), workflows,
-        changes: crate::paths::Changes::unknown("full release build; path filters do not select components") })
+        changes: crate::paths::Changes::unknown("full release build; path filters do not select components") }, identity))
+}
+
+fn input_identity(workflows: &BTreeMap<String, String>, entries: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut patterns = Vec::new();
+    let scoped = workflows.iter().all(|(path, text)| {
+        let Ok(workflow) = crate::workflow::Workflow::parse(path, text) else { return false };
+        let filters = workflow.on_submit.paths;
+        if filters.is_empty() || filters.iter().any(|p| {
+            crate::paths::validate(p).is_err()
+                || p.contains(['[', ']', '{', '}', '(', ')', '+', '\\'])
+                || p.split('/').any(|s| s.contains("**") && s != "**")
+        }) { return false; }
+        patterns.extend(filters);
+        true
+    });
+    let mut hash = Sha256::new();
+    hash.update(b"release-input-v1\0");
+    for entry in entries.split('\0').filter(|e| !e.is_empty()) {
+        let path = entry.split_once('\t').map(|(_, p)| p);
+        if !scoped || path.is_some_and(|p| workflows.contains_key(p) || patterns.iter().any(|pat| crate::paths::matches(pat, p))) {
+            hash.update(entry.as_bytes());
+            hash.update([0]);
+        }
+    }
+    hex::encode(hash.finalize())
 }
 
 /// Materialize source only for the controller's authorized release operation.
@@ -853,6 +890,48 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command as SyncCommand;
+
+    #[tokio::test]
+    async fn service_inputs_ignore_unrelated_changes_but_include_shared_inputs_and_definition() {
+        let repo = TempDir::new().unwrap();
+        run(repo.path(), &["init", "-b", "main"]);
+        let definition = "on:\n  submit:\n    paths: ['api/**', 'shared/**']\njobs:\n  build:\n    steps:\n      - run: echo build\n";
+        fs::write(repo.path().join("api.yml"), definition).unwrap();
+        fs::create_dir(repo.path().join("api")).unwrap();
+        fs::create_dir(repo.path().join("shared")).unwrap();
+        fs::write(repo.path().join("api/code"), "api").unwrap();
+        fs::write(repo.path().join("shared/code"), "shared").unwrap();
+        commit(repo.path(), "initial");
+        let paths = vec!["api.yml".into()];
+        let load = || build_source_scoped(repo.path().to_str().unwrap(), "refs/heads/main", None, &paths, "", 10000);
+        let (original, identity) = load().await.unwrap();
+        fs::write(repo.path().join("worker"), "unrelated service").unwrap();
+        commit(repo.path(), "worker only");
+        let (unrelated, unchanged) = load().await.unwrap();
+        assert_ne!(original.base_revision, unrelated.base_revision);
+        assert_eq!(identity, unchanged);
+        fs::write(repo.path().join("shared/code"), "new shared dependency").unwrap();
+        commit(repo.path(), "shared dependency");
+        let (_, shared) = load().await.unwrap();
+        assert_ne!(identity, shared);
+        fs::write(repo.path().join("api.yml"), format!("{definition}# new definition\n")).unwrap();
+        commit(repo.path(), "definition");
+        let (_, changed_definition) = load().await.unwrap();
+        assert_ne!(shared, changed_definition);
+        fs::remove_file(repo.path().join("api/code")).unwrap();
+        commit(repo.path(), "delete input");
+        assert_ne!(changed_definition, load().await.unwrap().1);
+    }
+
+    #[test]
+    fn absent_or_unsupported_filters_fingerprint_the_entire_tree() {
+        let before = "100644 blob aaa\tapi.yml\0";
+        let after = format!("{before}100644 blob bbb\tworker/code\0");
+        for header in ["on: submit", "on:\n  submit:\n    paths: ['api/[ab]/**']", "on:\n  submit:\n    paths: ['api/foo**bar']", "on:\n  submit:\n    paths-ignore: ['worker/**']"] {
+            let workflows = BTreeMap::from([("api.yml".into(), format!("{header}\njobs:\n  build:\n    steps:\n      - run: echo ok\n"))]);
+            assert_ne!(input_identity(&workflows, before), input_identity(&workflows, &after), "{header}");
+        }
+    }
 
     fn run(at: &Path, args: &[&str]) -> String {
         let out = SyncCommand::new("git")

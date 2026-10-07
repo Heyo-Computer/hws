@@ -306,6 +306,8 @@ pub struct Config {
     pub release_builds: Option<String>,
     /// Named environment promotion policies; absent means no automatic promotion.
     pub release_environments: Option<String>,
+    /// Enable only after every original executor sharing the queue is retired.
+    pub release_service_environments_enabled: bool,
     /// Operator-owned runner/backend/archive-database mapping; never workflow supplied.
     pub host_maintenance_targets: Option<String>,
     /// Repository-scoped managed systemd app-lb targets; never workflow supplied.
@@ -664,6 +666,7 @@ impl Config {
             release_policies: opt("CI_RELEASE_POLICIES"),
             release_builds,
             release_environments,
+            release_service_environments_enabled: flag("CI_RELEASE_SERVICE_ENVIRONMENTS_ENABLED", false)?,
             host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
             host_app_lb_targets: opt("CI_HOST_APP_LB_TARGETS"),
             host_heyvm_bootstrap_targets: opt("CI_HOST_HEYVM_BOOTSTRAP_TARGETS"),

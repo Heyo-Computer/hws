@@ -4,6 +4,28 @@ The five stacked changes are opt-in. Installing their binaries alone does not
 change submission behavior or enable daily builds or environment promotion.
 This document is an activation procedure, not a record of a live deployment.
 
+## Service-scoped upgrade
+
+New release builds select one service, and promotion state is keyed by
+environment and service. See [service release policies](README.md#environment-promotion-of-retained-releases)
+for the current API and `services` policy shape. The environment-wide example
+and procedure below describe the legacy installation, not a new activation.
+
+Migration 052 preserves the legacy tables and adds service-scoped tables.
+Upgrade every CI executor sharing the queue before setting
+`CI_RELEASE_SERVICE_ENVIRONMENTS_ENABLED=true`. Until then, leave it false and
+retain the legacy policy so admitted legacy work can finish. Install the same
+service-scoped policy on every executor before activation. Do not copy legacy
+environment pointers into service history or roll back to an executor that
+cannot recognize service-scoped promotions after activation.
+
+Configure a build component and an independent regional promotion workflow for
+each service to expose it in the panel. Stage may automatically promote each
+service's newest retained candidate; production may require manual promotion.
+Manual promotion holds only that service's automation. Unchanged declared build
+inputs reuse a retained candidate, so unrelated services need no rebuild or
+redeployment. Existing managed rollout actions still own regional sequencing.
+
 ## State and ownership
 
 - Existing CI PostgreSQL stores build membership, immutable bundle manifests,
