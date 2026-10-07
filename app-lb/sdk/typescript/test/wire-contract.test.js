@@ -48,7 +48,7 @@ const KNOWN = {
     JwtSpec: ["secret", "public_key", "jwks_url", "algorithms", "issuer", "audience", "require", "subject_claim", "email_claim", "name_claim", "leeway_secs", "cookie", "login_endpoint", "login_url", "login_redirect_param", "authorize_url", "token_url"],
     DeploymentView: ["id", "namespace", "account_id", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
     UpstreamTrafficStatus: ["deployment_id", "upstream", "state", "healthy", "in_flight", "reason", "started_at"],
-    PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs"],
+    PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs", "boot_failures", "boot_backoff_secs"],
     VmView: ["sandbox_id", "addr", "in_flight", "healthy", "draining", "uptime_secs", "cpu_percent", "memory_bytes"],
     PendingVmView: ["sandbox_id", "age_secs", "status"],
     DeploymentMetrics: ["requests", "latency_ms", "cold_start_s", "autoscale"],

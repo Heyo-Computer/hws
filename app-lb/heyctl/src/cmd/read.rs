@@ -1671,6 +1671,19 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
                     ),
                 );
             }
+            // The backoff, because it is the one state where nothing is wrong
+            // *right now* and still nothing happens: `pending: 0, ready: 0`
+            // for up to an hour reads as a platform that cannot boot.
+            if let Some(wait) = view.pool.boot_backoff_secs {
+                output::field(
+                    "Boot backoff",
+                    format!(
+                        "{} failed boots in a row; next VM in {} (any spec edit retries now)",
+                        view.pool.boot_failures,
+                        output::duration(wait)
+                    ),
+                );
+            }
             if a.create_failures > 0 {
                 output::field(
                     "Create failures",

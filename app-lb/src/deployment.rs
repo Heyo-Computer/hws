@@ -679,6 +679,13 @@ impl Deployment {
         let until = self.boot_backoff_until.load(Ordering::Relaxed);
         (until > now).then(|| until - now)
     }
+
+    /// Failed boots in a row since the last VM that passed its health check.
+    /// What [`boot_backoff_secs`] grows from; reset by a healthy boot, and —
+    /// because every spec write builds a fresh `Deployment` — by any edit.
+    pub fn boot_failure_streak(&self) -> u64 {
+        self.boot_failures.load(Ordering::Relaxed)
+    }
 }
 
 /// First backoff after a failed boot. Small on purpose: one flaky boot must not

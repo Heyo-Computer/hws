@@ -209,7 +209,9 @@
         "cpu_percent": 41.25,
         "memory_bytes": 1073741824,
         "boot_timeout_secs": 300,
-        "cold_start_timeout_secs": 120
+        "cold_start_timeout_secs": 120,
+        "boot_failures": 3,
+        "boot_backoff_secs": 240
       },
       "vms": [
         {
