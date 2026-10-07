@@ -257,9 +257,6 @@ jobs:
         timeout-minutes: 10
         run: |
           set -eu
-          export DEBIAN_FRONTEND=noninteractive
-          timeout 180 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update -qq
-          timeout 300 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y --no-install-recommends postgresql-16 nats-server
           pg_ctlcluster 16 main status >/dev/null 2>&1 || pg_ctlcluster -o '-c listen_addresses=127.0.0.1' 16 main start
           runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER ROLE postgres PASSWORD 'disposable-test-password'"
           runuser -u postgres -- createdb ci_release_retry

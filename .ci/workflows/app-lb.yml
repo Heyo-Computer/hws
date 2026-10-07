@@ -45,10 +45,17 @@ on:
 
 jobs:
   release:
+    # The protocol check is its own job so that "Re-run failed jobs" means
+    # something here. Re-runs are per job: while this was one job, a failure in
+    # any step — the protocol check included — re-ran the whole 75-minute
+    # release build. Split, a passed `protocol` is carried over and a passed
+    # build is not repeated to retry the check. It runs first because it is the
+    # quicker of the two and gates the upload just as it did as a step.
+    needs: [protocol]
     # Let CI choose an eligible Firecracker host by available capacity rather
     # than pinning builds to the controller's host. Driver filtering excludes
     # native-only machines; a warm cache must not override disk headroom.
-    vm:
+    vm: &apps_vm
       driver: firecracker
       build:
         dockerfile: .ci/image/apps/Dockerfile
@@ -135,7 +142,8 @@ jobs:
       # attached, /var/cache/ci sits on the 10 GB rootfs alongside the toolchain
       # and the registry, and a build that fills it dies with an unreadable
       # SIGBUS mid-compile. Failing here names the actual problem in one line.
-      - name: Guard the cache disk
+      - &guard_cache_disk
+        name: Guard the cache disk
         run: |
           df -P "$CARGO_TARGET_DIR" /
           if [ "$(stat -c %d "$CARGO_TARGET_DIR")" = "$(stat -c %d /)" ]; then
@@ -148,23 +156,6 @@ jobs:
             echo "cache disk at ${usage}%, wiping $CARGO_TARGET_DIR"
             rm -rf "$CARGO_TARGET_DIR"
           fi
-
-      # Fail before compiling if test dependencies cannot be installed. An
-      # incomplete apt index must not masquerade as an unavailable package.
-      - name: Prepare protocol test tools
-        run: |
-          set -eux
-          export DEBIAN_FRONTEND=noninteractive
-          export TZ=Etc/UTC
-          # The Ubuntu image defaults to HTTP; guest connections to the archive
-          # and security endpoints on port 80 fail intermittently. Use HTTPS
-          # for both, keeping certificate verification and strict index errors.
-          sed -i -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-                 -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
-                 /etc/apt/sources.list.d/ubuntu.sources
-          timeout 240 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-          timeout 240 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends python3 openssl
-        timeout-minutes: 10
 
       - name: Build
         # No `. "$HOME/.cargo/env"`: the image puts cargo on PATH through
@@ -289,21 +280,6 @@ jobs:
           ls -la dist
           cat dist/BUILD-INFO
 
-      # Keep the disposable CA feature out of the shipped release binary.
-      # Exercise real proxy traffic, including TLS, rather than only linking.
-      - name: Build protocol test binary
-        working-directory: /workspace
-        run: |
-          set -eu
-          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
-          cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
-        timeout-minutes: 15
-
-      - name: Verify proxy protocol compatibility
-        working-directory: /workspace
-        run: APP_LB_TEST_BINARY="$CARGO_TARGET_DIR/debug/app-lb" python3 -u -B app-lb/testdata/gateway_smoke.py
-        timeout-minutes: 3
-
       # Lands in whichever sink the orchestrator is configured for — `disk`
       # (CI_ARTIFACT_DIR) by default, or the central `art serve` when
       # CI_ARTIFACT_SINK=artifacts. The workflow does not choose; it uploads.
@@ -339,3 +315,30 @@ jobs:
           # `.ci/install.sh` (which resolves tags) still needs one; this is
           # for a host or a person that was handed the link.
           public: true
+
+  # Real proxy traffic, TLS included, against a debug build — rather than only
+  # proving the release binary links. Same VM settings as `release` (the alias
+  # below), so the two share one warm pool and one cache disk: the fingerprint
+  # covers the `vm:` block, not the job's name. `python3` and the `openssl` CLI
+  # the smoke test needs are baked into the image.
+  protocol:
+    vm: *apps_vm
+    env:
+      CARGO_TERM_COLOR: never
+    timeout-minutes: 30
+    steps:
+      - *guard_cache_disk
+
+      # Keep the disposable CA feature out of the shipped release binary.
+      - name: Build protocol test binary
+        working-directory: /workspace
+        run: |
+          set -eu
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
+          cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
+        timeout-minutes: 15
+
+      - name: Verify proxy protocol compatibility
+        working-directory: /workspace
+        run: APP_LB_TEST_BINARY="$CARGO_TARGET_DIR/debug/app-lb" python3 -u -B app-lb/testdata/gateway_smoke.py
+        timeout-minutes: 3
