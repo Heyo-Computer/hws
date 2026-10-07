@@ -682,6 +682,8 @@ fn metrics_response_is_stable() {
                     memory_bytes: Some(1_073_741_824),
                     boot_timeout_secs: 300,
                     cold_start_timeout_secs: 120,
+                    boot_failures: 3,
+                    boot_backoff_secs: Some(240),
                 },
                 vms: vec![VmView {
                     sandbox_id: "applb-sandbox-a1b2c3".into(),
@@ -757,6 +759,8 @@ fn a_site_view_carries_its_root_and_spa_flag() {
                 memory_bytes: None,
                 boot_timeout_secs: 300,
                 cold_start_timeout_secs: 120,
+                boot_failures: 0,
+                boot_backoff_secs: None,
             },
             vms: vec![],
             pending_vms: vec![],

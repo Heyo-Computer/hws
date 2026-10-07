@@ -336,7 +336,7 @@ Desired replicas is `ceil(demand / target_concurrency) + warm_pool`, clamped to 
 
 `retain` preserves only the `/workspace` data disk. Writes to the rootfs and memory are lost in both modes, because the rootfs is recopied from the image on every cold boot. So `retain` is only meaningfully stateful with `disk_size_gb` set and state kept under `/workspace`. For interchangeable replicas, use `destroy`.
 
-Consecutive failed boots back off the next create exponentially, from 30 seconds up to one hour, and reset on the first healthy boot.
+Consecutive failed boots back off the next create exponentially, from 30 seconds up to one hour, and reset on the first healthy boot. Any spec write also resets them (even a scaling patch that changes nothing), so a fix is tried at once. While a pool is held off, `/metrics` reports the streak and the wait in `pool.boot_failures` and `pool.boot_backoff_secs`, and `heyctl describe` prints a **Boot backoff** line; without them a held-off pool reads as `pending: 0, ready: 0` with nothing booting.
 
 ### `health`
 
@@ -784,6 +784,7 @@ For `obs`, `/namespaces/<ns>/plugins/obs/ui` is the app-obs dashboard narrowed t
 
 **A pool stays at zero ready.** Start with `GET /metrics?deployment=<id>` and look at `metrics.autoscale`:
 
+- `pool.boot_backoff_secs` set: the autoscaler is waiting out a boot-failure backoff, so no VM is booting by design. Find why boots fail (below), fix it, and the spec write that ships the fix retries at once.
 - `vms_created` and `boot_timeouts` both rising: the daemon creates VMs but the guest never passes health. Read the start log inside the guest with `heyctl exec <id> -- cat /var/log/heyvm-start.log` (and `.err.log`). It reaches app-obs only when the image has `socat` (see "Install `socat` in custom images"); otherwise it lives only as long as that boot. Common causes: a `start_command` that blocks instead of daemonizing, a server bound to `127.0.0.1` instead of the guest interface, the wrong `port`, or a `health.path` behind auth or returning 5xx.
 - `vms_created` flat while desired is above zero: creates fail before a VM exists (`create_failures` and `last_create_error` say why). Check for a missing image (for example, after `heyvm prune --images`), a full disk, host memory admission in heyvmd, a secret in `env_from` that doesn't exist, or a mount or workspace that isn't ready. The app-lb log names the reason (`not creating a replica yet: ...`).
 - `vms_created` and `vms_drained` climbing together with no failures: scale-to-zero churn. Check `scale_to_zero_after_secs`, but first find out why the replica was retired.

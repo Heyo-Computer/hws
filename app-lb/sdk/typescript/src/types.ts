@@ -567,6 +567,14 @@ export interface PoolStatus {
   memory_bytes: number | null;
   boot_timeout_secs: number;
   cold_start_timeout_secs: number;
+  /** Failed boots in a row since the last VM that passed its health check. */
+  boot_failures: number;
+  /**
+   * Seconds until the autoscaler may create a VM again while the boot-failure
+   * backoff holds it off; `null` when it may create one now. Any spec write
+   * clears it.
+   */
+  boot_backoff_secs: number | null;
 }
 
 export interface VmView {
