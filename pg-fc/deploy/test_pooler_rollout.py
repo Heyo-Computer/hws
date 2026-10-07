@@ -151,13 +151,14 @@ class ReplacementTests(unittest.TestCase):
 
     def test_sql_probe_forces_local_pooler_and_decodes_credentials_without_argv(self):
         with patch.dict(os.environ, {"PGSERVICE": "wrong-service", "PGHOSTADDR": "203.0.113.1"}):
-            env = installer.sql_environment("postgresql://reader:encoded%40value@pg.example/db%2Dname?sslmode=verify-full", 6432)
+            env = installer.sql_environment("postgresql://reader:encoded%40value@pg.example/db%2Dname?sslmode=verify-full&application_name=pooler%20probe", 6432)
         self.assertEqual(env["PGHOSTADDR"], "127.0.0.1")
         self.assertEqual(env["PGPORT"], "6432")
         self.assertEqual(env["PGHOST"], "pg.example")
         self.assertEqual(env["PGDATABASE"], "db-name")
         self.assertEqual(env["PGPASSWORD"], "encoded@value")
         self.assertEqual(env["PGSSLMODE"], "verify-full")
+        self.assertEqual(env["PGAPPNAME"], "pooler probe")
         self.assertNotIn("PGSERVICE", env)
         self.assertIn("default_transaction_read_only=on", env["PGOPTIONS"])
         regional = installer.sql_environment("postgresql://reader@writer.example/db?sslmode=verify-full", 6432, "replica.example")
@@ -166,6 +167,8 @@ class ReplacementTests(unittest.TestCase):
         self.assertEqual(regional["PGSSLMODE"], "verify-full")
         with self.assertRaises(RuntimeError):
             installer.sql_environment("postgresql://reader@pg.example/db?hostaddr=203.0.113.2", 6432)
+        with self.assertRaises(RuntimeError):
+            installer.sql_environment("postgresql://reader@pg.example/db?application_name=one&application_name=two", 6432)
 
     def test_managed_job_receipt_and_replay(self):
         host = object.__new__(Host)

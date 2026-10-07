@@ -112,7 +112,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Replace CI only after both regional stages succeed
-        if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', '.ci/workflows/ci.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+        if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', 'pg-fc/deploy/replace_pooler.py', '.ci/workflows/ci.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
         uses: ci/deploy-controller
         timeout-minutes: 25
         with:

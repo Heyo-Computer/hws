@@ -109,7 +109,8 @@ def sql_environment(value, port, tls_server_name=None):
     require(url.scheme in ("postgres", "postgresql") and url.hostname and url.username
             and url.path.startswith("/") and len(url.path) > 1, "SQL probe requires a database URL")
     options = urllib.parse.parse_qs(url.query, strict_parsing=True)
-    allowed = {"sslmode": "PGSSLMODE", "sslrootcert": "PGSSLROOTCERT", "sslcert": "PGSSLCERT", "sslkey": "PGSSLKEY"}
+    allowed = {"sslmode": "PGSSLMODE", "sslrootcert": "PGSSLROOTCERT", "sslcert": "PGSSLCERT", "sslkey": "PGSSLKEY",
+               "application_name": "PGAPPNAME"}
     require(all(key in allowed and len(values) == 1 for key, values in options.items()), "unsupported SQL URL options")
     # Never pass a credential-bearing URL in argv or inherit a service/host
     # override which would accidentally probe a different pooler.

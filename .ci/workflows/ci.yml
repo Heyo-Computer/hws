@@ -48,6 +48,8 @@ on:
       - 'ci/**'
       # CI and app-lb deliberately compile the same host-bundle validator.
       - 'app-lb/src/host_bundle.rs'
+      # Retained pooler promotions embed this host-side recipe in the CI binary.
+      - 'pg-fc/deploy/replace_pooler.py'
       # This workflow and the image it builds in — named precisely rather than
       # as `.ci/**`, so adding a workflow for another crate does not rebuild
       # this one.
@@ -67,7 +69,7 @@ jobs:
     # runs the same glob matcher as `paths:`, so the guard and the filter cannot
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
-    if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', '.ci/workflows/ci.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+    if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', 'pg-fc/deploy/replace_pooler.py', '.ci/workflows/ci.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
     # Unpinned: the controller chooses an eligible host in the runner network.
     vm: &ci_vm
       driver: firecracker
