@@ -18,6 +18,17 @@ export interface RouteRule {
   host_suffix?: string;
   path_prefix?: string;
   strip_prefix?: boolean;
+  /** Answer matched requests with a redirect instead of serving them. */
+  redirect?: RouteRedirect;
+}
+
+export interface RouteRedirect {
+  /** Absolute http(s) URL. */
+  to: string;
+  /** 301 (default), 302, 303, 307 or 308. */
+  status?: number;
+  /** Append the request path and query to `to`. Defaults to true. */
+  keep_path?: boolean;
 }
 
 export interface ScalingPolicy {

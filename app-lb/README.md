@@ -991,8 +991,9 @@ relative links resolve. Files are streamed in 64 KiB pieces rather than read
 whole, so a large asset does not pin its own size in memory per concurrent
 request.
 
-What you don't: rewrites, redirects, per-location blocks, directory listings,
-compression. A site that needs those wants a real web server behind a
+What you don't: rewrites, per-location blocks, directory listings,
+compression. A whole-host redirect is a route field, not a site one — see
+[Redirecting a route](#redirecting-a-route). A site that needs those wants a real web server behind a
 `proxy_pass` deployment.
 
 **Nothing outside `root` is ever served.** Every path component is checked before
@@ -2306,6 +2307,7 @@ A rule may set any combination of three fields:
 | `host_suffix` | a domain and its subdomains | anchored at a label boundary |
 | `path_prefix` | a leading path segment, e.g. `/api` | prefix, not exact |
 | `strip_prefix` | `true` or `false` | removes this rule's path prefix before proxying; defaults to `false` |
+| `redirect` | `{"to": URL, …}` | answers the matched request with a redirect instead of serving it — see [Redirecting a route](#redirecting-a-route) |
 
 - **`host`** — exact hostname match, e.g. `{"host": "demo.local"}` matches only
   `demo.local` (any port).
@@ -2355,6 +2357,42 @@ Host matching (exact or suffix) is case-insensitive, strips the port, and falls
 back to HTTP/2's `:authority` when there is no `Host` header. A request that
 matches no rule anywhere is a **404**. Every route must set at least one field —
 an empty rule `{}` is rejected at registration.
+
+### Redirecting a route
+
+A rule with a `redirect` captures its requests and sends them elsewhere, while
+the deployment's other rules serve as usual. A site can take an extra host
+just to forward it:
+
+```jsonc
+"routes": [
+  { "host": "heyo.computer" },                                              // served from the site
+  { "host": "docs.heyo.computer", "redirect": { "to": "https://heyo.computer/docs" } }
+]
+```
+
+`docs.heyo.computer/guide?x=1` answers `301 Location:
+https://heyo.computer/docs/guide?x=1`.
+
+| Field | Default | |
+| --- | --- | --- |
+| `to` | *(required)* | Absolute `http`/`https` URL |
+| `status` | `301` | `301`, `302`, `303`, `307` or `308` |
+| `keep_path` | `true` | Append the request path and query to `to`. `false` sends every request to `to` exactly |
+
+With `strip_prefix` the rule's `path_prefix` comes off the path before it is
+appended. The redirect is answered after the deployment's auth gate and
+maintenance check, so it never bypasses either. Registration refuses a target
+that is not an absolute http(s) URL, a `to` with a query or fragment when the
+path is kept (the path would land after it), and a target that matches its own
+rule again, which would redirect forever. The rule's host still needs DNS and
+a certificate like any other route.
+
+```sh
+heyctl set route heyo-marketing --add \
+  --route 'host=docs.heyo.computer,redirect=https://heyo.computer/docs'
+# status=302 and keep-path=false are the other keys
+```
 
 ### Deployments with no routes
 

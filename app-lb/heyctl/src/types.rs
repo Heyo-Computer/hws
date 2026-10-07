@@ -254,6 +254,24 @@ pub struct RouteRule {
     pub host_suffix: Option<String>,
     pub path_prefix: Option<String>,
     pub strip_prefix: bool,
+    pub redirect: Option<RouteRedirect>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouteRedirect {
+    pub to: String,
+    #[serde(default = "default_redirect_status")]
+    pub status: u16,
+    #[serde(default = "default_keep_path")]
+    pub keep_path: bool,
+}
+
+fn default_redirect_status() -> u16 {
+    301
+}
+
+fn default_keep_path() -> bool {
+    true
 }
 
 impl RouteRule {
@@ -277,7 +295,14 @@ impl RouteRule {
             }
             s.push_str(p);
         }
-        if s.is_empty() { "<empty>".into() } else { s }
+        if s.is_empty() {
+            s.push_str("<empty>");
+        }
+        if let Some(r) = &self.redirect {
+            let path = if r.keep_path { "/…" } else { "" };
+            s.push_str(&format!(" → {} {}{path}", r.status, r.to.trim_end_matches('/')));
+        }
+        s
     }
 }
 

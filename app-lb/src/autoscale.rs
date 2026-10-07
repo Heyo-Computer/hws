@@ -2646,6 +2646,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }],
             vm: Some(VmSpec {
                 correlated_creates: false,
@@ -2697,6 +2698,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/legacy".into()),
                 strip_prefix: false,
+                redirect: None,
             }],
             vm: None,
             scaling: ScalingPolicy::default(),

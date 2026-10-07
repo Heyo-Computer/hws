@@ -393,6 +393,71 @@ pub struct RouteRule {
     /// preserving the original pass-through behavior for existing specs.
     #[serde(default, skip_serializing_if = "is_false")]
     pub strip_prefix: bool,
+    /// Answer every request this rule matches with a redirect instead of
+    /// serving it, so one deployment can capture a host (an old subdomain, a
+    /// vanity name) and send it elsewhere while its other routes serve as usual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<RouteRedirect>,
+}
+
+/// Where a redirecting route sends its requests.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct RouteRedirect {
+    /// Absolute `http`/`https` URL. With `keep_path` the request path (after
+    /// `strip_prefix`, if the rule strips) and query are appended to it, so
+    /// `https://example.com/docs` sends `/a/b?q` to `https://example.com/docs/a/b?q`.
+    pub to: String,
+    /// `301` (default), `302`, `303`, `307` or `308`.
+    #[serde(default = "default_redirect_status")]
+    pub status: u16,
+    /// Append the request path and query to `to`. Off sends every request to
+    /// `to` exactly.
+    #[serde(default = "default_true")]
+    pub keep_path: bool,
+}
+
+fn default_redirect_status() -> u16 {
+    301
+}
+
+impl RouteRedirect {
+    pub const STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
+
+    /// The `Location` for a request whose (already prefix-stripped) path and
+    /// query are given. `path` always starts with `/`.
+    pub fn location(&self, path: &str, query: Option<&str>) -> String {
+        if !self.keep_path {
+            return self.to.clone();
+        }
+        let mut out = format!("{}{path}", self.to.trim_end_matches('/'));
+        if let Some(q) = query.filter(|q| !q.is_empty()) {
+            out.push('?');
+            out.push_str(q);
+        }
+        out
+    }
+
+    fn validate(&self, route: &RouteRule) -> Result<(), String> {
+        if !Self::STATUSES.contains(&self.status) {
+            return Err(format!("status {} is not a redirect; use one of 301, 302, 303, 307 or 308", self.status));
+        }
+        let url = url::Url::parse(&self.to).map_err(|e| format!("{:?} is not an absolute URL: {e}", self.to))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
+            return Err(format!("{:?} must be an http:// or https:// URL with a host", self.to));
+        }
+        if self.keep_path && (url.query().is_some() || url.fragment().is_some()) {
+            return Err(format!("{:?} has a query or fragment, which the appended request path would land after; set keep_path: false or drop it", self.to));
+        }
+        // With the path kept, a target on the rule's own host and path matches
+        // the rule again: an endless redirect, every path one level deeper.
+        if self.keep_path
+            && route.host.as_deref().is_some_and(|h| url.host_str().is_some_and(|t| t.eq_ignore_ascii_case(h)))
+            && route.path_prefix.as_deref().is_none_or(|p| url.path().starts_with(p))
+        {
+            return Err(format!("{:?} matches this route again, which would redirect forever", self.to));
+        }
+        Ok(())
+    }
 }
 
 impl RouteRule {
@@ -3938,6 +4003,7 @@ pub enum SpecError {
     NoRoutes,
     EmptyRoute,
     StripPrefixWithoutPath,
+    InvalidRedirect(String),
     /// A sign-in gate on a deployment with no routes. The gate only ever runs
     /// on a proxied request, and an unrouted deployment receives none.
     AuthWithoutRoutes,
@@ -4286,6 +4352,7 @@ impl std::fmt::Display for SpecError {
                 f,
                 "route.strip_prefix requires route.path_prefix"
             ),
+            Self::InvalidRedirect(why) => write!(f, "route.redirect: {why}"),
             Self::UnsupportedDriver(d) => write!(
                 f,
                 "driver {d} is not supported: app-lb routes directly to the guest IP, \
@@ -5083,6 +5150,11 @@ impl DeploymentSpec {
             .any(|route| route.strip_prefix && route.path_prefix.is_none())
         {
             return Err(SpecError::StripPrefixWithoutPath);
+        }
+        for route in &self.routes {
+            if let Some(redirect) = &route.redirect {
+                redirect.validate(route).map_err(SpecError::InvalidRedirect)?;
+            }
         }
         // A cloud URL is a bind on a VM's port. A static deployment's
         // upstreams and a site's files are not on any daemon to bind.
@@ -5908,6 +5980,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }],
             vm: Some(VmSpec {
                 correlated_creates: false,
@@ -5986,6 +6059,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/legacy".into()),
                 strip_prefix: false,
+                redirect: None,
             }],
             vm: None,
             scaling: ScalingPolicy::default(),
@@ -6812,6 +6886,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some("/app".into()),
             strip_prefix: false,
+            redirect: None,
         }];
         s.auth = Some(auth_gate());
         assert_eq!(
@@ -7241,6 +7316,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         }]).unwrap();
 
         let json = serde_json::to_string(&gate).unwrap();
@@ -7262,6 +7338,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         }]).unwrap();
     }
 
@@ -7279,6 +7356,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }]),
             Err(SpecError::OauthWithoutGoogle)
         );
@@ -7293,6 +7371,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }]),
             Err(SpecError::NoAuthProvider)
         );
@@ -7307,6 +7386,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }]),
             Err(SpecError::EmptyClientId)
         );
@@ -7321,6 +7401,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                redirect: None,
             }]),
             Err(SpecError::EmptyAllowList)
         );
@@ -7640,6 +7721,33 @@ mod tests {
         assert_eq!(s.validate(), Err(SpecError::StripPrefixWithoutPath));
     }
 
+    #[test]
+    fn route_redirects_are_checked_before_they_can_loop_or_lie() {
+        let site = |redirect: serde_json::Value| -> DeploymentSpec {
+            serde_json::from_value(serde_json::json!({
+                "id":"m", "site":{"root":"/srv/m"},
+                "routes":[{"host":"m.example"}, {"host":"docs.m.example", "redirect": redirect}]
+            })).unwrap()
+        };
+        let ok = site(serde_json::json!({"to":"https://m.example/docs"}));
+        assert_eq!(ok.validate(), Ok(()));
+        let r = ok.routes[1].redirect.as_ref().unwrap();
+        assert_eq!((r.status, r.keep_path), (301, true));
+        for (bad, why) in [
+            (serde_json::json!({"to":"/docs"}), "absolute"),
+            (serde_json::json!({"to":"ftp://m.example/"}), "http"),
+            (serde_json::json!({"to":"https://m.example/", "status":200}), "not a redirect"),
+            (serde_json::json!({"to":"https://m.example/?a=1"}), "query"),
+            (serde_json::json!({"to":"https://DOCS.m.example/docs"}), "forever"),
+        ] {
+            match site(bad.clone()).validate() {
+                Err(SpecError::InvalidRedirect(msg)) => assert!(msg.contains(why), "{bad}: {msg}"),
+                other => panic!("{bad}: {other:?}"),
+            }
+        }
+        assert_eq!(site(serde_json::json!({"to":"https://m.example/?a=1", "keep_path":false})).validate(), Ok(()));
+    }
+
     /// `destroy` is the historical behaviour, so a spec written before
     /// `idle_action` existed must keep meaning what it meant.
     #[test]
@@ -7917,6 +8025,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         };
         assert!(r.matches(Some("demo.local"), "/"));
         assert!(r.matches(Some("DEMO.LOCAL"), "/"));
@@ -7931,6 +8040,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some("/api".into()),
             strip_prefix: false,
+            redirect: None,
         };
         assert!(r.matches(Some("demo.local"), "/api/v1"));
         assert!(!r.matches(Some("demo.local"), "/web"));
@@ -7944,6 +8054,7 @@ mod tests {
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         };
         // Apex and any depth of subdomain.
         assert!(r.matches(Some("apps.example.com"), "/"));
@@ -7965,6 +8076,7 @@ mod tests {
             host_suffix: Some(".example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         };
         assert!(r.matches(Some("a.example.com"), "/"));
         assert!(r.matches(Some("example.com"), "/"));
@@ -7977,6 +8089,7 @@ mod tests {
             host_suffix: Some("example.com".into()),
             path_prefix: Some("/api".into()),
             strip_prefix: false,
+            redirect: None,
         };
         assert!(r.matches(Some("a.example.com"), "/api/v1"));
         assert!(!r.matches(Some("a.example.com"), "/web"));
@@ -7990,24 +8103,28 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         };
         let wild = RouteRule {
             host: None,
             host_suffix: Some("example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         };
         let long_wild = RouteRule {
             host: None,
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         };
         let path_only = RouteRule {
             host: None,
             host_suffix: None,
             path_prefix: Some("/some/long/path".into()),
             strip_prefix: false,
+            redirect: None,
         };
         assert!(exact.specificity() > long_wild.specificity());
         assert!(long_wild.specificity() > wild.specificity(), "longer suffix wins");
@@ -8022,6 +8139,7 @@ mod tests {
             host_suffix: Some(".".into()),
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         };
         assert!(!dot.is_empty(), "a suffix field is set");
         assert!(!dot.matches(Some("example.com"), "/"), "but it matches nothing");
@@ -8034,18 +8152,21 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            redirect: None,
         };
         let long_path = RouteRule {
             host: None,
             host_suffix: None,
             path_prefix: Some("/a/very/long/prefix".into()),
             strip_prefix: false,
+            redirect: None,
         };
         let short_path = RouteRule {
             host: None,
             host_suffix: None,
             path_prefix: Some("/a".into()),
             strip_prefix: false,
+            redirect: None,
         };
         assert!(host_only.specificity() > long_path.specificity());
         assert!(long_path.specificity() > short_path.specificity());
