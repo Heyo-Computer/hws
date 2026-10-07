@@ -152,6 +152,9 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
                     response_headers.append(line.lower())
                 assert b'upgrade: pg-fc-sql/1\r\n' in response_headers
                 assert stream.read(11)==b'\x00SQL-ready\xff'
+                # No application heartbeat: both proxy hops must keep an idle
+                # accepted SQL tunnel past Pingora's 60-second body deadline.
+                time.sleep(65)
                 payload=b'\x00\xffsql\x13\x80'
                 tunnel.sendall(payload)
                 assert stream.read(len(payload))==payload[::-1]

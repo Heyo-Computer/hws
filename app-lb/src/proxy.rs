@@ -385,10 +385,21 @@ impl ProxyHttp for LbProxy {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // A successfully upgraded SQL stream can legitimately be idle. Keep
+        // the HTTP body deadline until the backend accepts this exact protocol;
+        // an Upgrade request alone must not disable slow-client protection.
+        if session.is_upgrade(upstream_response) == Some(true)
+            && session.req_header().headers.get(http::header::UPGRADE)
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"pg-fc-sql/1"))
+            && upstream_response.headers.get(http::header::UPGRADE)
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"pg-fc-sql/1"))
+        {
+            session.set_read_timeout(None);
+        }
         // Makes it possible to see which VM served a request, which is how the
         // load-spreading and retry behaviour get verified.
         if let Some(id) = ctx.request.as_ref().and_then(RemoteRequest::backend_id) {
