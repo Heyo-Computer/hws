@@ -1376,12 +1376,18 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
         // one of each — so these two sections cannot appear together.
         if let Some(artifact) = &d.spec.artifact {
             output::section("Artifact source");
-            output::field("Store", &artifact.store);
+            let lb_store = artifact.uses_lb_store();
+            output::field(
+                "Store",
+                if lb_store { "app-lb's global artifact store" } else { &artifact.store },
+            );
             let remote = artifact.store.starts_with("http://")
                 || artifact.store.starts_with("https://");
             output::field(
                 "Transport",
-                if remote {
+                if lb_store {
+                    "pulled by app-lb with its own key, digest verified on arrival"
+                } else if remote {
                     "streamed over HTTP, digest verified on arrival"
                 } else {
                     "materialized locally by `art` (hole-aware)"
@@ -1415,6 +1421,10 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
             output::field(
                 "Credential",
                 match (&artifact.auth, remote) {
+                    (None, _) if lb_store => "app-lb's own (none needed)".to_string(),
+                    (Some(a), _) if lb_store => {
+                        format!("secret {} — app-lb's own store needs none", a.render())
+                    }
                     (Some(a), true) => format!("secret {}", a.render()),
                     // Said rather than shown as configured: the server logs it
                     // as unused on every pull, and this is where somebody would

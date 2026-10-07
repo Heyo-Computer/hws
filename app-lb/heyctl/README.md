@@ -571,7 +571,13 @@ already built. `heyctl set artifact` records where from, and `heyctl pull` fetch
 materializes it as an `.ext4` the daemon can boot, and rolls the pool onto it.
 
 ```sh
-# Store the API key first, if the store is gated. As with a build's, it stays write-only.
+# The usual case: an image pushed through app-lb (`heyctl artifact push`). No --store means
+# app-lb's own global store, which app-lb authenticates to itself — no secret. The ref must be
+# under the deployment's namespace, or a digest.
+heyctl set artifact web --ref acme/web:v2
+
+# Some other store: store the API key first, if it is gated. As with a build's, it stays
+# write-only.
 heyctl create secret art api_key=…
 heyctl create secret art --from-stdin api_key < ~/.art-key
 
@@ -581,6 +587,9 @@ heyctl set artifact web --grow-gb 8         # extend the rootfs (sparsely) on ma
 
 # A store root on the app-lb host instead of a URL — much cheaper, see below.
 heyctl set artifact web --store /srv/artifacts --ref web-v2
+
+# Back to app-lb's own store.
+heyctl set artifact web --store '' --ref acme/web:v3
 
 # Pull and roll out.
 heyctl pull web --wait                      # blocks until it succeeds or fails
@@ -689,9 +698,40 @@ Four things worth knowing:
 
 ## Artifact stores
 
-An artifact store (`art serve`) is a separate service from app-lb, so `heyctl artifact` keeps
-its own saved *registries* rather than using the `--server` context. A store is authenticated by
-a shared key, not a username and password, and `--context` never retargets a push.
+`heyctl artifact` goes **through app-lb** by default. The load balancer fronts one configured
+global artifact store under `/namespaces/<ns>/artifacts` on its admin API, and heyctl reaches it
+with the context every other command uses — `--context`, `--server`, `--token`, Cloud's
+`/namespaces/<ns>/lb` door included. Nobody but app-lb holds the store's key, and nobody needs
+to know where the store is.
+
+```sh
+heyctl login --server https://cloud.example.com/namespaces/acme/lb --token-stdin <<< "$HEYO_KEY"
+heyctl artifact push --image web-v2 --tag acme/web:v2
+heyctl artifact ls                                  # acme's tags only
+heyctl set artifact web --ref acme/web:v2           # no --store: app-lb's own store
+heyctl pull web --wait
+```
+
+- **The namespace** is the one the credential is confined to, or `-n NS`.
+- **Tags live under it.** `acme/web:v2`, never `web:v2`: a bare tag is refused, with the
+  namespaced spelling suggested, rather than silently pushed somewhere you did not type. A tag
+  heyctl derives for you (from a file or directory name) goes under `<ns>/` on its own.
+- **Tiers** are the context's: `view` to list, describe and pull, `admin` to push, untag or make a
+  repository `--public`.
+- **No store-wide views.** `artifact usage` is not available through app-lb, and `ls` lists only
+  the namespace's tags. A `503` means this app-lb has no global store configured; a `502` means it
+  cannot reach it.
+- **Blobs stream** in both directions, with a `Content-Length` and nothing buffered whole, exactly
+  as against a store.
+
+### Talking to a store directly
+
+Saved *registries* are the operator's escape hatch: for someone who runs an artifact store
+(`art serve`) and holds its shared `ART_API_KEY`. A command goes straight to a store, skipping
+app-lb, when `--registry` or `--registry-url` (`HEYCTL_REGISTRY`, `HEYCTL_ART_URL`) is given, or a
+registry is saved and current (or is the only one). `--lb` overrides all of that and goes through
+app-lb anyway. Direct mode has no namespace rule, `usage` works, and `--context` does not change
+which store is used.
 
 ```sh
 heyctl artifact login http://10.0.0.4:8080          # prompts for the key
@@ -702,24 +742,25 @@ heyctl artifact login … --no-store-key              # verify only; supply HEYC
 heyctl artifact registries                          # CURRENT NAME URL KEY
 heyctl artifact use prod-store
 heyctl artifact logout --key-only                   # drop the key, keep the url
+heyctl artifact logout                              # forget it: back to going through app-lb
 ```
 
 Registries live in the same `0600` config file as the contexts, under their own key, and
-`heyctl whoami` reports both identities — which is the answer to "why did my push get a 401
-when everything else works".
+`heyctl whoami` says which route the next artifact command takes — which is the answer to "why
+did my push get a 401 when everything else works".
 
 ### Pushing an image to an artifact store
 
 ```sh
-heyctl artifact push --image web-v2                 # a heyvm image, by name
-heyctl artifact push ./rootfs.ext4 --tag web-v2     # or a path
+heyctl artifact push --image web-v2                 # a heyvm image, by name (tag acme/web-v2)
+heyctl artifact push ./rootfs.ext4 --tag acme/web:v2  # or a path
 heyctl artifact push ./rootfs.ext4 --no-tag         # upload only; name the manifest digest
 heyctl artifact push ./rootfs.ext4 --force          # upload even if the store has the bytes
 ```
 
 `--image NAME` resolves `~/.heyo/images/firecracker/<name>.ext4` (or `$MVM_DATA_DIR/…`), which is
 where `heyvm mvm build` puts one — so building locally and pushing is two commands. The tag
-defaults to the filename without `.ext4`.
+defaults to the filename without `.ext4` (under `<ns>/` through app-lb).
 
 A push hashes the file, asks the store whether it already holds those bytes, uploads only if not,
 then writes a manifest and moves the tag onto it. The manifest matters: it is what makes a pushed
@@ -732,7 +773,7 @@ The counterpart of `push`, one step earlier: `push` ships an image somebody alre
 `push-dockerfile` ships the recipe and lets app-lb build it on the host that will run it.
 
 ```sh
-heyctl artifact push-dockerfile ./Dockerfile --build-context . --tag web-rootfs
+heyctl artifact push-dockerfile ./Dockerfile --build-context . --tag acme/web-rootfs
 heyctl artifact push-dockerfile ./Dockerfile --image-name web --size-mb 4096
 heyctl artifact push-dockerfile ./Dockerfile --no-tag       # name the manifest digest instead
 ```
@@ -751,11 +792,14 @@ The manifest is `heyvm.dockerfile.v1`: entries `Dockerfile` and `context.tar.gz`
 the image name and size defaults. Its digest covers all of that together, so
 `heyctl set build web --store … --ref <digest>` pins a build to exact inputs.
 
+`set build` still names its store explicitly (`--store`); only an `artifact` block defaults to
+app-lb's own.
+
 ```sh
-heyctl artifact ls                                  # the store's tags
-heyctl artifact describe web-v2                     # what a tag or digest resolves to
-heyctl artifact usage                               # blobs, logical vs stored, free space
-heyctl artifact untag web-v2                        # the blob stays until the store's `art gc`
+heyctl artifact ls                                  # the tags you can name
+heyctl artifact describe acme/web:v2                # what a tag or digest resolves to
+heyctl artifact untag acme/web:v2                   # the blob stays until the store's `art gc`
+heyctl artifact usage --registry prod-store         # blobs, logical vs stored, free space (direct only)
 ```
 
 ### Updating a static deployment

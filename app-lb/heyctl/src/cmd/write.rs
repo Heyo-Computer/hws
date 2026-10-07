@@ -933,7 +933,11 @@ pub struct SetArtifactArgs {
     pub resource: String,
 
     /// The artifact store: an `art serve` URL (`http://host:8080`) or an
-    /// absolute path to a store root on the app-lb host. Required the first time.
+    /// absolute path to a store root on the app-lb host. Omit it to pull from
+    /// app-lb's own global store — where `heyctl artifact push` puts images —
+    /// which needs a ref under the deployment's namespace (`<ns>/web:v2`) or a
+    /// digest, and no --secret. `--store ''` switches an existing deployment
+    /// back to app-lb's store.
     #[arg(long, value_name = "URL|PATH")]
     pub store: Option<String>,
     /// Tag or digest naming the rootfs. A tag follows whatever it is moved to;
@@ -986,7 +990,7 @@ pub fn set_artifact(ctx: &Ctx, args: &SetArtifactArgs) -> Result<()> {
         || args.no_auth;
     if !touched {
         bail!(
-            "nothing to set — pass --store, --ref, --image-name, --grow-gb, --secret or \
+            "nothing to set — pass --ref, --store, --image-name, --grow-gb, --secret or \
              --no-auth (or --clear to remove the artifact source)"
         );
     }
@@ -997,43 +1001,53 @@ pub fn set_artifact(ctx: &Ctx, args: &SetArtifactArgs) -> Result<()> {
     };
 
     edit_spec(ctx, &id, args.dry_run, "artifact source updated", |spec| {
-        let artifact = spec::artifact_mut(spec, &id)?;
-        // Both are required to pull at all, and a block with one of them is a
-        // spec app-lb would reject on `PUT` — so say which is missing here,
-        // where the flag that would fix it is still in view.
-        if artifact.get("store").and_then(Value::as_str).is_none() && args.store.is_none() {
-            bail!(
-                "deployment {id:?} has no artifact source yet, so --store is required \
-                 (e.g. --store http://127.0.0.1:8080, or --store /srv/artifacts)"
-            );
-        }
-        if artifact.get("ref").and_then(Value::as_str).is_none() && args.artifact_ref.is_none() {
-            bail!(
-                "deployment {id:?} has no artifact ref yet, so --ref is required \
-                 (a tag like `debian-hermes`, or a digest). \
-                 `heyctl artifact ls` lists a store's tags"
-            );
-        }
-        for (key, value) in [
-            ("store", args.store.as_deref()),
-            ("ref", args.artifact_ref.as_deref()),
-            ("image_name", args.image_name.as_deref()),
-        ] {
-            if let Some(v) = value {
-                artifact.insert(key.to_string(), Value::String(v.to_string()));
-            }
-        }
-        if let Some(gb) = args.grow_gb {
-            artifact.insert("grow_gb".into(), Value::from(gb));
-        }
-        if let Some(auth) = &auth {
-            artifact.insert("auth".into(), auth.clone());
-        }
-        if args.no_auth {
-            artifact.remove("auth");
-        }
-        Ok(())
+        apply_artifact_args(spec, &id, args, auth.as_ref())
     })
+}
+
+/// The edit `set artifact` makes, apart from the fetch and the `PUT` around it.
+fn apply_artifact_args(
+    spec: &mut Value,
+    id: &str,
+    args: &SetArtifactArgs,
+    auth: Option<&Value>,
+) -> Result<()> {
+    let artifact = spec::artifact_mut(spec, id)?;
+    // A ref is required to pull at all, and a block without one is a spec
+    // app-lb would reject on `PUT` — so say so here, where the flag that
+    // would fix it is still in view. The store is not: an absent one means
+    // app-lb's own global store, and is left absent rather than written
+    // out as an empty string.
+    if artifact.get("ref").and_then(Value::as_str).is_none() && args.artifact_ref.is_none() {
+        bail!(
+            "deployment {id:?} has no artifact ref yet, so --ref is required \
+             (a tag like `<namespace>/web:v2`, or a digest). \
+             `heyctl artifact ls` lists the tags you can name"
+        );
+    }
+    // `--store ''` switches back to app-lb's own store by dropping the key.
+    if args.store.as_deref().is_some_and(|s| s.trim().is_empty()) {
+        artifact.remove("store");
+    }
+    for (key, value) in [
+        ("store", args.store.as_deref().filter(|s| !s.trim().is_empty())),
+        ("ref", args.artifact_ref.as_deref()),
+        ("image_name", args.image_name.as_deref()),
+    ] {
+        if let Some(v) = value {
+            artifact.insert(key.to_string(), Value::String(v.to_string()));
+        }
+    }
+    if let Some(gb) = args.grow_gb {
+        artifact.insert("grow_gb".into(), Value::from(gb));
+    }
+    if let Some(auth) = auth {
+        artifact.insert("auth".into(), auth.clone());
+    }
+    if args.no_auth {
+        artifact.remove("auth");
+    }
+    Ok(())
 }
 
 // -- mount pull ------------------------------------------------------------
@@ -3287,6 +3301,48 @@ fn report_write(ctx: &Ctx, result: &Value, id: &str, verb: &str) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct SetArtifactCmd {
+        #[command(flatten)]
+        args: SetArtifactArgs,
+    }
+
+    fn set_artifact_args(argv: &[&str]) -> SetArtifactArgs {
+        let mut full = vec!["set-artifact", "web"];
+        full.extend_from_slice(argv);
+        SetArtifactCmd::try_parse_from(full).expect("flags parse").args
+    }
+
+    #[test]
+    fn a_first_artifact_source_needs_only_a_ref() {
+        // No --store: app-lb's own global store, left absent in the spec
+        // rather than written as an empty string.
+        let mut spec = serde_json::json!({"id": "web", "routes": []});
+        let args = set_artifact_args(&["--ref", "acme/web:v2"]);
+        apply_artifact_args(&mut spec, "web", &args, None).unwrap();
+        assert_eq!(spec["artifact"], serde_json::json!({"ref": "acme/web:v2"}));
+
+        // A ref is still required.
+        let mut spec = serde_json::json!({"id": "web", "routes": []});
+        let e = apply_artifact_args(&mut spec, "web", &set_artifact_args(&["--grow-gb", "4"]), None)
+            .unwrap_err();
+        assert!(e.to_string().contains("--ref is required"), "{e}");
+        assert!(!e.to_string().contains("--store"), "{e}");
+    }
+
+    #[test]
+    fn an_explicit_store_still_works_and_an_empty_one_switches_back() {
+        let mut spec = serde_json::json!({"id": "web", "routes": []});
+        let args = set_artifact_args(&["--store", "http://art:8080", "--ref", "debian"]);
+        apply_artifact_args(&mut spec, "web", &args, None).unwrap();
+        assert_eq!(spec["artifact"]["store"], "http://art:8080");
+
+        let args = set_artifact_args(&["--store", "", "--ref", "acme/web:v3"]);
+        apply_artifact_args(&mut spec, "web", &args, None).unwrap();
+        assert!(spec["artifact"].get("store").is_none(), "{spec}");
+        assert_eq!(spec["artifact"]["ref"], "acme/web:v3");
+    }
 
     /// A `#[derive(Args)]` struct is parsed through a command that flattens it.
     #[derive(Parser, Debug)]

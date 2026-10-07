@@ -68,11 +68,67 @@ const HASH_CHUNK: usize = 1 << 20;
 pub struct RegistryClient {
     agent: ureq::Agent,
     base: String,
-    api_key: Option<String>,
+    /// The whole `Authorization` value: `Bearer <ART_API_KEY>` against a store,
+    /// or the context's own Bearer/Basic header through app-lb.
+    auth: Option<String>,
+    /// Set when this client talks to app-lb's `/namespaces/{ns}/artifacts`
+    /// gateway rather than to a store: the namespace, which is also what the
+    /// error messages need to say something useful about a 403.
+    gateway: Option<String>,
+}
+
+/// The base URL of app-lb's artifact gateway for one namespace.
+///
+/// `server` is the context's server exactly as every other heyctl command uses
+/// it — including Cloud's `https://<cloud>/namespaces/<ns>/lb` door, under which
+/// app-lb's admin API (and therefore this route) sits.
+pub fn gateway_base(server: &str, namespace: &str) -> String {
+    format!(
+        "{}/namespaces/{}/artifacts",
+        normalize_url(server),
+        escape(namespace)
+    )
 }
 
 impl RegistryClient {
+    /// A client for an artifact store reached directly, with its shared key.
     pub fn new(url: &str, api_key: Option<&str>, insecure: bool, timeout: Duration) -> Result<Self> {
+        Self::build(
+            normalize_url(url),
+            api_key.map(|k| format!("Bearer {k}")),
+            None,
+            insecure,
+            timeout,
+        )
+    }
+
+    /// A client for app-lb's artifact gateway: the same store routes, under
+    /// `/namespaces/{ns}/artifacts` on the admin API, authenticated with the
+    /// context's credential (`auth_header` is the full `Authorization` value).
+    /// The customer never holds — or needs to know about — the store's key.
+    pub fn gateway(
+        server: &str,
+        namespace: &str,
+        auth_header: Option<String>,
+        insecure: bool,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::build(
+            gateway_base(server, namespace),
+            auth_header,
+            Some(namespace.to_string()),
+            insecure,
+            timeout,
+        )
+    }
+
+    fn build(
+        base: String,
+        auth: Option<String>,
+        gateway: Option<String>,
+        insecure: bool,
+        timeout: Duration,
+    ) -> Result<Self> {
         let mut tls = ureq::native_tls::TlsConnector::builder();
         if insecure {
             tls.danger_accept_invalid_certs(true);
@@ -91,8 +147,9 @@ impl RegistryClient {
 
         Ok(Self {
             agent,
-            base: normalize_url(url),
-            api_key: api_key.map(str::to_string),
+            base,
+            auth,
+            gateway,
         })
     }
 
@@ -101,16 +158,45 @@ impl RegistryClient {
     }
 
     pub fn has_credentials(&self) -> bool {
-        self.api_key.is_some()
+        self.auth.is_some()
+    }
+
+    /// The namespace, when this client goes through app-lb's gateway.
+    pub fn gateway_namespace(&self) -> Option<&str> {
+        self.gateway.as_deref()
     }
 
     fn request(&self, method: &str, path: &str) -> ureq::Request {
         let req = self.agent.request(method, &format!("{}{}", self.base, path));
-        match &self.api_key {
+        match &self.auth {
             // Bearer rather than `X-Api-Key`: the store accepts either, and a
             // custom header is the one an intermediary strips.
-            Some(k) => req.set("Authorization", &format!("Bearer {k}")),
+            Some(h) => req.set("Authorization", h),
             None => req,
+        }
+    }
+
+    /// A reference as a path segment. A store takes it percent-encoded as one
+    /// segment; app-lb's gateway matches `/tags/<ns>/<repo>:<tag>` against a
+    /// wildcard and checks the `<ns>/` prefix itself, so there `/` and `:` go
+    /// through as they are — which also survives a proxy (Cloud's door) that
+    /// would normalize an encoded slash.
+    fn seg(&self, reference: &str) -> String {
+        match self.gateway {
+            Some(_) => escape_keeping(reference, b"/:"),
+            None => escape(reference),
+        }
+    }
+
+    /// The error for a request that never got an answer.
+    fn unreachable(&self, t: impl std::fmt::Display) -> anyhow::Error {
+        match &self.gateway {
+            Some(_) => anyhow!(
+                "cannot reach app-lb's artifact gateway at {} ({t}) — check the context's \
+                 server with `heyctl whoami`",
+                self.base
+            ),
+            None => anyhow!("cannot reach the artifact store at {} ({t})", self.base),
         }
     }
 
@@ -124,6 +210,7 @@ impl RegistryClient {
             Err(ureq::Error::Status(code, resp)) => {
                 Ok((code, resp.into_string().unwrap_or_default()))
             }
+            Err(ureq::Error::Transport(t)) if self.gateway.is_some() => Err(self.unreachable(t)),
             Err(ureq::Error::Transport(t)) => Err(anyhow!(
                 "cannot reach the artifact store at {} ({t}) — is `art serve` running, and is \
                  the url right?",
@@ -157,8 +244,12 @@ impl RegistryClient {
             .and_then(|v| v.get("error")?.as_str().map(str::to_string))
             .unwrap_or_else(|| body.trim().chars().take(300).collect());
 
+        if let Some(ns) = &self.gateway {
+            return gateway_error(ns, code, &detail, self.auth.is_some());
+        }
+
         match code {
-            401 if self.api_key.is_some() => anyhow!(
+            401 if self.auth.is_some() => anyhow!(
                 "the store rejected this API key (HTTP 401) — check it against the store's \
                  ART_API_KEY, or re-run `heyctl artifact login`"
             ),
@@ -193,18 +284,24 @@ impl RegistryClient {
         self.json("GET", "/tags")
     }
 
+    /// The gateway's own description: `{"namespace", "available", "prefix"}`.
+    /// Only meaningful on a [`gateway`](Self::gateway) client.
+    pub fn gateway_info(&self) -> Result<Value> {
+        self.json("GET", "")
+    }
+
     pub fn usage(&self) -> Result<Value> {
         self.json("GET", "/usage")
     }
 
     pub fn manifest(&self, reference: &str) -> Result<Value> {
-        self.json("GET", &format!("/manifests/{}", escape(reference)))
+        self.json("GET", &format!("/manifests/{}", self.seg(reference)))
     }
 
     /// Whether the store already holds this blob, and how big it says it is.
     /// A `404` is an answer, not a failure — it is the whole question.
     pub fn blob_exists(&self, digest: &str) -> Result<Option<u64>> {
-        let req = self.request("HEAD", &format!("/blobs/{}", escape(digest)));
+        let req = self.request("HEAD", &format!("/blobs/{}", self.seg(digest)));
         match req.call() {
             Ok(resp) => Ok(Some(
                 resp.header("Content-Length")
@@ -215,10 +312,7 @@ impl RegistryClient {
             Err(ureq::Error::Status(code, resp)) => {
                 Err(self.api_error(code, &resp.into_string().unwrap_or_default()))
             }
-            Err(ureq::Error::Transport(t)) => Err(anyhow!(
-                "cannot reach the artifact store at {} ({t})",
-                self.base
-            )),
+            Err(ureq::Error::Transport(t)) => Err(self.unreachable(t)),
         }
     }
 
@@ -233,7 +327,7 @@ impl RegistryClient {
         let file = std::fs::File::open(path)
             .with_context(|| format!("opening {}", path.display()))?;
         let req = self
-            .request("PUT", &format!("/blobs/{}", escape(digest)))
+            .request("PUT", &format!("/blobs/{}", self.seg(digest)))
             .set("Content-Type", "application/octet-stream")
             .set("Content-Length", &size.to_string());
 
@@ -244,7 +338,7 @@ impl RegistryClient {
                 Err(self.api_error(code, &resp.into_string().unwrap_or_default()))
             }
             Err(ureq::Error::Transport(t)) => Err(anyhow!(
-                "the upload to {} failed ({t}) — nothing was tagged, so the store is unchanged",
+                "the upload to {} failed ({t}) — nothing was tagged, so no tag moved",
                 self.base
             )),
         }
@@ -260,9 +354,7 @@ impl RegistryClient {
             Err(ureq::Error::Status(code, resp)) => {
                 return Err(self.api_error(code, &resp.into_string().unwrap_or_default()));
             }
-            Err(ureq::Error::Transport(t)) => {
-                return Err(anyhow!("cannot reach the artifact store at {} ({t})", self.base));
-            }
+            Err(ureq::Error::Transport(t)) => return Err(self.unreachable(t)),
         };
         if code >= 400 {
             return Err(self.api_error(code, &body));
@@ -279,28 +371,26 @@ impl RegistryClient {
     /// is the store's own format for the file behind it.
     pub fn put_tag(&self, name: &str, digest: &str) -> Result<()> {
         let req = self
-            .request("PUT", &format!("/tags/{}", escape(name)))
+            .request("PUT", &format!("/tags/{}", self.seg(name)))
             .set("Content-Type", "text/plain");
         match req.send_string(digest) {
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(code, resp)) => {
                 Err(self.api_error(code, &resp.into_string().unwrap_or_default()))
             }
-            Err(ureq::Error::Transport(t)) => {
-                Err(anyhow!("cannot reach the artifact store at {} ({t})", self.base))
-            }
+            Err(ureq::Error::Transport(t)) => Err(self.unreachable(t)),
         }
     }
 
     pub fn delete_tag(&self, name: &str) -> Result<()> {
-        self.send("DELETE", &format!("/tags/{}", escape(name))).map(|_| ())
+        self.send("DELETE", &format!("/tags/{}", self.seg(name))).map(|_| ())
     }
 
     /// Set a repository's metadata: whether it is public — on the hub and
     /// pullable without a key — and its description.
     pub fn put_repo(&self, repo: &str, public: bool, description: Option<&str>) -> Result<Value> {
         let req = self
-            .request("PUT", &format!("/repos/{}", escape(repo)))
+            .request("PUT", &format!("/repos/{}", self.seg(repo)))
             .set("Content-Type", "application/json");
         match req.send_json(json!({ "public": public, "description": description })) {
             Ok(resp) => serde_json::from_str(&resp.into_string().unwrap_or_default())
@@ -308,16 +398,14 @@ impl RegistryClient {
             Err(ureq::Error::Status(code, resp)) => {
                 Err(self.api_error(code, &resp.into_string().unwrap_or_default()))
             }
-            Err(ureq::Error::Transport(t)) => {
-                Err(anyhow!("cannot reach the artifact store at {} ({t})", self.base))
-            }
+            Err(ureq::Error::Transport(t)) => Err(self.unreachable(t)),
         }
     }
 
     /// What a reference names: a manifest when there is one by that name,
     /// otherwise the blob a tag points at directly. `None` if neither exists.
     pub fn resolve(&self, reference: &str) -> Result<Option<Resolved>> {
-        let (code, body) = self.raw(self.request("GET", &format!("/manifests/{}", escape(reference))))?;
+        let (code, body) = self.raw(self.request("GET", &format!("/manifests/{}", self.seg(reference))))?;
         match code {
             200 => {
                 let m: Value = serde_json::from_str(&body)
@@ -328,7 +416,7 @@ impl RegistryClient {
             _ => return Err(self.api_error(code, &body)),
         }
         // A tag may name a bare blob (`art put --tag`).
-        let (code, body) = self.raw(self.request("GET", &format!("/tags/{}", escape(reference))))?;
+        let (code, body) = self.raw(self.request("GET", &format!("/tags/{}", self.seg(reference))))?;
         match code {
             200 => {
                 let v: Value = serde_json::from_str(&body).context("the store's tag was not JSON")?;
@@ -349,14 +437,12 @@ impl RegistryClient {
     /// Written to a temp name beside `dest` and renamed into place, so a failed
     /// pull never leaves a half-file that looks complete.
     pub fn get_blob(&self, digest: &str, dest: &Path, mut progress: impl FnMut(u64, u64)) -> Result<u64> {
-        let resp = match self.request("GET", &format!("/blobs/{}", escape(digest))).call() {
+        let resp = match self.request("GET", &format!("/blobs/{}", self.seg(digest))).call() {
             Ok(r) => r,
             Err(ureq::Error::Status(code, resp)) => {
                 return Err(self.api_error(code, &resp.into_string().unwrap_or_default()));
             }
-            Err(ureq::Error::Transport(t)) => {
-                return Err(anyhow!("cannot reach the artifact store at {} ({t})", self.base));
-            }
+            Err(ureq::Error::Transport(t)) => return Err(self.unreachable(t)),
         };
         let total = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
         let tmp = dest.with_file_name(format!(
@@ -395,6 +481,61 @@ impl RegistryClient {
         }
         result
     }
+}
+
+/// An error answer from app-lb's artifact gateway, worded for somebody who
+/// holds a context and has never heard of the store behind it.
+fn gateway_error(ns: &str, code: u16, detail: &str, has_credentials: bool) -> anyhow::Error {
+    let detail_suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    match code {
+        401 if has_credentials => anyhow!(
+            "app-lb rejected this context's credential (HTTP 401) — check it with \
+             `heyctl whoami`, or log in again with `heyctl login`"
+        ),
+        401 => anyhow!(
+            "app-lb requires a credential for artifacts (HTTP 401) — log in with \
+             `heyctl login`, or pass --token"
+        ),
+        403 => anyhow!(
+            "app-lb refused (HTTP 403){detail_suffix} — artifacts are confined to namespace \
+             {ns:?} (tags under `{ns}/`), and writes need a credential with admin on it"
+        ),
+        503 => anyhow!(
+            "this app-lb has no global artifact store configured (HTTP 503){detail_suffix} — \
+             ask its operator, or talk to a store directly with --registry-url"
+        ),
+        502 => anyhow!(
+            "app-lb could not reach its artifact store (HTTP 502){detail_suffix} — try again, \
+             or ask the app-lb's operator"
+        ),
+        _ if detail.is_empty() => anyhow!("app-lb's artifact gateway returned HTTP {code}"),
+        _ => anyhow!("{detail} (HTTP {code})"),
+    }
+}
+
+/// Refuse a reference outside `ns` before it costs a request (or an upload).
+///
+/// app-lb only lets a namespace see tags under `<ns>/`, and a bare `web:v2` is
+/// refused rather than rewritten: silently pushing to a different name than
+/// the one typed would leave a deployment naming a tag that does not exist.
+/// A digest has no namespace and is always allowed when `allow_digest`.
+pub fn check_namespaced(reference: &str, ns: &str, allow_digest: bool) -> Result<()> {
+    if allow_digest && is_digest(reference) {
+        return Ok(());
+    }
+    let prefix = format!("{ns}/");
+    if reference.starts_with(&prefix) && reference.len() > prefix.len() {
+        return Ok(());
+    }
+    bail!(
+        "{reference:?} is outside namespace {ns:?}: through app-lb every tag starts with \
+         `{prefix}` — try `{prefix}{}`",
+        reference.trim_start_matches('/')
+    )
 }
 
 /// What a pull reference resolved to.
@@ -695,12 +836,18 @@ fn normalize_url(s: &str) -> String {
 /// store's own rules, but those rules are enforced on the store, and this is the
 /// side that builds the URL.
 fn escape(segment: &str) -> String {
+    escape_keeping(segment, b"")
+}
+
+/// [`escape`], leaving the bytes in `keep` as they are.
+fn escape_keeping(segment: &str, keep: &[u8]) -> String {
     let mut out = String::with_capacity(segment.len());
     for b in segment.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
             }
+            _ if keep.contains(&b) => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -885,8 +1032,64 @@ mod tests {
     }
 
     #[test]
+    fn the_gateway_sits_under_the_contexts_server_cloud_prefix_included() {
+        assert_eq!(
+            gateway_base("http://127.0.0.1:9090/", "acme"),
+            "http://127.0.0.1:9090/namespaces/acme/artifacts"
+        );
+        assert_eq!(gateway_base("lb:9090", "acme"), "http://lb:9090/namespaces/acme/artifacts");
+        // Cloud's door already carries a namespace prefix; app-lb's admin API —
+        // and so the gateway — lives underneath it.
+        assert_eq!(
+            gateway_base("https://cloud.example.com/namespaces/acme/lb", "acme"),
+            "https://cloud.example.com/namespaces/acme/lb/namespaces/acme/artifacts"
+        );
+        let c = RegistryClient::gateway(
+            "https://cloud.example.com/namespaces/acme/lb",
+            "acme",
+            Some("Bearer heyo_api_x".into()),
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(c.gateway_namespace(), Some("acme"));
+        assert!(c.has_credentials());
+    }
+
+    #[test]
+    fn a_bare_tag_is_refused_through_the_gateway_with_the_namespaced_spelling() {
+        assert!(check_namespaced("acme/web:v2", "acme", false).is_ok());
+        assert!(check_namespaced("acme/a/b", "acme", false).is_ok());
+        let e = check_namespaced("web:v2", "acme", false).unwrap_err().to_string();
+        assert!(e.contains("acme/web:v2"), "{e}");
+        // Another namespace's tag, and the namespace itself, are both outside.
+        assert!(check_namespaced("other/web:v2", "acme", false).is_err());
+        assert!(check_namespaced("acme/", "acme", false).is_err());
+        assert!(check_namespaced("acmeweb", "acme", false).is_err());
+        // A digest has no namespace: fine to read, never a tag to push.
+        let d = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(check_namespaced(d, "acme", true).is_ok());
+        assert!(check_namespaced(d, "acme", false).is_err());
+    }
+
+    #[test]
+    fn gateway_errors_never_mention_the_stores_key() {
+        for (code, needle) in [
+            (401, "heyctl login"),
+            (403, "namespace \"acme\""),
+            (503, "no global artifact store configured"),
+            (502, "could not reach its artifact store"),
+        ] {
+            let e = gateway_error("acme", code, "", true).to_string();
+            assert!(e.contains(needle), "{code}: {e}");
+            assert!(!e.contains("ART_API_KEY") && !e.contains("artifact login"), "{e}");
+        }
+    }
+
+    #[test]
     fn path_segments_are_escaped() {
         assert_eq!(escape("debian-hermes"), "debian-hermes");
         assert_eq!(escape("a/b"), "a%2Fb");
+        assert_eq!(escape_keeping("acme/web:v2 x", b"/:"), "acme/web:v2%20x");
     }
 }
