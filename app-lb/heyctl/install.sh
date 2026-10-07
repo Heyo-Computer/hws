@@ -2,9 +2,9 @@
 # heyctl installer — fetches a published `heyctl` binary from the Heyo artifact
 # store and installs it into ${HEYCTL_PREFIX}/bin (default ~/.local/bin).
 #
-#   curl -fsSL https://heyo.computer/install.sh | sh
-#   curl -fsSL https://heyo.computer/install.sh | sh -s -- --prefix /usr/local
-#   curl -fsSL https://heyo.computer/install.sh | HEYCTL_VERSION=0.1.7 sh
+#   curl -fsSL https://heyo.computer/heyctl/install.sh | sh
+#   curl -fsSL https://heyo.computer/heyctl/install.sh | sh -s -- --prefix /usr/local
+#   curl -fsSL https://heyo.computer/heyctl/install.sh | HEYCTL_VERSION=0.2.0 sh
 #
 # Note the `-s --` when passing flags through a pipe: without it `sh` reads the
 # script from stdin and treats the flags as its own.
@@ -105,8 +105,8 @@ usage() {
     cat >&2 <<'USAGE'
 heyctl installer
 
-  curl -fsSL https://heyo.computer/install.sh | sh
-  curl -fsSL https://heyo.computer/install.sh | sh -s -- --prefix /usr/local
+  curl -fsSL https://heyo.computer/heyctl/install.sh | sh
+  curl -fsSL https://heyo.computer/heyctl/install.sh | sh -s -- --prefix /usr/local
 
 Options
   --prefix PATH     Install into PATH/bin (default ~/.local)
