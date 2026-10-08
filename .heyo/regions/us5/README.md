@@ -25,7 +25,7 @@ app-lb's plugin configuration references the same key. It is a role of its
 own (app-lb speaking to remote), so it is not a key on `remote`.
 
 ```sh
-heyctl --context us5 plugins set remote '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}'
+echo '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}' | heyctl --context us5 plugins set remote -f -
 heyctl --context us5 plugins enable remote
 ```
 
