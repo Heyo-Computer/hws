@@ -793,10 +793,11 @@ Plugins are compiled in and switched on at runtime from `/plugins` or with `heyc
 | `vapi` | Monitors vapi inference gateways and exposes their admission settings and a test prompt box. |
 | `remote` | Per-namespace git from [remote](../remote/README.md): installed in every namespace by default, it serves the namespace's repositories, history, branches and repo tokens in the plugin console. |
 | `obs` | Per-namespace observability from [app-obs](app-obs.md): installed by each namespace, it starts collection for that namespace's apps and serves their logs, metrics and alerts to the namespace's own tokens. |
+| `ci` | Per-namespace CI on the region's [ci](ci.md) service: installed by each namespace, it admits the namespace to register repositories, mint submit tokens and run builds on the operator's tenant network, and serves its runs and live logs to the namespace. |
 
 ### Installing a plugin in a namespace
 
-Some plugins (today, `obs` and `remote`) are installed per namespace. The operator enables and configures the plugin once for the host; then a namespace administrator installs it:
+Some plugins (today, `obs`, `ci` and `remote`) are installed per namespace. The operator enables and configures the plugin once for the host; then a namespace administrator installs it:
 
 ```sh
 heyctl plugins enable obs   # operator, after `heyctl plugins set obs '{"url": "http://127.0.0.1:9600", "api_token": {"secret": "app-obs", "key": "api_token"}}'`
@@ -808,6 +809,16 @@ heyctl plugins install obs -n team-a   # an admin token for all of team-a
 An install is a record on the plugin, kept while the plugin is disabled. The namespace's view of the plugin is served at `/namespaces/<ns>/plugins/<id>/…`, behind the namespace wall: a namespace token reaches its own namespace's pages and no other, a `GET` needs the view tier there and anything else the admin tier. Installing needs an admin credential for the whole namespace, not a token narrowed to some of its deployments. Before the plugin is installed those routes answer `409` with `"code": "plugin_not_installed"`, and while the operator has it switched off, `"code": "plugin_disabled"`.
 
 For `obs`, `/namespaces/<ns>/plugins/obs/ui` is the app-obs dashboard narrowed to the namespace, and `…/obs/api/fleet`, `…/obs/api/deployments/<id>[/logs]` and `…/obs/api/alerts` are its JSON API. app-lb sends them to app-obs's `/ns/<ns>/…` routes with the token from the plugin's configuration; the caller's own credential never reaches app-obs. A namespace user's dashboard (`/dashboard?namespace=<ns>`) shows an **Observability** link once it is installed, or an **Install observability** button for an admin, plus a **Plugins** link to the namespace's plugin page.
+
+For `ci`, the operator gives ci's URL, a secret reference to ci's `CI_PLUGIN_API_TOKEN`, and the heyvm network tenant builds run on. That network must be one ci serves and not ci's own default. `namespace_networks` gives particular namespaces a network of their own. A namespace installs `ci` with `{}`: it cannot pick its network. `ci` never installs itself unless `"auto_install": true`, because installing grants the right to run builds.
+
+```sh
+heyctl plugins set ci '{"url": "http://127.0.0.1:9500", "api_token": {"secret": "ci", "key": "plugin_api_token"}, "tenant_network": "tenants"}'
+heyctl plugins enable ci
+heyctl plugins install ci -n team-a
+```
+
+ci polls `GET /api/plugins/ci` for the install list and the network settings. `/namespaces/<ns>/plugins/ci/ui` is the namespace's runs page, `…/ci/ui/<page>` its other pages (`repos`, `runs/<id>`, `runs/<id>/jobs/<job>`, `workflows`), and `…/ci/api/…` its JSON API and log streams, all forwarded to ci's `/ns/<ns>/…` routes. app-lb also sends ci the caller's identity (`x-heyo-actor`, `x-heyo-actor-email`, `x-heyo-actor-admin`), which ci records and uses to restrict changes to the namespace's admins. See [ci](ci.md#namespaces) for what a tenant workflow may do.
 
 For `remote`, the operator gives remote's URL and a secret reference to remote's `REMOTE_PLUGIN_API_TOKEN`. `/namespaces/<ns>/plugins/remote/ui` is the namespace's repositories, and `…/remote/ui/<page>` every other page (`<repo>`, `<repo>/tree/<ref>/<path>`, `<repo>/commits`, `-/new`, `-/tokens`, …). They are forwarded to remote's `/-/ns/<ns>/…`, because remote's own root belongs to namespaces. app-lb sends the caller's identity, and remote gives a namespace admin admin in the namespace and anyone else read. Like `obs`, it installs itself unless `"auto_install": false`.
 

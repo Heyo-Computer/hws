@@ -6,7 +6,7 @@
 //! and failing at once (it could not reach what it needs), so every write
 //! prints `last_error` when there is one rather than reporting bare success.
 //!
-//! Some plugins (`obs`, `remote`) also install per namespace. `enable`/`disable` are the
+//! Some plugins (`obs`, `ci`, `remote`) also install per namespace. `enable`/`disable` are the
 //! operator's fleet-wide switch; `install`/`uninstall` are a namespace
 //! administrator's, and a plugin serves a namespace only when both are on.
 
@@ -162,6 +162,9 @@ fn install(ctx: &Ctx, args: &InstallArgs) -> Result<()> {
             "Telemetry for every deployment in {ns:?} is collected from now on. \
              Read it with `heyctl top -n {ns}` and `heyctl logs <deployment> -n {ns}`."
         );
+    }
+    if p.dashboard.is_some() && p.enabled {
+        eprintln!("Its dashboard is at /namespaces/{ns}/plugin-console/{} on app-lb.", p.id);
     }
     Ok(())
 }

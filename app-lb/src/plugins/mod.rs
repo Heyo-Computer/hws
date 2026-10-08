@@ -48,6 +48,7 @@
 //! `/namespaces/<ns>/plugin-console/<id>` frames that page under its own
 //! navigation.
 
+pub mod ci;
 pub mod ns_proxy;
 pub mod obs;
 pub mod pgfc;

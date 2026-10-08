@@ -7931,7 +7931,10 @@ mod tests {
                 Some(disks), PublicUrl::from_config(false, "127.0.0.1:80", "127.0.0.1:443"),
                 feed, &[], None,
                 Arc::new(crate::plugins::PluginHost::new(
-                    vec![crate::plugins::obs::ObsPlugin::new(plugin_secrets)],
+                    vec![
+                        crate::plugins::obs::ObsPlugin::new(plugin_secrets.clone()),
+                        crate::plugins::ci::CiPlugin::new(plugin_secrets),
+                    ],
                     crate::plugins::PluginStore::new(root.join("plugins")),
                 )),
             );
@@ -8890,6 +8893,50 @@ mod tests {
             let (status, _, v) = send(&f, "DELETE", "/namespaces/team-a/plugins/obs", "").await;
             assert_eq!((status, &v["installed"]), (StatusCode::OK, &serde_json::json!(false)));
             f.state.plugins.set("obs", false, None).await.unwrap();
+        }
+
+        /// ci through the router: installed by hand, never automatically, and
+        /// told who is asking. An ungated caller is the operator, who
+        /// administers every namespace.
+        #[tokio::test]
+        async fn a_namespace_installs_ci_and_reads_through_the_router() {
+            let ci = Router::new().fallback(|request: Request<Body>| async move {
+                let h = |n: &str| request.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+                Json(serde_json::json!({
+                    "path": request.uri().path(),
+                    "base": h("x-heyo-base"),
+                    "admin": h("x-heyo-actor-admin"),
+                }))
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ci_url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, ci).await.unwrap() });
+            let f = fixture(true).await;
+            f.state.secrets.put(crate::secrets::SecretSpec {
+                id: "ci".into(),
+                namespace: crate::config::DEFAULT_NAMESPACE.into(),
+                description: None,
+                data: [("plugin_api_token".to_string(), "t".to_string())].into(),
+                updated_at: 0,
+            });
+            let config = serde_json::json!({"url": ci_url, "tenant_network": "tenants",
+                "api_token": {"secret": "ci", "key": "plugin_api_token"}});
+            f.state.plugins.set("ci", true, Some(config)).await.unwrap();
+            let (status, _, v) = send(&f, "GET", "/namespaces/team-a/plugins/ci", "").await;
+            assert_eq!((status, &v["installed"]), (StatusCode::OK, &serde_json::json!(false)));
+            assert_eq!(v["dashboard"], "ui");
+
+            let (status, _, v) = send(&f, "PUT", "/namespaces/team-a/plugins/ci", "").await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let (status, _, v) = send(&f, "GET", "/namespaces/team-a/plugins/ci/ui/repos", "").await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["path"], "/ns/team-a/repos");
+            assert_eq!(v["base"], "/namespaces/team-a/plugins/ci");
+            assert_eq!(v["admin"], "true");
+            let (status, html) = page(&f, "/namespaces/team-a/plugin-console/ci").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(html.contains(r#"<meta name="plugin-id" content="ci">"#));
+            f.state.plugins.set("ci", false, None).await.unwrap();
         }
 
         /// GET `uri` and return the status and the body as text, for a page.

@@ -755,6 +755,14 @@ PANELS.obs = installsPanel("obs", "Observability", (view, tile) => {
   return tile("app-obs", s.url || "—") + tile("reachable", s.up ? "yes" : "no");
 });
 
+// Installing ci lets that namespace register repositories and run builds on
+// the tenant network; it never installs itself.
+PANELS.ci = installsPanel("ci", "CI", (view, tile) => {
+  const s = view.status || {};
+  return tile("ci", s.url || "—") + tile("reachable", s.up ? "yes" : "no")
+    + tile("tenant network", s.tenant_network || "—");
+});
+
 // remote's pages for each namespace that has it installed: its repos, in the
 // plugin console.
 PANELS.remote = installsPanel("remote", "Git", (view, tile) => {
