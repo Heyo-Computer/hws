@@ -122,7 +122,8 @@ pub async fn register(store: &Store, request: Request, actor: &str) -> Result<se
 
 pub async fn list(store: &Store, before: Option<&str>) -> Result<Vec<serde_json::Value>> {
     // The ID disambiguates releases with the same timestamp without offsets.
-    Ok(sqlx::query_scalar("SELECT to_jsonb(b) FROM ci_release_bundle b
+    Ok(sqlx::query_scalar("SELECT to_jsonb(b) || jsonb_build_object('commit_message',
+            (SELECT commit_message FROM ci_release_build WHERE id=b.build_id)) FROM ci_release_bundle b
         WHERE (SELECT count(*) FROM jsonb_object_keys(
             CASE WHEN jsonb_typeof(manifest->'components')='object'
             THEN manifest->'components' ELSE '{}'::jsonb END))=1

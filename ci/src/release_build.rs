@@ -279,7 +279,7 @@ pub async fn admit(d: &Dispatcher, request: Request, actor: &str) -> Result<Valu
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let (source, identity) = crate::release_git::build_source_scoped(
+    let (source, identity, commit_message) = crate::release_git::build_source_scoped(
         repository,
         &policy.git_ref,
         request.revision.as_deref(),
@@ -311,6 +311,7 @@ pub async fn admit(d: &Dispatcher, request: Request, actor: &str) -> Result<Valu
         &source,
         &plans,
         actor,
+        &commit_message,
     )
     .await?;
     // Scheduling is deliberately after commit. Existing stalled-run recovery
@@ -336,12 +337,13 @@ async fn persist(
     source: &GitPatchSource,
     plans: &[Plan],
     actor: &str,
+    commit_message: &str,
 ) -> Result<Value> {
     let mut tx = store.pool().begin().await?;
     let id = uuid::Uuid::new_v4().to_string();
     let inserted = sqlx::query(
-        "INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by)
-        VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(repository,name) DO NOTHING",
+        "INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,commit_message)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(repository,name) DO NOTHING",
     )
     .bind(&id)
     .bind(repository)
@@ -350,6 +352,7 @@ async fn persist(
     .bind(&policy.git_ref)
     .bind(serde_json::to_value(policy)?)
     .bind(actor)
+    .bind(commit_message)
     .execute(&mut *tx)
     .await?
     .rows_affected()
@@ -807,6 +810,7 @@ mod tests {
             &source,
             &api_plans,
             "scheduler",
+            "API change",
         )
         .await
         .unwrap();
@@ -818,6 +822,7 @@ mod tests {
             &source,
             &worker_plans,
             "scheduler",
+            "Worker change",
         )
         .await
         .unwrap();
@@ -830,7 +835,8 @@ mod tests {
                 &worker,
                 &source,
                 &worker_plans,
-                "scheduler"
+                "scheduler",
+                "Worker change"
             )
             .await
             .is_err()
@@ -866,6 +872,10 @@ mod tests {
         let reused = reusable(&store, "repo", &worker).await.unwrap().unwrap();
         assert_eq!(reused["revision"], source.base_revision);
         assert_eq!(reused["id"], w["id"]);
+        assert_eq!(reused["commit_message"], "Worker change");
+        let catalog = crate::release_catalog::list(&store, None).await.unwrap();
+        let candidate = catalog.iter().find(|r| r["id"] == w["id"]).unwrap();
+        assert_eq!(candidate["commit_message"], "Worker change");
         for field in ["inputs", "artifact", "network", "evidence"] {
             let mut different = worker.clone();
             match field {
@@ -895,11 +905,12 @@ mod tests {
         let source = source();
         let plans = plans(&policy, &source).unwrap();
         let (a, b) = tokio::join!(
-            persist(&store, "repo", "daily", &policy, &source, &plans, "a"),
-            persist(&store, "repo", "daily", &policy, &source, &plans, "b")
+            persist(&store, "repo", "daily", &policy, &source, &plans, "a", "Source commit"),
+            persist(&store, "repo", "daily", &policy, &source, &plans, "b", "Source commit")
         );
         let build = a.unwrap();
         assert_eq!(build["id"], b.unwrap()["id"]);
+        assert_eq!(build["commit_message"], "Source commit");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ci_run")
                 .fetch_one(store.pool())
@@ -910,7 +921,7 @@ mod tests {
         let mut changed = source.clone();
         changed.base_revision = "c".repeat(40);
         assert!(
-            persist(&store, "repo", "daily", &policy, &changed, &plans, "a")
+            persist(&store, "repo", "daily", &policy, &changed, &plans, "a", "Different commit")
                 .await
                 .is_err()
         );
@@ -1004,13 +1015,16 @@ mod tests {
         a.unwrap();
         b.unwrap();
         let catalog = crate::release_catalog::list(&store, None).await.unwrap();
-        assert_eq!(catalog.len(), 1);
+        assert!(catalog.is_empty(), "historical multi-service builds must not be deployable candidates");
+        let retained: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(b) FROM ci_release_bundle b")
+            .fetch_all(store.pool()).await.unwrap();
+        assert_eq!(retained.len(), 1, "concurrent completion must retain one historical record");
         assert_eq!(
-            catalog[0]["manifest"]["components"]["api"]["uri"],
+            retained[0]["manifest"]["components"]["api"]["uri"],
             format!("retained-{}", "d".repeat(64))
         );
-        assert_eq!(catalog[0]["manifest"]["retained"], true);
-        assert!(catalog[0]["publication_run_id"].is_null());
+        assert_eq!(retained[0]["manifest"]["retained"], true);
+        assert!(retained[0]["publication_run_id"].is_null());
         assert_eq!(
             existing(&store, "repo", "daily", None)
                 .await
