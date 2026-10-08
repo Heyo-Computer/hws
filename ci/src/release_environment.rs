@@ -19,6 +19,8 @@ pub enum Mode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
+    /// Legacy default; new environments put source ownership on each service.
+    #[serde(default)]
     pub repository: String,
     #[serde(default)]
     pub workflow_id: String,
@@ -47,6 +49,12 @@ pub struct Policy {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rollout {
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub mode: Option<Mode>,
+    #[serde(default)]
+    pub requires: Option<Vec<String>>,
     /// Existing CI secrets scope; inherits the environment's legacy scope.
     #[serde(default)]
     pub workflow_id: String,
@@ -95,6 +103,15 @@ fn select(policy: &Policy, service: Option<&str>) -> Result<(String, Policy)> {
         .ok_or_else(|| anyhow::anyhow!("unknown environment service"))?;
     let mut resolved = policy.clone();
     resolved.services.clear();
+    if let Some(repository) = &rollout.repository {
+        resolved.repository = repository.clone();
+    }
+    if let Some(mode) = rollout.mode {
+        resolved.mode = mode;
+    }
+    if let Some(requires) = &rollout.requires {
+        resolved.requires = requires.clone();
+    }
     if !rollout.workflow_id.is_empty() {
         resolved.workflow_id = rollout.workflow_id.clone();
     }
@@ -156,11 +173,11 @@ pub fn policies(raw: Option<&str>) -> Result<BTreeMap<String, Policy>> {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
             "environment name requires ASCII letters, digits, '-' or '_'"
         );
-        ensure!(
-            !policy.repository.is_empty(),
-            "environment requires repository"
-        );
         if policy.services.is_empty() {
+            ensure!(
+                !policy.repository.is_empty(),
+                "environment requires repository"
+            );
             ensure!(
                 !policy.workflow_id.is_empty(),
                 "environment requires workflow scope"
@@ -185,27 +202,47 @@ pub fn policies(raw: Option<&str>) -> Result<BTreeMap<String, Policy>> {
                 );
                 let (_, resolved) = select(policy, Some(service))?;
                 ensure!(
+                    !resolved.repository.is_empty(),
+                    "service requires repository"
+                );
+                ensure!(
                     !resolved.workflow_id.is_empty(),
                     "service requires workflow scope"
                 );
                 plan(name, &resolved)?;
             }
         }
-        let mut pending = policy.requires.clone();
-        let mut visited = std::collections::BTreeSet::new();
-        while let Some(dependency) = pending.pop() {
-            ensure!(dependency != *name, "environment prerequisite cycle");
-            if !visited.insert(dependency.clone()) {
-                continue;
+        let services: Vec<Option<&str>> = if policy.services.is_empty() {
+            vec![None]
+        } else {
+            policy.services.keys().map(|s| Some(s.as_str())).collect()
+        };
+        for service in services {
+            let resolved = match service {
+                Some(service) => select(policy, Some(service))?.1,
+                None => policy.clone(),
+            };
+            let mut pending = resolved.requires.clone();
+            let mut visited = std::collections::BTreeSet::new();
+            while let Some(dependency) = pending.pop() {
+                ensure!(dependency != *name, "environment prerequisite cycle");
+                if !visited.insert(dependency.clone()) {
+                    continue;
+                }
+                let prerequisite = policies
+                    .get(&dependency)
+                    .ok_or_else(|| anyhow::anyhow!("unknown prerequisite {dependency}"))?;
+                let prerequisite = if prerequisite.services.is_empty() {
+                    prerequisite.clone()
+                } else {
+                    select(prerequisite, service)?.1
+                };
+                ensure!(
+                    crate::repos::same_repo(&resolved.repository, &prerequisite.repository),
+                    "prerequisite must use the same repository"
+                );
+                pending.extend(prerequisite.requires.clone());
             }
-            let prerequisite = policies
-                .get(&dependency)
-                .ok_or_else(|| anyhow::anyhow!("unknown prerequisite {dependency}"))?;
-            ensure!(
-                crate::repos::same_repo(&policy.repository, &prerequisite.repository),
-                "prerequisite must use the same repository"
-            );
-            pending.extend(prerequisite.requires.clone());
         }
     }
     Ok(policies)
@@ -383,11 +420,11 @@ pub async fn admit(
     let policy = configured
         .get(&request.environment)
         .ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
+    let (selected, policy) = select(policy, request.service.as_deref())?;
     ensure!(
         !automatic || policy.mode == Mode::Automatic,
         "environment requires manual promotion"
     );
-    let (selected, policy) = select(policy, request.service.as_deref())?;
     let selected = if configured[&request.environment].services.is_empty() {
         let names = service_names(d, &policy)?;
         ensure!(
@@ -680,7 +717,20 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
             .await?,
         );
         for service in names {
-            services.push(service_view(&d.store, &name, &service).await?);
+            let mut view = service_view(&d.store, &name, &service).await?;
+            let configured = policy.services.is_empty() || policy.services.contains_key(&service);
+            view["configured"] = json!(configured);
+            if configured {
+                let resolved = if policy.services.is_empty() {
+                    policy.clone()
+                } else {
+                    select(&policy, Some(&service))?.1
+                };
+                view["repository"] = json!(resolved.repository);
+                view["mode"] = json!(resolved.mode);
+                view["requires"] = json!(resolved.requires);
+            }
+            services.push(view);
         }
         let legacy = service_view(&d.store, &name, "").await?;
         environments.push(json!({"name":name,"mode":policy.mode,"repository":policy.repository,"requires":policy.requires,
@@ -731,7 +781,7 @@ async fn set_automation(
         request.service.is_some(),
         "service is required for automation mutation"
     );
-    let (service, _) = select(policy, request.service.as_deref())?;
+    let (service, policy) = select(policy, request.service.as_deref())?;
     ensure!(
         !service.is_empty(),
         "service is required for automation mutation"
@@ -857,16 +907,24 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
         return Ok(());
     }
     for (environment, policy) in policies(d.config.release_environments.as_deref())? {
-        if policy.mode != Mode::Automatic {
+        if policy.services.is_empty() && policy.mode != Mode::Automatic {
             continue;
         }
         for service in service_names(d, &policy)? {
+            let resolved = if policy.services.is_empty() {
+                policy.clone()
+            } else {
+                select(&policy, Some(&service))?.1
+            };
+            if resolved.mode != Mode::Automatic {
+                continue;
+            }
             let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_environment WHERE name=$1 AND service=$2 AND (automation_held OR active_run IS NOT NULL))")
             .bind(&environment).bind(&service).fetch_one(d.store.pool()).await?;
             if held {
                 continue;
             }
-            let id = latest_ready(&d.store, &policy.repository, &service).await?;
+            let id = latest_ready(&d.store, &resolved.repository, &service).await?;
             let Some(id) = id else { continue };
             let attempted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_promotion WHERE environment=$1 AND bundle_id=$2 AND service=$3)")
             .bind(&environment).bind(&id).bind(&service).fetch_one(d.store.pool()).await?;
@@ -899,8 +957,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn environments_resolve_repository_and_policy_per_service() {
+        let rollout = |repository: &str| -> Rollout {
+            serde_json::from_value(json!({"repository":repository,"workflow":policy().workflow}))
+                .unwrap()
+        };
+        let mut stage = policy();
+        stage.repository.clear();
+        stage.workflow.clear();
+        stage.mode = Mode::Automatic;
+        stage.services = BTreeMap::from([
+            ("auth".into(), rollout("private-repo")),
+            ("ci".into(), rollout("public-repo")),
+        ]);
+        stage.services.get_mut("auth").unwrap().mode = Some(Mode::Manual);
+        let mut production = stage.clone();
+        production.mode = Mode::Manual;
+        production.requires = vec!["stage".into()];
+        let mut config = BTreeMap::from([("stage", stage), ("production", production)]);
+        let validate = |config: &BTreeMap<&str, Policy>| {
+            policies(Some(&serde_yaml::to_string(config).unwrap()))
+        };
+        assert!(validate(&config).is_ok());
+        let (_, auth) = select(&config["stage"], Some("auth")).unwrap();
+        let (_, ci) = select(&config["stage"], Some("ci")).unwrap();
+        assert_eq!(auth.repository, "private-repo");
+        assert_eq!(auth.mode, Mode::Manual);
+        assert_eq!(ci.repository, "public-repo");
+        assert_eq!(ci.mode, Mode::Automatic);
+        assert_eq!(
+            select(&config["production"], Some("ci"))
+                .unwrap()
+                .1
+                .requires,
+            ["stage"]
+        );
+        config
+            .get_mut("production")
+            .unwrap()
+            .services
+            .get_mut("auth")
+            .unwrap()
+            .repository = Some("wrong-repo".into());
+        assert!(
+            validate(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("same repository")
+        );
+        config
+            .get_mut("production")
+            .unwrap()
+            .services
+            .get_mut("auth")
+            .unwrap()
+            .repository = Some("private-repo".into());
+        config
+            .get_mut("stage")
+            .unwrap()
+            .services
+            .get_mut("ci")
+            .unwrap()
+            .requires = Some(vec!["production".into()]);
+        assert!(validate(&config).unwrap_err().to_string().contains("cycle"));
+        config
+            .get_mut("stage")
+            .unwrap()
+            .services
+            .get_mut("ci")
+            .unwrap()
+            .requires = Some(vec![]);
+        assert!(validate(&config).is_ok());
+        config.get_mut("stage").unwrap().services.remove("auth");
+        assert!(
+            validate(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown environment service")
+        );
+    }
+
+    #[test]
     fn service_selection_is_explicit_and_rejects_cross_service_bundles() {
         let rollout = Rollout {
+            repository: None,
+            mode: None,
+            requires: None,
             workflow_id: "scope".into(),
             workflow: policy().workflow,
             service_targets: BTreeMap::new(),
@@ -1497,6 +1639,28 @@ mod tests {
         set_automation(&store, &automatic, toggle(false))
             .await
             .unwrap();
+        let mut scoped = automatic.clone();
+        scoped.repository = "unrelated-environment-default".into();
+        scoped.mode = Mode::Manual;
+        scoped.workflow.clear();
+        scoped.services.insert(
+            "api".into(),
+            serde_json::from_value(json!({
+                "repository":policy.repository,"mode":"automatic","workflow":policy.workflow
+            }))
+            .unwrap(),
+        );
+        set_automation(&store, &scoped, toggle(true)).await.unwrap();
+        set_automation(&store, &scoped, toggle(false))
+            .await
+            .unwrap();
+        scoped.services.get_mut("api").unwrap().mode = Some(Mode::Manual);
+        scoped.mode = Mode::Automatic;
+        assert!(
+            set_automation(&store, &scoped, toggle(false))
+                .await
+                .is_err()
+        );
         request.request_id = "repeat-current".into();
         let repeated = persist(
             &store, &request, &automatic, &bundle, &plan, &source, "policy", true,

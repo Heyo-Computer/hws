@@ -93,7 +93,12 @@
   const label = id => release(id)?.name || id || 'None recorded';
   const selectedEnv = () => environments.find(e => e.name === $('environment').value);
   const selectedService = () => selectedEnv()?.services?.find(s => s.service === $('service').value);
-  const candidates = service => releases.filter(r => r.repository === selectedEnv()?.repository && r.manifest.retained === true && components(r).length === 1 && components(r)[0] === service);
+  const policy = service => ({repository:service?.repository ?? selectedEnv()?.repository,mode:service?.mode ?? selectedEnv()?.mode,requires:service?.requires ?? selectedEnv()?.requires ?? []});
+  const configured = service => !!service && service.configured !== false;
+  const candidates = name => {
+    const service = selectedEnv()?.services?.find(s => s.service === name);
+    return configured(service) ? releases.filter(r => r.repository === policy(service).repository && r.manifest.retained === true && components(r).length === 1 && components(r)[0] === name) : [];
+  };
   const selectedRelease = () => release($('candidate').value);
   const revision = r => r?.manifest?.revision || 'Not recorded';
   const short = v => v ? String(v).slice(0,12) : 'Not reported';
@@ -151,30 +156,32 @@
     $('selection').innerHTML = `${r ? `<p class="release-name" style="overflow-wrap:anywhere">${esc(r.name)}</p><div class="notice"><strong>Scoped release · ${esc(scope(r))}</strong>Only the components listed below are in this bundle. This is not a declaration of full-platform coverage.</div>${chips(r)}<p class="sub">Candidate source revision</p><code>${esc(revision(r))}</code>` : '<p class="empty">No retained release available for this repository.</p>'}
       <div class="facts"><div><span class="eyebrow">Last successful release</span><strong>${esc(label(s.current_bundle))}</strong><span class="sub">${esc(current ? scope(current) : 'Scope not available')}</span><code>${esc(short(current?.manifest?.revision))}</code></div><div><span class="eyebrow">Rollback target</span><strong>${esc(label(s.previous_bundle))}</strong><span class="sub">${esc(previous ? scope(previous) : 'Scope not available')}</span><code>${esc(short(previous?.manifest?.revision))}</code></div></div>
       <p class="sub">These are rollout records, not observed running versions.</p>
-      ${(e.requires || []).length ? `<p class="sub">Requires this release to pass: ${e.requires.map(esc).join(', ')}</p>` : ''}
+      ${policy(service).requires.length ? `<p class="sub">Requires this release to pass: ${policy(service).requires.map(esc).join(', ')}</p>` : ''}
+      ${!configured(service) ? '<p class="warn">This service is no longer configured. Historical rollout records are read-only.</p>' : ''}
       ${service.recovery_required ? '<div class="notice"><strong>Recovery required</strong>This service deployment failed. Regions may contain different versions. Other services retain their own release state.</div>' : ''}
       ${s.active_run ? `<p class="warn">Deployment in progress</p><code>${esc(s.active_run)}</code>` : ''}
       <div class="actions" style="margin-top:20px"><button class="btn primary" data-action="deploy" ${s.active_run || !r || !components(r).length ? 'disabled' : ''}>Deploy ${esc(service.service)}</button><button class="btn" data-action="rollback" ${s.active_run || service.recovery_required || !previous || !candidates(service.service).some(r => r.id === previous.id) ? 'disabled' : ''}>Roll back ${esc(service.service)}…</button></div>
       ${service.recovery_required ? `<button class="btn" data-action="recover" ${s.active_run || !candidates(service.service).some(r => r.id === service.recovery_bundle) ? 'disabled' : ''}>Recover ${esc(service.service)}…</button>` : ''}
       <p class="sub">Manual deployment holds automation until explicitly resumed.</p>
-      <button class="btn" data-action="automation" ${e.mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button>`;
+      <button class="btn" data-action="automation" ${!configured(service) || policy(service).mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button>`;
   }
   function renderService() {
     const e = selectedEnv(), selected = $('candidate').value;
     const service = selectedService(), choices = candidates(service?.service);
     $('selection-title').textContent = service ? `Deploy ${service.service}` : 'Deploy a release';
     $('catalog-title').textContent = service ? `${service.service} releases` : 'Available releases';
-    $('catalog-help').textContent = choices.length ? 'Choose a version below, review its target, then confirm deployment.' : service ? 'Build the first candidate for this service.' : 'No deployment actions are available until release policies are configured.';
+    $('catalog-help').textContent = choices.length ? 'Choose a version below, review its target, then confirm deployment.' : configured(service) ? 'Build the first candidate for this service.' : 'No deployment actions are available until release policies are configured.';
     $('release-count').textContent = `${choices.length} candidates`;
     $('catalog').innerHTML = !service ? '<p class="empty">Release deployment is not configured for this environment. An operator must install its service release policies; the inventory is not a release catalog.</p>' : choices.length ? `<table><thead><tr><th>Version / source revision</th><th>Deployment record</th><th>Action</th></tr></thead><tbody>${choices.map(r => `<tr><td><span class="release-name">${esc(r.name)}</span><code title="${esc(revision(r))}">${esc(short(revision(r)))}</code><span class="sub">${esc(date(r.created_at))}</span></td><td><span class="tag">${r.id === service.state?.current_bundle ? 'Last successful' : r.id === service.state?.previous_bundle ? 'Rollback target' : 'Available'}</span></td><td><button class="btn" data-release="${esc(r.id)}" ${service.state?.active_run ? 'disabled' : ''}>Review &amp; deploy</button></td></tr>`).join('')}</tbody></table>` : `<p class="empty">No retained candidates for ${esc(service.service)}. Build a candidate using the form beside this list. Building does not deploy it.</p>`;
     $('candidate').innerHTML = choices.map(r => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
     if (choices.some(r => r.id === selected)) $('candidate').value = selected;
     $('candidate').disabled = !choices.length;
-    $('policy').innerHTML = e ? `<span class="tag">${esc(e.mode)} policy</span><span class="tag">Service automation ${service?.state?.automation_held ? 'held' : e.mode === 'automatic' ? 'enabled' : 'off'}</span><span class="sub">${esc(e.repository)}</span>` : 'No environments configured';
-    $('build').elements.repository.value = e?.repository || '';
-    $('build').querySelector('button').disabled = !service;
-    $('build').closest('details').open = !!service && !choices.length;
-    $('builds').innerHTML = builds.filter(b => b.repository === e?.repository && Object.keys(b.policy?.components || {}).includes(service?.service)).map(b => `<div class="history-item"><strong>${esc(b.name)}</strong><span class="sub">${esc(b.status)} · ${esc(short(b.revision))}</span>${b.error ? `<p class="bad">${esc(b.error)}</p>` : ''}</div>`).join('');
+    if (service && !configured(service)) $('catalog').innerHTML = '<p class="empty">This service is not configured for this environment. Historical rollout records remain available; builds and deployments are disabled.</p>';
+    $('policy').innerHTML = e ? !configured(service) ? '<span class="tag">Service not configured</span>' : `<span class="tag">${esc(policy(service).mode)} policy</span><span class="tag">Service automation ${service?.state?.automation_held ? 'held' : policy(service).mode === 'automatic' ? 'enabled' : 'off'}</span>` : 'No environments configured';
+    $('build').elements.repository.value = policy(service).repository || '';
+    $('build').querySelector('button').disabled = !configured(service);
+    $('build').closest('details').open = configured(service) && !choices.length;
+    $('builds').innerHTML = builds.filter(b => b.repository === policy(service).repository && Object.keys(b.policy?.components || {}).includes(service?.service)).map(b => `<div class="history-item"><strong>${esc(b.name)}</strong><span class="sub">${esc(b.status)} · ${esc(short(b.revision))}</span>${b.error ? `<p class="bad">${esc(b.error)}</p>` : ''}</div>`).join('');
     $('history-title').textContent = service ? `${service.service} deployment history` : 'Deployment history';
     $('history').innerHTML = (service?.history || []).map(p => `<div class="history-item"><div class="section-head" style="padding:0;border:0"><strong>${esc(label(p.bundle_id))}</strong><span class="tag ${p.status === 'success' ? 'good' : ['failure','cancelled'].includes(p.status) ? 'bad' : ''}">${esc(p.status)}</span></div><span class="sub">${esc(date(p.created_at))} · ${p.automatic ? 'Automatic' : 'Manual'}</span>${(p.deployments || []).map(d => `<p><code>${esc(d.service)}</code> · ${esc(d.status)}<span class="sub"><code>${esc(d.revision)}</code></span></p>`).join('')}<span class="sub">Run ${esc(p.run_id)}</span>${p.error ? `<p class="bad">${esc(p.error)}</p>` : ''}</div>`).join('') || '<p class="empty">No deployment recorded for this service.</p>';
     if (e?.legacy?.state || e?.legacy?.history?.length) $('history').innerHTML += '<p class="empty">Legacy environment-wide history is retained separately. It is not attributed to this service.</p>';
@@ -214,16 +221,17 @@
     renderSelection();
     $('selection').querySelector('[data-action="deploy"]').click();
   };
-  $('build').onsubmit = event => { event.preventDefault(); if (!selectedService()) return; const data = Object.fromEntries(new FormData(event.target)); data.service = selectedService().service; if (!data.revision.trim()) delete data.revision; perform(() => api('release-builds',data)); };
+  $('build').onsubmit = event => { event.preventDefault(); if (!configured(selectedService())) return; const data = Object.fromEntries(new FormData(event.target)); data.repository = policy(selectedService()).repository; data.service = selectedService().service; if (!data.revision.trim()) delete data.revision; perform(() => api('release-builds',data)); };
   $('selection').onclick = event => {
     const button = event.target.closest('button[data-action]'); if (!button || button.disabled || busy) return;
     const e = selectedEnv(), service = selectedService(), s = service.state || {}, action = button.dataset.action;
+    if (!configured(service)) return;
     if (action === 'automation') {
       if (!s.automation_held || confirm(`Resume automatic deployment of ${service.service} to ${e.name}?`)) perform(() => api('release-automation',{environment:e.name,service:service.service,held:!s.automation_held}));
       return;
     }
     const recover = action === 'recover', bundle = recover ? service.recovery_bundle : action === 'rollback' ? s.previous_bundle : $('candidate').value, r = release(bundle);
-    if (!r) return;
+    if (!r || !candidates(service.service).some(candidate => candidate.id === bundle)) return;
     confirmation = {environment:e.name,service:service.service,bundle,recover};
     $('confirm-title').textContent = action === 'rollback' ? 'Roll back this service?' : recover ? 'Recover this service?' : 'Deploy this service release?';
     $('confirm-body').innerHTML = `<p>Environment: <strong>${esc(e.name)}</strong></p><p>Service: <strong>${esc(service.service)}</strong></p><p>Release: <strong>${esc(r.name)}</strong></p><div class="notice"><strong>${esc(scope(r))}</strong>${chips(r)}</div><code>${esc(revision(r))}</code><p class="sub">Only this service's configured targets will change. Other services retain their versions. Automation for this service will remain held.</p>`;
@@ -234,6 +242,8 @@
     if (!confirmation || busy) return;
     const {environment,service,bundle,recover} = confirmation;
     $('confirmation').close(); confirmation = null;
+    const target = environments.find(e => e.name === environment)?.services?.find(s => s.service === service);
+    if (!configured(target)) return;
     const key = `${environment}:${service}:${bundle}:${recover}`;
     if (!pending.has(key)) pending.set(key,crypto.randomUUID());
     perform(async () => { await api('release-promotions',{environment,service,bundle_id:bundle,request_id:pending.get(key),recover}); pending.delete(key); });

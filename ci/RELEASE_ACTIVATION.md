@@ -26,6 +26,23 @@ Manual promotion holds only that service's automation. Unchanged declared build
 inputs reuse a retained candidate, so unrelated services need no rebuild or
 redeployment. Existing managed rollout actions still own regional sequencing.
 
+### Consolidating repository-named environments
+
+Install support for service-level repositories on every CI executor before
+changing policies. Put each service under `stage` with its existing repository,
+workflow scope and rollout targets. Do not merely rename `heyo-stage` and
+`hws-stage`: persisted state is keyed by environment and service.
+
+Before retiring either name, let its active promotions finish and preserve its
+service current/previous pointers, automation holds and promotion history under
+the new name in one database transaction. Reject destination conflicts rather
+than overwriting them. Preserve historical request identities and run references;
+do not relabel legacy environment-wide history as a service deployment. Keep
+automation held during this transition, then install the identical consolidated
+policy on both executors and verify the panel before restoring intended modes.
+Retained candidates remain repository/service scoped and need no rebuild.
+Production must remain unconfigured until its targets and policy are supplied.
+
 ## State and ownership
 
 - Existing CI PostgreSQL stores build membership, immutable bundle manifests,
@@ -42,15 +59,18 @@ redeployment. Existing managed rollout actions still own regional sequencing.
   A verified global cache does not require a new disk-preserving VM update path.
 - CI executes existing managed rollout actions. app-lb's control panel reads and
   changes CI state through authenticated ingress; it is not a rollout authority.
-- An environment is a named repository-specific policy, not a hardcoded region.
-  Its sequential workflow determines regional order. Stage may be automatic;
-  production may be manual. Both permit manual selection and rollback.
+- An environment is a deployment destination such as stage or production, not
+  a repository or a hardcoded region. Each configured service resolves its own
+  repository and rollout workflow; mode and prerequisites inherit environment
+  defaults unless overridden. Its workflow determines regional order. Stage may
+  be automatic; production may be manual. Both permit selection and rollback.
 - A manual promotion holds automation. Resume is explicit. Existing jobs are not
   migrated or killed by an automation hold.
 - Optional `requires: [environment-name]` policies require the exact bundle to
   have a settled successful promotion in each named environment. This applies to
   both manual and automatic deployment, including undoing a successful release.
-  Unknown environments, cross-repository dependencies and cycles are rejected.
+  Unknown environments, mismatched repositories for the same service and cycles
+  are rejected.
 - After a failed partial deployment, **Recover failed deployment** restores the
   last completely successful release, not the previous release. For A → B → C,
   where C fails, recovery restores B; after a successful B, **Roll back** selects A.

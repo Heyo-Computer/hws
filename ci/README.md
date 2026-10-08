@@ -1888,18 +1888,22 @@ See [verification and activation](RELEASE_ACTIVATION.md) for the tested policy
 example, verification commands, supported scope and staged activation procedure.
 
 `CI_RELEASE_ENVIRONMENTS` is an optional operator-owned YAML map keyed by named
-environment. Each entry contains `repository`, `workflow_id`, `mode` (`manual`
-by default, or `automatic`), optional `network`, and `services`. Each service
-entry owns its `workflow`, target maps and `placements`, optionally overriding
-`workflow_id`. Targets and placements use the existing mappings described
-below. Environment names are installation-wide and each belongs to one repository;
-use distinct names such as `hws-stage` and `retail-stage`. This is not an atomic
-multi-repository release.
+environment, such as `stage`, `production` or `preview`, not a repository.
+Each entry contains `mode` (`manual` by default, or `automatic`), optional
+`network`, default `workflow_id`, and `services`. Each service owns its
+`repository`, `workflow`, target maps and `placements`, optionally overriding
+`workflow_id`, `mode` and `requires`. An environment-level `repository` remains
+a legacy fallback. Services from different repositories can share Stage while
+retaining independent versions and deployment history. Targets and placements
+use the existing mappings described below; regions are targets within an
+environment. This is not an atomic multi-repository release.
 
-Optional `requires: [hws-stage]` requires a settled successful promotion of the
-exact same bundle in every named prerequisite. Both manual and automatic
-admissions enforce it. Prerequisites must exist, use the same repository and form
-an acyclic graph. This records that a release passed stage; it does not assert
+Optional `requires: [stage]` requires a settled successful promotion of the
+exact same service bundle in every named prerequisite. Both manual and automatic
+admissions enforce it. The same service must resolve to the same repository in
+each prerequisite, and its prerequisite graph must be acyclic. A service override
+replaces the environment's prerequisite list; `requires: []` explicitly clears it.
+This records that a release passed stage; it does not assert
 that stage still runs that release or that the environment is currently healthy.
 
 The embedded workflow uses `on: promotion`, with unconditional non-matrix jobs
@@ -1918,7 +1922,9 @@ request returns the same run; reusing its ID for a different bundle is refused.
 One service in one environment permits one promotion at a time; other services,
 environments and CI jobs are not locked. A candidate must contain exactly the
 selected service. `GET /release-environments` returns `services[]`, each with its
-own current/previous release, active run, automation hold and recent history.
+resolved `repository`, `mode`, `requires`, `configured` flag, current/previous
+release, active run, automation hold and recent history. Historical services
+removed from configuration remain visible but cannot admit new deployments.
 Unattributed historical state is under `legacy`; it is not a live service version.
 These endpoints use the same admin identity and origin checks as release builds.
 
