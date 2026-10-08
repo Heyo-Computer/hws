@@ -1367,6 +1367,65 @@ everything else becomes `secrets.*` and is **masked on the write path** — befo
 a log line is persisted or streamed, so a secret never reaches disk in plain text
 for someone to find later.
 
+## Namespaces
+
+An app-lb namespace that installs the `ci` plugin gets its own repositories,
+submit tokens, runs and live logs on this installation's runners. `''` in the
+`namespace` column of `ci_repo` and `ci_run` (migration 053) is the fleet;
+anything else is a tenant, and every tenant lookup is scoped by it.
+
+**Reached through app-lb, at `/ns/{ns}/`.** app-lb's plugin proxy maps
+`/namespaces/<ns>/plugins/ci/ui/<tail>` to `/ns/<ns>/<tail>` and `…/api/<x>` to
+`/ns/<ns>/api/<x>`, and sends `Authorization: Bearer <CI_PLUGIN_API_TOKEN>`,
+`x-heyo-base`, and the actor headers `x-heyo-actor`, `x-heyo-actor-email` and
+`x-heyo-actor-admin`. Those headers are app-lb's word for who is asking, and
+are believable only behind the bearer — so without `CI_PLUGIN_API_TOKEN` the
+routes are not mounted at all, and the bearer is checked (in constant time)
+before the path is even looked at. Keep `/ns/` out of `public_paths`.
+
+`src/web/ns.rs` then requires the namespace to be installed, builds every link
+from `x-heyo-base` (only when it is exactly `/namespaces/<ns>/plugins/ci`;
+otherwise the page links `/ns/<ns>/…` directly), and loads every run, job,
+repository and token through the store's `*_in` queries, so another
+namespace's id is a `404` indistinguishable from one that never existed.
+Writes need `x-heyo-actor-admin: true` and answer `303` to a page under the
+base. Embedded in an iframe, the page hides its own top bar.
+
+**The install gate** (`src/tenants.rs`) polls app-lb's
+`GET /api/plugins/ci` with `CI_APP_LB_URL`/`CI_APP_LB_TOKEN` and caches
+`enabled`, `installed_in`, `tenant_network` and `namespace_networks`. A `409`
+(plugin disabled) or a `404` (an app-lb without the plugin) is "no tenants";
+a transport error keeps the last answer. An uninstalled namespace's pages
+`404` and its tokens' submits `403` within one poll. `CI_REQUIRE_INSTALL=false`
+counts every namespace as installed while the plugin is enabled, for an app-lb
+that installs implicitly or a one-namespace development loop.
+
+**Tenant limits** (`src/tenancy.rs`), checked at submit so the refusal reaches
+the terminal that ran `git submit`:
+
+- Jobs build in `namespace_networks[<ns>]`, else `tenant_network`, which must
+  be served by this instance and must not be the fleet default (the first
+  entry of `CI_NETWORK`). A job may pin a host there; another network,
+  `uses: default` and an existing VM are refused.
+- `runs-on`, `on: release`, and every action other than `ci/upload-artifact`
+  and `ci/download-artifact` are refused.
+- Release policies and `workflow` objects never apply, even to a URL they
+  name. Registrations are unique per `(namespace, URL)`, so a tenant
+  registering a fleet repository's URL gets its own row, and the shared
+  `CI_WEBHOOK_SECRET` only ever submits as the fleet.
+- A tenant job's VM is never reused by the next job.
+
+Each rule has a second door at execution: the step-action check in
+`run_steps`, the native enqueue and poll, and `authorize_publication`, which
+every merge, publish, deploy, rollout and host-maintenance flow calls first.
+
+**Secrets** resolve under `ci/ns/<ns>/<workflow>/<environment>/`
+(`Secrets::prefix_for`), where `<workflow>` is the registration's name. The
+namespace segment is forced, so a tenant repository named after a fleet
+workflow reads `ci/ns/<ns>/deploy/prod`, never `ci/deploy/prod`. heyosecret
+has no per-namespace authorization, so an operator writes a namespace's
+secrets under its prefix; there is no self-service writer yet.
+
 ## Deploying it
 
 A **static `proxy_pass` deployment with an `update` block**, like app-obs — see

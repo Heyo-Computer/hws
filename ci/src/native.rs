@@ -139,6 +139,13 @@ pub async fn enqueue(
     run_id: &str,
     labels: &[String],
 ) -> Result<(), String> {
+    // Native runners are fleet hosts outside any VM boundary. A namespace run
+    // is refused `runs-on` at submit; this is the second door.
+    let tenant: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_run WHERE id=$1 AND namespace<>'')")
+        .bind(run_id).fetch_one(store.pool()).await.map_err(|e| e.to_string())?;
+    if tenant {
+        return Err("native runners are not available to namespace runs".into());
+    }
     let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
     let row = sqlx::query("UPDATE ci_job SET status='queued',queued_at=now() WHERE id=$1 AND run_id=$2 AND status='pending' RETURNING job_key")
         .bind(job_id).bind(run_id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
@@ -177,7 +184,7 @@ pub async fn poll(
     }
     let labels: Vec<String> = runner.get("labels");
     let token = Uuid::new_v4();
-    let row = sqlx::query("WITH candidate AS (SELECT n.job_id FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE n.state='queued' AND n.required_labels <@ $2 AND j.status='queued' AND r.status NOT IN ('success','failure','cancelled') AND ((j.plan->>'max_parallel') IS NULL OR (SELECT count(*) FROM ci_native_job peer JOIN ci_job pj ON pj.id=peer.job_id WHERE pj.run_id=j.run_id AND pj.base_id=j.base_id AND peer.state='leased') < (j.plan->>'max_parallel')::int) ORDER BY n.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE ci_native_job n SET state='leased',runner_id=$1,lease_token=$3,lease_expires_at=now()+make_interval(secs=>$4) FROM candidate WHERE n.job_id=candidate.job_id RETURNING n.job_id,n.run_id,n.lease_expires_at")
+    let row = sqlx::query("WITH candidate AS (SELECT n.job_id FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE n.state='queued' AND r.namespace='' AND n.required_labels <@ $2 AND j.status='queued' AND r.status NOT IN ('success','failure','cancelled') AND ((j.plan->>'max_parallel') IS NULL OR (SELECT count(*) FROM ci_native_job peer JOIN ci_job pj ON pj.id=peer.job_id WHERE pj.run_id=j.run_id AND pj.base_id=j.base_id AND peer.state='leased') < (j.plan->>'max_parallel')::int) ORDER BY n.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE ci_native_job n SET state='leased',runner_id=$1,lease_token=$3,lease_expires_at=now()+make_interval(secs=>$4) FROM candidate WHERE n.job_id=candidate.job_id RETURNING n.job_id,n.run_id,n.lease_expires_at")
         .bind(&p.runner_id).bind(labels).bind(token).bind(LEASE_SECONDS as f64).fetch_optional(&mut *tx).await.map_err(|e| internal(Box::new(e)))?;
     let Some(row) = row else {
         tx.commit().await.map_err(|e| internal(Box::new(e)))?;
@@ -206,7 +213,8 @@ pub async fn poll(
     let run=store.get_run(&run_id).await.map_err(|e|internal(Box::new(e)))?;
     let workflow=run.as_ref().map(|r|r.workflow_id.as_str()).unwrap_or("");
     let environment=plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default");
-    let resolved=secrets.resolve(&crate::secrets::Secrets::prefix(workflow,environment)).await.map_err(|e|internal(Box::new(e)))?;
+    let namespace=run.as_ref().map(|r|r.namespace.as_str()).unwrap_or("");
+    let resolved=secrets.resolve(&crate::secrets::Secrets::prefix_in(namespace,workflow,environment)).await.map_err(|e|internal(Box::new(e)))?;
     let (secret_scope,var_scope)=resolved.scopes();
     let mut context=plan.base_context();
     context.set("ci", crate::dispatch::Dispatcher::ci_scope(run.as_ref()));
@@ -292,12 +300,12 @@ pub async fn record_artifact(store:&Store,token:Uuid,index:usize,name:&str,store
 pub async fn complete(store: &Store, secrets:&crate::secrets::Secrets, c: Completion) -> Result<Option<String>, String> {
     let bytes=serde_json::to_vec(&c).map_err(|e|e.to_string())?;
     let completion_hash=hex::encode(Sha256::digest(bytes));
-    let scope=sqlx::query("SELECT r.workflow_id,j.plan FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE n.runner_id=$1 AND n.lease_token=$2")
+    let scope=sqlx::query("SELECT r.workflow_id,r.namespace,j.plan FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE n.runner_id=$1 AND n.lease_token=$2")
         .bind(&c.runner_id).bind(c.lease_token).fetch_optional(store.pool()).await.map_err(|e|e.to_string())?;
     let Some(scope)=scope else{return Ok(None)};
     let scope_plan:JobPlan=serde_json::from_value(scope.get("plan")).map_err(|e|e.to_string())?;
     let environment=scope_plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default");
-    let resolved=secrets.resolve(&crate::secrets::Secrets::prefix(scope.get("workflow_id"),environment)).await.map_err(|e|e.to_string())?;
+    let resolved=secrets.resolve(&crate::secrets::Secrets::prefix_in(scope.get("namespace"),scope.get("workflow_id"),environment)).await.map_err(|e|e.to_string())?;
     let masker=resolved.masker();
     let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
     let row=sqlx::query("SELECT n.job_id,n.run_id,n.state,n.completion_hash,j.job_key,j.plan FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE n.runner_id=$1 AND n.lease_token=$2 FOR UPDATE OF n,j,r")
