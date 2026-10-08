@@ -1346,6 +1346,21 @@ impl Jobs {
         self.cfg.sites_dir.as_deref()
     }
 
+    /// Create the parent of a site root that app-lb chose under its own
+    /// `sites_dir`. A fresh host has no `<sites_dir>/<namespace>`, and both a
+    /// build and a pull stage their tree beside the root, so either would fail
+    /// on the first site. A root the operator named is left alone: its parent
+    /// is theirs to provide.
+    fn ensure_managed_site_parent(&self, root: &Path) -> Result<(), String> {
+        if let (Some(managed), Some(parent)) = (&self.cfg.sites_dir, root.parent())
+            && root.starts_with(managed)
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+        }
+        Ok(())
+    }
+
     /// A site's build: check the repo out and copy `build.context` (default:
     /// the whole checkout) into `site.root` with the staged swap an artifact
     /// pull uses. Nothing in the checkout is run, so a repo cannot execute
@@ -1369,12 +1384,7 @@ impl Jobs {
             None => checkout.clone(),
         };
         let root = PathBuf::from(site.root.trim());
-        if let (Some(managed), Some(parent)) = (&self.cfg.sites_dir, root.parent())
-            && root.starts_with(managed)
-        {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-        }
+        self.ensure_managed_site_parent(&root)?;
         let index = site.index.trim().to_string();
         let context_shown = spec.context.clone().unwrap_or_else(|| ".".into());
         self.log(job_id, format!("copying {context_shown} at {} into {}", short(&commit), root.display()));
@@ -1828,6 +1838,7 @@ impl Jobs {
                     r.target_namespace.clone(),
                 )
             });
+        self.ensure_managed_site_parent(Path::new(site.root.trim()))?;
         let mut log = |line: String| self.log(job_id, line);
         let prepared = self
             .puller
@@ -3136,6 +3147,21 @@ mod tests {
         spec.vm.as_mut().unwrap().port = 9090;
         assert_ne!(deployment_config_fingerprint(&spec), authorized);
         assert_ne!(fingerprint(&("a", false, &authorized)), fingerprint(&("b", false, &authorized)));
+    }
+
+    #[test]
+    fn a_managed_site_root_gets_its_parent_and_a_named_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = jobs_at(dir.path());
+
+        let managed = dir.path().join("sites").join("default").join("heyo-retail");
+        jobs.ensure_managed_site_parent(&managed).unwrap();
+        assert!(managed.parent().unwrap().is_dir(), "a pull onto a fresh host needs <sites_dir>/<namespace>");
+        assert!(!managed.exists(), "the root itself is the staged swap's to create");
+
+        let named = dir.path().join("srv").join("retail").join("dist");
+        jobs.ensure_managed_site_parent(&named).unwrap();
+        assert!(!named.parent().unwrap().exists(), "an operator-named root's parent is theirs");
     }
 
     #[test]
