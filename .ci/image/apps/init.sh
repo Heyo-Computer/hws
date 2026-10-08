@@ -25,6 +25,12 @@ if [ ! -c /dev/null ]; then
 fi
 mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
 
+# Docker's /dev/shm mount is not part of the exported rootfs, and mounting
+# devtmpfs above hides any image directory. PostgreSQL creates its POSIX shared
+# memory control segment at startup, before the first test can connect.
+mkdir -p /dev/shm || exit 1
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm || exit 1
+
 # Quiet the console. The firecracker serial path frames a command's output with
 # newline-delimited markers, so anything else printed there can be read as part
 # of a step's output — or worse, swallow the end marker.
