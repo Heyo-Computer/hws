@@ -57,6 +57,13 @@ const DISKS_HTML: &str = include_str!("disks.html");
 /// The plugin console at `GET /plugins`.
 const PLUGINS_HTML: &str = include_str!("plugins.html");
 
+/// A namespace's plugins at `GET /namespaces/:name/plugin-console`.
+const NAMESPACE_PLUGINS_HTML: &str = include_str!("namespace_plugins.html");
+
+/// One plugin's dashboard, framed under app-lb's navigation, at
+/// `GET /namespaces/:name/plugin-console/:id`.
+const PLUGIN_FRAME_HTML: &str = include_str!("plugin_frame.html");
+
 /// How to turn a deployment's hostname into a URL somebody can click.
 ///
 /// The dashboard runs on the *admin* listener, so it cannot infer the data
@@ -253,6 +260,11 @@ struct AdminState {
     plugins: Arc<crate::plugins::PluginHost>,
     /// The plugin console, with the display name already substituted.
     plugins_html: Arc<str>,
+    /// A namespace's plugin list and one plugin's framed dashboard, with the
+    /// display name already substituted; the namespace and plugin are filled
+    /// per request.
+    namespace_plugins_html: Arc<str>,
+    plugin_frame_html: Arc<str>,
     /// The network topology console, with the display name already substituted.
     network_html: Arc<str>,
     /// How to turn a deployment's hostname into a link, given where the data
@@ -349,6 +361,10 @@ impl AdminApi {
             Arc::from(DISKS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let plugins_html: Arc<str> =
             Arc::from(PLUGINS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let namespace_plugins_html: Arc<str> =
+            Arc::from(NAMESPACE_PLUGINS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let plugin_frame_html: Arc<str> =
+            Arc::from(PLUGIN_FRAME_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let network_html: Arc<str> =
             Arc::from(NETWORK_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
@@ -410,6 +426,8 @@ impl AdminApi {
                 disks_html,
                 plugins,
                 plugins_html,
+                namespace_plugins_html,
+                plugin_frame_html,
                 network_html,
                 public_url,
                 feed,
@@ -587,6 +605,15 @@ impl Caller {
             Self::Federated(g) => {
                 g.fleet || g.namespaces.get(ns).is_some_and(|s| *s == AdminScope::Admin)
             }
+        }
+    }
+
+    /// The caller's email, when its credential carries one: a federated
+    /// session does, a token does not.
+    fn email(&self) -> Option<String> {
+        match self {
+            Self::Federated(g) => g.subject.email.clone(),
+            _ => None,
         }
     }
 
@@ -2450,7 +2477,10 @@ async fn plugin_installs(State(state): State<AdminState>, Path(id): Path<String>
 /// The namespace a `/namespaces/:name/plugins…` route acts on, read
 /// positionally off the real path the way [`deployment_of`] reads an id.
 fn namespace_plugin_target<'a>(matched: &str, path: &'a str) -> Option<&'a str> {
-    if !matched.starts_with("/namespaces/:name/plugins") {
+    // `plugin-console` is not a `plugins` prefix: it is named on its own.
+    if !matched.starts_with("/namespaces/:name/plugins")
+        && !matched.starts_with("/namespaces/:name/plugin-console")
+    {
         return None;
     }
     path.split('/').nth(2).filter(|s| !s.is_empty())
@@ -2652,11 +2682,20 @@ async fn uninstall_namespace_plugin(
 async fn namespace_plugin_surface(
     State(state): State<AdminState>,
     Path((ns, id, _rest)): Path<(String, String, String)>,
+    caller: Option<axum::Extension<Caller>>,
     mut req: Request,
 ) -> Response {
     if let Some(r) = bad_namespace(&ns) {
         return r;
     }
+    // Who is asking, for a plugin whose upstream records it. Ungated (no
+    // `Caller`) is the operator's loopback, which administers everything.
+    let caller = caller.as_deref();
+    req.extensions_mut().insert(crate::plugins::ns_proxy::NamespaceActor {
+        principal: caller.and_then(Caller::principal),
+        email: caller.and_then(Caller::email),
+        admin: caller.is_none_or(|c| c.administers_namespace(&ns)),
+    });
     let prefix = format!("/namespaces/{ns}/plugins/{id}");
     let rest = req
         .uri()
@@ -2674,6 +2713,49 @@ async fn namespace_plugin_surface(
         Err(_) => return err(StatusCode::BAD_REQUEST, "unparseable plugin path").into_response(),
     }
     state.plugins.dispatch_namespace(&id, &ns, req).await
+}
+
+/// `GET /namespaces/:name/plugin-console` — the plugins a namespace can
+/// install, with an Install button for its administrator and an Open link
+/// to each installed plugin's dashboard. Walled by the namespace like the
+/// rest of `/namespaces/:name/plugins`.
+async fn namespace_plugin_console(
+    State(state): State<AdminState>,
+    Path(ns): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    let page = render_page(&state, &state.namespace_plugins_html, &headers)
+        .replace("{{NAMESPACE}}", &html_escape(&ns));
+    ([(axum::http::header::CACHE_CONTROL, "no-store")], Html(page)).into_response()
+}
+
+/// `GET /namespaces/:name/plugin-console/:id` — one plugin's dashboard,
+/// framed under app-lb's own bar. The frame's page comes from the plugin's
+/// namespace surface, so it is served only where that is: an installed,
+/// enabled plugin. The page says which of those is missing.
+async fn namespace_plugin_frame(
+    State(state): State<AdminState>,
+    Path((ns, id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    let Some(view) = state.plugins.namespace_plugin(&id, &ns) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no plugin named {id:?} can be installed in a namespace"),
+        )
+        .into_response();
+    };
+    let page = render_page(&state, &state.plugin_frame_html, &headers)
+        .replace("{{NAMESPACE}}", &html_escape(&ns))
+        .replace("{{PLUGIN_ID}}", &html_escape(view.id))
+        .replace("{{PLUGIN_NAME}}", &html_escape(view.name));
+    ([(axum::http::header::CACHE_CONTROL, "no-store")], Html(page)).into_response()
 }
 
 /// `GET /network` — the network topology console.
@@ -6776,6 +6858,11 @@ fn router(state: AdminState) -> Router {
         .route("/namespaces/:name/plugins", get(namespace_plugins))
         .route("/namespaces/:name/plugins/:id", get(namespace_plugin))
         .route("/namespaces/:name/plugins/:id/*rest", get(namespace_plugin_surface))
+        // The pages over those: the namespace's plugin list and one plugin's
+        // framed dashboard. A prefix of their own, so nothing here can
+        // shadow a path on a plugin's surface.
+        .route("/namespaces/:name/plugin-console", get(namespace_plugin_console))
+        .route("/namespaces/:name/plugin-console/:id", get(namespace_plugin_frame))
         // The namespace's corner of the global artifact store. Reads are view
         // tier, walled by the namespace in the path; the writes are on the
         // CRUD side below and also need the whole namespace.
@@ -8805,6 +8892,45 @@ mod tests {
             f.state.plugins.set("obs", false, None).await.unwrap();
         }
 
+        /// GET `uri` and return the status and the body as text, for a page.
+        async fn page(f: &Fixture, uri: &str) -> (StatusCode, String) {
+            let mut app = router(f.state.clone());
+            std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+            let response = app.call(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        /// The namespace's plugin page and one plugin's framed dashboard are
+        /// served for any installable plugin, filled in for the namespace,
+        /// and say where the dashboard is; the page itself decides, from the
+        /// plugin's JSON, whether there is anything to frame yet.
+        #[tokio::test]
+        async fn the_plugin_console_frames_a_plugins_dashboard() {
+            let f = fixture(true).await;
+            let (status, html) = page(&f, "/namespaces/team-a/plugin-console").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(html.contains(r#"<meta name="plugin-namespace" content="team-a">"#));
+            assert!(!html.contains("{{"), "an unfilled placeholder shipped");
+
+            let (status, html) = page(&f, "/namespaces/team-a/plugin-console/obs").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(html.contains(r#"<meta name="plugin-id" content="obs">"#));
+            assert!(html.contains("Observability"));
+            assert!(html.contains("<iframe") || html.contains("createElement(\"iframe\")"));
+            assert!(!html.contains("{{"), "an unfilled placeholder shipped");
+
+            let (status, _) = page(&f, "/namespaces/team-a/plugin-console/nope").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, _) = page(&f, "/namespaces/a%20b/plugin-console").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+
+            // The JSON the page reads names the dashboard.
+            let (status, _, v) = send(&f, "GET", "/namespaces/team-a/plugins/obs", "").await;
+            assert_eq!((status, v["dashboard"].as_str()), (StatusCode::OK, Some("ui")));
+        }
+
         async fn remove(f: &Fixture, etag: Option<&str>) -> StatusCode {
             let mut request = Request::builder().method("DELETE").uri("/deployments/obsolete/record");
             if let Some(etag) = etag { request = request.header(header::IF_MATCH, etag); }
@@ -9417,6 +9543,8 @@ mod tests {
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
                 ("network", NETWORK_HTML),
+                ("namespace plugins", NAMESPACE_PLUGINS_HTML),
+                ("plugin frame", PLUGIN_FRAME_HTML),
             ] {
                 assert!(page.contains("{{HTML_ATTRS}}"), "{name} lost the theme attributes");
                 assert!(page.contains("{{WHO}}"), "{name} lost the identity slot");
@@ -9431,7 +9559,11 @@ mod tests {
                     // The dashboard's view facts, filled by its own handler.
                     .replace("{{MULTI_SERVER}}", "false")
                     .replace("{{CONFINED}}", "false")
-                    .replace("{{SCOPE_NAMESPACE}}", "");
+                    .replace("{{SCOPE_NAMESPACE}}", "")
+                    // The plugin console's, filled by its handlers.
+                    .replace("{{NAMESPACE}}", "team-a")
+                    .replace("{{PLUGIN_ID}}", "obs")
+                    .replace("{{PLUGIN_NAME}}", "Observability");
                 assert!(!rendered.contains("{{"), "{name} left a placeholder unfilled");
             }
         }
@@ -9447,6 +9579,8 @@ mod tests {
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
                 ("network", NETWORK_HTML),
+                ("namespace plugins", NAMESPACE_PLUGINS_HTML),
+                ("plugin frame", PLUGIN_FRAME_HTML),
             ] {
                 assert!(page.contains(r#"href="/__ui/heyo.css""#), "{name} does not load the shared sheet");
                 assert!(page.contains(r#"src="/__ui/theme.js""#), "{name} does not load the shared toggle");
@@ -9681,7 +9815,7 @@ mod tests {
     mod page_consistency {
         use super::*;
 
-        fn pages() -> [(&'static str, &'static str); 6] {
+        fn pages() -> [(&'static str, &'static str); 8] {
             [
                 ("dashboard", DASHBOARD_HTML),
                 ("directory", DIRECTORY_HTML),
@@ -9689,6 +9823,8 @@ mod tests {
                 ("disks", DISKS_HTML),
                 ("plugins", PLUGINS_HTML),
                 ("network", NETWORK_HTML),
+                ("namespace plugins", NAMESPACE_PLUGINS_HTML),
+                ("plugin frame", PLUGIN_FRAME_HTML),
             ]
         }
 
@@ -10778,6 +10914,18 @@ mod tests {
             const SURFACE: &str = "/namespaces/:name/plugins/:id/*rest";
             const ITEM: &str = "/namespaces/:name/plugins/:id";
             const LIST: &str = "/namespaces/:name/plugins";
+            const CONSOLE: &str = "/namespaces/:name/plugin-console";
+            const FRAME: &str = "/namespaces/:name/plugin-console/:id";
+
+            // The plugin console pages sit behind the same wall.
+            for (m, p) in [
+                (CONSOLE, "/namespaces/team-a/plugin-console"),
+                (FRAME, "/namespaces/team-a/plugin-console/obs"),
+            ] {
+                assert!(matches!(at(Some(&ns_view), None, m, p, AdminScope::View), Verdict::Allow(_)));
+                let other = p.replace("team-a", "team-b");
+                assert!(matches!(at(Some(&ns_admin), None, m, &other, AdminScope::View), Verdict::Forbidden(_)));
+            }
 
             // Its own namespace: read the list and the plugin's pages.
             for (m, p) in [

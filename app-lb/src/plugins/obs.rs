@@ -22,27 +22,21 @@
 //! the page's relative `api/…` URLs resolve beside it whichever prefix it is
 //! served under.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
 use axum::extract::Request;
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{NamespaceScope, Plugin, PluginMeta};
+use super::ns_proxy::{NsProxy, Upstream, check_url};
+use super::{Plugin, PluginMeta};
 use crate::secrets::{SecretRef, SecretStore};
 
-/// Log searches scan parquet; app-obs bounds them itself and answers 504 past
-/// its own deadline, so this only has to be longer than that.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_POLL_SECS: u64 = 30;
-/// Alert definitions are the only bodies sent upstream.
-const MAX_BODY: usize = 64 * 1024;
 
 // ---- configuration --------------------------------------------------------
 
@@ -76,10 +70,7 @@ fn default_auto_install() -> bool {
 
 fn parse_config(config: &Value) -> Result<ObsConfig, String> {
     let cfg: ObsConfig = serde_json::from_value(config.clone()).map_err(|e| e.to_string())?;
-    match url::Url::parse(&cfg.url) {
-        Ok(u) if matches!(u.scheme(), "http" | "https") && u.host().is_some() => {}
-        _ => return Err(format!("url {:?} must be an http(s) URL", cfg.url)),
-    }
+    check_url(&cfg.url)?;
     if !(5..=3600).contains(&cfg.poll_secs) {
         return Err("poll_secs must be between 5 and 3600".into());
     }
@@ -89,88 +80,18 @@ fn parse_config(config: &Value) -> Result<ObsConfig, String> {
     Ok(cfg)
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-struct Health {
-    up: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    polled_at: u64,
-}
-
 // ---- the plugin -----------------------------------------------------------
 
 pub struct ObsPlugin {
-    me: std::sync::Weak<ObsPlugin>,
-    secrets: Arc<SecretStore>,
-    http: reqwest::Client,
-    config: RwLock<Option<Arc<ObsConfig>>>,
-    health: RwLock<Health>,
-    poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    proxy: Arc<NsProxy>,
 }
 
 impl ObsPlugin {
     pub fn new(secrets: Arc<SecretStore>) -> Arc<Self> {
-        Arc::new_cyclic(|me| Self {
-            me: me.clone(),
-            secrets,
-            http: reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("reqwest client builds"),
-            config: RwLock::new(None),
-            health: RwLock::new(Health::default()),
-            poller: Mutex::new(None),
+        Arc::new(Self {
+            // app-obs has one page and records no actors.
+            proxy: NsProxy::new("app-obs", "obs", secrets, false, false),
         })
-    }
-
-    /// A request to app-obs's `<path_and_query>` with the service token.
-    /// Resolved per request, so rotating the secret needs no re-apply.
-    fn request(
-        &self,
-        cfg: &ObsConfig,
-        method: reqwest::Method,
-        path_and_query: &str,
-    ) -> Result<reqwest::RequestBuilder, String> {
-        let url = format!("{}{path_and_query}", cfg.url.trim_end_matches('/'));
-        let mut req = self.http.request(method, url);
-        if let Some(r) = &cfg.api_token {
-            let token = self
-                .secrets
-                .resolve(r)
-                .map_err(|e| format!("cannot resolve app-obs's api_token: {e}"))?;
-            req = req.bearer_auth(token);
-        }
-        Ok(req)
-    }
-
-    async fn poll(&self, cfg: &ObsConfig) {
-        let polled_at = crate::deployment::now_secs();
-        let result = async {
-            let resp = self
-                .request(cfg, reqwest::Method::GET, "/healthz")?
-                .timeout(POLL_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| format!("/healthz: {e}"))?;
-            if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(format!("/healthz: HTTP {}", resp.status()))
-            }
-        }
-        .await;
-        *self.health.write().unwrap() = Health {
-            up: result.is_ok(),
-            error: result.err(),
-            polled_at,
-        };
-    }
-
-    fn stop_poller(&self) {
-        if let Some(h) = self.poller.lock().unwrap().take() {
-            h.abort();
-        }
     }
 }
 
@@ -206,45 +127,38 @@ impl Plugin for ObsPlugin {
     }
 
     async fn apply(&self, config: Option<Value>) -> Result<(), String> {
-        self.stop_poller();
         let Some(config) = config else {
-            *self.config.write().unwrap() = None;
-            *self.health.write().unwrap() = Health::default();
-            return Ok(());
+            return self.proxy.configure(None, Duration::ZERO).await;
         };
-        let cfg = Arc::new(parse_config(&config)?);
-        *self.config.write().unwrap() = Some(cfg.clone());
-        self.poll(&cfg).await;
-        let me = self.me.clone();
+        let cfg = parse_config(&config)?;
         let every = Duration::from_secs(cfg.poll_secs);
-        let poll_cfg = cfg.clone();
-        *self.poller.lock().unwrap() = Some(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(every);
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let Some(me) = me.upgrade() else { return };
-                me.poll(&poll_cfg).await;
-            }
-        }));
-        match self.health.read().unwrap().error.clone() {
-            None => Ok(()),
-            Some(e) => Err(format!("app-obs at {}: {e}", cfg.url)),
-        }
+        self.proxy
+            .configure(
+                Some(Upstream {
+                    url: cfg.url,
+                    api_token: cfg.api_token,
+                }),
+                every,
+            )
+            .await
     }
 
     async fn status(&self) -> Value {
-        let Some(cfg) = self.config.read().unwrap().clone() else {
+        let Some(up) = self.proxy.upstream() else {
             return json!({});
         };
-        let health = self.health.read().unwrap().clone();
+        let health = self.proxy.health();
         json!({
-            "url": cfg.url,
-            "authenticated": cfg.api_token.is_some(),
+            "url": up.url,
+            "authenticated": up.api_token.is_some(),
             "up": health.up,
             "error": health.error,
             "polled_at": health.polled_at,
         })
+    }
+
+    fn dashboard_path(&self) -> Option<&'static str> {
+        Some("ui")
     }
 
     fn per_namespace(&self) -> bool {
@@ -268,126 +182,20 @@ impl Plugin for ObsPlugin {
     }
 }
 
-// ---- the namespace surface ------------------------------------------------
-
-fn fail(code: StatusCode, error: impl Into<String>) -> Response {
-    (code, axum::Json(json!({ "error": error.into() }))).into_response()
-}
-
-/// Whether a path segment is, or percent-decodes to, `.` or `..`. Either
-/// would be resolved away by the URL parser on the way upstream and could
-/// climb out of `/ns/<ns>` onto app-obs's fleet-wide routes.
-fn is_dot_segment(segment: &str) -> bool {
-    let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
-    decoded == "." || decoded == ".."
-}
-
-/// Where a namespace-surface path goes on app-obs, or `None` if it is not one
-/// this plugin forwards.
-fn upstream_path(ns: &str, rest: &str) -> Option<String> {
-    if rest.contains('\\') || rest.split('/').any(is_dot_segment) {
-        return None;
-    }
-    if rest == "/ui" {
-        return Some(format!("/ns/{ns}/"));
-    }
-    if rest.starts_with("/api/") {
-        return Some(format!("/ns/{ns}{rest}"));
-    }
-    None
-}
-
 async fn proxy(
     axum::extract::State(p): axum::extract::State<Arc<ObsPlugin>>,
     req: Request,
 ) -> Response {
-    let Some(NamespaceScope(ns)) = req.extensions().get::<NamespaceScope>().cloned() else {
-        return fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "no namespace scope on the request",
-        );
-    };
-    let rest = req.uri().path().to_string();
-
-    let Some(mut target) = upstream_path(&ns, &rest) else {
-        return fail(StatusCode::NOT_FOUND, format!("no obs route at {rest}"));
-    };
-    if let Some(q) = req.uri().query() {
-        target.push('?');
-        target.push_str(q);
-    }
-
-    let Some(cfg) = p.config.read().unwrap().clone() else {
-        return fail(StatusCode::CONFLICT, "the obs plugin is not configured");
-    };
-    let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
-        Ok(m) => m,
-        Err(e) => return fail(StatusCode::METHOD_NOT_ALLOWED, e.to_string()),
-    };
-    let content_type = req.headers().get(header::CONTENT_TYPE).cloned();
-    let body = match axum::body::to_bytes(req.into_body(), MAX_BODY).await {
-        Ok(b) => b,
-        Err(_) => return fail(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
-    };
-    let mut upstream = match p.request(&cfg, method, &target) {
-        Ok(r) => r,
-        Err(e) => return fail(StatusCode::BAD_GATEWAY, e),
-    };
-    if !body.is_empty() {
-        if let Some(ct) = content_type.as_ref().and_then(|v| v.to_str().ok()) {
-            upstream = upstream.header(reqwest::header::CONTENT_TYPE, ct);
-        }
-        upstream = upstream.body(body);
-    }
-    let resp = match upstream.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return fail(
-                StatusCode::BAD_GATEWAY,
-                format!("app-obs is unreachable: {e}"),
-            );
-        }
-    };
-    let status = resp.status().as_u16();
-    // A 401 from app-obs means app-lb's stored token is wrong, not the
-    // caller's credential; passing it through would read as their session
-    // failing.
-    if status == 401 {
-        return fail(
-            StatusCode::BAD_GATEWAY,
-            "app-obs rejected the api_token configured for the obs plugin",
-        );
-    }
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return fail(
-                StatusCode::BAD_GATEWAY,
-                format!("reading app-obs's response: {e}"),
-            );
-        }
-    };
-    (
-        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-store".to_string()),
-        ],
-        bytes,
-    )
-        .into_response()
+    p.proxy.forward(req).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::ns_proxy::upstream_path;
     use crate::plugins::{PluginHost, PluginStore};
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
 
     fn secrets_with(token: &str) -> Arc<SecretStore> {
         let dir =
@@ -498,10 +306,10 @@ mod tests {
     #[test]
     fn paths_cannot_climb_out_of_the_namespace() {
         assert_eq!(
-            upstream_path("a", "/api/fleet").as_deref(),
+            upstream_path("a", "/api/fleet", false).as_deref(),
             Some("/ns/a/api/fleet")
         );
-        assert_eq!(upstream_path("a", "/ui").as_deref(), Some("/ns/a/"));
+        assert_eq!(upstream_path("a", "/ui", false).as_deref(), Some("/ns/a/"));
         for bad in [
             "/api/../../api/fleet",
             "/api/%2e%2e/%2E%2E/api/fleet",
@@ -511,7 +319,7 @@ mod tests {
             "/stats",
             "/healthz",
         ] {
-            assert_eq!(upstream_path("a", bad), None, "forwarded {bad}");
+            assert_eq!(upstream_path("a", bad, false), None, "forwarded {bad}");
         }
     }
 
@@ -609,21 +417,37 @@ mod tests {
         assert!(host.auto_install("team-a", None).await.is_empty());
 
         host.set("obs", true, Some(configured(&url))).await.unwrap();
-        assert_eq!(host.auto_install("team-a", Some("auto".into())).await, vec!["obs"]);
+        assert_eq!(
+            host.auto_install("team-a", Some("auto".into())).await,
+            vec!["obs"]
+        );
         assert!(host.is_installed("obs", "team-a"));
-        assert!(host.auto_install("team-a", None).await.is_empty(), "idempotent");
+        assert!(
+            host.auto_install("team-a", None).await.is_empty(),
+            "idempotent"
+        );
 
         host.uninstall("obs", "team-a").await.unwrap();
-        assert!(host.auto_install("team-a", None).await.is_empty(), "an opt-out sticks");
+        assert!(
+            host.auto_install("team-a", None).await.is_empty(),
+            "an opt-out sticks"
+        );
         assert!(!host.is_installed("obs", "team-a"));
         // Disabling and re-enabling keeps the opt-out too.
         host.set("obs", false, None).await.unwrap();
         host.set("obs", true, None).await.unwrap();
         assert!(host.auto_install("team-a", None).await.is_empty());
-        host.install("obs", "team-a", json!({}), None).await.unwrap();
+        host.install("obs", "team-a", json!({}), None)
+            .await
+            .unwrap();
         host.uninstall("obs", "team-a").await.unwrap();
-        host.install("obs", "team-a", json!({}), None).await.unwrap();
-        assert!(host.store().get("obs").unwrap().declined.is_empty(), "installing clears it");
+        host.install("obs", "team-a", json!({}), None)
+            .await
+            .unwrap();
+        assert!(
+            host.store().get("obs").unwrap().declined.is_empty(),
+            "installing clears it"
+        );
 
         // Opted out at the fleet level.
         let mut off = configured(&url);

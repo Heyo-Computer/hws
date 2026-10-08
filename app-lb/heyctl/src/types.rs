@@ -1591,6 +1591,10 @@ pub struct PluginView {
     pub per_namespace: bool,
     /// The namespaces it is installed in. Empty for a fleet-only plugin.
     pub installed_in: Vec<String>,
+    /// Where its dashboard sits on a namespace's surface (`ui`), for a
+    /// plugin that has one; app-lb frames it at
+    /// `/namespaces/<ns>/plugin-console/<id>`.
+    pub dashboard: Option<String>,
     pub enabled: bool,
     /// Kept while disabled, so re-enabling does not lose it.
     pub config: Value,
@@ -2226,6 +2230,8 @@ pub struct NamespacePlugin {
     pub description: String,
     pub enabled: bool,
     pub installed: bool,
+    /// Where its dashboard sits on the namespace's surface, if it has one.
+    pub dashboard: Option<String>,
     pub installed_at: Option<u64>,
     /// Who installed it — `token:<id>` or `user:<id>`; absent for the operator.
     pub installed_by: Option<String>,

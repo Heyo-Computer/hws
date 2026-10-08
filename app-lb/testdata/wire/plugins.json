@@ -12,6 +12,7 @@
       "type": "object"
     },
     "per_namespace": true,
+    "dashboard": "ui",
     "installed_in": [
       "team-a"
     ],

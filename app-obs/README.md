@@ -255,7 +255,7 @@ anyone notices the skew.
 
 Tenants do not reach this service directly. app-lb's `obs` plugin is installed
 per namespace (`heyctl plugins install obs -n <ns>`) and serves
-`/namespaces/<ns>/plugins/obs/` by forwarding to this service's
+`/namespaces/<ns>/plugins/obs/ui` by forwarding to this service's
 `/ns/<ns>/…` routes with `APP_OBS_API_TOKEN`, after checking the caller may read
 that namespace. Every stored row carries the namespace it was written under,
 and a namespace that has not installed the plugin is not collected at all. See

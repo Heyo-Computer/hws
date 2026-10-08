@@ -519,6 +519,8 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `GET /api/plugins/:id/installs` | Namespaces that installed a per-namespace plugin (fleet scope; app-obs polls it). |
 | `GET /namespaces/:name/plugins`, `GET /namespaces/:name/plugins/:id` | What a namespace may install and whether it has (namespace wall). |
 | `GET /namespaces/:name/plugins/:id/*` | An installed plugin's namespace pages, e.g. `…/obs/ui` and `…/obs/api/fleet`. |
+| `GET /namespaces/:name/plugin-console` | The namespace's plugin page: what it can install, Install/Uninstall for its admin, and an **Open dashboard** link per installed plugin. |
+| `GET /namespaces/:name/plugin-console/:id` | One plugin's dashboard framed under app-lb's navigation. |
 | `GET /namespaces/:name/artifacts`, `GET`/`HEAD /namespaces/:name/artifacts/*` | The namespace's artifacts in the global store. See [Namespace artifacts](#namespace-artifacts). |
 
 ### CRUD tier
@@ -804,7 +806,13 @@ heyctl plugins install obs -n team-a   # an admin token for all of team-a
 
 An install is a record on the plugin, kept while the plugin is disabled. The namespace's view of the plugin is served at `/namespaces/<ns>/plugins/<id>/…`, behind the namespace wall: a namespace token reaches its own namespace's pages and no other, a `GET` needs the view tier there and anything else the admin tier. Installing needs an admin credential for the whole namespace, not a token narrowed to some of its deployments. Before the plugin is installed those routes answer `409` with `"code": "plugin_not_installed"`, and while the operator has it switched off, `"code": "plugin_disabled"`.
 
-For `obs`, `/namespaces/<ns>/plugins/obs/ui` is the app-obs dashboard narrowed to the namespace, and `…/obs/api/fleet`, `…/obs/api/deployments/<id>[/logs]` and `…/obs/api/alerts` are its JSON API. app-lb sends them to app-obs's `/ns/<ns>/…` routes with the token from the plugin's configuration; the caller's own credential never reaches app-obs. A namespace user's dashboard (`/dashboard?namespace=<ns>`) shows an **Observability** link once it is installed, or an **Install observability** button for an admin.
+For `obs`, `/namespaces/<ns>/plugins/obs/ui` is the app-obs dashboard narrowed to the namespace, and `…/obs/api/fleet`, `…/obs/api/deployments/<id>[/logs]` and `…/obs/api/alerts` are its JSON API. app-lb sends them to app-obs's `/ns/<ns>/…` routes with the token from the plugin's configuration; the caller's own credential never reaches app-obs. A namespace user's dashboard (`/dashboard?namespace=<ns>`) shows an **Observability** link once it is installed, or an **Install observability** button for an admin, plus a **Plugins** link to the namespace's plugin page.
+
+### Plugin dashboards
+
+A plugin with a dashboard on its namespace surface says where it is in the `dashboard` field of `GET /namespaces/<ns>/plugins` and `GET /api/plugins` (`"ui"` for `obs`). `/namespaces/<ns>/plugin-console` lists the namespace's plugins, and `/namespaces/<ns>/plugin-console/<id>` frames that dashboard under app-lb's own bar, so a namespace user moves between the dashboard and a plugin without leaving app-lb. Both pages sit behind the same namespace wall as the plugin's routes. The frame is same-origin and carries the browser's session.
+
+Because a plugin's page is served on app-lb's admin origin, every response from a plugin's namespace surface carries `X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and a `Content-Security-Policy` of `frame-ancestors 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'`. A redirect from the upstream is passed on only when it stays under `/namespaces/<ns>/plugins/<id>/`, and an event stream is passed through as it arrives rather than buffered.
 
 ## Troubleshooting
 

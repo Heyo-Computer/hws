@@ -1849,4 +1849,14 @@ mod ns_tests {
         }
         assert!(DASHBOARD_HTML.contains("api(`api/fleet"));
     }
+
+    /// Framed by app-lb's plugin console, the page drops what that console
+    /// already shows, and decides so before it paints.
+    #[test]
+    fn a_framed_page_hides_what_the_console_already_shows() {
+        let head = DASHBOARD_HTML.split("</head>").next().unwrap();
+        assert!(head.contains("window.self !== window.top"));
+        assert!(head.contains(r#"classList.add("embedded")"#));
+        assert!(head.contains(".embedded .topbar-brand"));
+    }
 }
