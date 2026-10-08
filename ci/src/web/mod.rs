@@ -2033,6 +2033,7 @@ mod tests {
             secrets: crate::secrets::Secrets::new(&config),
             artifacts: Arc::from(crate::artifacts::sink_for(&config).expect("disk sink")),
             objects: Arc::new(crate::objects::Workflows::new(&config)),
+            tenants: Arc::new(crate::tenants::Tenants::new(&config)),
         });
         router(config, runners, store, dispatcher)
     }

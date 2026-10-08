@@ -175,6 +175,8 @@ pub struct Dispatcher {
     pub secrets: crate::secrets::Secrets,
     pub artifacts: Arc<dyn crate::artifacts::ArtifactSink>,
     pub objects: Arc<crate::objects::Workflows>,
+    /// Which namespaces installed the `ci` plugin, and where they build.
+    pub tenants: Arc<crate::tenants::Tenants>,
 }
 
 impl Dispatcher {
@@ -244,10 +246,37 @@ impl Dispatcher {
             None => req.repository.url.clone(),
         };
 
+        // A namespace's registration plans under the tenant policy: one
+        // network, decided by app-lb's plugin config and checked against the
+        // pool here, and none of the operator's per-repository statements —
+        // release policies and workflow objects are matched by URL, and a
+        // tenant registering a fleet repository's URL must not inherit them.
+        let namespace = repo.map(|r| r.namespace.clone()).unwrap_or_default();
+        let tenant_network = if namespace.is_empty() {
+            None
+        } else {
+            if !self.tenants.is_installed(&namespace) {
+                return Err(DispatchError::NotInstalled(namespace));
+            }
+            let pool = self.runners.snapshot();
+            let tenants = self.tenants.snapshot();
+            let set = crate::tenancy::resolve_network(&pool, &namespace, tenants.network_for(&namespace))
+                .map_err(|e| DispatchError::Tenancy(e.to_string()))?;
+            if req.workflow_id.is_some() {
+                return Err(DispatchError::Tenancy(
+                    "workflow objects are fleet configuration and cannot be named by a namespace submit".into(),
+                ));
+            }
+            Some(set.clone())
+        };
+
         // Policy comes from the CI service's operator configuration, never the
         // submitted tree. Resolve every target before admitting any run.
-        let release_policy = crate::release_policy::select(self.config.release_policies.as_deref(), &repo_url)
-            .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+        let release_policy = match &tenant_network {
+            Some(_) => None,
+            None => crate::release_policy::select(self.config.release_policies.as_deref(), &repo_url)
+                .map_err(|e| DispatchError::Workflow(e.to_string()))?,
+        };
         // A partial submit (`--only`, a named workflow object, a rerun) never
         // authorizes merge or deployment, so its release workflow is not planned
         // at all. Planning it only to discard it meant its placement still had
@@ -268,6 +297,7 @@ impl Dispatcher {
         // what somebody named the object.
         let objects = self.objects.snapshot();
         let matched: Vec<crate::objects::Workflow> = match &req.workflow_id {
+            _ if tenant_network.is_some() => Vec::new(),
             Some(id) => objects.find(id).cloned().into_iter().collect(),
             None => objects.for_repo(&repo_url).cloned().collect(),
         };
@@ -302,9 +332,14 @@ impl Dispatcher {
                 // that says nothing about where it runs still lands somewhere
                 // deliberate rather than wherever this instance happens to
                 // consider first.
-                network: repo
-                    .and_then(|r| r.network.clone())
-                    .filter(|n| !n.trim().is_empty()),
+                // A namespace's network is the policy's, whatever the
+                // registration row says — it has no network field to set.
+                network: match &tenant_network {
+                    Some(set) => Some(set.network_name.clone()),
+                    None => repo
+                        .and_then(|r| r.network.clone())
+                        .filter(|n| !n.trim().is_empty()),
+                },
                 // A registration may carry its own glob, for the repository
                 // whose workflows are not where this installation's default
                 // says. A workflow object still wins over it: the object is the
@@ -383,6 +418,13 @@ impl Dispatcher {
             for (path, text) in &files {
                 let wf = crate::workflow::Workflow::parse(path, text)
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                // Before anything else reads the file: a namespace workflow
+                // that asks for a fleet capability is refused outright, not
+                // skipped, so the submitter learns why it did not run.
+                if let Some(set) = &tenant_network {
+                    crate::tenancy::check_workflow(&wf, set)
+                        .map_err(|e| DispatchError::Tenancy(e.to_string()))?;
+                }
                 let is_release = wf.on.iter().any(|t| t == "release");
                 if is_release && wf.on.len() != 1 {
                     return Err(DispatchError::Workflow(format!(
@@ -468,6 +510,10 @@ impl Dispatcher {
                 // reassigned mid-build — the same reason the expanded plan is
                 // stored rather than recomputed.
                 self.assign_network(&mut plan, source.network.as_deref(), &mut warnings)?;
+                if let Some(set) = &tenant_network {
+                    crate::tenancy::seal_plan(&mut plan, set)
+                        .map_err(|e| DispatchError::Tenancy(e.to_string()))?;
+                }
 
                 // Every run's descriptor is committed below with its metadata.
                 // No accepted run depends on this controller's staging directory.
@@ -527,6 +573,7 @@ impl Dispatcher {
                             }
                             .to_string(),
                             rerun_of: req.rerun.as_ref().map(|r| r.of.clone()),
+                            namespace: namespace.clone(),
                         };
                 if is_release && release_run_id.replace(run_id.clone()).is_some() {
                     return Err(DispatchError::Workflow(
@@ -689,6 +736,16 @@ impl Dispatcher {
             Some(id) => self.store.get_repo(id).await?,
             None => self.store.repo_by_url(&run.repo_url).await?,
         };
+        // The new run belongs where the old one did, and a namespace run is
+        // re-planned only from its own namespace's registration. Without it
+        // there is nothing to carry the namespace — the URL fallback above is
+        // fleet-only — and re-running it as a fleet build would hand a
+        // tenant's source the fleet's network and secrets.
+        if repo.as_ref().map(|r| r.namespace.as_str()).unwrap_or("") != run.namespace {
+            return Err(DispatchError::Tenancy(format!(
+                "run {run_id}'s registration is gone; register the repository again and submit"
+            )));
+        }
         if let Some(r) = &repo
             && !r.enabled
         {
@@ -1651,7 +1708,7 @@ impl Dispatcher {
             (path.clone(), hex::encode(sha2::Sha256::digest(yaml.as_bytes())))
         }).collect();
         let environment = plan.env.get("CI_ENVIRONMENT").cloned().unwrap_or_else(|| "default".into());
-        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix(&run.workflow_id, &environment))
+        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, &environment))
             .await.map_err(|e| DispatchError::Secrets(format!("resolving source credential: {e}")))?;
         let git_auth_token = resolved.secrets.get("CI_GIT_AUTH_TOKEN")
             .or_else(|| resolved.secrets.get("GITHUB_TOKEN")).cloned();
@@ -2348,7 +2405,7 @@ impl Dispatcher {
             let run = self.store.get_run(&msg.run_id).await?
                 .ok_or_else(|| anyhow::anyhow!("run no longer exists"))?;
             let environment = plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default");
-            let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix(&run.workflow_id, environment)).await?;
+            let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, environment)).await?;
             let masker = resolved.masker();
             let mut text = match vm.info().await {
                 Ok(info) => format!("[ci] VM {} status={:?} size={:?}\n", info.id, info.status, info.size_class),
@@ -2593,7 +2650,7 @@ impl Dispatcher {
         // steps. They travel only in exec env; neither the persisted command nor
         // the descriptor contains them.
         let environment = plan.env.get("CI_ENVIRONMENT").cloned().unwrap_or_else(|| "default".into());
-        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix(&run.workflow_id, &environment))
+        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, &environment))
             .await.map_err(|e| DispatchError::Secrets(format!("resolving checkout credential: {e}")))?;
         let masker = resolved.masker();
         let mut checkout_env = HashMap::new();
@@ -2678,6 +2735,10 @@ impl Dispatcher {
             .as_ref()
             .map(|r| r.workflow_id.clone())
             .unwrap_or_default();
+        let namespace = run
+            .as_ref()
+            .map(|r| r.namespace.clone())
+            .unwrap_or_default();
         // The same scope the scheduler evaluated the job's own `if:` against, so
         // a step condition and a job condition cannot disagree about which
         // commit they are looking at.
@@ -2687,7 +2748,7 @@ impl Dispatcher {
             .get("CI_ENVIRONMENT")
             .cloned()
             .unwrap_or_else(|| "default".to_string());
-        let prefix = crate::secrets::Secrets::prefix(&workflow_id, &environment);
+        let prefix = crate::secrets::Secrets::prefix_in(&namespace, &workflow_id, &environment);
         let resolved = self
             .secrets
             .resolve(&prefix)
@@ -2751,10 +2812,17 @@ impl Dispatcher {
                     .store
                     .log_path(&msg.run_id, &plan.key, idx as i32, &sid);
                 self.store.start_step(&sid, &sid).await?;
-                match self
-                    .run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path, &masker)
-                    .await
-                {
+                // The submit-time policy already refused these; this is the
+                // second door, for a plan that reached the queue another way.
+                let outcome = if !namespace.is_empty() && !crate::tenancy::action_allowed(action) {
+                    Err(DispatchError::StepFailed(format!(
+                        "{action} is not available to namespace runs"
+                    )))
+                } else {
+                    self.run_action(msg, plan, vm, action, step, &ctx, &sid, &log_path, &masker)
+                        .await
+                };
+                match outcome {
                     Ok((note, outputs)) => {
                         if let Some(id) = &step.id {
                             step_outputs.insert(id.clone(), serde_json::json!({
@@ -4958,6 +5026,11 @@ pub enum DispatchError {
     ControllerUnavailable(String),
     DiskPressure(String),
     Native(String),
+    /// A namespace submit the tenant policy refuses. See [`crate::tenancy`].
+    Tenancy(String),
+    /// A namespace that has not installed the `ci` plugin, or whose install
+    /// app-lb has since withdrawn. The submit route answers 403 for it.
+    NotInstalled(String),
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
     Bus(crate::bus::BusError),
@@ -5144,6 +5217,8 @@ impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Native(e) => write!(f, "native runner: {e}"),
+            Self::Tenancy(e) => write!(f, "namespace policy: {e}"),
+            Self::NotInstalled(ns) => write!(f, "namespace {ns} has not installed ci; install it from its plugins page in app-lb"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Pool(e) => write!(f, "{e}"),
             Self::Bus(e) => write!(f, "{e}"),
@@ -6805,6 +6880,7 @@ mod tests {
             // submitted tree, which is the path an installation with no app-lb
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
+            tenants: Arc::new(crate::tenants::Tenants::new(&config)),
         })
     }
 
