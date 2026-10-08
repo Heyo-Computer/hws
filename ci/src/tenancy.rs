@@ -362,15 +362,17 @@ mod tests {
                 "ci/rollout-host-app-lb",
             ),
         ];
+        let mut checked = 0;
         for (yaml, why) in cases {
-            let Ok(w) = Workflow::parse(".ci/workflows/build.yml", yaml) else {
-                // A workflow the parser refuses is refused anyway; the policy
-                // only has to cover what parses.
-                continue;
+            let w = match Workflow::parse(".ci/workflows/build.yml", yaml) {
+                Ok(w) => w,
+                Err(e) => panic!("{yaml}: the case must parse to test the policy: {e}"),
             };
             let err = check_workflow(&w, &tenants()).expect_err(yaml);
             assert!(err.0.contains(why), "{yaml}: {err}");
+            checked += 1;
         }
+        assert_eq!(checked, cases.len());
     }
 
     #[test]

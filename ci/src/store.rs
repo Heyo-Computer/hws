@@ -3675,6 +3675,80 @@ jobs:
         store.delete_repo(&first.id).await.unwrap();
     }
 
+    /// Migration 053's point: one URL may be registered by the fleet and by a
+    /// namespace, separately, and the namespace's registration never touches
+    /// the fleet's row — nor can the namespace reach it by id.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_namespace_registers_a_fleet_url_without_touching_the_fleets_row() {
+        let store = test_store().await;
+        let url = test_repo_url();
+        let fleet = store
+            .register_repo(&url, "fleet app", Some("ci/*.yml"), Some("prod"), None)
+            .await
+            .unwrap();
+        assert_eq!(fleet.namespace, "");
+
+        let tenant = store
+            .register_repo_in("team-a", &url, "team app", None, None, Some(("user:1", "a@example.com")))
+            .await
+            .unwrap();
+        assert_ne!(tenant.id, fleet.id, "a registration of its own");
+        assert_eq!(tenant.namespace, "team-a");
+
+        let again = store.get_repo(&fleet.id).await.unwrap().unwrap();
+        assert_eq!(again.name, "fleet app");
+        assert_eq!(again.workflow_path.as_deref(), Some("ci/*.yml"));
+        assert_eq!(again.network.as_deref(), Some("prod"));
+
+        // The shared-secret lookup is fleet-only.
+        assert_eq!(store.repo_by_url(&url).await.unwrap().map(|r| r.id), Some(fleet.id.clone()));
+        // Re-registering in the namespace edits the namespace's row only.
+        let renamed = store
+            .register_repo_in("team-a", &url, "team app 2", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(renamed.id, tenant.id);
+        assert_eq!(store.get_repo(&fleet.id).await.unwrap().unwrap().name, "fleet app");
+
+        // Cross-namespace reads and writes find nothing.
+        assert!(store.get_repo_in("team-a", &fleet.id).await.unwrap().is_none());
+        assert!(store.get_repo_in("team-b", &tenant.id).await.unwrap().is_none());
+        assert!(store.get_repo_in("", &tenant.id).await.unwrap().is_none());
+        assert!(store.repos().await.unwrap().iter().all(|r| r.id != tenant.id));
+        assert!(store.repos_in("team-a").await.unwrap().iter().any(|r| r.id == tenant.id));
+        assert!(!store.set_repo_enabled_in("team-b", &tenant.id, false).await.unwrap());
+        assert!(!store.delete_repo_in("team-b", &tenant.id).await.unwrap());
+        let (token, _) = store.create_repo_token(&tenant.id, "ci", None).await.unwrap();
+        assert!(!store.revoke_repo_token_in("team-b", &tenant.id, &token.id).await.unwrap());
+        assert!(!store.revoke_repo_token_in("team-a", &fleet.id, &token.id).await.unwrap(), "token of another repo");
+        assert!(store.revoke_repo_token_in("team-a", &tenant.id, &token.id).await.unwrap());
+
+        // A run is tagged with its namespace and found only there.
+        let run = crate::vm::new_id();
+        store
+            .create_run(
+                &run,
+                &RunRequest { repo_id: Some(tenant.id.clone()), repo_url: url.clone(), namespace: "team-a".into(), ..Default::default() },
+                &test_plan(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.get_run(&run).await.unwrap().unwrap().namespace, "team-a");
+        assert!(store.get_run_in("team-a", &run).await.unwrap().is_some());
+        assert!(store.get_run_in("team-b", &run).await.unwrap().is_none());
+        assert!(store.get_run_in("", &run).await.unwrap().is_none());
+        assert!(store.recent_runs_in("team-a", 500, None).await.unwrap().iter().any(|r| r.id == run));
+        assert!(store.recent_runs_in("", 500, None).await.unwrap().iter().all(|r| r.id != run));
+        assert!(store.run_namespaces().await.unwrap().contains(&"team-a".to_string()));
+        // Fleet-only flows refuse it.
+        assert!(crate::tenancy::refuse_tenant_run(&store, &run).await.is_err());
+        assert!(crate::submission::authorize_publication(&store, &run).await.is_err());
+
+        assert!(store.delete_repo_in("team-a", &tenant.id).await.unwrap());
+        store.delete_repo(&fleet.id).await.unwrap();
+    }
+
     /// The assignment this whole column exists for: a repository points at a
     /// network, and reassigning it is one write rather than a re-registration
     /// that also rewrites the name and the workflow path.

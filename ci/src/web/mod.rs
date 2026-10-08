@@ -22,6 +22,7 @@
 pub mod api;
 pub mod identity;
 mod instance_http;
+mod ns;
 pub mod pages;
 pub mod stream;
 
@@ -157,6 +158,10 @@ pub fn router(
         // above, for the reason this module's header gives — a machine route
         // behind the gate answers 401 whatever it carries. See [`api`].
         .merge(api::router())
+        // A namespace's pages and API, for app-lb's `ci` plugin proxy. Not
+        // mounted without CI_PLUGIN_API_TOKEN, and never in `public_paths`:
+        // see [`ns`].
+        .merge(ns::router(&state).unwrap_or_default())
         .layer(axum::middleware::from_fn_with_state(state.clone(), instance_http::route))
         .with_state(state)
 }
@@ -626,6 +631,19 @@ async fn submit(
         );
     }
 
+    // A namespace's token stops working the moment app-lb stops listing the
+    // namespace as installed — checked here, before the source is unpacked,
+    // and again by the dispatcher for re-runs.
+    if let Some(repo) = repo
+        && repo.is_tenant()
+        && !state.dispatcher.tenants.is_installed(&repo.namespace)
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            &crate::dispatch::DispatchError::NotInstalled(repo.namespace.clone()).to_string(),
+        );
+    }
+
     // Present only when a browser reached this through app-lb's gate; `git
     // submit` arrives with a token and no identity, so the payload's `pusher` is
     // the fallback.
@@ -660,6 +678,8 @@ async fn submit(
         }
         Err(crate::dispatch::DispatchError::ControllerUnavailable(message)) =>
             error(StatusCode::SERVICE_UNAVAILABLE, &message),
+        Err(e @ crate::dispatch::DispatchError::NotInstalled(_)) =>
+            error(StatusCode::FORBIDDEN, &e.to_string()),
         Err(e) => {
             tracing::warn!("submit failed: {e}");
             error(StatusCode::BAD_REQUEST, &e.to_string())
@@ -707,18 +727,31 @@ fn chrome<'a>(
     headers: &HeaderMap,
     who: Option<&'a Identity>,
 ) -> pages::Chrome<'a> {
+    chrome_in(state, headers, who.map(|i| i.display()), pages::Scope::Fleet)
+}
+
+/// [`chrome`] for any scope, with the signed-in name already resolved — a
+/// namespace page's comes from app-lb's actor headers, not from an
+/// [`Identity`].
+fn chrome_in<'a>(
+    state: &'a AppState,
+    headers: &HeaderMap,
+    who: Option<&'a str>,
+    scope: pages::Scope,
+) -> pages::Chrome<'a> {
     let cookies = headers
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok());
     let theme = crate::heyo_ui::theme_from_cookie_header(cookies, &state.config.ui_cookie_name);
     pages::Chrome {
         app_name: &state.config.name,
-        who: who.map(|i| i.display()),
+        who,
         html_attrs: crate::heyo_ui::html_attrs(
             theme,
             state.config.ui_cookie_domain.as_deref(),
             &state.config.ui_cookie_name,
         ),
+        scope,
     }
 }
 
@@ -761,9 +794,28 @@ async fn runs_page(
         Ok(repos) => repos,
         Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
     };
-    match state.store.recent_runs(RECENT_RUNS, repo).await {
-        Ok(runs) => pages::runs_page(&chrome(&state, &headers, who.as_ref()), &runs, &repos, repo)
-            .into_response(),
+    // `?namespace=<ns>` narrows to one tenant, and `-` to the fleet's own.
+    // The picker and the column appear only once a namespace has run.
+    let namespace = match q.get("namespace").map(String::as_str) {
+        None | Some("") => None,
+        Some("-") => Some(""),
+        Some(ns) => Some(ns),
+    };
+    let namespaces = state.store.run_namespaces().await.unwrap_or_default();
+    let runs = match namespace {
+        Some(ns) => state.store.recent_runs_in(ns, RECENT_RUNS, repo).await,
+        None => state.store.recent_runs(RECENT_RUNS, repo).await,
+    };
+    match runs {
+        Ok(runs) => pages::runs_page_with_namespaces(
+            &chrome(&state, &headers, who.as_ref()),
+            &runs,
+            &repos,
+            repo,
+            &namespaces,
+            namespace,
+        )
+        .into_response(),
         Err(e) => page_error(&state, &headers, who.as_ref(), &e.to_string()),
     }
 }
@@ -778,91 +830,72 @@ async fn run_page(
     let event_before = q.get("events_before").and_then(|value| value.parse::<i64>().ok());
     match state.store.get_run(&run_id).await {
         Ok(Some(run)) => {
-            let jobs = match state.store.jobs_of(&run_id).await {
-                Ok(jobs) => jobs,
-                Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
-            };
-            let artifacts = state.store.artifacts_of(&run_id).await.unwrap_or_default();
-
-            // The VM log is the step recorded at index -2 by the executor. Read
-            // from the same place as any other step log, so a swept run shows
-            // the row with the bytes gone rather than vanishing from the page.
-            let mut vm_logs = Vec::new();
-            for job in &jobs {
-                let steps = match state.store.steps_of(&job.id).await {
-                    Ok(steps) => steps,
-                    Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
-                };
-                if let Some(step) = steps.iter().find(|s| s.idx == VM_LOG_STEP_IDX) {
-                    let log = match state.store.read_log(step).await {
-                        Ok(log) => log,
-                        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
-                    };
-                    vm_logs.push((job.display.clone(), log));
-                }
+            match render_run(&state, &chrome(&state, &headers, who.as_ref()), &run, event_before).await {
+                Ok(page) => page.into_response(),
+                Err(e) => page_error(&state, &headers, who.as_ref(), &e),
             }
-
-            let reruns = state.store.reruns_of(&run_id).await.unwrap_or_default();
-            let release = match crate::release::get(&state.store, &run_id).await {
-                Ok(release) => release,
-                Err(e) => {
-                    return page_error(
-                        &state,
-                        &headers,
-                        who.as_ref(),
-                        &format!("could not load release: {e}"),
-                    );
-                }
-            };
-            let deployments = match state.store.service_deployments_of(&run_id).await {
-                Ok(deployments) => deployments,
-                Err(e) => {
-                    return page_error(
-                        &state,
-                        &headers,
-                        who.as_ref(),
-                        &format!("could not load deployments: {e}"),
-                    );
-                }
-            };
-            let mut events = match state
-                .store
-                .run_events(&run_id, event_before, RUN_EVENT_PAGE_SIZE + 1)
-                .await
-            {
-                Ok(events) => events,
-                Err(e) => {
-                    return page_error(
-                        &state,
-                        &headers,
-                        who.as_ref(),
-                        &format!("could not load event timeline: {e}"),
-                    );
-                }
-            };
-            let events_have_more = events.len() as i64 > RUN_EVENT_PAGE_SIZE;
-            if events_have_more {
-                events.pop();
-            }
-            pages::run_page_with_deployments(
-                &chrome(&state, &headers, who.as_ref()),
-                &run,
-                &reruns,
-                &jobs,
-                &artifacts,
-                &vm_logs,
-                release.as_ref(),
-                &deployments,
-                &events,
-                event_before,
-                events_have_more,
-                state.config.log_retention.map(|d| d.as_secs() / 86_400),
-            )
-            .into_response()
         }
         Ok(None) => not_found(&state, &headers, who.as_ref(), &format!("No run {run_id}.")),
         Err(e) => page_error(&state, &headers, who.as_ref(), &e.to_string()),
     }
+}
+
+/// Everything a run page shows, for a run the caller has already decided the
+/// viewer may see — the fleet page by its gate, a namespace's by its scope.
+async fn render_run(
+    state: &AppState,
+    chrome: &pages::Chrome<'_>,
+    run: &crate::store::Run,
+    event_before: Option<i64>,
+) -> Result<maud::Markup, String> {
+    let run_id = run.id.as_str();
+    let jobs = state.store.jobs_of(run_id).await.map_err(|e| e.to_string())?;
+    let artifacts = state.store.artifacts_of(run_id).await.unwrap_or_default();
+
+    // The VM log is the step recorded at index -2 by the executor. Read
+    // from the same place as any other step log, so a swept run shows
+    // the row with the bytes gone rather than vanishing from the page.
+    let mut vm_logs = Vec::new();
+    for job in &jobs {
+        let steps = state.store.steps_of(&job.id).await.map_err(|e| e.to_string())?;
+        if let Some(step) = steps.iter().find(|s| s.idx == VM_LOG_STEP_IDX) {
+            let log = state.store.read_log(step).await.map_err(|e| e.to_string())?;
+            vm_logs.push((job.display.clone(), log));
+        }
+    }
+
+    let reruns = state.store.reruns_of(run_id).await.unwrap_or_default();
+    let release = crate::release::get(&state.store, run_id)
+        .await
+        .map_err(|e| format!("could not load release: {e}"))?;
+    let deployments = state
+        .store
+        .service_deployments_of(run_id)
+        .await
+        .map_err(|e| format!("could not load deployments: {e}"))?;
+    let mut events = state
+        .store
+        .run_events(run_id, event_before, RUN_EVENT_PAGE_SIZE + 1)
+        .await
+        .map_err(|e| format!("could not load event timeline: {e}"))?;
+    let events_have_more = events.len() as i64 > RUN_EVENT_PAGE_SIZE;
+    if events_have_more {
+        events.pop();
+    }
+    Ok(pages::run_page_with_deployments(
+        chrome,
+        run,
+        &reruns,
+        &jobs,
+        &artifacts,
+        &vm_logs,
+        release.as_ref(),
+        &deployments,
+        &events,
+        event_before,
+        events_have_more,
+        state.config.log_retention.map(|d| d.as_secs() / 86_400),
+    ))
 }
 
 /// `POST /runs/{id}/cancel` — stop a run.
@@ -967,26 +1000,35 @@ async fn job_page(
     let Ok(Some(run)) = state.store.get_run(&run_id).await else {
         return not_found(&state, &headers, who.as_ref(), &format!("No run {run_id}."));
     };
-    let jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
-    let Some(job) = jobs.into_iter().find(|j| j.job_key == job_key) else {
-        return not_found(
+    match render_job(&state, &chrome(&state, &headers, who.as_ref()), &run, &job_key).await {
+        Ok(Some(page)) => page.into_response(),
+        Ok(None) => not_found(
             &state,
             &headers,
             who.as_ref(),
             &format!("Run {run_id} has no job {job_key}."),
-        );
+        ),
+        Err(e) => page_error(&state, &headers, who.as_ref(), &e),
+    }
+}
+
+/// One job's page, for a run the caller has already decided the viewer may
+/// see. `None` when the run has no such job.
+async fn render_job(
+    state: &AppState,
+    chrome: &pages::Chrome<'_>,
+    run: &crate::store::Run,
+    job_key: &str,
+) -> Result<Option<maud::Markup>, String> {
+    let jobs = state.store.jobs_of(&run.id).await.unwrap_or_default();
+    let Some(job) = jobs.into_iter().find(|j| j.job_key == job_key) else {
+        return Ok(None);
     };
 
     let mut steps = Vec::new();
-    let stored_steps = match state.store.steps_of(&job.id).await {
-        Ok(steps) => steps,
-        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
-    };
+    let stored_steps = state.store.steps_of(&job.id).await.map_err(|e| e.to_string())?;
     for step in stored_steps {
-        let log = match state.store.read_log(&step).await {
-            Ok(log) => log.unwrap_or_default(),
-            Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
-        };
+        let log = state.store.read_log(&step).await.map_err(|e| e.to_string())?.unwrap_or_default();
         steps.push((step, log));
     }
 
@@ -997,39 +1039,37 @@ async fn job_page(
         job.status.as_str(),
         "success" | "failure" | "skipped" | "cancelled"
     ))
-    .then(|| stream::mint(&state.config, &run_id, &job_key));
+    .then(|| stream::mint(&state.config, &run.id, job_key));
 
-    pages::job_page(
-        &chrome(&state, &headers, who.as_ref()),
-        &run,
-        &job,
-        &steps,
-        token.as_deref(),
-    )
-    .into_response()
+    Ok(Some(pages::job_page(chrome, run, &job, &steps, token.as_deref())))
 }
 
 async fn workflows_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let who = who_of(&headers);
-    match state.store.recent_runs(500, None).await {
-        Ok(runs) => {
-            // Newest first already, so the first sighting of an id is its most
-            // recent run.
-            let mut seen: Vec<(String, Option<crate::store::Run>)> = Vec::new();
-            for r in runs {
-                if !seen.iter().any(|(id, _)| *id == r.workflow_id) {
-                    seen.push((r.workflow_id.clone(), Some(r)));
-                }
-            }
-            pages::workflows_page(
-                &chrome(&state, &headers, who.as_ref()),
-                &seen,
-                &state.config.default_workflow_path,
-            )
-            .into_response()
-        }
+    // The fleet's workflows only. A namespace names its own, and a tenant
+    // repository called `deploy` is not the fleet's deploy workflow.
+    match state.store.recent_runs_in("", 500, None).await {
+        Ok(runs) => pages::workflows_page(
+            &chrome(&state, &headers, who.as_ref()),
+            &latest_per_workflow(runs),
+            &state.config.default_workflow_path,
+        )
+        .into_response(),
         Err(e) => page_error(&state, &headers, who.as_ref(), &e.to_string()),
     }
+}
+
+/// Each workflow id once, with its most recent run.
+fn latest_per_workflow(runs: Vec<crate::store::Run>) -> Vec<(String, Option<crate::store::Run>)> {
+    // Newest first already, so the first sighting of an id is its most
+    // recent run.
+    let mut seen: Vec<(String, Option<crate::store::Run>)> = Vec::new();
+    for r in runs {
+        if !seen.iter().any(|(id, _)| *id == r.workflow_id) {
+            seen.push((r.workflow_id.clone(), Some(r)));
+        }
+    }
+    seen
 }
 
 // ---- registered repositories --------------------------------------------
@@ -1570,7 +1610,12 @@ async fn log_stream(
         )
             .into_response();
     }
+    tail_job(state, run_id, job_key)
+}
 
+/// The SSE tail itself, once a caller has decided the job may be read: the
+/// fleet route by its run-scoped token, a namespace's by its namespace.
+fn tail_job(state: AppState, run_id: String, job_key: String) -> axum::response::Response {
     let stream = async_stream::stream! {
         // Byte offsets already sent, per step index. A step's log only ever
         // grows, so an offset is all the state a tail needs.
@@ -2005,6 +2050,13 @@ mod tests {
     }
 
     async fn test_router_with_config(config: Arc<Config>) -> Router {
+        let tenants = Arc::new(crate::tenants::Tenants::new(&config));
+        test_router_with(config, tenants).await.0
+    }
+
+    /// [`test_router_with_config`] with a chosen install list, and the store
+    /// behind it so a test can seed rows.
+    async fn test_router_with(config: Arc<Config>, tenants: Arc<crate::tenants::Tenants>) -> (Router, Store) {
         let url = std::env::var("CI_TEST_DATABASE_URL").expect("CI_TEST_DATABASE_URL");
         let dir = std::env::temp_dir().join(format!("ci-web-logs-{}", crate::vm::new_id()));
         let store = Store::connect(&url, dir, std::time::Duration::from_secs(30))
@@ -2033,9 +2085,9 @@ mod tests {
             secrets: crate::secrets::Secrets::new(&config),
             artifacts: Arc::from(crate::artifacts::sink_for(&config).expect("disk sink")),
             objects: Arc::new(crate::objects::Workflows::new(&config)),
-            tenants: Arc::new(crate::tenants::Tenants::new(&config)),
+            tenants,
         });
-        router(config, runners, store, dispatcher)
+        (router(config, runners, store.clone(), dispatcher), store)
     }
 
     #[tokio::test]
@@ -2473,5 +2525,182 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("A clone URL is required"), "{html}");
+    }
+
+    /// The namespace routes end to end against a real store: the bearer, the
+    /// install list, scoping of every id by namespace, admin-only writes, and
+    /// where a write sends the browser afterwards.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL and CI_NATS_URL"]
+    async fn namespace_routes_are_gated_installed_and_scoped() {
+        const PLUGIN: &str = "plugin-token-for-tests-0123";
+        const BASE: &str = "/namespaces/team-a/plugins/ci";
+        let mut config = Arc::try_unwrap(test_config()).unwrap();
+        config.plugin_api_token = Some(PLUGIN.into());
+        let config = Arc::new(config);
+        let tenants = Arc::new(crate::tenants::Tenants::fixed(
+            crate::tenants::TenantSet {
+                enabled: true,
+                installed_in: vec!["team-a".into(), "team-b".into()],
+                tenant_network: Some("tenants".into()),
+                ..Default::default()
+            },
+            true,
+        ));
+        let (app, store) = test_router_with(config.clone(), tenants).await;
+
+        let url = format!("https://example.test/{}.git", crate::vm::new_id());
+        let a = store.register_repo_in("team-a", &url, "a", None, None, None).await.unwrap();
+        let b = store.register_repo_in("team-b", &url, "b", None, None, None).await.unwrap();
+        let (b_token, _) = store.create_repo_token(&b.id, "b", None).await.unwrap();
+        let plan = crate::plan::Plan::build(
+            &crate::workflow::Workflow::parse("wf.yml", "jobs:\n  build:\n    steps: [{run: x}]\n").unwrap(),
+        )
+        .unwrap();
+        let (a_run, b_run) = (crate::vm::new_id(), crate::vm::new_id());
+        for (run, repo, ns) in [(&a_run, &a, "team-a"), (&b_run, &b, "team-b")] {
+            store
+                .create_run(
+                    run,
+                    &crate::store::RunRequest {
+                        repo_id: Some(repo.id.clone()),
+                        repo_url: url.clone(),
+                        namespace: ns.into(),
+                        ..Default::default()
+                    },
+                    &plan,
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn send(app: &Router, method: &str, uri: &str, extra: &[(&str, &str)], body: &str) -> axum::response::Response {
+            let mut req = Request::builder().method(method).uri(uri);
+            for (k, v) in extra {
+                req = req.header(*k, *v);
+            }
+            if method == "POST" {
+                req = req.header("content-type", "application/x-www-form-urlencoded");
+            }
+            app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap()
+        }
+        let bearer = format!("Bearer {PLUGIN}");
+        let viewer: Vec<(&str, &str)> = vec![("authorization", &bearer), ("x-heyo-base", BASE), ("x-heyo-actor", "user:1")];
+        let mut admin = viewer.clone();
+        admin.push(("x-heyo-actor-admin", "true"));
+
+        // No bearer: 401 everywhere, installed or not.
+        for uri in ["/ns/team-a/", &format!("/ns/team-a/runs/{a_run}"), "/ns/team-c/"] {
+            assert_eq!(send(&app, "GET", uri, &[], "").await.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        // Not installed: 404.
+        assert_eq!(send(&app, "GET", "/ns/team-c/", &viewer, "").await.status(), StatusCode::NOT_FOUND);
+
+        // Its own run renders, with links under the base.
+        let res = send(&app, "GET", &format!("/ns/team-a/runs/{a_run}"), &viewer, "").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(res.into_body(), 1 << 22).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains(&format!("{BASE}/ui/runs/{a_run}/jobs/build")), "{html}");
+
+        // Another namespace's ids are 404 on every route.
+        for uri in [
+            format!("/ns/team-a/runs/{b_run}"),
+            format!("/ns/team-a/runs/{b_run}/jobs/build"),
+            format!("/ns/team-a/api/runs/{b_run}"),
+            format!("/ns/team-a/api/runs/{b_run}/logs"),
+            format!("/ns/team-a/api/stream/{b_run}/build?token={}", stream::mint(&config, &b_run, "build")),
+        ] {
+            assert_eq!(send(&app, "GET", &uri, &viewer, "").await.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        for uri in [
+            format!("/ns/team-a/repos/{}/tokens/{}/revoke", b.id, b_token.id),
+            format!("/ns/team-a/repos/{}/tokens", b.id),
+            format!("/ns/team-a/repos/{}/delete", b.id),
+            format!("/ns/team-a/runs/{b_run}/cancel"),
+        ] {
+            assert_eq!(send(&app, "POST", &uri, &admin, "").await.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        // team-b's token under team-a's repository id is not revoked either.
+        let res = send(&app, "POST", &format!("/ns/team-a/repos/{}/tokens/{}/revoke", a.id, b_token.id), &admin, "").await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert!(store.repo_tokens(&b.id).await.unwrap()[0].is_active());
+
+        // The API lists only this namespace.
+        let res = send(&app, "GET", "/ns/team-a/api/runs", &viewer, "").await;
+        let body: serde_json::Value = serde_json::from_slice(&to_bytes(res.into_body(), 1 << 22).await.unwrap()).unwrap();
+        let ids: Vec<&str> = body["runs"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(ids.contains(&a_run.as_str()) && !ids.contains(&b_run.as_str()), "{body}");
+
+        // Writes need the admin header, and land under the base.
+        let form = format!("url={}&name=x", urlencode_form(&format!("{url}-2")));
+        assert_eq!(send(&app, "POST", "/ns/team-a/repos", &viewer, &form).await.status(), StatusCode::FORBIDDEN);
+        let res = send(&app, "POST", "/ns/team-a/repos", &admin, &form).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let location = res.headers()["location"].to_str().unwrap().to_string();
+        assert!(location.starts_with(&format!("{BASE}/ui/repos")), "{location}");
+        let registered = store.repos_in("team-a").await.unwrap();
+        assert!(registered.iter().any(|r| r.name == "x"));
+        assert!(store.repos().await.unwrap().iter().all(|r| r.name != "x"), "not a fleet registration");
+
+        // A bogus base falls back to the native paths.
+        let mut bogus = admin.clone();
+        bogus[1] = ("x-heyo-base", "/namespaces/team-b/plugins/ci");
+        let res = send(&app, "GET", "/ns/team-a/", &bogus, "").await;
+        let html = String::from_utf8(to_bytes(res.into_body(), 1 << 22).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("href=\"/ns/team-a/repos\"") && !html.contains("/namespaces/team-b"), "{html}");
+
+        // A namespace token submitting while its namespace is not installed is
+        // refused before anything is unpacked.
+        let c = store.register_repo_in("team-c", &url, "c", None, None, None).await.unwrap();
+        let (_, c_token) = store.create_repo_token(&c.id, "c", None).await.unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/submit")
+                    .header("authorization", format!("Bearer {c_token}"))
+                    .body(Body::from(r#"{"source":{"format":"git-patch","contentBase64":""}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let text = String::from_utf8(to_bytes(res.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert!(text.contains("has not installed ci"), "{text}");
+
+        for r in store.repos_in("team-a").await.unwrap() {
+            store.delete_repo(&r.id).await.unwrap();
+        }
+        store.delete_repo(&b.id).await.unwrap();
+        store.delete_repo(&c.id).await.unwrap();
+    }
+
+    fn urlencode_form(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    /// Without CI_PLUGIN_API_TOKEN the namespace routes do not exist at all.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL and CI_NATS_URL"]
+    async fn namespace_routes_are_absent_without_the_plugin_token() {
+        let app = test_router().await;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ns/team-a/")
+                    .header("authorization", "Bearer anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }
