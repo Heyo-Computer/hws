@@ -288,6 +288,7 @@ pub async fn adopt_retained_deployment(headers: HeaderMap, State(state):State<Ap
         let r = request();
         mode.store(2, Ordering::SeqCst);
         assert!(register(&state, &r).await.is_err());
+        service_deploy::wait_for_test_lifecycle_rollback(database,"ci").await?;
         assert!(ensure_managed(database, "ci").await.is_ok());
         mode.store(0, Ordering::SeqCst); reads.store(0, Ordering::SeqCst);
         assert!(register(&state, &r).await?);
@@ -314,14 +315,16 @@ pub async fn adopt_retained_deployment(headers: HeaderMap, State(state):State<Ap
         let (status, body) = service_deploy::deploy_service(headers, State(state.clone()), Json(spec)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{}", body.0);
         assert!(body.0["error"].as_str().unwrap().contains("retained-workspace"));
+        service_deploy::wait_for_test_lifecycle_rollback(database,"ci").await?;
         for table in ["service_deployment_states", "service_discovery_sets", "service_deployment_runs"] {
             assert!(database.query_one(Statement::from_string(DbBackend::Postgres,
                 format!("SELECT 1 FROM {table} WHERE service_id='ci'"))).await?.is_none());
         }
         let mut changed = r.clone(); changed.binary_sha256 = "d".repeat(64);
         assert!(register(&state, &changed).await.is_err());
-        super::super::application_update::test_durable_updates(&state).await?;
-        super::super::application_update::test_regional_updates(&state).await?;
+        service_deploy::wait_for_test_lifecycle_rollback(database,"ci").await?;
+        super::super::application_update::test_durable_updates(&state).await.context("legacy application update scenario")?;
+        super::super::application_update::test_regional_updates(&state).await.context("regional application update scenario")?;
         task.abort();
         Ok(())
     }

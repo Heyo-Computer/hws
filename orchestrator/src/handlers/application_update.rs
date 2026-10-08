@@ -631,7 +631,9 @@ pub(super) async fn test_durable_updates(state: &AppState) -> Result<()> {
     let changed = UpdateRequest { operation_id:r.operation_id.clone(),intent_hash:"changed".into() };
     assert!(accept(&binding,&changed,"test-admin").await.is_err());
     let competing = UpdateRequest { operation_id:"app-update-2".into(),intent_hash:r.intent_hash.clone() };
-    assert!(accept(&binding,&competing,"test-admin").await.is_err());
+    let error = accept(&binding,&competing,"test-admin").await.unwrap_err();
+    assert!(format!("{error:#}").contains("application_updates_active"), "{error:#}");
+    service_deploy::wait_for_test_lifecycle_rollback(db::get_db()?,"ci").await?;
     assert!(reconcile(&state,"ci",&r.operation_id,&r.intent_hash).await.is_err());
     reconcile(&state.clone(),"ci",&r.operation_id,&r.intent_hash).await?;
     assert_eq!(activations.load(Ordering::SeqCst),1);
@@ -758,10 +760,19 @@ pub(super) async fn test_regional_updates(state: &AppState) -> Result<()> {
     reconcile_regional(&state,"ci","regional-main").await?;
     assert_eq!(status_value(database,"ci","regional-main").await?["status"],"passed");
     let mut altered=request.clone(); altered.release.binary_sha256="d".repeat(64);
-    assert!(accept_regional(&state,"ci",&altered).await.is_err(),"altered immutable replay was accepted");
+    let error = accept_regional(&state,"ci",&altered).await.unwrap_err();
+    assert_eq!(error.to_string(),"regional application update changed on replay");
+    service_deploy::wait_for_test_lifecycle_rollback(database,"ci").await?;
 
     let mut cancelled=request; cancelled.operation_id="regional-cancelled".into();
-    accept_regional(&state,"ci",&cancelled).await?;
+    let held = service_deploy::try_service_lifecycle_lock(database,"ci").await?.unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2),
+        accept_regional(&state,"ci",&cancelled)).await?.unwrap_err();
+    assert_eq!(error.to_string(),"application lifecycle is busy");
+    assert!(database.query_one(Statement::from_string(DbBackend::Postgres,
+        "SELECT 1 FROM regional_application_updates WHERE operation_id='regional-cancelled'")).await?.is_none());
+    held.rollback().await?;
+    accept_regional(&state,"ci",&cancelled).await.context("accept cancellation scenario after rollback")?;
     database.execute(Statement::from_string(DbBackend::Postgres,"UPDATE regional_application_updates SET stop_requested=true,status='cancelling' WHERE operation_id='regional-cancelled'")).await?;
     reconcile_regional(&state,"ci","regional-cancelled").await?;
     reconcile_regional(&state,"ci","regional-cancelled").await?;

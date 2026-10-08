@@ -45,7 +45,14 @@ jobs:
           cargo test --locked
           ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/postgres cargo test --locked --bin orchestrator concurrent_step_claim_creates_one_running_attempt_postgres -- --ignored
           ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/postgres cargo test --locked --bin orchestrator regional_rollout_postgres_restart_drain_and_rollback -- --ignored
-          ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/postgres cargo test --locked --bin orchestrator adoption_postgres_atomic_replay_drift_and_owner_guard -- --ignored
+          # Exercise asynchronous rollback cleanup repeatedly, without carrying
+          # rows across attempts or shrinking the production connection pool.
+          for attempt in 1 2 3; do
+            database="adoption_lifecycle_${attempt}"
+            runuser -u postgres -- createdb "$database"
+            ORCHESTRATOR_TEST_DATABASE_URL="postgres://postgres:disposable-test-password@127.0.0.1/$database" cargo test --locked --bin orchestrator adoption_postgres_atomic_replay_drift_and_owner_guard -- --ignored
+            runuser -u postgres -- dropdb "$database"
+          done
           cargo build --release --locked --bin orchestrator
           mkdir -p /workspace/dist
           cp "$CARGO_TARGET_DIR/release/orchestrator" /workspace/dist/orchestrator

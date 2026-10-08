@@ -2512,6 +2512,21 @@ pub(super) async fn try_service_lifecycle_lock(
     Ok(Some(transaction))
 }
 
+#[cfg(test)]
+pub(super) async fn wait_for_test_lifecycle_rollback(db: &DatabaseConnection, service_id: &str) -> Result<()> {
+    // Transaction drop queues rollback. Another pooled connection can observe
+    // its lock until that rollback completes; do not retry the tested mutation.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(transaction) = try_service_lifecycle_lock(db, service_id).await? {
+                transaction.rollback().await?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.context("test lifecycle rollback did not release its lock")?
+}
+
 async fn reconcile_pending_service_retirements(state: &AppState) -> Result<()> {
     let db = db::get_db()?;
     for retirement in list_pending_service_retirements(db).await? {
