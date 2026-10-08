@@ -331,6 +331,17 @@ pub struct Config {
     /// repository, cannot say which repository is submitting, and a leaked copy
     /// is a leak of the whole system.
     pub require_repo_token: bool,
+    /// The bearer app-lb's `ci` plugin proxy presents on every `/ns/{ns}/`
+    /// request. Unset means the namespace routes are not mounted at all: the
+    /// actor headers on them are trustworthy only behind this check, so there
+    /// is no configuration in which they are served without it.
+    pub plugin_api_token: Option<String>,
+    /// Whether namespace activity needs the namespace in app-lb's
+    /// `installed_in` list. On by default, which is what makes an uninstall
+    /// stop a namespace's pages and submits within one poll. Off treats every
+    /// namespace as installed while the plugin is enabled — for an app-lb that
+    /// installs implicitly, or a development loop with one namespace.
+    pub require_install: bool,
     /// Dedicated bearer for native runner machine routes. Never inferred from
     /// app-lb forwarded identity or the submit credential.
     pub native_runner_secret: Option<String>,
@@ -672,6 +683,8 @@ impl Config {
             host_heyvm_bootstrap_targets: opt("CI_HOST_HEYVM_BOOTSTRAP_TARGETS"),
             webhook_secret,
             require_repo_token: flag("CI_REQUIRE_REPO_TOKEN", false)?,
+            plugin_api_token: opt("CI_PLUGIN_API_TOKEN"),
+            require_install: flag("CI_REQUIRE_INSTALL", true)?,
             native_runner_secret: opt("CI_NATIVE_RUNNER_SECRET"),
             default_workflow_path: opt("CI_WORKFLOW_PATH")
                 .unwrap_or_else(|| ".ci/workflows/*.yml".to_string()),

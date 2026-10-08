@@ -760,6 +760,7 @@ mod tests {
             vms: Arc::new(crate::vm::Vms::new()), secrets: crate::secrets::Secrets::unconfigured(),
             artifacts: Arc::from(crate::artifacts::sink_for(&config).unwrap()),
             objects: Arc::new(crate::objects::Workflows::new(&config)),
+            tenants: Arc::new(crate::tenants::Tenants::new(&config)),
         }
     }
 

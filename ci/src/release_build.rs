@@ -381,6 +381,10 @@ async fn persist(
                 source: "release-build".into(),
                 actor_subject: Some(actor.into()),
                 changes: source.changes.clone(),
+                // Always the fleet: a release build is admitted from an
+                // operator policy on the fleet API, never from a namespace,
+                // and its secrets are read under the fleet prefix above.
+                namespace: String::new(),
                 ..Default::default()
             };
             Store::create_run_in(&mut tx, &run, &request, plan).await?;

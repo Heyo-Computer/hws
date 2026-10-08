@@ -167,7 +167,7 @@ app-obs is one collector per region, shared by every tenant. Tenants reach it th
 
 1. The operator enables the fleet plugin on app-lb, giving it this collector's API URL and a secret reference to `APP_OBS_API_TOKEN`.
 2. A namespace admin installs it in their namespace: `heyctl plugins install obs -n <ns>`.
-3. Anyone who can read that namespace opens `/namespaces/<ns>/plugins/obs/` on app-lb. It is this dashboard, narrowed to the namespace. The hosted MCP server's telemetry tools use the same API.
+3. Anyone who can read that namespace opens `/namespaces/<ns>/plugin-console/obs` on app-lb, which frames this dashboard, narrowed to the namespace, under app-lb's navigation. The page itself is `/namespaces/<ns>/plugins/obs/ui`. The hosted MCP server's telemetry tools use the same API.
 
 app-lb checks the caller's namespace access and forwards to app-obs's `/ns/<ns>/…` routes with the service token. The tenant's own credential never reaches app-obs.
 

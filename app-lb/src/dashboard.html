@@ -3185,40 +3185,47 @@ async function applyNamespaceTier() {
     ? "Namespace " + pinnedNamespace + " · " + (tier === "admin" ? "admin" : "read-only") + " access"
     : "This session cannot reach namespace " + pinnedNamespace + ".";
   banner.hidden = false;
-  if (tier) renderObsLink(tier);
+  if (tier) renderPluginLinks(tier);
 }
 
-// The obs plugin, when the operator has switched it on: a link to this
-// namespace's telemetry once installed, an Install button for an admin
-// before that. Nothing at all while it is off on this host.
-async function renderObsLink(tier) {
+// The namespace's plugins, for whichever the operator has switched on: a
+// link to each installed one's dashboard, an Install button for an admin
+// before that, and the namespace's plugin page. Nothing at all when this
+// host offers namespaces no plugins.
+async function renderPluginLinks(tier) {
   const ns = encodeURIComponent(pinnedNamespace);
-  const res = await api("GET", "namespaces/" + ns + "/plugins/obs").catch(() => ({ ok: false }));
-  if (!res.ok || !res.data || !res.data.enabled) return;
+  const res = await api("GET", "namespaces/" + ns + "/plugins").catch(() => ({ ok: false }));
+  if (!res.ok || !Array.isArray(res.data) || !res.data.some(p => p.enabled)) return;
   const banner = $("ns-banner");
-  const old = banner.querySelector("[data-obs]");
-  if (old) old.remove();
-  if (res.data.installed) {
-    const a = document.createElement("a");
-    a.dataset.obs = "";
-    a.href = "namespaces/" + ns + "/plugins/obs/ui";
-    a.textContent = "Observability →";
-    banner.appendChild(a);
-  } else if (tier === "admin") {
-    const b = document.createElement("button");
-    b.dataset.obs = "";
-    b.className = "btn mini";
-    b.style.marginLeft = ".5em";
-    b.textContent = "Install observability";
-    b.title = "Collect logs and metrics for every app in this namespace";
-    b.addEventListener("click", async () => {
-      const put = await api("PUT", "namespaces/" + ns + "/plugins/obs", {});
-      if (!put.ok) return toast(errMsg(put), true);
-      toast("observability installed in " + pinnedNamespace);
-      renderObsLink(tier);
-    });
-    banner.appendChild(b);
+  banner.querySelectorAll("[data-plugin]").forEach(el => el.remove());
+  for (const p of res.data.filter(p => p.enabled && p.dashboard)) {
+    if (p.installed) {
+      const a = document.createElement("a");
+      a.dataset.plugin = p.id;
+      a.href = "namespaces/" + ns + "/plugin-console/" + encodeURIComponent(p.id);
+      a.textContent = p.name + " →";
+      banner.appendChild(a);
+    } else if (tier === "admin") {
+      const b = document.createElement("button");
+      b.dataset.plugin = p.id;
+      b.className = "btn mini";
+      b.style.marginLeft = ".5em";
+      b.textContent = "Install " + p.name.toLowerCase();
+      b.title = p.description;
+      b.addEventListener("click", async () => {
+        const put = await api("PUT", "namespaces/" + ns + "/plugins/" + encodeURIComponent(p.id), {});
+        if (!put.ok) return toast(errMsg(put), true);
+        toast(p.name.toLowerCase() + " installed in " + pinnedNamespace);
+        renderPluginLinks(tier);
+      });
+      banner.appendChild(b);
+    }
   }
+  const all = document.createElement("a");
+  all.dataset.plugin = "";
+  all.href = "namespaces/" + ns + "/plugin-console";
+  all.textContent = "Plugins";
+  banner.appendChild(all);
 }
 
 applyNamespaceTier();

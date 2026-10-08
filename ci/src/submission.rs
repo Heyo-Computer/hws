@@ -128,6 +128,11 @@ pub async fn is_member(store: &Store, run_id: &str) -> Result<bool, String> {
 }
 
 pub async fn authorize_publication(store: &Store, run_id: &str) -> Result<(), String> {
+    // Every merge, publish, deploy, rollout and host-maintenance flow passes
+    // through here first, so this is the one place a namespace run is refused
+    // all of them. The submit-time tenant policy already refuses the actions;
+    // this holds even for a plan that reached the queue some other way.
+    crate::tenancy::refuse_tenant_run(store, run_id).await?;
     let blocked: bool = sqlx::query_scalar(
         "SELECT validation_only OR EXISTS(SELECT 1 FROM ci_submission_validation WHERE validation_run_id=$1)
          FROM ci_run WHERE id=$1",

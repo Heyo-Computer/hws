@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{APP_NAME}} · {{NAMESPACE}} plugins</title>
+<!-- Read by the script rather than spliced into it: the server fills these
+     escaped for HTML, which is not the same as escaped for JavaScript. -->
+<meta name="plugin-namespace" content="{{NAMESPACE}}">
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
+<style>
+  /* Same aliases as plugins.html; copied because each page is
+     `include_str!`d and there is no build step to share them through. */
+  :root {
+    --plane: var(--bg-dark);
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+    --success-text: var(--success);
+  }
+  * { box-sizing: border-box; }
+  body { padding: 28px 24px 72px; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .lede { color: var(--text-2); margin: 0 0 22px; }
+  .banner { font-size: 13px; color: var(--text-2); margin: 0 0 14px; }
+  .banner a { margin-left: .5em; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 0; padding: 16px 18px; margin-bottom: 12px;
+  }
+  .plugin-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .plugin-head h2 { font-size: 15px; font-weight: 650; margin: 0; }
+  .plugin-head .spacer { margin-left: auto; }
+  .desc { color: var(--text-2); font-size: 13px; margin: 6px 0 0; }
+  .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  a.act, button.act {
+    font: inherit; font-size: 12.5px; padding: 5px 11px; border-radius: 0; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    text-decoration: none; display: inline-block;
+  }
+  a.act:hover, button.act:hover { border-color: var(--accent); }
+  a.act.primary { border-color: var(--accent); color: var(--accent); }
+  button.act.danger { color: var(--critical); }
+  button.act.danger:hover { border-color: var(--critical); }
+  button.act:disabled { opacity: .5; cursor: not-allowed; }
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 0; flex: none; white-space: nowrap; }
+  .tag.on  { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.off { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
+  .empty { color: var(--text-2); padding: 20px 0; text-align: center; }
+  .flash {
+    position: sticky; top: 0; z-index: 5; margin: 0 0 14px;
+    padding: 10px 14px; border-radius: 0; font-size: 13px; display: none;
+  }
+  .flash.on { display: block; }
+  .flash.ok { background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--success-text); }
+  .flash.bad { background: color-mix(in srgb, var(--critical) 14%, var(--surface)); color: var(--critical); }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="topbar">
+    <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
+    <nav class="topbar-nav">
+      <a href="/">Directory</a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/siem">Security</a>
+      <a href="/storage" data-fleet-only>Disks</a>
+      <a href="/plugins" data-fleet-only>Plugins</a>
+      <a href="/network">Network</a>
+      <a href="/metrics">Metrics</a>
+    </nav>
+    <div class="topbar-right">
+      <span class="topbar-user">{{WHO}}</span>
+      <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+    </div>
+  </header>
+  <p class="banner" id="banner">Namespace <strong>{{NAMESPACE}}</strong>
+    <a href="/dashboard?namespace={{NAMESPACE}}">Dashboard</a></p>
+  <p class="lede">Plugins this host offers namespaces. The operator switches each one on for the
+    host; installing it here, or removing it, needs admin access to the namespace.</p>
+
+  <div class="flash" id="flash"></div>
+  <div id="plugins"><div class="empty">Loading…</div></div>
+</div>
+
+<script>
+"use strict";
+
+const NS = document.querySelector('meta[name="plugin-namespace"]').content;
+const nsPath = "/namespaces/" + encodeURIComponent(NS);
+let tier = "none";
+
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const $ = id => document.getElementById(id);
+
+async function api(method, path, body) {
+  const opts = { method, headers: { accept: "application/json" } };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const r = await fetch(path, opts);
+    const text = await r.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { message: text }; }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+function flash(kind, message) {
+  const el = $("flash");
+  el.className = "flash on " + kind;
+  el.textContent = message;
+  if (flash.timer) clearTimeout(flash.timer);
+  flash.timer = setTimeout(() => { el.className = "flash"; }, 12000);
+}
+
+function failure(r, what) {
+  const d = r.data || {};
+  if (r.status === 401 || r.status === 403)
+    return `${what} needs admin access to namespace ${NS}.`;
+  return `${what} failed: ${d.error || d.message || ("HTTP " + r.status)}`;
+}
+
+// The caller's tier here, from /whoami: a view grant sees the list without
+// the buttons it would only be refused at, and the fleet-only nav is hidden
+// from anyone without the fleet.
+async function loadTier() {
+  const who = await api("GET", "/whoami");
+  if (!who.ok) return;
+  tier = who.data.fleet ? "admin" : ((who.data.namespaces || {})[NS] || "none");
+  if (!who.data.fleet) document.querySelectorAll("[data-fleet-only]").forEach(a => a.hidden = true);
+}
+
+function card(p) {
+  const el = document.createElement("div");
+  el.className = "card";
+  const state = !p.enabled
+    ? `<span class="tag off">off on this host</span>`
+    : p.installed ? `<span class="tag on">installed</span>` : `<span class="tag off">not installed</span>`;
+  const open = p.enabled && p.installed && p.dashboard
+    ? `<a class="act primary" href="${nsPath}/plugin-console/${encodeURIComponent(p.id)}">Open dashboard</a>`
+    : "";
+  let control = "";
+  if (tier === "admin" && p.enabled && !p.installed)
+    control = `<button class="act" type="button" data-install>Install</button>`;
+  else if (tier === "admin" && p.installed)
+    control = `<button class="act danger" type="button" data-uninstall>Uninstall</button>`;
+  const by = p.installed && p.installed_at
+    ? `<p class="note">Installed ${esc(new Date(p.installed_at * 1000).toLocaleString())}${p.installed_by ? " by " + esc(p.installed_by) : ""}.</p>`
+    : "";
+  const off = !p.enabled
+    ? `<p class="note">The operator has not switched this plugin on for this host.</p>`
+    : "";
+  el.innerHTML = `
+    <div class="plugin-head">
+      <h2>${esc(p.name)}</h2>${state}
+      <span class="spacer"></span>${open}${control}
+    </div>
+    <p class="desc">${esc(p.description)}</p>${by}${off}`;
+  const install = el.querySelector("[data-install]");
+  if (install) install.addEventListener("click", async () => {
+    install.disabled = true;
+    const r = await api("PUT", `${nsPath}/plugins/${encodeURIComponent(p.id)}`, {});
+    if (!r.ok) { install.disabled = false; flash("bad", failure(r, "Installing")); return; }
+    flash("ok", `${p.name} installed in ${NS}.`);
+    load();
+  });
+  const uninstall = el.querySelector("[data-uninstall]");
+  if (uninstall) uninstall.addEventListener("click", async () => {
+    if (!confirm(`Uninstall ${p.name} from ${NS}?`)) return;
+    uninstall.disabled = true;
+    const r = await api("DELETE", `${nsPath}/plugins/${encodeURIComponent(p.id)}`);
+    if (!r.ok) { uninstall.disabled = false; flash("bad", failure(r, "Uninstalling")); return; }
+    flash("ok", `${p.name} uninstalled from ${NS}.`);
+    load();
+  });
+  return el;
+}
+
+async function load() {
+  const r = await api("GET", `${nsPath}/plugins`);
+  const root = $("plugins");
+  if (!r.ok) { root.innerHTML = `<div class="empty">${esc(failure(r, "Loading plugins"))}</div>`; return; }
+  root.innerHTML = r.data.length ? "" : `<div class="empty">This host offers namespaces no plugins.</div>`;
+  for (const p of r.data) root.appendChild(card(p));
+}
+
+loadTier().then(load);
+</script>
+</body>
+</html>
