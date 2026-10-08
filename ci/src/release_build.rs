@@ -1015,13 +1015,16 @@ mod tests {
         a.unwrap();
         b.unwrap();
         let catalog = crate::release_catalog::list(&store, None).await.unwrap();
-        assert_eq!(catalog.len(), 1);
+        assert!(catalog.is_empty(), "historical multi-service builds must not be deployable candidates");
+        let retained: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(b) FROM ci_release_bundle b")
+            .fetch_all(store.pool()).await.unwrap();
+        assert_eq!(retained.len(), 1, "concurrent completion must retain one historical record");
         assert_eq!(
-            catalog[0]["manifest"]["components"]["api"]["uri"],
+            retained[0]["manifest"]["components"]["api"]["uri"],
             format!("retained-{}", "d".repeat(64))
         );
-        assert_eq!(catalog[0]["manifest"]["retained"], true);
-        assert!(catalog[0]["publication_run_id"].is_null());
+        assert_eq!(retained[0]["manifest"]["retained"], true);
+        assert!(retained[0]["publication_run_id"].is_null());
         assert_eq!(
             existing(&store, "repo", "daily", None)
                 .await
