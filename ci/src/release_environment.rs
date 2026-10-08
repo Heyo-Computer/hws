@@ -330,19 +330,24 @@ async fn bundle(store: &Store, id: &str) -> Result<Value> {
 /// An admitted promotion is its own provenance, never a fabricated Git receipt.
 pub async fn bundle_for_run(store: &Store, run_id: &str) -> Result<Option<Value>> {
     let promotion =
-        sqlx::query("SELECT bundle_id,service FROM ci_release_service_promotion WHERE run_id=$1 UNION ALL SELECT bundle_id,'' AS service FROM ci_release_promotion WHERE run_id=$1")
+        sqlx::query("SELECT bundle_id,service FROM ci_release_service_promotion WHERE run_id=$1")
             .bind(run_id)
             .fetch_optional(store.pool())
             .await?;
     let Some(promotion) = promotion else {
+        let historical: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_release_promotion WHERE run_id=$1)",
+        )
+        .bind(run_id)
+        .fetch_one(store.pool())
+        .await?;
+        ensure!(!historical, "legacy bundled deployments are archived and cannot execute; select a service release");
         return Ok(None);
     };
     let id: String = promotion.get("bundle_id");
     let value = bundle(store, &id).await?;
     let service: &str = promotion.get("service");
-    if !service.is_empty() {
-        candidate_service(&value["manifest"], Some(service))?;
-    }
+    candidate_service(&value["manifest"], Some(service))?;
     let run = store
         .get_run(run_id)
         .await?
@@ -405,7 +410,7 @@ pub async fn admit(
     );
     ensure!(
         request.service.is_some(),
-        "service is required; unscoped legacy retries must use the original API"
+        "service is required; environment-wide deployments are no longer supported"
     );
     let _admission = d
         .executor
@@ -732,9 +737,8 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
             }
             services.push(view);
         }
-        let legacy = service_view(&d.store, &name, "").await?;
         environments.push(json!({"name":name,"mode":policy.mode,"repository":policy.repository,"requires":policy.requires,
-            "services":services,"legacy":legacy}));
+            "services":services}));
     }
     Ok(json!({"environments":environments}))
 }
@@ -2017,8 +2021,8 @@ mod tests {
             service_view(&store, "stage", "worker").await.unwrap()
         );
 
-        // Legacy provenance may contain multiple components; singleton checks
-        // are exclusively for newly admitted scoped runs.
+        // Historical manifests remain intact but cannot authorize execution,
+        // even if a caller retries an old run rather than admitting a new one.
         let mut historical_manifest =
             super::bundle(&store, "old").await.unwrap()["manifest"].clone();
         historical_manifest["build_id"] = json!("legacy-build");
@@ -2030,10 +2034,12 @@ mod tests {
             .bind(&historical_manifest)
             .bind(hex::encode(Sha256::digest(serde_json::to_vec(&historical_manifest).unwrap())))
             .execute(store.pool()).await.unwrap();
-        assert_eq!(
-            bundle_for_run(&store, "legacy-run").await.unwrap().unwrap()["manifest"],
-            historical_manifest
-        );
+        assert!(bundle_for_run(&store, "legacy-run").await.unwrap_err()
+            .to_string().contains("archived and cannot execute"));
+        assert_eq!(super::bundle(&store, "legacy-bundle").await.unwrap()["manifest"], historical_manifest);
+        let visible = crate::release_catalog::list(&store, None).await.unwrap();
+        assert!(visible.iter().any(|r| r["id"] == "old"));
+        assert!(!visible.iter().any(|r| r["id"] == "legacy-bundle"));
         let legacy_request = Request {
             environment: "legacy".into(),
             service: Some("api".into()),

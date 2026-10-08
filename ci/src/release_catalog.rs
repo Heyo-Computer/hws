@@ -1,4 +1,4 @@
-//! Immutable, explicitly selected bundles of validated build artifacts.
+//! Immutable service releases with explicitly selected, validated artifacts.
 //! Registration does not build, merge, deploy, or infer that every service was
 //! built. Daily full-revision builds and environment promotion consume this
 //! catalog separately; existing per-submit path filters are not full builds.
@@ -55,8 +55,8 @@ fn name_valid(name: &str) -> bool {
 fn validate(request: &Request) -> Result<()> {
     ensure!(name_valid(&request.name), "release name requires 1-128 ASCII letters, digits, '.', '_' or '-'");
     ensure!(!request.publication_run_id.is_empty(), "publication run is required");
-    ensure!(!request.components.is_empty() && request.components.len() <= 256,
-        "select between 1 and 256 components");
+    ensure!(request.components.len() == 1,
+        "select exactly one service; multi-service bundles are no longer supported");
     for (name, selection) in &request.components {
         ensure!(name_valid(name), "invalid component name");
         ensure!(!selection.workflow.trim().is_empty() && !selection.artifact.trim().is_empty()
@@ -123,7 +123,10 @@ pub async fn register(store: &Store, request: Request, actor: &str) -> Result<se
 pub async fn list(store: &Store, before: Option<&str>) -> Result<Vec<serde_json::Value>> {
     // The ID disambiguates releases with the same timestamp without offsets.
     Ok(sqlx::query_scalar("SELECT to_jsonb(b) FROM ci_release_bundle b
-        WHERE ($1::text IS NULL OR (created_at,id) <
+        WHERE (SELECT count(*) FROM jsonb_object_keys(
+            CASE WHEN jsonb_typeof(manifest->'components')='object'
+            THEN manifest->'components' ELSE '{}'::jsonb END))=1
+        AND ($1::text IS NULL OR (created_at,id) <
             (SELECT created_at,id FROM ci_release_bundle WHERE id=$1))
         ORDER BY created_at DESC,id DESC LIMIT 100")
         .bind(before).fetch_all(store.pool()).await?)
@@ -141,6 +144,10 @@ mod tests {
         request.components.insert("cloud".into(), Selection { workflow: ".ci/cloud.yml".into(),
             artifact: "cloud-linux".into(), job: "build-linux".into() });
         assert!(validate(&request).is_ok());
+        request.components.insert("auth".into(), Selection { workflow: ".ci/auth.yml".into(),
+            artifact: "auth-linux".into(), job: "build-linux".into() });
+        assert!(validate(&request).unwrap_err().to_string().contains("exactly one service"));
+        request.components.remove("auth");
         request.components.get_mut("cloud").unwrap().job.clear();
         assert!(validate(&request).is_err());
         assert!(serde_json::from_value::<Selection>(serde_json::json!({

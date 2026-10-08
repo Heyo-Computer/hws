@@ -13,6 +13,9 @@ const root = path.resolve(__dirname, '../..');
     const ci = {service:'ci',repository:'repo',mode:'automatic',requires:['stage-check'],configured:true,state:{current_bundle:'ci-current',previous_bundle:'ci-old',automation_held:true},history:[]};
     const retired = {service:'retired',repository:'repo',mode:'automatic',configured:false,recovery_required:true,recovery_bundle:'retired-new',state:{current_bundle:'retired-new',previous_bundle:'retired-new'},history:[{bundle_id:'retired-new',status:'success',run_id:'historical-run'}]};
     const stage = {name:'stage',repository:'legacy-repo',mode:'manual',requires:['legacy-check'],services:[ci,{service:'auth',repository:'another-repo',mode:'manual',requires:['auth-check'],configured:true,state:{},history:[]},{service:'cloud',state:{},history:[]},retired]};
+    // Older API responses must not restore environment-wide bundle controls or history.
+    stage.legacy = {state:{current_bundle:'legacy-bundle',previous_bundle:'legacy-old'},history:[{bundle_id:'legacy-bundle'}]};
+    releases.push({...candidate('legacy-bundle','ci'),manifest:{retained:true,components:{ci:{},auth:{}}}});
     const environments = [stage,{name:'production',repository:'repo',mode:'manual',requires:['stage'],services:[{service:'ci',state:{},history:[]}]},{name:'unconfigured',repository:'repo',mode:'manual',services:[]}];
     const builds = [{name:'auth-build',repository:'another-repo',status:'success',policy:{components:{auth:{}}}},{name:'wrong-repo-auth-build',repository:'repo',status:'success',policy:{components:{auth:{}}}}];
     let unavailable = false;
@@ -39,6 +42,7 @@ const root = path.resolve(__dirname, '../..');
     await page.goto('https://panel.test/releases'); await settled();
     assert.deepEqual(await page.locator('#candidate option').allTextContents(),['ci-new','ci-current','ci-old']);
     assert.equal(await page.locator('#catalog [data-release]').count(),3);
+    assert.equal(await page.locator('#history').innerText(),'No deployment recorded for this service.');
     assert.equal(await page.locator('#inventory').isVisible(),false);
     assert.deepEqual(await page.locator('#environment option').allTextContents(),['stage','production','unconfigured']);
     assert.match(await page.locator('#policy').innerText(),/automatic policy/);

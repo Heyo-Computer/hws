@@ -856,8 +856,8 @@ mod tests {
                     DELETE FROM ci_artifact WHERE id='artifact';
                     INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,status)
                     VALUES('daily','https://github.com/example/ci.git','daily','source','refs/heads/main','{}','test','ready');
-                    INSERT INTO ci_release_environment(name,repository)
-                    VALUES('stage','https://github.com/example/ci.git');")
+                    INSERT INTO ci_release_service_environment(name,service,repository)
+                    VALUES('stage','ci','https://github.com/example/ci.git');")
                     .execute(f.store.pool()).await.unwrap();
                 let manifest = json!({"version":2,"retained":true,"revision":"source",
                     "repository":"https://github.com/example/ci.git","components":{"ci":{
@@ -869,8 +869,8 @@ mod tests {
                 sqlx::query("INSERT INTO ci_release_bundle(id,repository,name,build_id,manifest,manifest_sha256,created_by)
                     VALUES('bundle','https://github.com/example/ci.git','daily','daily',$1,$2,'test')")
                     .bind(manifest).bind(hash).execute(f.store.pool()).await.unwrap();
-                sqlx::raw_sql("INSERT INTO ci_release_promotion(run_id,environment,request_id,bundle_id,automatic,policy)
-                    VALUES('run','stage','request','bundle',false,'{}');")
+                sqlx::raw_sql("INSERT INTO ci_release_service_promotion(run_id,environment,service,request_id,bundle_id,automatic,policy)
+                    VALUES('run','stage','ci','request','bundle',false,'{}');")
                     .execute(f.store.pool()).await.unwrap();
             }
             let workflow = retained.then_some("ci.yml");
