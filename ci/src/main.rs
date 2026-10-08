@@ -59,6 +59,8 @@ mod service_archive;
 mod service_rollout;
 mod store;
 mod submission;
+mod tenancy;
+mod tenants;
 mod trigger;
 mod vm;
 mod vm_cleanup;
@@ -203,6 +205,7 @@ async fn main() {
 
     let secrets_client = secrets::Secrets::new(&config);
     let objects = Arc::new(objects::Workflows::new(&config));
+    let tenants = Arc::new(tenants::Tenants::new(&config));
     let runners = Arc::new(Runners::new(config.clone()));
     // The first read of the pool is awaited so a network that does not exist is
     // reported now rather than by the first job. Which failures are fatal is the
@@ -374,6 +377,7 @@ async fn main() {
         secrets: secrets_client,
         artifacts,
         objects: objects.clone(),
+        tenants: tenants.clone(),
     });
 
     // One eager read so a misconfigured CI_APP_LB_URL is visible at startup
@@ -388,6 +392,13 @@ async fn main() {
         }
     }
     objects.clone().spawn_refresh_loop();
+    // The same eager read for the namespace install gate. A failure is a
+    // warning: until app-lb answers, no namespace is installed, which is the
+    // safe reading.
+    if let Err(e) = tenants.refresh().await {
+        tracing::warn!("could not read the ci plugin's installs at startup: {e}");
+    }
+    tenants.clone().spawn_refresh_loop();
 
     start_execution(dispatcher.clone()).await;
 

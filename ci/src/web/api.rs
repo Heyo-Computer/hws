@@ -563,7 +563,7 @@ async fn run_status(
     .into_response()
 }
 
-fn run_json(state: &AppState, run: &Run) -> serde_json::Value {
+pub(super) fn run_json(state: &AppState, run: &Run) -> serde_json::Value {
     let status = RunStatus::parse(&run.status);
     serde_json::json!({
         "id": run.id,
@@ -598,7 +598,7 @@ fn run_json(state: &AppState, run: &Run) -> serde_json::Value {
     })
 }
 
-fn job_json(job: &JobRow, steps: &[StepRow]) -> serde_json::Value {
+pub(super) fn job_json(job: &JobRow, steps: &[StepRow]) -> serde_json::Value {
     let status = JobStatus::parse(&job.status);
     serde_json::json!({
         "key": job.job_key,
@@ -651,7 +651,7 @@ fn step_name(step: &StepRow) -> String {
 // -- GET /api/runs/{run_id}/logs ---------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct LogQuery {
+pub(super) struct LogQuery {
     /// One job's logs rather than every job's. The `job_key`, as the status
     /// response spells it.
     job: Option<String>,
@@ -686,7 +686,13 @@ async fn run_logs(
         Ok(r) => r,
         Err(response) => return response,
     };
+    logs_of(&state, &run, &q).await
+}
 
+/// The logs answer for a run the caller may read, shared with the namespace
+/// API, which decides readability by namespace rather than by token.
+pub(super) async fn logs_of(state: &AppState, run: &Run, q: &LogQuery) -> axum::response::Response {
+    let run_id = run.id.as_str();
     let tail = q.tail.unwrap_or(DEFAULT_TAIL_BYTES).min(MAX_TAIL_BYTES);
     let failed_only = q.failed_only.unwrap_or(false);
 

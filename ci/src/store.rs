@@ -242,6 +242,10 @@ pub struct Run {
     /// The run this one re-plays, when it was started from the dashboard's
     /// "Run again" or "Re-run failed jobs" rather than by a submit.
     pub rerun_of: Option<String>,
+    /// The app-lb namespace this run belongs to; `""` is the fleet. Copied
+    /// from the registration at submit time rather than joined, so a run whose
+    /// registration is later deleted still knows whose it was.
+    pub namespace: String,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -279,6 +283,8 @@ impl Run {
             // Absent on a row read before migration 012 ran; "not a re-run" is
             // the right reading of that.
             rerun_of: r.try_get("rerun_of").ok().flatten(),
+            // Absent before migration 053, and every row from then is fleet.
+            namespace: r.try_get("namespace").unwrap_or_default(),
             created_at: r.get("created_at"),
             started_at: r.get("started_at"),
             finished_at: r.get("finished_at"),
@@ -427,11 +433,18 @@ pub struct Repo {
     /// installation default; a workflow's `uses:` still overrides it per job.
     pub network: Option<String>,
     pub enabled: bool,
+    /// The app-lb namespace that registered it; `""` is the fleet. A tenant
+    /// registration's submits are planned under [`crate::tenancy`].
+    pub namespace: String,
     pub created_email: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 impl Repo {
+    pub fn is_tenant(&self) -> bool {
+        !self.namespace.is_empty()
+    }
+
     fn from_row(r: &PgRow) -> Self {
         Self {
             id: r.get("id"),
@@ -441,6 +454,7 @@ impl Repo {
             workflow_path: r.get("workflow_path"),
             network: r.get("network"),
             enabled: r.get("enabled"),
+            namespace: r.try_get("namespace").unwrap_or_default(),
             created_email: r.get("created_email"),
             created_at: r.get("created_at"),
         }
@@ -504,6 +518,9 @@ pub struct RunRequest {
     pub source: String,
     /// The run this one re-plays, for a re-run started from the dashboard.
     pub rerun_of: Option<String>,
+    /// The namespace the run belongs to — the registration's, never the
+    /// payload's. `""` (the default) is the fleet.
+    pub namespace: String,
 }
 
 #[derive(Clone)]
@@ -996,8 +1013,9 @@ impl Store {
         sqlx::query(
             "INSERT INTO ci_run (id, workflow_id, workflow_path, workflow_name, repo_url,
                                  git_ref, sha, before_sha, actor_subject, actor_email,
-                                 source, status, repo_id, changes, rerun_of, default_branch, release_base_sha)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12,$13,$14,$15,$16)",
+                                 source, status, repo_id, changes, rerun_of, default_branch, release_base_sha,
+                                 namespace)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12,$13,$14,$15,$16,$17)",
         )
         .bind(run_id)
         .bind(&req.workflow_id)
@@ -1024,6 +1042,7 @@ impl Store {
         .bind(&req.rerun_of)
         .bind(&req.default_branch)
         .bind(&req.release_base_sha)
+        .bind(&req.namespace)
         .execute(&mut **tx)
         .await
         .map_err(StoreError::sql)?;
@@ -1128,6 +1147,14 @@ impl Store {
         Ok(row.as_ref().map(Run::from_row))
     }
 
+    /// [`Self::get_run`], answering only for a run in `namespace`.
+    ///
+    /// A run in another namespace is `None`, the same as one that never
+    /// existed: a tenant is not entitled to learn which ids are real.
+    pub async fn get_run_in(&self, namespace: &str, run_id: &str) -> Result<Option<Run>, StoreError> {
+        Ok(self.get_run(run_id).await?.filter(|r| r.namespace == namespace))
+    }
+
     /// Runs started from this one by the dashboard, oldest first — the other
     /// direction of `rerun_of`, so the original's page can point at what came
     /// after it.
@@ -1154,20 +1181,55 @@ impl Store {
         limit: i64,
         repo_id: Option<&str>,
     ) -> Result<Vec<Run>, StoreError> {
+        self.recent_runs_where(limit, repo_id, None).await
+    }
+
+    /// [`Self::recent_runs`], narrowed to one namespace — `""` for the fleet's
+    /// own. The namespace pages read only this, so a repository filter naming
+    /// another namespace's registration matches nothing.
+    pub async fn recent_runs_in(
+        &self,
+        namespace: &str,
+        limit: i64,
+        repo_id: Option<&str>,
+    ) -> Result<Vec<Run>, StoreError> {
+        self.recent_runs_where(limit, repo_id, Some(namespace)).await
+    }
+
+    async fn recent_runs_where(
+        &self,
+        limit: i64,
+        repo_id: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Run>, StoreError> {
         let rows = sqlx::query(
             "SELECT r.*, rp.name AS repo_name
                FROM ci_run r
                LEFT JOIN ci_repo rp ON rp.id = r.repo_id
-              WHERE $2::text IS NULL OR r.repo_id = $2
+              WHERE ($2::text IS NULL OR r.repo_id = $2)
+                AND ($3::text IS NULL OR r.namespace = $3)
               ORDER BY r.created_at DESC
               LIMIT $1",
         )
         .bind(limit)
         .bind(repo_id)
+        .bind(namespace)
         .fetch_all(&self.pool)
         .await
         .map_err(StoreError::sql)?;
         Ok(rows.iter().map(Run::from_row).collect())
+    }
+
+    /// Every tenant namespace that has a run, for the fleet runs page's filter.
+    /// Empty on an installation no namespace has used, which is what keeps that
+    /// page exactly as it was until one does.
+    pub async fn run_namespaces(&self) -> Result<Vec<String>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT namespace FROM ci_run WHERE namespace <> '' ORDER BY namespace",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::sql)
     }
 
     pub async fn set_run_status(
@@ -2179,11 +2241,29 @@ impl Store {
         network: Option<&str>,
         actor: Option<(&str, &str)>,
     ) -> Result<Repo, StoreError> {
+        self.register_repo_in("", url, name, workflow_path, network, actor).await
+    }
+
+    /// [`Self::register_repo`] in a namespace — `""` is the fleet.
+    ///
+    /// The upsert is keyed on `(namespace, normalized)`: re-registering a URL
+    /// edits *this namespace's* registration of it and never another's. A
+    /// tenant naming a fleet repository's URL gets a registration of its own,
+    /// with its own tokens, rather than the fleet's row.
+    pub async fn register_repo_in(
+        &self,
+        namespace: &str,
+        url: &str,
+        name: &str,
+        workflow_path: Option<&str>,
+        network: Option<&str>,
+        actor: Option<(&str, &str)>,
+    ) -> Result<Repo, StoreError> {
         let row = sqlx::query(
             "INSERT INTO ci_repo (id, url, normalized, name, workflow_path, network,
-                                  created_by, created_email)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-             ON CONFLICT (normalized) DO UPDATE
+                                  created_by, created_email, namespace)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             ON CONFLICT (namespace, normalized) DO UPDATE
                 SET url = EXCLUDED.url,
                     name = EXCLUDED.name,
                     workflow_path = EXCLUDED.workflow_path,
@@ -2198,6 +2278,7 @@ impl Store {
         .bind(network)
         .bind(actor.map(|a| a.0))
         .bind(actor.map(|a| a.1))
+        .bind(namespace)
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::sql)?;
@@ -2228,12 +2309,27 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
+    /// The fleet's registrations. Tenant namespaces manage their own on their
+    /// own pages; listing them here would offer the operator's network picker
+    /// for repositories whose network the tenant policy decides.
     pub async fn repos(&self) -> Result<Vec<Repo>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM ci_repo ORDER BY name, normalized")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(StoreError::sql)?;
+        self.repos_in("").await
+    }
+
+    pub async fn repos_in(&self, namespace: &str) -> Result<Vec<Repo>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM ci_repo WHERE namespace = $1 ORDER BY name, normalized",
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
         Ok(rows.iter().map(Repo::from_row).collect())
+    }
+
+    /// [`Self::get_repo`], answering only for a registration in `namespace`.
+    pub async fn get_repo_in(&self, namespace: &str, id: &str) -> Result<Option<Repo>, StoreError> {
+        Ok(self.get_repo(id).await?.filter(|r| r.namespace == namespace))
     }
 
     pub async fn get_repo(&self, id: &str) -> Result<Option<Repo>, StoreError> {
@@ -2245,9 +2341,14 @@ impl Store {
         Ok(row.as_ref().map(Repo::from_row))
     }
 
-    /// The registration for a clone URL, in any of its spellings.
+    /// The fleet registration for a clone URL, in any of its spellings.
+    ///
+    /// **Fleet only.** This is how a shared-secret submit finds a registration,
+    /// and the shared secret is the operator's credential: it must never land
+    /// a run in a tenant namespace, where the tenant's secrets and network
+    /// would apply to a submit the tenant did not make.
     pub async fn repo_by_url(&self, url: &str) -> Result<Option<Repo>, StoreError> {
-        let row = sqlx::query("SELECT * FROM ci_repo WHERE normalized = $1")
+        let row = sqlx::query("SELECT * FROM ci_repo WHERE normalized = $1 AND namespace = ''")
             .bind(crate::repos::normalize(url))
             .fetch_optional(&self.pool)
             .await
@@ -2266,6 +2367,29 @@ impl Store {
         let result = sqlx::query("UPDATE ci_repo SET enabled = $2 WHERE id = $1")
             .bind(id)
             .bind(enabled)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// [`Self::set_repo_enabled`], only for a registration in `namespace`.
+    pub async fn set_repo_enabled_in(&self, namespace: &str, id: &str, enabled: bool) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE ci_repo SET enabled = $3 WHERE id = $1 AND namespace = $2")
+            .bind(id)
+            .bind(namespace)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// [`Self::delete_repo`], only for a registration in `namespace`.
+    pub async fn delete_repo_in(&self, namespace: &str, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM ci_repo WHERE id = $1 AND namespace = $2")
+            .bind(id)
+            .bind(namespace)
             .execute(&self.pool)
             .await
             .map_err(StoreError::sql)?;
@@ -2335,6 +2459,30 @@ impl Store {
               WHERE id = $1 AND revoked_at IS NULL",
         )
         .bind(token_id)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// [`Self::revoke_repo_token`], only for a token of `repo_id`, and only when
+    /// that registration is in `namespace`. A token id from anywhere else is
+    /// `false`, the same as one already revoked.
+    pub async fn revoke_repo_token_in(
+        &self,
+        namespace: &str,
+        repo_id: &str,
+        token_id: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE ci_repo_token t SET revoked_at = now()
+               FROM ci_repo r
+              WHERE t.id = $1 AND t.repo_id = $2 AND r.id = t.repo_id
+                AND r.namespace = $3 AND t.revoked_at IS NULL",
+        )
+        .bind(token_id)
+        .bind(repo_id)
+        .bind(namespace)
         .execute(&self.pool)
         .await
         .map_err(StoreError::sql)?;
@@ -3525,6 +3673,80 @@ jobs:
         );
 
         store.delete_repo(&first.id).await.unwrap();
+    }
+
+    /// Migration 053's point: one URL may be registered by the fleet and by a
+    /// namespace, separately, and the namespace's registration never touches
+    /// the fleet's row — nor can the namespace reach it by id.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_namespace_registers_a_fleet_url_without_touching_the_fleets_row() {
+        let store = test_store().await;
+        let url = test_repo_url();
+        let fleet = store
+            .register_repo(&url, "fleet app", Some("ci/*.yml"), Some("prod"), None)
+            .await
+            .unwrap();
+        assert_eq!(fleet.namespace, "");
+
+        let tenant = store
+            .register_repo_in("team-a", &url, "team app", None, None, Some(("user:1", "a@example.com")))
+            .await
+            .unwrap();
+        assert_ne!(tenant.id, fleet.id, "a registration of its own");
+        assert_eq!(tenant.namespace, "team-a");
+
+        let again = store.get_repo(&fleet.id).await.unwrap().unwrap();
+        assert_eq!(again.name, "fleet app");
+        assert_eq!(again.workflow_path.as_deref(), Some("ci/*.yml"));
+        assert_eq!(again.network.as_deref(), Some("prod"));
+
+        // The shared-secret lookup is fleet-only.
+        assert_eq!(store.repo_by_url(&url).await.unwrap().map(|r| r.id), Some(fleet.id.clone()));
+        // Re-registering in the namespace edits the namespace's row only.
+        let renamed = store
+            .register_repo_in("team-a", &url, "team app 2", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(renamed.id, tenant.id);
+        assert_eq!(store.get_repo(&fleet.id).await.unwrap().unwrap().name, "fleet app");
+
+        // Cross-namespace reads and writes find nothing.
+        assert!(store.get_repo_in("team-a", &fleet.id).await.unwrap().is_none());
+        assert!(store.get_repo_in("team-b", &tenant.id).await.unwrap().is_none());
+        assert!(store.get_repo_in("", &tenant.id).await.unwrap().is_none());
+        assert!(store.repos().await.unwrap().iter().all(|r| r.id != tenant.id));
+        assert!(store.repos_in("team-a").await.unwrap().iter().any(|r| r.id == tenant.id));
+        assert!(!store.set_repo_enabled_in("team-b", &tenant.id, false).await.unwrap());
+        assert!(!store.delete_repo_in("team-b", &tenant.id).await.unwrap());
+        let (token, _) = store.create_repo_token(&tenant.id, "ci", None).await.unwrap();
+        assert!(!store.revoke_repo_token_in("team-b", &tenant.id, &token.id).await.unwrap());
+        assert!(!store.revoke_repo_token_in("team-a", &fleet.id, &token.id).await.unwrap(), "token of another repo");
+        assert!(store.revoke_repo_token_in("team-a", &tenant.id, &token.id).await.unwrap());
+
+        // A run is tagged with its namespace and found only there.
+        let run = crate::vm::new_id();
+        store
+            .create_run(
+                &run,
+                &RunRequest { repo_id: Some(tenant.id.clone()), repo_url: url.clone(), namespace: "team-a".into(), ..Default::default() },
+                &test_plan(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.get_run(&run).await.unwrap().unwrap().namespace, "team-a");
+        assert!(store.get_run_in("team-a", &run).await.unwrap().is_some());
+        assert!(store.get_run_in("team-b", &run).await.unwrap().is_none());
+        assert!(store.get_run_in("", &run).await.unwrap().is_none());
+        assert!(store.recent_runs_in("team-a", 500, None).await.unwrap().iter().any(|r| r.id == run));
+        assert!(store.recent_runs_in("", 500, None).await.unwrap().iter().all(|r| r.id != run));
+        assert!(store.run_namespaces().await.unwrap().contains(&"team-a".to_string()));
+        // Fleet-only flows refuse it.
+        assert!(crate::tenancy::refuse_tenant_run(&store, &run).await.is_err());
+        assert!(crate::submission::authorize_publication(&store, &run).await.is_err());
+
+        assert!(store.delete_repo_in("team-a", &tenant.id).await.unwrap());
+        store.delete_repo(&fleet.id).await.unwrap();
     }
 
     /// The assignment this whole column exists for: a repository points at a

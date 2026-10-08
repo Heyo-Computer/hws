@@ -131,13 +131,20 @@ fn list_namespace(ctx: &Ctx, ns: &str) -> Result<()> {
         println!("This app-lb has no plugins that install per namespace.");
         return Ok(());
     }
-    let mut table = Table::new(["ID", "NAME", "STATE", "INSTALLED", "DESCRIPTION"]);
+    let mut table = Table::new(["ID", "NAME", "STATE", "INSTALLED", "DASHBOARD", "DESCRIPTION"]);
     for p in &plugins {
+        // Only where it would open: the page answers an uninstalled or
+        // switched-off plugin with an explanation, not the dashboard.
+        let dashboard = match (&p.dashboard, p.enabled && p.installed) {
+            (Some(_), true) => format!("/namespaces/{ns}/plugin-console/{}", p.id),
+            _ => "-".into(),
+        };
         table.row([
             p.id.clone(),
             p.name.clone(),
             namespace_state(p).to_string(),
             p.installed_at.map(output::timestamp).unwrap_or_else(|| "-".into()),
+            dashboard,
             p.description.clone(),
         ]);
     }

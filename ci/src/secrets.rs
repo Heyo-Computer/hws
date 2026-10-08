@@ -172,6 +172,32 @@ impl Secrets {
         format!("ci/{}/{}", sanitize(workflow_id), sanitize(environment))
     }
 
+    /// The prefix a run's secrets live under, wherever it came from.
+    ///
+    /// A fleet run is [`Self::prefix`]. A tenant run is forced under
+    /// `ci/ns/<namespace>/<workflow>/<environment>`, whatever its workflow is
+    /// called: a tenant registration's workflow id is a name the tenant chose,
+    /// and without the namespace segment a repository named after a fleet
+    /// workflow would read that workflow's deploy credentials.
+    pub fn prefix_for(run: &crate::store::Run, environment: &str) -> String {
+        Self::prefix_in(&run.namespace, &run.workflow_id, environment)
+    }
+
+    /// [`Self::prefix_for`] from its parts, for a caller holding a namespace
+    /// and a workflow id rather than a whole run.
+    pub fn prefix_in(namespace: &str, workflow_id: &str, environment: &str) -> String {
+        if namespace.is_empty() {
+            Self::prefix(workflow_id, environment)
+        } else {
+            format!(
+                "ci/ns/{}/{}/{}",
+                sanitize(namespace),
+                sanitize(workflow_id),
+                sanitize(environment)
+            )
+        }
+    }
+
     /// Resolve every secret and variable under a prefix.
     ///
     /// Returns an empty set when heyosecret is not configured: a workflow that
@@ -424,6 +450,18 @@ mod tests {
         );
         // `/` is the separator and must not survive from a component.
         assert!(!Secrets::prefix("a/b", "c")[3..].starts_with("a/b"));
+    }
+
+    /// A tenant's secrets live under its namespace whatever its workflow is
+    /// called, so a tenant repository named after a fleet workflow — `deploy`
+    /// here — reads `ci/ns/team-a/deploy/prod`, never `ci/deploy/prod`.
+    #[test]
+    fn a_tenant_prefix_is_under_its_namespace_and_cannot_collide_with_the_fleet() {
+        assert_eq!(Secrets::prefix_in("", "deploy", "prod"), "ci/deploy/prod");
+        assert_eq!(Secrets::prefix_in("team-a", "deploy", "prod"), "ci/ns/team-a/deploy/prod");
+        assert_ne!(Secrets::prefix_in("team-a", "deploy", "prod"), Secrets::prefix("deploy", "prod"));
+        // A namespace cannot climb out of its segment either.
+        assert_eq!(Secrets::prefix_in("a/b", "w", "e"), "ci/ns/a-b/w/e");
     }
 
     #[test]

@@ -378,7 +378,7 @@ pub fn spawn(d: Arc<Dispatcher>) {
                     let job = d.store.get_job(&row.get::<String,_>("job_id")).await?.ok_or_else(|| anyhow::anyhow!("missing maintenance job"))?;
                     let plan: JobPlan = serde_json::from_value(job.plan)?;
                     let run_row = d.store.get_run(&run).await?.ok_or_else(|| anyhow::anyhow!("missing maintenance run"))?;
-                    let prefix = crate::secrets::Secrets::prefix(&run_row.workflow_id, plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));
+                    let prefix = crate::secrets::Secrets::prefix_for(&run_row, plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));
                     let resolved = d.secrets.resolve(&prefix).await?;
                     let token = resolved.secrets.get(&request.token_secret).filter(|s| !s.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("maintenance credential unavailable"))?;
                     poll(&d.store, &id, token, target.as_ref()).await
@@ -429,7 +429,7 @@ pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<Value> {
     ensure!(sha == request.sha, "release provenance changed");
     let job = d.store.get_job(&job_id).await?.ok_or_else(|| anyhow::anyhow!("missing job"))?;
     let plan: JobPlan = serde_json::from_value(job.plan)?;
-    let prefix = crate::secrets::Secrets::prefix(&run.workflow_id, plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));
+    let prefix = crate::secrets::Secrets::prefix_for(&run, plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));
     let resolved = d.secrets.resolve(&prefix).await?;
     let token = resolved.secrets.get(&request.token_secret).filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("maintenance credential unavailable"))?;

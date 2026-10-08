@@ -141,6 +141,82 @@ pub struct Chrome<'a> {
     /// an error renderer and a redirect target without threading a second
     /// lifetime through all three.
     pub html_attrs: String,
+    /// Whose pages these are, and the URLs they link with. Every link and form
+    /// on the pages a namespace can see is built through this, never written
+    /// as a literal path.
+    pub scope: Scope,
+}
+
+/// Which installation a page belongs to, and how its URLs are spelled.
+///
+/// The fleet's pages are served at this binary's root and link with plain
+/// absolute paths, exactly as they always have. A namespace's pages are
+/// served at `/ns/{ns}/` and reached two ways:
+///
+/// - **Through app-lb's plugin proxy**, which forwards `x-heyo-base:
+///   /namespaces/{ns}/plugins/ci` and maps `{base}/ui/<tail>` to
+///   `/ns/{ns}/<tail>` and `{base}/api/<x>` to `/ns/{ns}/api/<x>`. The browser
+///   only ever sees app-lb's URLs, so that is what every link must be.
+/// - **Directly**, with no base, where the native paths are the URLs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Scope {
+    #[default]
+    Fleet,
+    Namespace {
+        namespace: String,
+        /// app-lb's base for this namespace's plugin, when the request came
+        /// through it. Validated by the caller; see `ns::scope_for`.
+        base: Option<String>,
+    },
+}
+
+impl Scope {
+    pub fn namespace(namespace: &str, base: Option<&str>) -> Self {
+        Self::Namespace {
+            namespace: namespace.to_string(),
+            base: base.map(str::to_string),
+        }
+    }
+
+    pub fn is_namespace(&self) -> bool {
+        matches!(self, Self::Namespace { .. })
+    }
+
+    /// A page's URL, from its path within the dashboard (`"/"`, `"/repos"`,
+    /// `"/runs/<id>"`).
+    pub fn ui(&self, path: &str) -> String {
+        match self {
+            Self::Fleet => path.to_string(),
+            Self::Namespace { base: Some(base), .. } => match path {
+                "" | "/" => format!("{base}/ui"),
+                p => format!("{base}/ui{p}"),
+            },
+            Self::Namespace { namespace, base: None } => match path {
+                "" | "/" => format!("/ns/{namespace}/"),
+                p => format!("/ns/{namespace}{p}"),
+            },
+        }
+    }
+
+    /// A machine route's URL — JSON or the log stream — from its path under
+    /// `/api`.
+    pub fn api(&self, path: &str) -> String {
+        match self {
+            Self::Fleet => format!("/api{path}"),
+            Self::Namespace { base: Some(base), .. } => format!("{base}/api{path}"),
+            Self::Namespace { namespace, base: None } => format!("/ns/{namespace}/api{path}"),
+        }
+    }
+
+    /// Where the shared stylesheet, script and fonts are fetched from. A
+    /// namespace serves its own copy under its prefix, so a proxied page never
+    /// asks app-lb's root for anything.
+    fn assets(&self) -> String {
+        match self {
+            Self::Fleet => crate::heyo_ui::ASSET_PREFIX.to_string(),
+            scope => scope.ui(crate::heyo_ui::ASSET_PREFIX),
+        }
+    }
 }
 
 /// Chrome shared by every page.
@@ -148,6 +224,9 @@ pub struct Chrome<'a> {
 /// `who` is the app-lb identity when there is one. An app-token caller and an
 /// ungated deployment both render without it rather than inventing a user.
 pub fn layout(chrome: &Chrome, current: &str, body: Markup) -> Markup {
+    if chrome.scope.is_namespace() {
+        return namespace_layout(chrome, current, body);
+    }
     let nav: Vec<(&str, &str, bool)> = vec![
         ("Runs", "/", current == "runs"),
         ("Networks", "/networks", current == "networks"),
@@ -176,6 +255,66 @@ pub fn layout(chrome: &Chrome, current: &str, body: Markup) -> Markup {
         (PreEscaped("</html>"))
     }
 }
+
+/// The shell for a namespace's pages.
+///
+/// Three tabs — Runs, Repositories, Workflows — because those are the only
+/// pages a namespace has: networks, VMs, releases and maintenance are the
+/// fleet's. The top bar is built here rather than by `heyo_ui::topbar_html`,
+/// whose brand link is this binary's `/`; under the proxy that is app-lb's
+/// root, not this namespace's runs.
+///
+/// Embedded in app-lb's plugin console, the page sits under app-lb's own
+/// chrome, so a one-line script marks `<html>` with `embedded` before first
+/// paint and the stylesheet hides this bar. Opened on its own, the bar stays.
+fn namespace_layout(chrome: &Chrome, current: &str, body: Markup) -> Markup {
+    let scope = &chrome.scope;
+    let nav = [
+        ("Runs", scope.ui("/"), current == "runs"),
+        ("Repositories", scope.ui("/repos"), current == "repos"),
+        ("Workflows", scope.ui("/workflows"), current == "workflows"),
+    ];
+    let assets = scope.assets();
+    html! {
+        (DOCTYPE)
+        (PreEscaped(format!("<html lang=\"en\" {}>", chrome.html_attrs)))
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { (chrome.app_name) }
+                script { (PreEscaped(EMBEDDED_SCRIPT)) }
+                link rel="stylesheet" href={ (assets) "heyo.css" };
+                script defer src={ (assets) "theme.js" } {}
+                style { (PreEscaped(STYLE)) (PreEscaped(".embedded .topbar { display: none; }")) }
+            }
+            body {
+                header .topbar {
+                    a .topbar-brand href=(scope.ui("/")) {
+                        span { "heyo" }
+                        span .topbar-app { (chrome.app_name) }
+                    }
+                    nav .topbar-nav {
+                        @for (label, href, here) in &nav {
+                            a href=(href) aria-current=[here.then_some("page")] { (label) }
+                        }
+                    }
+                    div .topbar-right {
+                        @if let Some(who) = chrome.who {
+                            span .topbar-user title=(who) { (who) }
+                        }
+                        (PreEscaped(crate::heyo_ui::theme_toggle_html()))
+                    }
+                }
+                main { (body) }
+            }
+        (PreEscaped("</html>"))
+    }
+}
+
+/// Runs before the stylesheet applies, so an embedded page never flashes its
+/// own top bar under app-lb's.
+const EMBEDDED_SCRIPT: &str =
+    "if (window.self !== window.top) document.documentElement.classList.add('embedded');";
 
 fn status_pill(status: RunnerStatus) -> Markup {
     html! { span class={ "pill " (status.as_str()) } { (status.as_str()) } }
@@ -777,6 +916,7 @@ mod tests {
             app_name: "ci",
             who: None,
             html_attrs: r#"data-theme="dark""#.into(),
+            scope: Scope::Fleet,
         }
     }
 
@@ -785,6 +925,7 @@ mod tests {
             app_name: "ci",
             who: Some(who),
             html_attrs: r#"data-theme="dark""#.into(),
+            scope: Scope::Fleet,
         }
     }
 
@@ -1347,6 +1488,24 @@ pub fn runs_page(
     repos: &[Repo],
     repo_filter: Option<&str>,
 ) -> Markup {
+    runs_page_with_namespaces(chrome, runs, repos, repo_filter, &[], None)
+}
+
+/// [`runs_page`], with the fleet's view of tenant namespaces.
+///
+/// `namespaces` is every namespace that has a run. While it is empty the page
+/// is exactly what it was before namespaces existed; once one has run, the
+/// table grows a Namespace column and the filter a namespace picker, where
+/// `-` means the fleet's own runs.
+pub fn runs_page_with_namespaces(
+    chrome: &Chrome,
+    runs: &[Run],
+    repos: &[Repo],
+    repo_filter: Option<&str>,
+    namespaces: &[String],
+    namespace_filter: Option<&str>,
+) -> Markup {
+    let tenants = !namespaces.is_empty();
     // The filter's label, resolved from the registrations rather than the runs:
     // a filter that matches no runs still has a name to show.
     let filter_name = repo_filter
@@ -1358,13 +1517,24 @@ pub fn runs_page(
             // Present only once something is registered — on a fresh install
             // the empty-state text below already points at /repos, and a
             // dropdown with no options is furniture.
-            @if !repos.is_empty() {
-                form .row method="get" action="/" {
-                    select name="repo" {
-                        option value="" selected[repo_filter.is_none()] { "All repositories" }
-                        @for rp in repos {
-                            option value=(rp.id) selected[repo_filter == Some(rp.id.as_str())] {
-                                (rp.name)
+            @if !repos.is_empty() || tenants {
+                form .row method="get" action=(chrome.scope.ui("/")) {
+                    @if !repos.is_empty() {
+                        select name="repo" {
+                            option value="" selected[repo_filter.is_none()] { "All repositories" }
+                            @for rp in repos {
+                                option value=(rp.id) selected[repo_filter == Some(rp.id.as_str())] {
+                                    (rp.name)
+                                }
+                            }
+                        }
+                    }
+                    @if tenants {
+                        select name="namespace" {
+                            option value="" selected[namespace_filter.is_none()] { "All namespaces" }
+                            option value="-" selected[namespace_filter == Some("")] { "Fleet only" }
+                            @for ns in namespaces {
+                                option value=(ns) selected[namespace_filter == Some(ns.as_str())] { (ns) }
                             }
                         }
                     }
@@ -1378,12 +1548,12 @@ pub fn runs_page(
                         @if let Some(name) = filter_name { strong { (name) } }
                         @else { "that repository" }
                         " yet. "
-                        a href="/" { "Show all runs" } "."
+                        a href=(chrome.scope.ui("/")) { "Show all runs" } "."
                     }
                 } @else {
                     p .empty {
                         "Nothing has been submitted yet. Register a repository on "
-                        a href="/repos" { "Repositories" }
+                        a href=(chrome.scope.ui("/repos")) { "Repositories" }
                         " for a token, then from a clone with "
                         code .mono { ".ci/workflows/*.yml" } " run " code .mono { "git submit" } "."
                     }
@@ -1392,13 +1562,15 @@ pub fn runs_page(
                 div .scroll {
                     table {
                         thead { tr {
-                            th { "Workflow" } th { "Repository" } th { "Ref" } th { "Commit" }
+                            th { "Workflow" } th { "Repository" }
+                            @if tenants { th { "Namespace" } }
+                            th { "Ref" } th { "Commit" }
                             th { "Status" } th { "Duration" } th { "Started" } th { "By" }
                         } }
                         tbody {
                             @for r in runs {
                                 tr .link {
-                                    td { a .row href={ "/runs/" (r.id) } {
+                                    td { a .row href=(chrome.scope.ui(&format!("/runs/{}", r.id))) {
                                         (r.workflow_name
                                             .as_deref()
                                             .filter(|n| !n.trim().is_empty())
@@ -1411,10 +1583,15 @@ pub fn runs_page(
                                     // secret submit) has nothing to filter by.
                                     td { @match (&r.repo_id, &r.repo_name) {
                                         (Some(id), Some(name)) => {
-                                            a href={ "/?repo=" (id) } { (name) }
+                                            a href={ (chrome.scope.ui("/")) "?repo=" (id) } { (name) }
                                         }
                                         _ => { "—" }
                                     } }
+                                    @if tenants {
+                                        td { @if r.namespace.is_empty() { span .meta { "fleet" } } @else {
+                                            a href={ (chrome.scope.ui("/")) "?namespace=" (r.namespace) } { (r.namespace) }
+                                        } }
+                                    }
                                     td { (short_ref(&r.git_ref)) }
                                     td .mono { (short(&r.sha, 12)) }
                                     td { (pill(&r.status)) }
@@ -1493,7 +1670,7 @@ pub fn run_page_with_deployments(
             // Lineage, both ways: what this run re-plays, and what re-played it.
             @if let Some(of) = &run.rerun_of {
                 p .meta {
-                    "Re-run of " a href={ "/runs/" (of) } { code .mono { (of) } }
+                    "Re-run of " a href=(chrome.scope.ui(&format!("/runs/{}", of))) { code .mono { (of) } }
                     @if jobs.iter().any(|j| j.carried_from.is_some()) {
                         " — failed jobs only; the rest were carried over"
                     }
@@ -1504,7 +1681,7 @@ pub fn run_page_with_deployments(
                     "Re-run as "
                     @for (i, r) in reruns.iter().enumerate() {
                         @if i > 0 { ", " }
-                        a href={ "/runs/" (r.id) } { code .mono { (r.id) } } " " (pill(&r.status))
+                        a href=(chrome.scope.ui(&format!("/runs/{}", r.id))) { code .mono { (r.id) } } " " (pill(&r.status))
                     }
                 }
             }
@@ -1514,7 +1691,7 @@ pub fn run_page_with_deployments(
             // Offered only while there is something to stop. A finished run
             // would get a button that reports having done nothing.
             @if !matches!(run.status.as_str(), "success" | "failure" | "cancelled") {
-                form method="post" action={ "/runs/" (run.id) "/cancel" } {
+                form method="post" action=(chrome.scope.ui(&format!("/runs/{}/cancel", run.id))) {
                     button type="submit" { "Cancel this run" }
                 }
                 p .meta {
@@ -1526,11 +1703,11 @@ pub fn run_page_with_deployments(
                 // sent. "Re-run failed jobs" is the one people reach for, so
                 // it is not offered on a run with nothing failed to re-run.
                 div .actions {
-                    form method="post" action={ "/runs/" (run.id) "/rerun" } {
+                    form method="post" action=(chrome.scope.ui(&format!("/runs/{}/rerun", run.id))) {
                         button type="submit" { "Run again" }
                     }
                     @if run.status != "success" {
-                        form method="post" action={ "/runs/" (run.id) "/rerun-failed" } {
+                        form method="post" action=(chrome.scope.ui(&format!("/runs/{}/rerun-failed", run.id))) {
                             button type="submit" { "Re-run failed jobs" }
                         }
                     }
@@ -1559,7 +1736,7 @@ pub fn run_page_with_deployments(
                         tbody {
                             @for j in jobs {
                                 tr .link {
-                                    td { a .row href={ "/runs/" (run.id) "/jobs/" (j.job_key) } {
+                                    td { a .row href=(chrome.scope.ui(&format!("/runs/{}/jobs/{}", run.id, j.job_key))) {
                                         (j.display)
                                     } }
                                     td {
@@ -1619,6 +1796,9 @@ pub fn run_page_with_deployments(
             }
         }
 
+        // A namespace run cannot deploy, so the section would only ever say
+        // so; the fleet's pages keep it.
+        @if !chrome.scope.is_namespace() {
         section id="deployments" {
             h2 { "Deployments" }
             p .sub { "Service deployments requested by this CI run. Unknown submissions are not automatically resubmitted." }
@@ -1662,6 +1842,7 @@ pub fn run_page_with_deployments(
                     }
                 }
             }
+        }
         }
 
         section id="events" {
@@ -1711,11 +1892,11 @@ pub fn run_page_with_deployments(
             }
             div .actions {
                 @if event_before.is_some() {
-                    a href={ "/runs/" (run.id) "#events" } { "Newest events" }
+                    a href={ (chrome.scope.ui(&format!("/runs/{}", run.id))) "#events" } { "Newest events" }
                 }
                 @if events_have_more {
                     @if let Some(last) = events.last() {
-                        a href={ "/runs/" (run.id) "?events_before=" (last.revision) "#events" } { "Older events" }
+                        a href={ (chrome.scope.ui(&format!("/runs/{}", run.id))) "?events_before=" (last.revision) "#events" } { "Older events" }
                     }
                 }
             }
@@ -1866,7 +2047,7 @@ pub fn job_page(
         section {
             h1 .page { (job.display) " " (pill(&job.status)) }
             p .meta {
-                a href={ "/runs/" (run.id) } { (run.workflow_name.as_deref().unwrap_or(&run.workflow_id)) }
+                a href=(chrome.scope.ui(&format!("/runs/{}", run.id))) { (run.workflow_name.as_deref().unwrap_or(&run.workflow_id)) }
                 " · " code .mono { (short(&run.sha, 12)) }
                 @if let Some(r) = &job.runner_hd_id { " · runner " code .mono { (r) } }
                 @if let Some(s) = &job.sandbox_id { " · vm " code .mono { (s) } }
@@ -1881,7 +2062,7 @@ pub fn job_page(
             @if let Some(from) = &job.carried_from {
                 div .notice {
                     "This job did not run here. Its result and outputs were carried over from "
-                    a href={ "/runs/" (from) "/jobs/" (job.job_key) } {
+                    a href=(chrome.scope.ui(&format!("/runs/{}/jobs/{}", from, job.job_key))) {
                         "the same job in run " code .mono { (from) }
                     }
                     " when that run's failed jobs were re-run; the steps are there."
@@ -1911,7 +2092,12 @@ pub fn job_page(
         }
 
         @if let Some(token) = stream_token {
-            (live_log_script(&run.id, &job.job_key, token))
+            (live_log_script(&chrome.scope.api(&format!(
+                "/stream/{}/{}?token={}",
+                urlencode(&run.id),
+                urlencode(&job.job_key),
+                urlencode(token)
+            ))))
         }
     };
     layout(chrome, "runs", body)
@@ -1936,13 +2122,11 @@ fn step_duration(s: &StepRow) -> String {
 /// blank exactly when someone is debugging. The server sends rendered HTML
 /// fragments; this appends them and reloads once the job is done, so the final
 /// state is the server's rendering rather than one assembled in the browser.
-fn live_log_script(run_id: &str, job_key: &str, token: &str) -> Markup {
-    let url = format!(
-        "/api/stream/{}/{}?token={}",
-        urlencode(run_id),
-        urlencode(job_key),
-        urlencode(token)
-    );
+///
+/// `url` is the stream's address as the browser must ask for it, built by the
+/// caller from its [`Scope`] — behind app-lb's namespace proxy that is not the
+/// path this binary routes it on.
+fn live_log_script(url: &str) -> Markup {
     let js = format!(
         r#"
 (function () {{
@@ -2019,7 +2203,7 @@ pub fn workflows_page(
                                     td { (workflow_label(id)) }
                                     td {
                                         @match last {
-                                            Some(r) => a href={ "/runs/" (r.id) } { (pill(&r.status)) },
+                                            Some(r) => a href=(chrome.scope.ui(&format!("/runs/{}", r.id))) { (pill(&r.status)) },
                                             None => span .meta { "never" },
                                         }
                                     }
@@ -2112,7 +2296,12 @@ fn network_options(pool: &Pool, selected: Option<&str>) -> Markup {
     }
 }
 
-fn token_rows(tokens: &[RepoToken]) -> Markup {
+fn token_rows(scope: &Scope, tokens: &[RepoToken]) -> Markup {
+    token_rows_managed(scope, tokens, true)
+}
+
+/// [`token_rows`], with the revoke button only for a viewer who may use it.
+fn token_rows_managed(scope: &Scope, tokens: &[RepoToken], can_manage: bool) -> Markup {
     html! {
         @for t in tokens {
             tr {
@@ -2140,9 +2329,9 @@ fn token_rows(tokens: &[RepoToken]) -> Markup {
                     }
                 }
                 td {
-                    @if t.is_active() {
+                    @if can_manage && t.is_active() {
                         form method="post"
-                             action={ "/repos/" (t.repo_id) "/tokens/" (t.id) "/revoke" } {
+                             action=(scope.ui(&format!("/repos/{}/tokens/{}/revoke", t.repo_id, t.id))) {
                             button .quiet type="submit" { "Revoke" }
                         }
                     }
@@ -2193,7 +2382,7 @@ pub fn repos_page(
                 }
             }
 
-            form .row method="post" action="/repos" {
+            form .row method="post" action=(chrome.scope.ui("/repos")) {
                 label {
                     "Clone URL"
                     input type="text" name="url" required
@@ -2232,16 +2421,16 @@ pub fn repos_page(
                             span .pill.cancelled { "paused" }
                         }
                         @if let Some(run) = &view.last_run {
-                            a href={ "/runs/" (run.id) } { (pill(&run.status)) }
+                            a href=(chrome.scope.ui(&format!("/runs/{}", run.id))) { (pill(&run.status)) }
                         }
-                        form method="post" action={ "/repos/" (view.repo.id) "/enabled" } {
+                        form method="post" action=(chrome.scope.ui(&format!("/repos/{}/enabled", view.repo.id))) {
                             input type="hidden" name="enabled"
                                   value=(if view.repo.enabled { "false" } else { "true" });
                             button .quiet type="submit" {
                                 (if view.repo.enabled { "Pause" } else { "Resume" })
                             }
                         }
-                        form method="post" action={ "/repos/" (view.repo.id) "/delete" } {
+                        form method="post" action=(chrome.scope.ui(&format!("/repos/{}/delete", view.repo.id))) {
                             button .quiet type="submit" { "Remove" }
                         }
                     }
@@ -2256,7 +2445,7 @@ pub fn repos_page(
                         " · " (view.repo.created_at.format("%Y-%m-%d").to_string())
                     }
 
-                    form .row method="post" action={ "/repos/" (view.repo.id) "/network" } {
+                    form .row method="post" action=(chrome.scope.ui(&format!("/repos/{}/network", view.repo.id))) {
                         label {
                             "Builds run in"
                             select name="network" {
@@ -2288,17 +2477,153 @@ pub fn repos_page(
                                     th { "Key" } th { "For" } th { "Created" }
                                     th { "Last used" } th { "Status" } th { }
                                 } }
-                                tbody { (token_rows(&view.tokens)) }
+                                tbody { (token_rows(&chrome.scope, &view.tokens)) }
                             }
                         }
                     }
 
-                    form .row method="post" action={ "/repos/" (view.repo.id) "/tokens" } {
+                    form .row method="post" action=(chrome.scope.ui(&format!("/repos/{}/tokens", view.repo.id))) {
                         label {
                             "New token for"
                             input type="text" name="name" placeholder="sam's laptop";
                         }
                         button type="submit" { "Mint" }
+                    }
+                }
+            }
+        }
+    };
+    layout(chrome, "repos", body)
+}
+
+/// `GET /ns/{ns}/repos` — a namespace's registrations.
+///
+/// The fleet page's shape without its operator controls: there is no network
+/// picker, because a namespace's builds run where app-lb's plugin config says
+/// (`network`, shown read-only), and no mention of the shared webhook secret,
+/// which can never submit into a namespace. `can_manage` is the forwarded
+/// `x-heyo-actor-admin`; without it the forms are not offered, and the routes
+/// refuse them anyway.
+pub fn namespace_repos_page(
+    chrome: &Chrome,
+    repos: &[RepoView],
+    endpoint: &str,
+    network: Option<&str>,
+    can_manage: bool,
+    flash: &RepoFlash,
+) -> Markup {
+    let scope = &chrome.scope;
+    let body = html! {
+        @if let Some(err) = &flash.error {
+            div .banner { (err) }
+        }
+        @if let Some(ok) = &flash.ok {
+            div .notice { (ok) }
+        }
+        @if let Some((repo_name, token)) = &flash.token {
+            div .notice {
+                strong { "A new submit token for " (repo_name) "." }
+                " This is the only time it is shown — nothing here stores it, only its \
+                 digest. Run these two lines in a clone of that repository:"
+                pre .secret { (setup_lines(endpoint, token)) }
+                "Then " code .mono { "git submit" } " builds it."
+            }
+        }
+
+        section {
+            h2 { "Repositories" }
+            p .sub {
+                "A registered repository submits with its own tokens, each revocable on \
+                 its own. Builds run in "
+                @match network {
+                    Some(n) => code .mono { (n) },
+                    None => "no network yet — an operator has to configure one",
+                }
+                ", in a fresh VM per job; they may upload and download artifacts, and \
+                 cannot deploy. Secrets are read from "
+                code .mono { "ci/ns/<namespace>/<repository>/<environment>" } "."
+            }
+            @if can_manage {
+                form .row method="post" action=(scope.ui("/repos")) {
+                    label {
+                        "Clone URL"
+                        input type="text" name="url" required
+                              placeholder="git@github.com:me/app.git";
+                    }
+                    label {
+                        "Name (optional)"
+                        input type="text" name="name" placeholder="me/app";
+                    }
+                    label {
+                        "Workflow path (optional)"
+                        input type="text" name="workflow_path" placeholder=".ci/workflows/*.yml";
+                    }
+                    button type="submit" { "Register" }
+                }
+            }
+        }
+
+        section {
+            @if repos.is_empty() {
+                p .empty {
+                    "No repository is registered yet."
+                    @if !can_manage { " A namespace admin registers one and mints its token." }
+                }
+            }
+            @for view in repos {
+                div .repo {
+                    div .head {
+                        h3 { (view.repo.name) }
+                        @if !view.repo.enabled {
+                            span .pill.cancelled { "paused" }
+                        }
+                        @if let Some(run) = &view.last_run {
+                            a href=(scope.ui(&format!("/runs/{}", run.id))) { (pill(&run.status)) }
+                        }
+                        @if can_manage {
+                            form method="post" action=(scope.ui(&format!("/repos/{}/enabled", view.repo.id))) {
+                                input type="hidden" name="enabled"
+                                      value=(if view.repo.enabled { "false" } else { "true" });
+                                button .quiet type="submit" {
+                                    (if view.repo.enabled { "Pause" } else { "Resume" })
+                                }
+                            }
+                            form method="post" action=(scope.ui(&format!("/repos/{}/delete", view.repo.id))) {
+                                button .quiet type="submit" { "Remove" }
+                            }
+                        }
+                    }
+                    p .meta {
+                        code .mono { (view.repo.url) }
+                        @if let Some(path) = &view.repo.workflow_path {
+                            " · " code .mono { (path) }
+                        }
+                        @if let Some(by) = &view.repo.created_email {
+                            " · registered by " (by)
+                        }
+                        " · " (view.repo.created_at.format("%Y-%m-%d").to_string())
+                    }
+                    @if view.tokens.is_empty() {
+                        p .empty { "No token yet, so nothing can submit as this repository." }
+                    } @else {
+                        div .scroll {
+                            table {
+                                thead { tr {
+                                    th { "Key" } th { "For" } th { "Created" }
+                                    th { "Last used" } th { "Status" } th { }
+                                } }
+                                tbody { (token_rows_managed(scope, &view.tokens, can_manage)) }
+                            }
+                        }
+                    }
+                    @if can_manage {
+                        form .row method="post" action=(scope.ui(&format!("/repos/{}/tokens", view.repo.id))) {
+                            label {
+                                "New token for"
+                                input type="text" name="name" placeholder="sam's laptop";
+                            }
+                            button type="submit" { "Mint" }
+                        }
                     }
                 }
             }
@@ -2317,6 +2642,7 @@ mod page_tests {
             app_name: "ci",
             who: None,
             html_attrs: r#"data-theme="dark""#.into(),
+            scope: Scope::Fleet,
         }
     }
 
@@ -2325,6 +2651,7 @@ mod page_tests {
             app_name: "ci",
             who: Some(who),
             html_attrs: r#"data-theme="dark""#.into(),
+            scope: Scope::Fleet,
         }
     }
 
@@ -2353,6 +2680,7 @@ mod page_tests {
             status: status.into(),
             error: None,
             rerun_of: None,
+            namespace: String::new(),
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
             finished_at: Some(Utc::now()),
@@ -2411,6 +2739,7 @@ mod page_tests {
             workflow_path: None,
             network: None,
             enabled: true,
+            namespace: String::new(),
             created_email: Some("sam@sarocu.com".into()),
             created_at: Utc::now(),
         }
@@ -3011,6 +3340,7 @@ mod page_tests {
                 workflow_path: None,
                 network: Some("prod-runners".into()),
                 enabled,
+                namespace: String::new(),
                 created_email: Some("sam@sarocu.com".into()),
                 created_at: Utc::now(),
             },
@@ -3111,5 +3441,196 @@ mod page_tests {
         .into_string();
         assert!(html.contains("CI_WEBHOOK_SECRET"));
         assert!(html.contains("A clone URL is required."));
+    }
+
+    // ---- namespace scope ----------------------------------------------------
+
+    const BASE: &str = "/namespaces/team-a/plugins/ci";
+
+    fn ns_chrome(base: Option<&str>) -> Chrome<'static> {
+        Chrome {
+            app_name: "ci",
+            who: Some("a@example.com"),
+            html_attrs: r#"data-theme="dark""#.into(),
+            scope: Scope::namespace("team-a", base),
+        }
+    }
+
+    /// Every URL the page tells a browser to fetch or follow.
+    fn urls(html: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for attr in ["href=\"", "action=\"", "src=\""] {
+            for piece in html.split(attr).skip(1) {
+                out.push(piece.split('"').next().unwrap_or_default().to_string());
+            }
+        }
+        out
+    }
+
+    /// Every namespace page, as a namespace sees it.
+    fn ns_pages(chrome: &Chrome, admin: bool) -> Vec<(&'static str, String)> {
+        let mut r = run("failure");
+        r.namespace = "team-a".into();
+        r.rerun_of = Some("019fca648a6e-00000009".into());
+        let mut carried = job("deploy", "success");
+        carried.carried_from = Some("019fca648a6e-00000009".into());
+        vec![
+            ("runs", runs_page(chrome, &[r.clone()], &[registered_repo()], None).into_string()),
+            ("runs filtered", runs_page(chrome, &[], &[registered_repo()], Some("x")).into_string()),
+            ("runs empty", runs_page(chrome, &[], &[], None).into_string()),
+            (
+                "run",
+                run_page(chrome, &r, &[run("success")], &[job("build", "failure"), carried.clone()], &[], &[], None)
+                    .into_string(),
+            ),
+            (
+                "running run",
+                run_page(chrome, &run("running"), &[], &[job("build", "running")], &[], &[], None).into_string(),
+            ),
+            (
+                "job",
+                job_page(
+                    chrome,
+                    &r,
+                    &job("build", "running"),
+                    &[(step(0, "Compile", "running"), "compiling\n".into())],
+                    Some("1234.abcd"),
+                )
+                .into_string(),
+            ),
+            ("carried job", job_page(chrome, &r, &carried, &[], None).into_string()),
+            (
+                "workflows",
+                workflows_page(chrome, &[("app".into(), Some(r.clone()))], ".ci/workflows/*.yml").into_string(),
+            ),
+            (
+                "repos",
+                namespace_repos_page(
+                    chrome,
+                    &[repo_view(true, false), repo_view(false, true)],
+                    "https://ci.example.com",
+                    Some("tenants"),
+                    admin,
+                    &RepoFlash::minted("app".into(), "cis_secret".into()),
+                )
+                .into_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_namespace_link_and_form_is_under_the_proxy_base() {
+        for admin in [true, false] {
+            for (name, html) in ns_pages(&ns_chrome(Some(BASE)), admin) {
+                let found = urls(&html);
+                assert!(!found.is_empty(), "{name}");
+                for url in found {
+                    assert!(url.starts_with(&format!("{BASE}/")) || url == format!("{BASE}/ui") || url.starts_with(&format!("{BASE}/ui?")), "{name}: {url} in {html}");
+                }
+                for fleet in ["\"/vms", "\"/networks", "\"/releases", "\"/maintenance", "\"/runners", "\"/__ui/", "\"/repos", "\"/runs/", "\"/\""] {
+                    assert!(!html.contains(fleet), "{name} links the fleet's {fleet}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_direct_namespace_page_links_its_native_paths() {
+        for (name, html) in ns_pages(&ns_chrome(None), true) {
+            for url in urls(&html) {
+                assert!(url.starts_with("/ns/team-a/"), "{name}: {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_namespace_page_has_three_tabs_an_embedded_hook_and_its_own_assets() {
+        let html = runs_page(&ns_chrome(Some(BASE)), &[], &[], None).into_string();
+        for tab in ["Runs", "Repositories", "Workflows"] {
+            assert!(html.contains(&format!(">{tab}</a>")), "{tab}");
+        }
+        for fleet in ["Networks", "VMs"] {
+            assert!(!html.contains(&format!(">{fleet}</a>")), "{fleet}");
+        }
+        assert!(html.contains("window.self !== window.top"), "{html}");
+        assert!(html.contains(".embedded .topbar { display: none; }"));
+        assert!(html.contains(&format!(r#"href="{BASE}/ui/__ui/heyo.css""#)), "{html}");
+        assert!(html.contains(&format!(r#"src="{BASE}/ui/__ui/theme.js""#)), "{html}");
+    }
+
+    #[test]
+    fn a_namespace_job_page_streams_through_the_proxy() {
+        let html = job_page(
+            &ns_chrome(Some(BASE)),
+            &run("running"),
+            &job("build", "running"),
+            &[],
+            Some("1234.abcd"),
+        )
+        .into_string();
+        assert!(
+            html.contains(&format!("{BASE}/api/stream/019fca648a6e-00000000/build?token=1234.abcd")),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_run_page_has_no_deployments_section() {
+        let html = run_page(&ns_chrome(Some(BASE)), &run("success"), &[], &[], &[], &[], None).into_string();
+        assert!(!html.contains("id=\"deployments\""));
+        let fleet = run_page(&chrome(), &run("success"), &[], &[], &[], &[], None).into_string();
+        assert!(fleet.contains("id=\"deployments\""));
+    }
+
+    #[test]
+    fn the_namespace_repos_page_offers_no_network_and_forms_only_to_admins() {
+        let page = |admin| {
+            namespace_repos_page(
+                &ns_chrome(Some(BASE)),
+                &[repo_view(true, false)],
+                "https://ci.example.com",
+                Some("tenants"),
+                admin,
+                &RepoFlash::default(),
+            )
+            .into_string()
+        };
+        let admin = page(true);
+        assert!(!admin.contains("name=\"network\""), "{admin}");
+        assert!(!admin.contains("CI_WEBHOOK_SECRET"));
+        assert!(admin.contains("tenants"));
+        assert!(admin.contains("ci/ns/&lt;namespace&gt;"), "{admin}");
+        assert!(admin.contains("<form"));
+        assert!(admin.contains("/revoke"));
+        let viewer = page(false);
+        assert!(!viewer.contains("<form"), "{viewer}");
+    }
+
+    /// The fleet page with no namespace in sight is the page it always was.
+    #[test]
+    fn the_fleet_runs_page_is_unchanged_until_a_namespace_has_run() {
+        let runs = [run("success")];
+        let repos = [registered_repo()];
+        assert_eq!(
+            runs_page(&chrome(), &runs, &repos, None).into_string(),
+            runs_page_with_namespaces(&chrome(), &runs, &repos, None, &[], None).into_string(),
+        );
+        assert!(!runs_page(&chrome(), &runs, &repos, None).into_string().contains("Namespace"));
+
+        let mut tenant = run("success");
+        tenant.namespace = "team-a".into();
+        let html = runs_page_with_namespaces(
+            &chrome(),
+            &[run("success"), tenant],
+            &repos,
+            None,
+            &["team-a".into()],
+            Some("team-a"),
+        )
+        .into_string();
+        assert!(html.contains("<th>Namespace</th>"), "{html}");
+        assert!(html.contains(r#"href="/?namespace=team-a""#), "{html}");
+        assert!(html.contains(r#"<option value="team-a" selected>"#), "{html}");
+        assert!(html.contains(r#"<option value="-">Fleet only</option>"#), "{html}");
     }
 }

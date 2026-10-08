@@ -249,7 +249,9 @@ Integrations:
 | --- | --- | --- |
 | `CI_HEYOSECRET_URL` | `HEYOSECRET_URL` | heyosecret base URL. |
 | `CI_HEYOSECRET_TOKEN` | `HEYOSECRET_INTERNAL_API_KEY`, then `PLATFORM_INTERNAL_API_KEY` | heyosecret bearer. Never reaches a build. |
-| `CI_APP_LB_URL`, `CI_APP_LB_TOKEN` | unset | app-lb admin API for `workflow` objects. Without it, ci uses repository registrations and `CI_WORKFLOW_PATH` only. |
+| `CI_APP_LB_URL`, `CI_APP_LB_TOKEN` | unset | app-lb admin API for `workflow` objects and for the `ci` plugin's namespace installs (`GET /api/plugins/ci`). Without it, ci uses repository registrations and `CI_WORKFLOW_PATH` only, and no namespace can use ci. |
+| `CI_PLUGIN_API_TOKEN` | unset | Bearer app-lb's `ci` plugin presents on every `/ns/{ns}/` request. The namespace routes are not mounted without it. See [Namespaces](#namespaces). |
+| `CI_REQUIRE_INSTALL` | `true` | Namespace pages and submits need the namespace in app-lb's install list. `false` treats every namespace as installed while the plugin is enabled. |
 | `CI_NATIVE_RUNNER_SECRET` | unset | Bearer for `/api/native/*`. Native runners are disabled without it. |
 
 Release, deployment and host-maintenance variables (`CI_RELEASE_POLICIES`, `CI_HOST_APP_LB_TARGETS`, `CI_HOST_MAINTENANCE_TARGETS`, `CI_HOST_HEYVM_BOOTSTRAP_TARGETS`, `CI_CONTROLLER_*`, `CI_APPLICATION_*`, `CI_EXPECTED_SHA`) are operator configuration for the built-in release actions. They are documented with those actions in the [ci README](../ci/README.md#operator-owned-release-policy).
@@ -269,7 +271,7 @@ app-lb's sign-in gate admits browsers only, so the machine routes must be listed
 ]
 ```
 
-Keep `/repos`, `/maintenance`, `/networks/*/join` and the `/vms` actions behind the gate. ci reads the forwarded identity headers (`x-auth-request-user`, `-email`, `-name`), which are trustworthy only on a gated deployment, and keeps its own admin list seeded from `CI_ADMIN_EMAILS`. See [app-lb auth](app-lb-auth.md).
+Keep `/repos`, `/maintenance`, `/networks/*/join` and the `/vms` actions behind the gate, and never list `/ns/`: those routes are for app-lb's plugin proxy and carry their own bearer (see [Namespaces](#namespaces)). ci reads the forwarded identity headers (`x-auth-request-user`, `-email`, `-name`), which are trustworthy only on a gated deployment, and keeps its own admin list seeded from `CI_ADMIN_EMAILS`. See [app-lb auth](app-lb-auth.md).
 
 ## Submitting with git submit
 
@@ -343,6 +345,43 @@ heyctl get workflows
 ```
 
 Objects match a submit by repository URL (`git@github.com:me/app.git` and `https://github.com/me/app` are the same). Several objects may name one repository; each produces its own runs. There is no in-place edit; delete and re-create with the same ID. See [heyctl](heyctl.md).
+
+## Namespaces
+
+An app-lb namespace that installs the `ci` plugin gets its own repositories, submit tokens, runs and live logs on the shared fleet runners. What the fleet registers stays the fleet's, and a namespace sees only its own.
+
+### How a namespace reaches ci
+
+The namespace's pages and API are served at `/ns/{ns}/` and reached through app-lb's plugin proxy, which maps `/namespaces/<ns>/plugins/ci/ui/<tail>` to `/ns/<ns>/<tail>` and `/namespaces/<ns>/plugins/ci/api/<x>` to `/ns/<ns>/api/<x>`. Each proxied request carries:
+
+| Header | Meaning |
+| --- | --- |
+| `Authorization: Bearer <CI_PLUGIN_API_TOKEN>` | Checked first, in constant time. Without it every `/ns/` route answers `401`. |
+| `x-heyo-base` | `/namespaces/<ns>/plugins/ci`. Every link, form and stream URL on the page is built from it. Any other value is ignored and the page links its native `/ns/<ns>/` paths. |
+| `x-heyo-actor`, `x-heyo-actor-email` | Who is asking. Recorded on registrations and tokens. |
+| `x-heyo-actor-admin` | `true` allows writes: registering, minting and revoking tokens, pausing, removing, cancelling and re-running. Anything else is read-only (`403` on a write). |
+
+The actor headers are trusted only behind the bearer, so the routes are not mounted at all unless `CI_PLUGIN_API_TOKEN` is set. ci polls app-lb's `GET /api/plugins/ci` (with `CI_APP_LB_URL`/`CI_APP_LB_TOKEN`) for which namespaces have installed the plugin and where they build. A namespace that is not installed gets `404` on every route, and its tokens' submits get `403`, within one poll of an uninstall. A `409` from app-lb (plugin disabled) or a `404` (an app-lb without the plugin) means no namespace is installed; a transport error keeps the last answer.
+
+Pages: runs (`/ns/<ns>/`), a run, a job with its live log, repositories and workflows. JSON: `api/runs`, `api/runs/<id>`, `api/runs/<id>/logs`, `api/repos` and the `api/stream/<run>/<job>` log stream. A run, job, repository or token from another namespace answers `404`, the same as one that does not exist. Embedded in app-lb's console (an iframe), the page hides its own top bar.
+
+A namespace's token submits through the ordinary `git submit` endpoint; register the repository on the namespace's repositories page and run the two `git config` lines it shows.
+
+### Tenant limits
+
+A namespace submit is planned under a narrower policy than a fleet one, and a workflow that breaks it is refused at submit with the rule it broke:
+
+- **One network.** Jobs run in the network app-lb's plugin config names for the namespace (`namespace_networks[<ns>]`, else `tenant_network`). It must be a network this instance serves and must not be the fleet default (the first entry of `CI_NETWORK`). A job may pin a host in that network (`uses: <network>/<host>`), but not another network, `uses: default`, or an existing VM.
+- **No native runners.** `runs-on` is refused.
+- **No release.** `on: release` is refused, and release policies and `workflow` objects never apply to a namespace's repositories, even when they name the same URL.
+- **Two actions.** Only `ci/upload-artifact` and `ci/download-artifact`; every deploy, publish, merge and host-maintenance action is refused, and refused again at execution.
+- **Fresh VMs.** A namespace job's VM is never handed to the next job.
+
+Registrations are unique per namespace and URL, so a namespace registering a fleet repository's URL gets a registration of its own and never edits the fleet's. The shared `CI_WEBHOOK_SECRET` only ever submits as the fleet.
+
+### Secrets
+
+A namespace run reads `${{ secrets.X }}` and `${{ vars.X }}` from heyosecret under `ci/ns/<ns>/<workflow>/<environment>/`, where `<workflow>` is the registered repository's name. The namespace segment is forced, so a repository named after a fleet workflow cannot read that workflow's secrets. heyosecret has no per-namespace authorization, so an operator writes a namespace's secrets under its prefix.
 
 ## Workflow reference
 
@@ -575,13 +614,13 @@ The producer must be in `needs` and must have succeeded. Size and SHA-256 are ve
 
 | Path | Shows |
 | --- | --- |
-| `/` | Recent runs (latest 50). |
+| `/` | Recent runs (latest 50), fleet and namespace alike. Once a namespace has run, a Namespace column and filter appear (`?namespace=<ns>`, or `-` for the fleet's own). |
 | `/runs/{run_id}` | Jobs, queued time and duration, artifacts and public links, VM logs, Release, Deployments, and an event timeline. Admin buttons: Cancel, Run again, Re-run failed jobs. |
 | `/runs/{run_id}/jobs/{job_key}` | One job's steps and live log. |
 | `/networks` (also `/runners`) | Every heyvm network on the account with its hosts, which ones this instance serves, each host's and network's queue depth read from JetStream, and daemons that joined no network. Admins can join this host to a network. |
 | `/vms` | ci-owned VMs by host, including ones still being created (`building`), with declared vs. reported size. Admin actions: destroy, resize, clean up failed. |
 | `/workflows` | app-lb workflow objects. |
-| `/repos` | Admin: register repositories, mint and revoke tokens, pause, assign a network. |
+| `/repos` | Admin: register the fleet's repositories, mint and revoke tokens, pause, assign a network. Namespace registrations are managed on the namespace's own page. |
 
 A `no consumer` flag on an online host in the Queue column means jobs are routed to a subject nothing reads: the host is not in a network this instance serves, or its consumer is not bound.
 
