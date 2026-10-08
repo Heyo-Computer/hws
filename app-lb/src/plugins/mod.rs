@@ -52,6 +52,7 @@ pub mod ci;
 pub mod ns_proxy;
 pub mod obs;
 pub mod pgfc;
+pub mod remote;
 pub mod vapi;
 
 use arc_swap::ArcSwap;

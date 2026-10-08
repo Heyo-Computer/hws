@@ -50,7 +50,14 @@ pub fn router(state: AppState) -> Router {
         .route("/{ns}/{repo}/info/refs", get(info_refs))
         .route("/{ns}/{repo}/{service}", post(git_rpc));
     let router = if state.cfg.web {
-        router.merge(crate::web::routes())
+        let router = router.merge(crate::web::routes());
+        match crate::plugin::router(
+            state.cfg.plugin_api_token.as_deref(),
+            crate::web::plugin_pages(),
+        ) {
+            Some(plugin) => router.merge(plugin),
+            None => router,
+        }
     } else {
         router
     };

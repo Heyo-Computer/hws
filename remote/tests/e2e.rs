@@ -735,3 +735,190 @@ async fn web_ui_shows_each_session_only_what_app_lb_grants() {
     assert!(viewer.cookie.is_none());
     assert_eq!(viewer.get("/team-b").await.0, 303);
 }
+
+/// app-lb's `remote` plugin: pages under `/-/ns/<ns>`, behind the plugin's
+/// bearer, for the caller app-lb names, with every link under app-lb's base.
+#[tokio::test]
+async fn the_plugin_surface_serves_app_lbs_caller_under_app_lbs_urls() {
+    const PLUGIN: &str = "test-plugin-token";
+    const BASE: &str = "/namespaces/team-a/plugins/remote";
+    let tmp = tempfile::tempdir().unwrap();
+    let env = store_env(&tmp.path().join("store"));
+    let prefix = format!("p{}", rand::random::<u32>());
+    let srv = start_with(
+        &env,
+        &tmp.path().join("cache"),
+        &prefix,
+        &[("REMOTE_PLUGIN_API_TOKEN", PLUGIN)],
+    );
+    let (st, body) = call(
+        "POST",
+        &format!("{}/api/repos/team-a", srv.url),
+        ADMIN,
+        Some(json!({"name": "site"})),
+    )
+    .await;
+    assert_eq!(st, 201, "{body}");
+
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let send =
+        |method: reqwest::Method, path: &str, headers: &[(&str, &str)], form: Option<&str>| {
+            let mut req = http.request(method, format!("{}{path}", srv.url));
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            if let Some(f) = form {
+                req = req
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(f.to_string());
+            }
+            async move {
+                let resp = req.send().await.unwrap();
+                let status = resp.status().as_u16();
+                let location = resp
+                    .headers()
+                    .get("location")
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default();
+                (status, resp.text().await.unwrap(), location)
+            }
+        };
+    let bearer = format!("Bearer {PLUGIN}");
+    let viewer = [
+        ("authorization", bearer.as_str()),
+        ("x-heyo-base", BASE),
+        ("x-heyo-actor", "user:7"),
+        ("x-heyo-actor-email", "u7@example.com"),
+    ];
+    let admin = [
+        ("authorization", bearer.as_str()),
+        ("x-heyo-base", BASE),
+        ("x-heyo-actor", "user:8"),
+        ("x-heyo-actor-admin", "true"),
+    ];
+
+    // Without the plugin's bearer the actor headers are anybody's.
+    let (st, _, _) = send(reqwest::Method::GET, "/-/ns/team-a/", &viewer[1..], None).await;
+    assert_eq!(st, 401);
+    let (st, _, _) = send(
+        reqwest::Method::GET,
+        "/-/ns/team-a/",
+        &[
+            ("authorization", &format!("Bearer {ADMIN}")),
+            ("x-heyo-actor-admin", "true"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st, 401, "the operator token is not the plugin's");
+
+    // The dashboard: the namespace's repos, linked under app-lb's base, its
+    // assets served from under the namespace, and no sign-in or sign-out.
+    let (st, page, _) = send(reqwest::Method::GET, "/-/ns/team-a/", &viewer, None).await;
+    assert_eq!(st, 200, "{page}");
+    assert!(page.contains(&format!("href=\"{BASE}/ui/site\"")), "{page}");
+    assert!(
+        page.contains(&format!("{BASE}/ui/-/__ui/heyo.css")),
+        "{page}"
+    );
+    assert!(page.contains("u7@example.com"), "{page}");
+    assert!(
+        !page.contains("href=\"/team-a") && !page.contains("/-/logout"),
+        "{page}"
+    );
+    assert!(
+        !page.contains("New repository"),
+        "a viewer is offered no writes"
+    );
+    let (st, css, _) = send(
+        reqwest::Method::GET,
+        "/-/ns/team-a/-/__ui/heyo.css",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(css.contains("font-face"), "the shared stylesheet");
+
+    // A repo page and an empty repo's quick setup keep the real clone URL.
+    let (st, page, _) = send(reqwest::Method::GET, "/-/ns/team-a/site", &viewer, None).await;
+    assert_eq!(st, 200, "{page}");
+    assert!(
+        page.contains(&format!("href=\"{BASE}/ui/site/commits\"")),
+        "{page}"
+    );
+    assert!(
+        page.contains(&format!("{}/team-a/site.git", srv.url)),
+        "{page}"
+    );
+
+    // The mount is the namespace: another one's repos are 404s.
+    let other = [
+        ("authorization", bearer.as_str()),
+        ("x-heyo-actor-admin", "true"),
+    ];
+    let (st, _, _) = send(reqwest::Method::GET, "/-/ns/team-b/site", &other, None).await;
+    assert_eq!(st, 404);
+
+    // Writes are app-lb admins' only, and land under the base.
+    let (st, _, _) = send(
+        reqwest::Method::POST,
+        "/-/ns/team-a/-/new",
+        &viewer,
+        Some("name=nope"),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, body, loc) = send(
+        reqwest::Method::POST,
+        "/-/ns/team-a/-/new",
+        &admin,
+        Some("name=docs"),
+    )
+    .await;
+    assert_eq!(
+        (st, loc.as_str()),
+        (303, format!("{BASE}/ui/docs").as_str()),
+        "{body}"
+    );
+    let (st, body) = call(
+        "GET",
+        &format!("{}/api/repos/team-a/docs", srv.url),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let (st, page, _) = send(
+        reqwest::Method::POST,
+        "/-/ns/team-a/-/tokens",
+        &admin,
+        Some("name=ci&access=read&ttl_days=1"),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(
+        page.contains("hrm_") && page.contains("applb:user:8"),
+        "{page}"
+    );
+
+    // A base that is not this namespace's is never echoed.
+    let (st, page, _) = send(
+        reqwest::Method::GET,
+        "/-/ns/team-a/",
+        &[
+            ("authorization", bearer.as_str()),
+            ("x-heyo-base", "/namespaces/team-b/plugins/remote"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(
+        page.contains("href=\"/-/ns/team-a/site\"") && !page.contains("team-b"),
+        "{page}"
+    );
+}

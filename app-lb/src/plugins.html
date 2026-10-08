@@ -763,6 +763,13 @@ PANELS.ci = installsPanel("ci", "CI", (view, tile) => {
     + tile("tenant network", s.tenant_network || "—");
 });
 
+// remote's pages for each namespace that has it installed: its repos, in the
+// plugin console.
+PANELS.remote = installsPanel("remote", "Git", (view, tile) => {
+  const s = view.status || {};
+  return tile("remote", s.url || "—") + tile("reachable", s.up ? "yes" : "no");
+});
+
 async function load() {
   const r = await api("GET", "/api/plugins");
   const root = $("plugins");

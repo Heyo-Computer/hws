@@ -618,6 +618,7 @@ fn main() {
             plugins::vapi::VapiPlugin::new(secrets.clone()),
             plugins::obs::ObsPlugin::new(secrets.clone()),
             plugins::ci::CiPlugin::new(secrets.clone()),
+            plugins::remote::RemotePlugin::new(secrets.clone()),
         ],
         plugin_store,
     ));

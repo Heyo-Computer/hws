@@ -92,6 +92,8 @@ pub struct NsProxy {
     ui_subpaths: bool,
     /// Send the caller's identity upstream, for one that records it.
     forward_actor: bool,
+    /// Where the upstream serves a namespace: `/ns` puts it at `/ns/<ns>/…`.
+    ns_prefix: &'static str,
     upstream: RwLock<Option<Arc<Upstream>>>,
     health: RwLock<Health>,
     poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -101,6 +103,20 @@ impl NsProxy {
     pub fn new(
         label: &'static str,
         plugin_id: &'static str,
+        secrets: Arc<SecretStore>,
+        ui_subpaths: bool,
+        forward_actor: bool,
+    ) -> Arc<Self> {
+        Self::new_at(label, plugin_id, "/ns", secrets, ui_subpaths, forward_actor)
+    }
+
+    /// [`NsProxy::new`] for an upstream that serves a namespace somewhere
+    /// other than `/ns/<ns>/…`, because its own root already belongs to
+    /// namespaces (remote's `/-/ns/<ns>/…`).
+    pub fn new_at(
+        label: &'static str,
+        plugin_id: &'static str,
+        ns_prefix: &'static str,
         secrets: Arc<SecretStore>,
         ui_subpaths: bool,
         forward_actor: bool,
@@ -119,6 +135,7 @@ impl NsProxy {
                 .expect("reqwest client builds"),
             ui_subpaths,
             forward_actor,
+            ns_prefix,
             upstream: RwLock::new(None),
             health: RwLock::new(Health::default()),
             poller: Mutex::new(None),
@@ -224,7 +241,8 @@ impl NsProxy {
         let base = format!("/namespaces/{ns}/plugins/{}", self.plugin_id);
         let rest = req.uri().path().to_string();
 
-        let Some(mut target) = upstream_path(&ns, &rest, self.ui_subpaths) else {
+        let Some(mut target) = upstream_path_at(self.ns_prefix, &ns, &rest, self.ui_subpaths)
+        else {
             return fail(
                 StatusCode::NOT_FOUND,
                 format!("no {} route at {rest}", self.plugin_id),
@@ -409,18 +427,24 @@ fn is_dot_segment(segment: &str) -> bool {
 /// so the page's relative `api/…` URLs resolve beside it whichever prefix it
 /// is served under; with `ui_subpaths`, `/ui/<page>` is the upstream's
 /// `/ns/<ns>/<page>`.
+#[cfg(test)]
 pub fn upstream_path(ns: &str, rest: &str, ui_subpaths: bool) -> Option<String> {
+    upstream_path_at("/ns", ns, rest, ui_subpaths)
+}
+
+/// [`upstream_path`] onto `<prefix>/<ns>/…`.
+pub fn upstream_path_at(prefix: &str, ns: &str, rest: &str, ui_subpaths: bool) -> Option<String> {
     if rest.contains('\\') || rest.split('/').any(is_dot_segment) {
         return None;
     }
     if rest == "/ui" {
-        return Some(format!("/ns/{ns}/"));
+        return Some(format!("{prefix}/{ns}/"));
     }
     if ui_subpaths && let Some(tail) = rest.strip_prefix("/ui/") {
-        return Some(format!("/ns/{ns}/{tail}"));
+        return Some(format!("{prefix}/{ns}/{tail}"));
     }
     if rest.starts_with("/api/") {
-        return Some(format!("/ns/{ns}{rest}"));
+        return Some(format!("{prefix}/{ns}{rest}"));
     }
     None
 }
