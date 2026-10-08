@@ -233,7 +233,17 @@
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
     overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
   }
+
+  /* Framed by app-lb's plugin console, which already shows the brand, who is
+     signed in and the theme toggle. The live clock and controls stay. */
+  .embedded .topbar-brand,
+  .embedded .topbar-user,
+  .embedded [data-theme-toggle] { display: none; }
 </style>
+<script>
+  // Before first paint, so a framed page never shows the bar it then hides.
+  if (window.self !== window.top) document.documentElement.classList.add("embedded");
+</script>
 </head>
 <body>
 <div class="wrap">

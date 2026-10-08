@@ -440,6 +440,8 @@ fn plugin_view_understands_every_field() {
     assert_eq!(on.config["url"], "http://127.0.0.1:34199");
     assert!(on.per_namespace);
     assert_eq!(on.installed_in, ["team-a"]);
+    assert_eq!(on.dashboard.as_deref(), Some("ui"));
+    assert!(plugins[1].dashboard.is_none());
     assert!(!plugins[1].enabled);
     assert!(!plugins[1].per_namespace);
 }
@@ -462,6 +464,7 @@ fn namespace_plugin_understands_every_field() {
     assert!(obs.enabled && obs.installed);
     assert_eq!(obs.installed_at, Some(1_760_000_000));
     assert_eq!(obs.installed_by.as_deref(), Some("token:0123456789ab"));
+    assert_eq!(obs.dashboard.as_deref(), Some("ui"));
     let other = &plugins[1];
     assert!(!other.enabled && !other.installed);
     assert!(other.installed_at.is_none() && other.config.is_none());

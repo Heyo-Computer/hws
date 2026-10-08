@@ -5,6 +5,7 @@
     "description": "Logs, metrics and alerts for every app in a namespace.",
     "enabled": true,
     "installed": true,
+    "dashboard": "ui",
     "installed_at": 1760000000,
     "installed_by": "token:0123456789ab",
     "config": {}

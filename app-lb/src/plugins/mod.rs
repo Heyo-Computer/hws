@@ -42,7 +42,13 @@
 //! plugin and nobody else's. The plugin is told which namespace a request is
 //! for through a [`NamespaceScope`] extension; it never reads it off a path
 //! the caller wrote.
+//!
+//! A plugin whose namespace surface includes a page answers
+//! [`Plugin::dashboard_path`], and app-lb's plugin console at
+//! `/namespaces/<ns>/plugin-console/<id>` frames that page under its own
+//! navigation.
 
+pub mod ns_proxy;
 pub mod obs;
 pub mod pgfc;
 pub mod vapi;
@@ -129,6 +135,13 @@ pub trait Plugin: Send + Sync + 'static {
     /// on the CRUD tier, so a route that changes something must not be a `GET`.
     fn namespace_routes(self: Arc<Self>) -> Router {
         Router::new()
+    }
+
+    /// Where the plugin's dashboard page sits on its namespace surface,
+    /// relative to `/namespaces/<ns>/plugins/<id>/` (`"ui"`), for a plugin
+    /// that has one. The plugin console frames it.
+    fn dashboard_path(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -290,6 +303,9 @@ pub struct PluginView {
     pub meta: PluginMeta,
     /// Whether namespaces install this plugin themselves.
     pub per_namespace: bool,
+    /// The dashboard page on the namespace surface; see [`Plugin::dashboard_path`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard: Option<&'static str>,
     /// The namespaces that have, for a per-namespace plugin.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub installed_in: Vec<String>,
@@ -311,6 +327,9 @@ pub struct NamespacePluginView {
     /// The fleet switch. An install of a disabled plugin is kept but idle.
     pub enabled: bool,
     pub installed: bool,
+    /// The dashboard page on the namespace surface; see [`Plugin::dashboard_path`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -429,6 +448,7 @@ impl PluginHost {
         let status = slot.plugin.status().await;
         PluginView {
             per_namespace: slot.plugin.per_namespace(),
+            dashboard: slot.plugin.dashboard_path(),
             installed_in: record.installs.keys().cloned().collect(),
             enabled: record.enabled,
             config: record.config,
@@ -481,10 +501,16 @@ impl PluginHost {
             description: meta.description,
             enabled: record.enabled,
             installed: install.is_some(),
+            dashboard: slot.plugin.dashboard_path(),
             installed_at: install.map(|i| i.installed_at),
             installed_by: install.and_then(|i| i.installed_by.clone()),
             config: install.map(|i| i.config.clone()),
         }
+    }
+
+    /// One installable plugin as `ns` sees it.
+    pub fn namespace_plugin(&self, id: &str, ns: &str) -> Option<NamespacePluginView> {
+        self.installable(id).map(|s| self.namespace_view(s, ns))
     }
 
     /// Every plugin a namespace may install, and whether `ns` has.
@@ -578,7 +604,9 @@ impl PluginHost {
         let mut installed = Vec::new();
         for slot in self.slots.iter().filter(|s| s.plugin.per_namespace()) {
             let id = slot.plugin.meta().id;
-            let Some(record) = self.store.get(id) else { continue };
+            let Some(record) = self.store.get(id) else {
+                continue;
+            };
             if !record.enabled
                 || !slot.plugin.auto_install(&record.config)
                 || record.installs.contains_key(ns)
@@ -586,9 +614,14 @@ impl PluginHost {
             {
                 continue;
             }
-            match self.install(id, ns, Value::Object(Default::default()), by.clone()).await {
+            match self
+                .install(id, ns, Value::Object(Default::default()), by.clone())
+                .await
+            {
                 Ok(_) => installed.push(id),
-                Err(e) => tracing::warn!(plugin = id, namespace = ns, error = %e, "automatic plugin install failed"),
+                Err(e) => {
+                    tracing::warn!(plugin = id, namespace = ns, error = %e, "automatic plugin install failed")
+                }
             }
         }
         installed
