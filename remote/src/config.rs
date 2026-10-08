@@ -37,6 +37,9 @@ pub struct Config {
     pub max_token_ttl_secs: u64,
     /// Serve the web UI (`REMOTE_WEB`, on unless `0`/`false`/`off`).
     pub web: bool,
+    /// app-lb's `remote` plugin's bearer (`REMOTE_PLUGIN_API_TOKEN`). Without
+    /// it the plugin surface (`crate::plugin`) is not mounted.
+    pub plugin_api_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +106,7 @@ impl Config {
             max_token_ttl_secs: num("REMOTE_MAX_TOKEN_TTL_SECS", 30 * 86_400),
             web: !get("REMOTE_WEB")
                 .is_some_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "no")),
+            plugin_api_token: get("REMOTE_PLUGIN_API_TOKEN"),
             listen,
         }
     }

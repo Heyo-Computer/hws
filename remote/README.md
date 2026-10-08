@@ -124,6 +124,33 @@ The UI's own paths sit under `/-/` and `/__ui/`. `REMOTE_WEB=0` turns the UI
 off. The theme cookie follows `REMOTE_UI_COOKIE_DOMAIN`, else
 `HEYO_UI_COOKIE_DOMAIN` (see `ui/README.md`).
 
+### In app-lb's plugin console
+
+app-lb's `remote` plugin serves a namespace's pages inside app-lb, at
+`/namespaces/<ns>/plugins/remote/ui[/…]`. app-lb rewrites those requests onto
+`/-/ns/<ns>/…` here, with `REMOTE_PLUGIN_API_TOKEN` as the bearer and the
+caller in `x-heyo-actor`, `x-heyo-actor-email` and `x-heyo-actor-admin`
+(`src/plugin.rs`). The pages are the same as at `/<ns>`, with every link
+spelled under app-lb's base and no sign-in. An app-lb namespace admin gets
+admin in the namespace, so they can create and delete repos and mint tokens.
+Anyone else gets read.
+
+Without `REMOTE_PLUGIN_API_TOKEN`, `/-/ns/…` is not mounted. It is one
+canonical credential for this role across regions, loaded into each region's
+app-lb as the `remote-plugin` secret, which the remote deployment and the
+plugin both reference:
+
+```sh
+openssl rand -hex 32 > /tmp/remote-plugin-token
+heyctl create secret remote-plugin --from-file api-token=/tmp/remote-plugin-token
+rm /tmp/remote-plugin-token
+heyctl plugins set remote '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}'
+heyctl plugins enable remote
+```
+
+The plugin installs itself in every namespace unless `"auto_install": false`.
+That grants nothing a namespace's own `applb_` tokens cannot already do here.
+
 ## API
 
 | | |
@@ -161,6 +188,7 @@ off. The theme cookie follows `REMOTE_UI_COOKIE_DOMAIN`, else
 | `REMOTE_ALLOW_FORCE_PUSH` | off | `receive.denyNonFastForwards` otherwise |
 | `REMOTE_MAX_TOKEN_TTL_SECS` | 30 days | cap on a token's `ttl_secs`; `0` (no expiry) is allowed |
 | `REMOTE_WEB` | on | `0` serves the API and git only, with no web UI |
+| `REMOTE_PLUGIN_API_TOKEN` | | app-lb's `remote` plugin bearer; mounts `/-/ns/<ns>/…` (see above) |
 
 The S3 credential needs these permissions on `<prefix>-*`:
 

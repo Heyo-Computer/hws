@@ -73,6 +73,9 @@ pub enum Kind {
     Federated,
     AppToken,
     RepoToken,
+    /// app-lb's `remote` plugin, speaking for a caller it already admitted to
+    /// one namespace. See `crate::plugin`.
+    Plugin,
 }
 
 #[derive(Debug, Clone, Serialize)]

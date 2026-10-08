@@ -791,11 +791,12 @@ Plugins are compiled in and switched on at runtime from `/plugins` or with `heyc
 | --- | --- |
 | `pgfc` | Monitors and manages [pg-fc](pg-fc.md) pools: schemas, dedicated databases, pooler settings, logs. |
 | `vapi` | Monitors vapi inference gateways and exposes their admission settings and a test prompt box. |
+| `remote` | Per-namespace git from [remote](../remote/README.md): installed in every namespace by default, it serves the namespace's repositories, history, branches and repo tokens in the plugin console. |
 | `obs` | Per-namespace observability from [app-obs](app-obs.md): installed by each namespace, it starts collection for that namespace's apps and serves their logs, metrics and alerts to the namespace's own tokens. |
 
 ### Installing a plugin in a namespace
 
-Some plugins (today, `obs`) are installed per namespace. The operator enables and configures the plugin once for the host; then a namespace administrator installs it:
+Some plugins (today, `obs` and `remote`) are installed per namespace. The operator enables and configures the plugin once for the host; then a namespace administrator installs it:
 
 ```sh
 heyctl plugins enable obs   # operator, after `heyctl plugins set obs '{"url": "http://127.0.0.1:9600", "api_token": {"secret": "app-obs", "key": "api_token"}}'`
@@ -807,6 +808,13 @@ heyctl plugins install obs -n team-a   # an admin token for all of team-a
 An install is a record on the plugin, kept while the plugin is disabled. The namespace's view of the plugin is served at `/namespaces/<ns>/plugins/<id>/…`, behind the namespace wall: a namespace token reaches its own namespace's pages and no other, a `GET` needs the view tier there and anything else the admin tier. Installing needs an admin credential for the whole namespace, not a token narrowed to some of its deployments. Before the plugin is installed those routes answer `409` with `"code": "plugin_not_installed"`, and while the operator has it switched off, `"code": "plugin_disabled"`.
 
 For `obs`, `/namespaces/<ns>/plugins/obs/ui` is the app-obs dashboard narrowed to the namespace, and `…/obs/api/fleet`, `…/obs/api/deployments/<id>[/logs]` and `…/obs/api/alerts` are its JSON API. app-lb sends them to app-obs's `/ns/<ns>/…` routes with the token from the plugin's configuration; the caller's own credential never reaches app-obs. A namespace user's dashboard (`/dashboard?namespace=<ns>`) shows an **Observability** link once it is installed, or an **Install observability** button for an admin, plus a **Plugins** link to the namespace's plugin page.
+
+For `remote`, the operator gives remote's URL and a secret reference to remote's `REMOTE_PLUGIN_API_TOKEN`. `/namespaces/<ns>/plugins/remote/ui` is the namespace's repositories, and `…/remote/ui/<page>` every other page (`<repo>`, `<repo>/tree/<ref>/<path>`, `<repo>/commits`, `-/new`, `-/tokens`, …). They are forwarded to remote's `/-/ns/<ns>/…`, because remote's own root belongs to namespaces. app-lb sends the caller's identity, and remote gives a namespace admin admin in the namespace and anyone else read. Like `obs`, it installs itself unless `"auto_install": false`.
+
+```sh
+heyctl plugins set remote '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}'
+heyctl plugins enable remote
+```
 
 ### Plugin dashboards
 

@@ -31,6 +31,7 @@ mod git;
 // as the other apps do. See `ui/README.md`.
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
+mod plugin;
 mod registry;
 mod sigv4;
 mod store;

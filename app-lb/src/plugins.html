@@ -755,6 +755,13 @@ PANELS.obs = installsPanel("obs", "Observability", (view, tile) => {
   return tile("app-obs", s.url || "—") + tile("reachable", s.up ? "yes" : "no");
 });
 
+// remote's pages for each namespace that has it installed: its repos, in the
+// plugin console.
+PANELS.remote = installsPanel("remote", "Git", (view, tile) => {
+  const s = view.status || {};
+  return tile("remote", s.url || "—") + tile("reachable", s.up ? "yes" : "no");
+});
+
 async function load() {
   const r = await api("GET", "/api/plugins");
   const root = $("plugins");
