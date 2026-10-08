@@ -285,6 +285,8 @@ jobs:
           export CI_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/ci_release_retry
           export CI_TEST_NATS_URL=nats://127.0.0.1:44222
           export CI_NATS_URL="$CI_TEST_NATS_URL"
+          cargo test --release --locked --bin ci release_build::tests:: -- --ignored --test-threads=1
+          cargo test --release --locked --bin ci release_environment::tests::promotion_persistence_is_idempotent_scoped_and_tracks_completion -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci dispatch::tests::published_release_failed_only_retry_preserves_identity_and_single_flight -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci executor::tests::both_regions_active_and_only_target_drains -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci controller_rollout::tests:: -- --ignored --test-threads=1
