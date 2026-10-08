@@ -179,6 +179,14 @@ file value, including an empty list, wins. Each binding supplies `service_id`,
 Both credential fields are HeyoSecret references, not values.
 The caller cannot choose a remote authority or supply its credential.
 
+Several deployments may share a region, with distinct deployment IDs for the
+service. First appearance determines region order; deployments within each
+region keep their configuration order. All deployments in one region must
+finish and bake before the next region starts. The accepted target list is
+frozen: do not change bindings during an active update. A server enrollment
+alone does not add a binding, change replica counts, or move running workloads.
+Deploy the compatible CI receipt reader before configuring repeated regions.
+
 Register each configured canonical service binding against its retained regional deployment
 after reading its current app-lb spec and public `/healthz` identity. Do not use
 the legacy private `cicd` definition, invent a Cloud archive ID from a workspace

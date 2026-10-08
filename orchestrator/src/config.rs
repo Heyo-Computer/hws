@@ -578,7 +578,6 @@ impl Config {
                 .context("invalid ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON")?
         };
         let mut identities = std::collections::HashSet::new();
-        let mut service_regions = std::collections::HashSet::new();
         let mut service_deployments = std::collections::HashSet::new();
         for binding in &mut bindings {
             for value in [&mut binding.authority, &mut binding.health_origin] {
@@ -590,8 +589,6 @@ impl Config {
             }
             anyhow::ensure!(!binding.service_id.trim().is_empty() && !binding.region.trim().is_empty(),
                 "external service and region must be nonempty");
-            anyhow::ensure!(service_regions.insert((binding.service_id.clone(), binding.region.clone())),
-                "duplicate external service region");
             anyhow::ensure!(service_deployments.insert((binding.service_id.clone(), binding.deployment_id.clone())),
                 "duplicate external service deployment");
             anyhow::ensure!(identities.insert((binding.authority.clone(), binding.namespace.clone(), binding.deployment_id.clone())),
@@ -618,6 +615,20 @@ fn default_regional_application_bake_seconds() -> u32 { 30 }
 #[cfg(test)]
 mod observer_config_tests {
     use super::*;
+
+    #[test]
+    fn multiple_deployments_can_share_a_region_but_not_an_identity() {
+        let empty = ConfigBuilder::builder().build().unwrap();
+        let mut values = serde_json::json!([
+            {"service_id":"ci","region":"west","deployment_id":"ci-a","namespace":"default",
+             "authority":"https://admin-a.test","health_origin":"https://ci-a.test","token_secret_path":"admin/token"},
+            {"service_id":"ci","region":"west","deployment_id":"ci-b","namespace":"default",
+             "authority":"https://admin-b.test","health_origin":"https://ci-b.test","token_secret_path":"admin/token"}
+        ]);
+        assert_eq!(Config::load_external_service_bindings(&empty, Some(&values.to_string())).unwrap().len(), 2);
+        values[1]["deployment_id"] = serde_json::json!("ci-a");
+        assert!(Config::load_external_service_bindings(&empty, Some(&values.to_string())).is_err());
+    }
 
     #[test]
     fn managed_observer_env_is_a_fallback_not_a_file_override() {

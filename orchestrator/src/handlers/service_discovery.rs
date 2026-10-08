@@ -75,7 +75,7 @@ pub(super) async fn read_inventory(db: &sea_orm::DatabaseConnection, after: Opti
         "SELECT ids.service_id,s.desired_replicas,s.replica_regions,
                 (SELECT jsonb_agg(jsonb_build_object('deploymentId',e.deployment_id,'region',e.region,
                     'observedAt',e.observed_at,'lifecycleOwner',e.lifecycle_owner,'capabilities',e.capabilities)
-                    ORDER BY e.region) FROM external_service_bindings e WHERE e.service_id=ids.service_id) AS external_bindings
+                    ORDER BY e.region,e.deployment_id) FROM external_service_bindings e WHERE e.service_id=ids.service_id) AS external_bindings
          FROM (SELECT service_id FROM service_discovery_sets UNION SELECT service_id FROM service_deployment_states UNION SELECT service_id FROM external_service_bindings) ids
          LEFT JOIN service_deployment_states s USING(service_id)
          WHERE ($1::text IS NULL OR ids.service_id > $1) ORDER BY ids.service_id LIMIT 101",

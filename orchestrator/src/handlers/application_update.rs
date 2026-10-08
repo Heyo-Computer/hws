@@ -24,7 +24,16 @@ fn binding<'a>(state: &'a AppState, service: &str) -> Result<&'a ExternalService
 fn bindings<'a>(state: &'a AppState, service: &str) -> Result<Vec<&'a ExternalServiceBinding>> {
     let matches: Vec<_> = state.config.external_service_bindings.iter().filter(|b| b.service_id == service).collect();
     anyhow::ensure!(!matches.is_empty(), "application lifecycle is not configured");
-    Ok(matches)
+    // First appearance defines operator region order. Finish every deployment
+    // in that region before advancing, even if configuration interleaves them.
+    let mut regions = std::collections::HashSet::new();
+    let mut ordered = Vec::with_capacity(matches.len());
+    for binding in &matches {
+        if regions.insert(&binding.region) {
+            ordered.extend(matches.iter().copied().filter(|b| b.region == binding.region));
+        }
+    }
+    Ok(ordered)
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -127,8 +136,8 @@ async fn accept(binding: &ExternalServiceBinding, r: &UpdateRequest, bearer: &st
     let tx = service_deploy::try_service_lifecycle_lock(db::get_db()?,&binding.service_id).await?
         .context("application lifecycle is busy")?;
     let registered = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
-        "SELECT authority,deployment_id,namespace,region FROM external_service_bindings WHERE service_id=$1 AND region=$2",
-        vec![binding.service_id.clone().into(),binding.region.clone().into()])).await?
+        "SELECT authority,deployment_id,namespace,region FROM external_service_bindings WHERE service_id=$1 AND region=$2 AND deployment_id=$3",
+        vec![binding.service_id.clone().into(),binding.region.clone().into(),binding.deployment_id.clone().into()])).await?
         .context("application has not been adopted")?;
     anyhow::ensure!(registered.try_get::<String>("","authority")?.trim_end_matches('/') == binding.authority.trim_end_matches('/')
         && registered.try_get::<String>("","deployment_id")? == binding.deployment_id
@@ -165,7 +174,8 @@ async fn accept_regional(state: &AppState, service: &str, r: &RegionalUpdateRequ
             "release digests must be lowercase SHA-256");
     }
     let configured = bindings(state,service)?;
-    anyhow::ensure!(configured.len() >= 2,"regional updates require at least two configured regions");
+    anyhow::ensure!(configured.iter().map(|b| &b.region).collect::<std::collections::HashSet<_>>().len() >= 2,
+        "regional updates require at least two configured regions");
     let tx = service_deploy::try_service_lifecycle_lock(db::get_db()?,service).await?.context("application lifecycle is busy")?;
     let hash = request_hash(r)?;
     if let Some(row) = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
@@ -181,8 +191,8 @@ async fn accept_regional(state: &AppState, service: &str, r: &RegionalUpdateRequ
     let mut frozen = Vec::with_capacity(configured.len());
     for (ordinal,binding) in configured.iter().enumerate() {
         let registered = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
-            "SELECT authority,namespace,deployment_id,evidence FROM external_service_bindings WHERE service_id=$1 AND region=$2",
-            vec![service.into(),binding.region.clone().into()])).await?.context("configured regional application has not been adopted")?;
+            "SELECT authority,namespace,deployment_id,evidence FROM external_service_bindings WHERE service_id=$1 AND region=$2 AND deployment_id=$3",
+            vec![service.into(),binding.region.clone().into(),binding.deployment_id.clone().into()])).await?.context("configured regional application has not been adopted")?;
         let evidence: Value=registered.try_get("","evidence")?;
         anyhow::ensure!(registered.try_get::<String>("","authority")?.trim_end_matches('/') == binding.authority.trim_end_matches('/')
             && registered.try_get::<String>("","namespace")? == binding.namespace
@@ -778,5 +788,41 @@ pub(super) async fn test_regional_updates(state: &AppState) -> Result<()> {
     reconcile_regional(&state,"ci","regional-cancelled").await?;
     reconcile_regional(&state,"ci","regional-cancelled").await?;
     assert_eq!(status_value(database,"ci","regional-cancelled").await?["status"],"cancelled","pre-prepare cancellation stranded parent");
-    us_task.abort(); eu_task.abort(); Ok(())
+
+    // A second deployment in the first region must finish before the next
+    // region starts. Interleave configuration to catch flat-list execution.
+    let second=Arc::new(Peer::default());
+    let (second_binding,second_task)=peer("us3","ci-us5",second.clone()).await?;
+    database.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO external_service_bindings(service_id,authority,namespace,deployment_id,region,source_rollout_revision,spec_etag,artifact_digest,application_revision,runtime_sandbox_id,runtime_port,observed_at,evidence) VALUES('ci',$1,'default',$2,$3,'generation-8','etag',$4,'old-revision','sb-us5',9500,now(),$5)",
+        vec![second_binding.authority.clone().into(),second_binding.deployment_id.clone().into(),second_binding.region.clone().into(),
+            "c".repeat(64).into(),json!({"healthOrigin":second_binding.health_origin}).into()])).await?;
+    database.execute_unprepared(include_str!("../../migrations/046_regional_external_application_updates.sql")).await?;
+    database.execute_unprepared(include_str!("../../migrations/047_regional_deployment_membership.sql")).await?;
+    let mut config=(*state.config).clone();
+    config.external_service_bindings.push(second_binding);
+    let state=AppState {config:Arc::new(config),..state};
+    let mut request=cancelled; request.operation_id="regional-multiple".into();
+    accept_regional(&state,"ci",&request).await?;
+    let frozen=status_value(database,"ci",&request.operation_id).await?;
+    assert_eq!(frozen["targets"].as_array().unwrap().iter().map(|t|t["deploymentId"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["ci-us3","ci-us5","ci-eu1"]);
+    for peer in [&us,&second,&eu] { peer.activations.store(0,Ordering::SeqCst); }
+    for _ in 0..4 { reconcile_regional(&state,"ci",&request.operation_id).await?; }
+    for (ordinal,peer) in [&us,&second,&eu].into_iter().enumerate() {
+        reconcile_regional(&state,"ci",&request.operation_id).await?;
+        reconcile_regional(&state,"ci",&request.operation_id).await?;
+        for (index,p) in [&us,&second,&eu].into_iter().enumerate() {
+            assert_eq!(p.activations.load(Ordering::SeqCst),usize::from(index<=ordinal),"target activated out of regional order");
+        }
+        peer.phase.store(3,Ordering::SeqCst);
+        reconcile_regional(&state,"ci",&request.operation_id).await?;
+        assert_eq!(status_value(database,"ci",&request.operation_id).await?["status"],"running");
+        database.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+            "UPDATE regional_application_update_targets SET bake_started_at=now()-interval '2 seconds',observed_at=now() WHERE parent_operation_id=$1 AND ordinal=$2",
+            vec![request.operation_id.clone().into(),(ordinal as i32).into()])).await?;
+        reconcile_regional(&state,"ci",&request.operation_id).await?;
+    }
+    assert_eq!(status_value(database,"ci",&request.operation_id).await?["status"],"passed");
+    us_task.abort(); eu_task.abort(); second_task.abort(); Ok(())
 }

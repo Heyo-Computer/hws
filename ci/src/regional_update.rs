@@ -121,15 +121,18 @@ fn verify_observation(observed: &Value, command: &Value, application: &str, prev
         && observed["serviceId"] == application, "regional receipt identity mismatch");
     let targets = observed["targets"].as_array().context("regional membership missing")?;
     let mut regions = std::collections::HashSet::new();
+    let mut children = std::collections::HashSet::new();
     let identities = |values: &[Value]| -> Vec<Value> { values.iter().map(|t|json!([
         t["region"],t["deploymentId"],t["authority"],t["healthOrigin"],t["operationId"]])).collect() };
-    anyhow::ensure!(targets.len() >= 2, "regional update requires multiple regions");
     for t in targets {
         let region = t["region"].as_str().filter(|s|!s.is_empty()).context("region missing")?;
         let deployment = t["deploymentId"].as_str().filter(|s|!s.is_empty()).context("deployment missing")?;
         let authority = t["authority"].as_str().context("authority missing")?;
-        anyhow::ensure!(regions.insert(region) && t["operationId"] == child_id(command["operationId"].as_str().unwrap(),authority,deployment), "regional child identity mismatch");
+        regions.insert(region);
+        let child = child_id(command["operationId"].as_str().unwrap(),authority,deployment);
+        anyhow::ensure!(t["operationId"] == child && children.insert(child), "regional child identity mismatch");
     }
+    anyhow::ensure!(regions.len() >= 2, "regional update requires multiple regions");
     if let Some(previous) = previous {
         anyhow::ensure!(identities(previous["targets"].as_array().context("saved targets missing")?) == identities(targets), "regional membership changed on replay");
     }
@@ -222,7 +225,7 @@ mod tests {
     fn one_finished_region_or_changed_membership_is_not_release_success() {
         let command=json!({"apiVersion":"regional-v1","operationId":"parent",
             "release":{"runId":"run","targetRevision":"release-8","artifactDigest":"a".repeat(64),"binarySha256":"b".repeat(64)}});
-        let targets:Vec<Value>=[("west","ci-west"),("east","ci-east")].into_iter().map(|(region,deployment)|json!({
+        let targets:Vec<Value>=[("west","ci-west-1"),("west","ci-west-2"),("east","ci-east")].into_iter().map(|(region,deployment)|json!({
             "region":region,"deploymentId":deployment,"authority":"https://admin.test","healthOrigin":format!("https://{region}.test"),
             "operationId":child_id("parent","https://admin.test",deployment),"status":"passed",
             "observation":{"status":"passed","phase":"complete","result":{"applicationRevision":"release-8",
@@ -231,6 +234,10 @@ mod tests {
         let observation=json!({"apiVersion":"regional-v1","operationId":"parent","serviceId":"ci",
             "request":command,"requestHash":hash(&command),"status":"passed","targets":targets});
         assert_eq!(verify_observation(&observation,&command,"ci",None).unwrap(),Some("passed"));
+        let mut single_region=observation.clone(); single_region["targets"].as_array_mut().unwrap().pop();
+        assert!(verify_observation(&single_region,&command,"ci",None).is_err());
+        let mut duplicate=observation.clone(); duplicate["targets"][1]=duplicate["targets"][0].clone();
+        assert!(verify_observation(&duplicate,&command,"ci",None).is_err());
         let mut incomplete=observation.clone(); incomplete["targets"][1]["status"]=json!("baking");
         assert!(verify_observation(&incomplete,&command,"ci",None).is_err());
         incomplete["status"]=json!("running");

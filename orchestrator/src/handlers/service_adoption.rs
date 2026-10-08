@@ -142,8 +142,8 @@ async fn register(state: &AppState, r: &ExternalServiceAdoptionRequest) -> Resul
     let first = observe(binding,r,&bearer).await?;
     let tx = service_deploy::try_service_lifecycle_lock(db::get_db()?,&r.service_id).await?.context("service lifecycle is busy")?;
     let existing = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
-        "SELECT authority,namespace,deployment_id,source_rollout_revision,spec_etag,artifact_digest,application_revision,runtime_sandbox_id,runtime_port,evidence FROM external_service_bindings WHERE service_id=$1 AND region=$2",
-        [r.service_id.clone().into(),binding.region.clone().into()])).await?;
+        "SELECT authority,namespace,deployment_id,source_rollout_revision,spec_etag,artifact_digest,application_revision,runtime_sandbox_id,runtime_port,evidence FROM external_service_bindings WHERE service_id=$1 AND region=$2 AND deployment_id=$3",
+        [r.service_id.clone().into(),binding.region.clone().into(),binding.deployment_id.clone().into()])).await?;
     if let Some(row)=existing {
         let exact = row.try_get::<String>("","authority")? == origin(&binding.authority)?.as_str() && row.try_get::<String>("","namespace")? == binding.namespace
             && row.try_get::<String>("","deployment_id")? == r.deployment_id && row.try_get::<String>("","source_rollout_revision")? == r.source_rollout_revision
