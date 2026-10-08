@@ -1324,23 +1324,11 @@ mod tests {
             .execute(store.pool()).await.unwrap();
         sqlx::query("INSERT INTO ci_release_bundle(id,repository,name,manifest,manifest_sha256,created_by) VALUES('legacy-bundle','repo','legacy','{}','legacy-digest','test')")
             .execute(store.pool()).await.unwrap();
-        let legacy_policy = policy();
-        let legacy_plan = plan("legacy", &legacy_policy).unwrap();
         let mut tx = store.pool().begin().await.unwrap();
-        Store::create_run_in(
-            &mut tx,
-            "legacy-run",
-            &crate::store::RunRequest {
-                workflow_id: "platform".into(),
-                repo_url: "repo".into(),
-                git_ref: "refs/heads/main".into(),
-                sha: "a".repeat(40),
-                ..Default::default()
-            },
-            &legacy_plan,
-        )
-        .await
-        .unwrap();
+        // Seed the historical schema directly: the current run writer requires
+        // columns added by later migrations (for example namespace).
+        sqlx::query("INSERT INTO ci_run(id,workflow_id,workflow_path,repo_url,git_ref,sha,status) VALUES('legacy-run','platform','release.yml','repo','refs/heads/main',$1,'queued')")
+            .bind("a".repeat(40)).execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO ci_release_promotion(run_id,environment,request_id,bundle_id,automatic,policy) VALUES('legacy-run','legacy','legacy-request','legacy-bundle',false,'{}')")
             .execute(&mut *tx).await.unwrap();
         sqlx::query("UPDATE ci_release_environment SET current_bundle='legacy-bundle',previous_bundle='legacy-bundle',active_run='legacy-run' WHERE name='legacy'")
