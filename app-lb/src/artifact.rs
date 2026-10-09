@@ -1007,6 +1007,7 @@ impl Puller {
         ));
 
         let image = name.map(str::to_string).unwrap_or_else(|| spec.image_for(deployment_id, &digest));
+        let _held = hold_image(&image, log).await;
 
         if !force
             && let Some((path, size)) = self.usable_on_daemon(&image, expected_size, spec.grow_gb).await?
@@ -1264,6 +1265,10 @@ impl Puller {
         log: &mut (dyn FnMut(String) + Send),
     ) -> Result<Pulled, String> {
         let root = spec.store.trim();
+        // Held through the materialize and upload below, when the name is
+        // known up front; a sync bundle that `art stat` cannot resolve goes
+        // unlocked, as it is named only once it has been materialized.
+        let mut _held = None;
 
         // Resolve first, so an image already on disk costs one `art stat`
         // instead of a full materialization. `stat` reports the blob a
@@ -1276,6 +1281,7 @@ impl Puller {
                     human(size)
                 ));
                 let image = name.map(str::to_string).unwrap_or_else(|| spec.image_for(deployment_id, &digest));
+                _held = Some(hold_image(&image, log).await);
                 if !force
                     && let Some((path, size)) = self.usable_on_daemon(&image, size, spec.grow_gb).await?
                 {
@@ -1675,6 +1681,51 @@ fn blob_entry(m: &Manifest, reference: &str, expected: Option<&str>) -> Result<(
 fn image_is_usable(size: u64, expected_size: u64, grow_gb: Option<u64>) -> bool {
     let required = expected_size.max(grow_gb.map(|gb| gb * 1024 * 1024 * 1024).unwrap_or(0));
     required == 0 || size >= required
+}
+
+/// The catalog names a pull of this process is putting into the daemon,
+/// one lock each.
+///
+/// Process-wide rather than per [`Puller`], because jobs, thaws and rollout
+/// candidates each hold their own and they all write the same catalog. Weak,
+/// so a name nobody is pulling costs nothing once its last holder is gone.
+static PULLING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Hold `image` for as long as the guard lives: from the "already in the
+/// catalog?" check through the upload that puts it there.
+///
+/// A content-addressed name is shared by every deployment of the same digest,
+/// so concurrent pulls of one hub image would otherwise each fetch it, each
+/// upload it — and each write the same [`TempImage`], whose name is the image
+/// and this process. Queued behind the lock, a later pull re-checks the
+/// catalog once the first is done and finds the image there, so N concurrent
+/// pulls of one digest cost one fetch. If the first one failed, the next one
+/// simply tries the fetch itself.
+async fn hold_image(
+    image: &str,
+    log: &mut (dyn FnMut(String) + Send),
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut pulling = PULLING.lock().unwrap_or_else(|e| e.into_inner());
+        pulling.retain(|_, held| held.strong_count() > 0);
+        match pulling.get(image).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                pulling.insert(image.to_string(), std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    match lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            log(format!("another pull is already putting {image} on the daemon; waiting for it"));
+            lock.lock_owned().await
+        }
+    }
 }
 
 struct TempImage {
@@ -2142,6 +2193,91 @@ mod tests {
         let (got, size) = puller.resolve_remote(&base, &digest, None, None).await.unwrap();
         assert_eq!((got.as_str(), size), (digest.as_str(), 1234));
         server.abort();
+    }
+
+    /// A store and a heyvmd in one: `GET /blobs` and `PUT /images` are
+    /// counted, and the first `fail_first` blob fetches answer 500.
+    async fn store_and_daemon(blob: Vec<u8>, fail_first: usize) -> (String, std::sync::Arc<Counts>) {
+        use axum::{Router, routing::get, extract::{Path, State}, http::StatusCode, response::IntoResponse};
+        use std::sync::{Arc, atomic::Ordering};
+        let digest = hex(&Sha256::digest(&blob));
+        let counts = Arc::new(Counts { blob, fail_first, ..Default::default() });
+        let manifest = format!(
+            r#"{{"schema":1,"kind":"heyvm.rootfs.v1","entries":[{{"name":"rootfs.ext4","digest":"{digest}","size":{}}}],"annotations":{{}}}}"#,
+            counts.blob.len()
+        );
+        let app = Router::new()
+            .route("/manifests/:id", get(move || { let m = manifest.clone(); async move { m } }))
+            .route("/blobs/:id", get(|State(c): State<Arc<Counts>>| async move {
+                // Slow enough that every concurrent pull is queued behind it.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if c.fetches.fetch_add(1, Ordering::SeqCst) < c.fail_first {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                c.blob.clone().into_response()
+            }))
+            .route("/images/:name", get(|State(c): State<Arc<Counts>>, Path(n): Path<String>| async move {
+                match c.catalog.lock().unwrap().get(&n) {
+                    Some(size) => axum::Json(serde_json::json!({"name": n, "path": format!("/imgs/{n}.ext4"), "size_bytes": size, "modified_at": 1})).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }).put(|State(c): State<Arc<Counts>>, Path(n): Path<String>, body: axum::body::Bytes| async move {
+                c.uploads.fetch_add(1, Ordering::SeqCst);
+                c.catalog.lock().unwrap().insert(n.clone(), body.len() as u64);
+                axum::Json(serde_json::json!({"name": n, "path": format!("/imgs/{n}.ext4"), "size_bytes": body.len(), "modified_at": 1}))
+            }))
+            .with_state(counts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, counts)
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        blob: Vec<u8>,
+        fail_first: usize,
+        fetches: std::sync::atomic::AtomicUsize,
+        uploads: std::sync::atomic::AtomicUsize,
+        catalog: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    }
+
+    async fn concurrent_pulls(base: &str, dir: &tempfile::TempDir, n: usize) -> Vec<Result<Pulled, String>> {
+        let vms = crate::vm::VmManager::new(Some(base.into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let puller = std::sync::Arc::new(Puller::new("art".into(), dir.path().join("scratch"), None, vms));
+        let spec: ArtifactSpec = serde_json::from_value(serde_json::json!({"store": base, "ref": "alpine"})).unwrap();
+        let pulls = (0..n).map(|i| {
+            let (puller, spec) = (puller.clone(), spec.clone());
+            tokio::spawn(async move { puller.pull(&format!("web-{i}"), &spec, None, false, &mut |_| {}).await })
+        });
+        futures::future::join_all(pulls).await.into_iter().map(|r| r.unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn concurrent_pulls_of_one_digest_fetch_and_upload_it_once() {
+        use std::sync::atomic::Ordering;
+        let (base, counts) = store_and_daemon(b"concurrent pulls share one fetch".to_vec(), 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let pulled: Vec<Pulled> = concurrent_pulls(&base, &dir, 5).await.into_iter().map(Result::unwrap).collect();
+
+        assert_eq!(counts.fetches.load(Ordering::SeqCst), 1, "one GET /blobs for five pulls");
+        assert_eq!(counts.uploads.load(Ordering::SeqCst), 1, "one PUT /images for five pulls");
+        assert_eq!(pulled.iter().filter(|p| !p.reused).count(), 1);
+        assert!(pulled.iter().all(|p| p.image == pulled[0].image && p.image.starts_with("img-")));
+        assert_eq!(pulled.iter().map(|p| p.bytes_written).sum::<u64>(), counts.blob.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_fetch_leaves_the_next_waiting_pull_to_fetch_for_itself() {
+        use std::sync::atomic::Ordering;
+        let (base, counts) = store_and_daemon(b"the first fetch of this one fails".to_vec(), 1).await;
+        let dir = tempfile::tempdir().unwrap();
+        let results = concurrent_pulls(&base, &dir, 3).await;
+
+        assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1, "only the pull that hit the 500 fails");
+        assert_eq!(counts.fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.uploads.load(Ordering::SeqCst), 1);
+        assert_eq!(results.iter().filter(|r| matches!(r, Ok(p) if p.reused)).count(), 1);
     }
 
     #[tokio::test]
