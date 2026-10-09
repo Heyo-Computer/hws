@@ -46,13 +46,24 @@
 //! A plugin whose namespace surface includes a page answers
 //! [`Plugin::dashboard_path`], and app-lb's plugin console at
 //! `/namespaces/<ns>/plugin-console/<id>` frames that page under its own
-//! navigation.
+//! navigation. A plugin backed by a fleet service proxies that page from the
+//! service; one that is app-lb all the way down serves its own with [`page`].
+//!
+//! ## Machine routes
+//!
+//! Some plugins are also called *by* the service they front: ci asks app-lb
+//! for a tenant run's secrets. Those callers hold the plugin's own shared
+//! token, not an app-lb credential, so [`Plugin::machine_routes`] are mounted
+//! at `/api/plugins/<id>/machine/…` outside the admin gate, answer 404 while
+//! the plugin is disabled, and authenticate every request themselves.
 
 pub mod ci;
 pub mod ns_proxy;
 pub mod obs;
 pub mod pgfc;
+pub mod postgres;
 pub mod remote;
+pub mod secrets;
 pub mod vapi;
 
 use arc_swap::ArcSwap;
@@ -145,7 +156,23 @@ pub trait Plugin: Send + Sync + 'static {
     fn dashboard_path(&self) -> Option<&'static str> {
         None
     }
+
+    /// Routes for the service behind the plugin rather than for a person,
+    /// relative to `/api/plugins/<id>/machine`. Mounted **outside** the admin
+    /// gate and only reachable while the plugin is enabled, so each route must
+    /// authenticate its caller itself — with a credential the plugin holds,
+    /// compared in constant time. Requests arrive with an [`Installs`]
+    /// extension naming the namespaces that installed the plugin.
+    fn machine_routes(self: Arc<Self>) -> Router {
+        Router::new()
+    }
 }
+
+/// The namespaces that have installed a plugin, as of the request. Handed to
+/// [`Plugin::machine_routes`], which have no namespace wall in front of them
+/// and so must check an install themselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Installs(pub BTreeSet<String>);
 
 /// The namespace a request to a plugin's namespace surface is for, already
 /// checked against the caller's reach by the admin gate.
@@ -743,6 +770,79 @@ impl PluginHost {
         }
         (view, crud)
     }
+}
+
+impl PluginHost {
+    /// Every plugin's machine routes, nested at `/api/plugins/<id>/machine`.
+    ///
+    /// Not gated: see [`Plugin::machine_routes`]. Each answers 404 while its
+    /// plugin is disabled — to a caller with no app-lb credential, a switched
+    /// off plugin is indistinguishable from one that is not there — and is
+    /// handed the plugin's current install list.
+    pub fn machine_router(self: &Arc<Self>) -> Router {
+        let mut out = Router::new();
+        for slot in &self.slots {
+            let id = slot.plugin.meta().id;
+            let routes = slot.plugin.clone().machine_routes();
+            if !routes.has_routes() {
+                continue;
+            }
+            let guard = axum::middleware::from_fn({
+                let host = self.clone();
+                move |mut req: Request, next: Next| {
+                    let host = host.clone();
+                    async move {
+                        let Some(record) = host.store.get(id).filter(|r| r.enabled) else {
+                            return plugin_error(
+                                StatusCode::NOT_FOUND,
+                                None,
+                                format!("no {id} machine route here"),
+                            );
+                        };
+                        req.extensions_mut()
+                            .insert(Installs(record.installs.keys().cloned().collect()));
+                        next.run(req).await
+                    }
+                }
+            });
+            out = out.nest(
+                &format!("/api/plugins/{id}/machine"),
+                routes.route_layer(guard),
+            );
+        }
+        out
+    }
+}
+
+/// Serve one of a native plugin's own pages on its namespace surface.
+///
+/// `html` is the page, compiled in. `{{NAMESPACE}}` in it is filled with the
+/// request's namespace, escaped for HTML (the page reads it back from a meta
+/// tag rather than having it spliced into script), and `{{HTML_ATTRS}}` with
+/// the theme from the request's cookie, as app-lb's own pages are, so the
+/// frame's first paint is already the right palette. The response carries the
+/// same headers as a proxied page — framable only by app-lb, talking only to
+/// app-lb, never cached — because it is served on the admin origin inside the
+/// plugin console just the same.
+pub fn page(html: &str, ns: &str, req: &Request) -> Response {
+    static COOKIES: std::sync::OnceLock<crate::heyo_ui::CookieConfig> = std::sync::OnceLock::new();
+    let cookies = req
+        .headers()
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    let attrs = COOKIES
+        .get_or_init(|| crate::heyo_ui::CookieConfig::from_env("APP_LB"))
+        .attrs(cookies);
+    let body = html
+        .replace("{{HTML_ATTRS}}", &attrs)
+        .replace("{{NAMESPACE}}", &crate::heyo_ui::escape(ns));
+    let mut out = Response::new(axum::body::Body::from(body));
+    out.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    ns_proxy::harden(out.headers_mut());
+    out
 }
 
 fn plugin_error(status: StatusCode, code: Option<&str>, error: String) -> Response {

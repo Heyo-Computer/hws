@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postgres · {{NAMESPACE}}</title>
+<!-- Read by the script rather than spliced into it: the server fills this
+     escaped for HTML, which is not the same as escaped for JavaScript. -->
+<meta name="plugin-namespace" content="{{NAMESPACE}}">
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
+<style>
+  /* Framed by the plugin console, which draws the bar; this is only the body. */
+  :root {
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+  }
+  * { box-sizing: border-box; }
+  body { padding: 20px 24px 60px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 17px; margin: 0 0 6px; }
+  .lede, .note { color: var(--text-2); font-size: 13px; margin: 0 0 12px; }
+  .note { color: var(--muted); font-size: 12px; }
+  code { font-size: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--border); padding: 14px 16px; margin-bottom: 12px; }
+  .card h2 { font-size: 14px; margin: 0 0 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; font-size: 12px; }
+  .mono { font-family: var(--font-mono, monospace); word-break: break-all; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  input[type=text] { font: inherit; font-size: 13px; padding: 5px 8px;
+    border: 1px solid var(--border); background: var(--bg-dark); color: var(--text); }
+  button.act { font: inherit; font-size: 12.5px; padding: 4px 10px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+  button.act:hover { border-color: var(--accent); }
+  button.act.small { font-size: 11px; padding: 1px 6px; }
+  button.act.danger { color: var(--critical); }
+  button.act:disabled { opacity: .5; cursor: not-allowed; }
+  .empty { color: var(--text-2); padding: 16px 0; text-align: center; }
+  .flash { margin: 0 0 12px; padding: 9px 12px; font-size: 13px; display: none; }
+  .flash.on { display: block; }
+  .flash.ok { background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--good); }
+  .flash.bad { background: color-mix(in srgb, var(--critical) 14%, var(--surface)); color: var(--critical); }
+  .creds { border-color: var(--accent); }
+  .creds dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; font-size: 13px; }
+  .creds dt { color: var(--text-2); }
+  .creds dd { margin: 0; }
+  .ok { color: var(--good); }
+  .down { color: var(--critical); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Postgres</h1>
+  <p class="lede">Dedicated databases for namespace <strong class="mono" id="ns"></strong>. Each has its
+    own role and password, and that role can open no other database.</p>
+  <div class="flash" id="flash"></div>
+  <p class="note" id="tier"></p>
+
+  <div class="card creds" id="creds" hidden>
+    <h2>Credentials for <span class="mono" id="creds-name"></span></h2>
+    <p class="lede">This is the only time the password is shown. Copy it now, or read it from the
+      namespace secret below.</p>
+    <dl id="creds-list"></dl>
+    <div class="row"><button class="act" type="button" id="creds-hide">I have saved them</button></div>
+  </div>
+
+  <div class="card">
+    <h2>Databases</h2>
+    <p class="note" id="where"></p>
+    <div id="list"><div class="empty">Loading…</div></div>
+  </div>
+
+  <div class="card" id="create-card" hidden>
+    <h2>New database</h2>
+    <div class="row">
+      <input type="text" id="new-name" placeholder="name, e.g. app" size="24" autocomplete="off">
+      <label class="note"><input type="checkbox" id="new-secret" checked> write the credentials to secret <code>pg-&lt;name&gt;</code></label>
+      <button class="act" type="button" id="create">Create</button>
+    </div>
+    <p class="note">Lowercase letters, digits and <code>_</code>, starting with a letter. The database
+      is created as <code>ns_&lt;namespace&gt;_&lt;name&gt;</code>. The secret holds <code>url</code>,
+      <code>host</code>, <code>port</code>, <code>database</code>, <code>user</code> and
+      <code>password</code>, ready for a deployment's <code>env_from</code>.</p>
+  </div>
+
+  <p class="note">Deleting a database revokes its credential. Its data stays on the pool until an
+    operator purges it, and its <code>pg-</code> secret stays until you delete it on the Secrets page.</p>
+</div>
+
+<script>
+"use strict";
+
+const NS = document.querySelector('meta[name="plugin-namespace"]').content;
+let admin = false;
+
+document.getElementById("ns").textContent = NS;
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function api(method, path, body) {
+  const opts = { method, headers: { accept: "application/json" } };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const r = await fetch(path, opts);
+    const text = await r.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { message: text }; }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+function failure(r, what) {
+  const d = r.data || {};
+  if (r.status === 401 || r.status === 403)
+    return what + " needs a namespace admin; this session cannot.";
+  return what + " failed: " + (d.error || d.message || "HTTP " + r.status);
+}
+
+function flash(kind, message) {
+  const el = document.getElementById("flash");
+  el.className = "flash on " + kind;
+  el.textContent = message;
+}
+
+// What this session may do in NS, from /whoami. Shown, never trusted: the
+// admin API decides every request on its own.
+function tierOf(w) {
+  if (!w) return "none";
+  if (w.fleet) return w.may && w.may.use_admin_routes ? "admin" : "view";
+  if (w.namespaces) return w.namespaces[NS] || "none";
+  if (w.namespace === NS) return w.admin_scope || "none";
+  return "none";
+}
+
+function when(secs) {
+  return secs ? new Date(secs * 1000).toLocaleString() : "—";
+}
+
+// Relative to this page (…/plugins/postgres/ui), whatever prefix serves it.
+async function load() {
+  const r = await api("GET", "api/databases");
+  const box = document.getElementById("list");
+  if (!r.ok) {
+    box.innerHTML = '<div class="empty">' + esc(failure(r, "Loading databases")) + "</div>";
+    return;
+  }
+  const d = r.data;
+  document.getElementById("where").innerHTML = "Connect to <code>" + esc(d.host) + ":" + esc(d.port) +
+    "</code> with <code>sslmode=" + esc(d.sslmode) + "</code>. Up to " + esc(d.limit) + " databases per namespace." +
+    (d.error ? ' <span class="down">' + esc(d.error) + "</span>" : "");
+  if (!d.databases.length) {
+    box.innerHTML = '<div class="empty">No databases yet.</div>';
+    return;
+  }
+  box.innerHTML = "<table><thead><tr><th>Name</th><th>Database / user</th><th>Secret</th><th>State</th><th>Created</th><th></th></tr></thead><tbody>" +
+    d.databases.map(db => "<tr><td class='mono'>" + esc(db.name) + "</td>" +
+      "<td class='mono'>" + esc(db.database) + (db.user !== db.database ? " / " + esc(db.user) : "") + "</td>" +
+      "<td class='mono'>" + esc(db.secret || "—") + "</td>" +
+      "<td>" + (db.live === true ? '<span class="ok">' + esc(db.tier || "live") + "</span>"
+        : db.live === false ? '<span class="down">missing at pg-fc</span>' : "unknown") + "</td>" +
+      "<td>" + esc(when(db.created_at)) + (db.created_by ? '<div class="note">' + esc(db.created_by) + "</div>" : "") + "</td>" +
+      "<td>" + (admin ? '<button class="act small danger" type="button" data-delete="' + esc(db.name) + '">delete</button>' : "") + "</td></tr>"
+    ).join("") + "</tbody></table>";
+  box.querySelectorAll("[data-delete]").forEach(b => b.addEventListener("click", async () => {
+    const name = b.dataset.delete;
+    if (!confirm("Delete database " + name + "? Its credential stops working now; its data stays on the pool until an operator purges it.")) return;
+    const r = await api("DELETE", "api/databases/" + encodeURIComponent(name));
+    if (!r.ok) return flash("bad", failure(r, "Deleting"));
+    flash("ok", "Deleted " + name + "." + (r.data.secret_kept ? " The secret " + r.data.secret_kept + " is still there." : ""));
+    load();
+  }));
+}
+
+function showCreds(c) {
+  document.getElementById("creds-name").textContent = c.name;
+  const rows = [["host", c.host], ["port", c.port], ["database", c.database], ["user", c.user],
+    ["password", c.password], ["url", c.url], ["sslmode", c.sslmode], ["secret", c.secret || "not written"]];
+  document.getElementById("creds-list").innerHTML = rows.map(([k, v]) =>
+    "<dt>" + esc(k) + '</dt><dd class="mono">' + esc(v) + "</dd>").join("");
+  document.getElementById("creds").hidden = false;
+}
+
+document.getElementById("creds-hide").addEventListener("click", () => {
+  document.getElementById("creds-list").innerHTML = "";
+  document.getElementById("creds").hidden = true;
+});
+
+document.getElementById("create").addEventListener("click", async ev => {
+  const name = document.getElementById("new-name").value.trim();
+  if (!name) return flash("bad", "Name the database.");
+  const secret = document.getElementById("new-secret").checked;
+  ev.target.disabled = true;
+  const r = await api("POST", "api/databases", { name, secret });
+  ev.target.disabled = false;
+  if (!r.ok) return flash("bad", failure(r, "Creating the database"));
+  document.getElementById("new-name").value = "";
+  showCreds(r.data);
+  flash(r.data.secret_error ? "bad" : "ok", r.data.secret_error
+    ? "Created " + name + ", but " + r.data.secret_error
+    : "Created " + name + ".");
+  load();
+});
+
+(async () => {
+  const who = await api("GET", "/whoami");
+  admin = tierOf(who.ok ? who.data : null) === "admin";
+  document.getElementById("create-card").hidden = !admin;
+  document.getElementById("tier").textContent = admin ? ""
+    : "Read-only: a namespace admin creates and deletes databases.";
+  load();
+})();
+</script>
+</body>
+</html>

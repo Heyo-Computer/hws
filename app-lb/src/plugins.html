@@ -770,6 +770,19 @@ PANELS.remote = installsPanel("remote", "Git", (view, tile) => {
   return tile("remote", s.url || "—") + tile("reachable", s.up ? "yes" : "no");
 });
 
+// Dedicated databases on pg-fc for each namespace that installs it; it never
+// installs itself, because each database is a VM on this region's hosts.
+PANELS.postgres = installsPanel("postgres", "Postgres", (view, tile) => {
+  const s = view.status || {};
+  return tile("pg-fc", s.url || "—") + tile("reachable", s.up ? "yes" : "no")
+    + tile("clients connect to", s.pg_host ? `${s.pg_host}:${s.pg_port}` : "—")
+    + tile("databases", String(s.databases ?? 0));
+});
+
+// A page over each namespace's own secrets; nothing runs, so the only fact
+// worth a tile is where it is installed.
+PANELS.secrets = installsPanel("secrets", "Secrets", () => "");
+
 async function load() {
   const r = await api("GET", "/api/plugins");
   const root = $("plugins");

@@ -1,4 +1,5 @@
-//! Secrets and variables, from heyosecret.
+//! Secrets and variables, from heyosecret — and, for a tenant's runs, from
+//! the namespace's own app-lb secrets.
 //!
 //! ## This process is the policy layer, because heyosecret has none
 //!
@@ -24,6 +25,19 @@
 //! heyosecret has no batch read: N secrets is N POSTs. One `list` by prefix
 //! yields the names, and the values are fetched concurrently, once, and held for
 //! the job's lifetime.
+//!
+//! ## A tenant's secrets are its namespace's
+//!
+//! A run submitted by a namespace that installed app-lb's `ci` plugin reads
+//! nothing from heyosecret. Its secrets are that namespace's app-lb secrets
+//! `ci`, `ci.<workflow>` and `ci.<workflow>.<environment>` — the same store
+//! the namespace's deployments read, managed on its Secrets page — and app-lb
+//! merges them (later ones winning) when ci asks on the plugin's machine
+//! route, `POST /api/plugins/ci/machine/secrets/resolve`, with
+//! `CI_PLUGIN_API_TOKEN`. app-lb answers only for the namespace named, and
+//! only if it installed ci, so a tenant cannot read the fleet's secrets or
+//! another tenant's, whatever its workflow is called. Everything app-lb
+//! returns is a secret and is masked; a tenant has no `vars.*`.
 
 use crate::config::Config;
 #[cfg(test)]
@@ -134,18 +148,36 @@ struct SecretValue {
     value_base64: String,
 }
 
-/// A heyosecret client scoped to this orchestrator.
+/// A heyosecret client scoped to this orchestrator, plus the app-lb route a
+/// tenant run's secrets come from.
 #[derive(Clone)]
 pub struct Secrets {
     http: reqwest::Client,
     base_url: Option<String>,
     token: Option<String>,
+    /// `CI_APP_LB_URL` and `CI_PLUGIN_API_TOKEN`: where a tenant's secrets
+    /// are resolved, and the bearer app-lb's `ci` plugin expects there.
+    app_lb_url: Option<String>,
+    plugin_token: Option<String>,
+}
+
+/// app-lb's answer on the `ci` plugin's resolve route.
+#[derive(Debug, Deserialize)]
+struct TenantSecrets {
+    #[serde(default)]
+    secrets: BTreeMap<String, String>,
 }
 
 impl Secrets {
     #[cfg(test)]
     pub fn unconfigured() -> Self {
-        Self { http: reqwest::Client::new(), base_url: None, token: None }
+        Self {
+            http: reqwest::Client::new(),
+            base_url: None,
+            token: None,
+            app_lb_url: None,
+            plugin_token: None,
+        }
     }
 
     pub fn new(config: &Config) -> Self {
@@ -156,6 +188,8 @@ impl Secrets {
                 .unwrap_or_default(),
             base_url: config.heyosecret_url.clone(),
             token: config.heyosecret_token.clone(),
+            app_lb_url: config.app_lb_url.clone(),
+            plugin_token: config.plugin_api_token.clone(),
         }
     }
 
@@ -172,30 +206,74 @@ impl Secrets {
         format!("ci/{}/{}", sanitize(workflow_id), sanitize(environment))
     }
 
-    /// The prefix a run's secrets live under, wherever it came from.
-    ///
-    /// A fleet run is [`Self::prefix`]. A tenant run is forced under
-    /// `ci/ns/<namespace>/<workflow>/<environment>`, whatever its workflow is
-    /// called: a tenant registration's workflow id is a name the tenant chose,
-    /// and without the namespace segment a repository named after a fleet
-    /// workflow would read that workflow's deploy credentials.
-    pub fn prefix_for(run: &crate::store::Run, environment: &str) -> String {
-        Self::prefix_in(&run.namespace, &run.workflow_id, environment)
+    /// Resolve a run's secrets and variables, wherever the run came from.
+    pub async fn resolve_run(
+        &self,
+        run: &crate::store::Run,
+        environment: &str,
+    ) -> Result<Resolved, SecretsError> {
+        self.resolve_for(&run.namespace, &run.workflow_id, environment)
+            .await
     }
 
-    /// [`Self::prefix_for`] from its parts, for a caller holding a namespace
+    /// [`Self::resolve_run`] from its parts, for a caller holding a namespace
     /// and a workflow id rather than a whole run.
-    pub fn prefix_in(namespace: &str, workflow_id: &str, environment: &str) -> String {
+    ///
+    /// A fleet run (`namespace` empty) reads heyosecret under
+    /// [`Self::prefix`]. A tenant run never does: a tenant registration's
+    /// workflow id is a name the tenant chose, and heyosecret's one shared
+    /// bearer would let a repository named after a fleet workflow read that
+    /// workflow's deploy credentials. It asks app-lb for its namespace's own
+    /// secrets instead (see the module docs), and gets none when app-lb is not
+    /// configured — the same answer an installation with no secret store
+    /// gives a fleet run.
+    pub async fn resolve_for(
+        &self,
+        namespace: &str,
+        workflow_id: &str,
+        environment: &str,
+    ) -> Result<Resolved, SecretsError> {
         if namespace.is_empty() {
-            Self::prefix(workflow_id, environment)
-        } else {
-            format!(
-                "ci/ns/{}/{}/{}",
-                sanitize(namespace),
-                sanitize(workflow_id),
-                sanitize(environment)
-            )
+            return self.resolve(&Self::prefix(workflow_id, environment)).await;
         }
+        let (Some(base), Some(token)) = (&self.app_lb_url, &self.plugin_token) else {
+            return Ok(Resolved::default());
+        };
+        let response = self
+            .http
+            .post(format!("{base}/api/plugins/ci/machine/secrets/resolve"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "namespace": namespace,
+                "workflow": workflow_id,
+                "environment": environment,
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                SecretsError::AppLb(format!("could not reach app-lb: {:?}", e.without_url()))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let hint = match status.as_u16() {
+                401 => " (CI_PLUGIN_API_TOKEN does not match the ci plugin's api_token)",
+                404 => " (the namespace has not installed ci, or app-lb predates tenant secrets)",
+                _ => "",
+            };
+            let body: String = body.chars().take(200).collect();
+            return Err(SecretsError::AppLb(format!(
+                "app-lb answered {status} for namespace {namespace:?}{hint}: {body}"
+            )));
+        }
+        let answer: TenantSecrets = response
+            .json()
+            .await
+            .map_err(|e| SecretsError::AppLb(format!("unreadable answer: {e}")))?;
+        Ok(Resolved {
+            secrets: answer.secrets,
+            vars: BTreeMap::new(),
+        })
     }
 
     /// Resolve every secret and variable under a prefix.
@@ -341,6 +419,8 @@ pub enum SecretsError {
     Decode(String),
     NotText(String),
     Unreadable { path: String, reason: String },
+    /// Resolving a tenant run's secrets through app-lb failed.
+    AppLb(String),
 }
 
 impl fmt::Display for SecretsError {
@@ -360,6 +440,7 @@ impl fmt::Display for SecretsError {
                  404 for every read failure, so this may be a missing path, no active \
                  version, or a decryption failure."
             ),
+            Self::AppLb(e) => write!(f, "could not resolve the namespace's secrets: {e}"),
         }
     }
 }
@@ -452,16 +533,105 @@ mod tests {
         assert!(!Secrets::prefix("a/b", "c")[3..].starts_with("a/b"));
     }
 
-    /// A tenant's secrets live under its namespace whatever its workflow is
-    /// called, so a tenant repository named after a fleet workflow — `deploy`
-    /// here — reads `ci/ns/team-a/deploy/prod`, never `ci/deploy/prod`.
-    #[test]
-    fn a_tenant_prefix_is_under_its_namespace_and_cannot_collide_with_the_fleet() {
-        assert_eq!(Secrets::prefix_in("", "deploy", "prod"), "ci/deploy/prod");
-        assert_eq!(Secrets::prefix_in("team-a", "deploy", "prod"), "ci/ns/team-a/deploy/prod");
-        assert_ne!(Secrets::prefix_in("team-a", "deploy", "prod"), Secrets::prefix("deploy", "prod"));
-        // A namespace cannot climb out of its segment either.
-        assert_eq!(Secrets::prefix_in("a/b", "w", "e"), "ci/ns/a-b/w/e");
+    /// A fake app-lb `ci` plugin resolve route: checks the bearer, records
+    /// what it was asked, and answers for `team-a` only.
+    async fn stub_app_lb(
+        asked: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/api/plugins/ci/machine/secrets/resolve",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let asked = asked.clone();
+                    async move {
+                        let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+                        if auth != Some("Bearer plugin-token") {
+                            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        asked.lock().unwrap().push(body.clone());
+                        if body["namespace"] != "team-a" {
+                            return (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({"error": "not installed"})),
+                            )
+                                .into_response();
+                        }
+                        axum::Json(
+                            serde_json::json!({"secrets": {"DEPLOY_TOKEN": "tenant-deploy-token"}}),
+                        )
+                        .into_response()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A tenant run's secrets come from its namespace in app-lb, never from
+    /// heyosecret — so a tenant repository named after a fleet workflow,
+    /// `deploy` here, cannot read `ci/deploy/prod` — and are masked.
+    #[tokio::test]
+    async fn a_tenant_run_reads_its_namespaces_secrets_from_app_lb_not_heyosecret() {
+        let heyosecret = stub_heyosecret(vec![(
+            "ci/deploy/prod/DEPLOY_TOKEN",
+            vec![],
+            "fleet-deploy-token",
+        )])
+        .await;
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app_lb = stub_app_lb(asked.clone()).await;
+        let s = Secrets {
+            app_lb_url: Some(app_lb),
+            plugin_token: Some("plugin-token".into()),
+            ..client(&heyosecret)
+        };
+
+        let fleet = s.resolve_for("", "deploy", "prod").await.unwrap();
+        assert_eq!(fleet.secrets["DEPLOY_TOKEN"], "fleet-deploy-token");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "a fleet run never asks app-lb"
+        );
+
+        let tenant = s.resolve_for("team-a", "deploy", "prod").await.unwrap();
+        assert_eq!(tenant.secrets["DEPLOY_TOKEN"], "tenant-deploy-token");
+        assert!(tenant.vars.is_empty());
+        assert_eq!(
+            tenant.masker().mask("token=tenant-deploy-token"),
+            format!("token={REDACTED}")
+        );
+        assert_eq!(
+            asked.lock().unwrap()[0],
+            serde_json::json!({"namespace": "team-a", "workflow": "deploy", "environment": "prod"})
+        );
+
+        // A namespace app-lb refuses is an error, not an empty set: a deploy
+        // step with an empty token is worse than a failed build.
+        let err = s.resolve_for("team-b", "deploy", "prod").await.unwrap_err();
+        assert!(matches!(err, SecretsError::AppLb(_)), "{err:?}");
+        let wrong = Secrets {
+            plugin_token: Some("nope".into()),
+            ..s.clone()
+        };
+        let err = wrong
+            .resolve_for("team-a", "deploy", "prod")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("401"), "{err}");
+
+        // No app-lb configured: nothing, and still never heyosecret.
+        let bare = Secrets {
+            app_lb_url: None,
+            ..s
+        };
+        let none = bare.resolve_for("team-a", "deploy", "prod").await.unwrap();
+        assert!(none.secrets.is_empty() && none.vars.is_empty());
     }
 
     #[test]
@@ -482,11 +652,7 @@ mod tests {
     /// no secrets.
     #[tokio::test]
     async fn an_unconfigured_store_resolves_to_nothing_rather_than_failing() {
-        let s = Secrets {
-            http: reqwest::Client::new(),
-            base_url: None,
-            token: None,
-        };
+        let s = Secrets::unconfigured();
         assert!(!s.is_configured());
         let r = s
             .resolve("ci/app/prod")
@@ -520,6 +686,8 @@ mod tests {
                 .timeout(Duration::from_millis(100)).build().unwrap(),
             base_url: Some(format!("http://{}", listener.local_addr().unwrap())),
             token: Some("private-bearer-value".into()),
+            app_lb_url: None,
+            plugin_token: None,
         };
         let list = secrets.resolve("ci/private-prefix/default").await.unwrap_err();
         let read = secrets.read(&SecretMetadata {
@@ -546,7 +714,11 @@ mod tests {
             ("ci/heyo-public/default/CI_HOST_HEYVM_BOOTSTRAP_TARGETS", vec![], "bootstrap spoof"),
         ]).await;
         let secrets = Secrets {
-            http: reqwest::Client::new(), base_url: Some(base), token: Some("test".into()),
+            http: reqwest::Client::new(),
+            base_url: Some(base),
+            token: Some("test".into()),
+            app_lb_url: None,
+            plugin_token: None,
         };
         assert_eq!(secrets.host_app_lb_targets().await.unwrap(), "operator mapping");
         assert_eq!(secrets.host_maintenance_targets().await.unwrap(), "maintenance mapping");
@@ -563,7 +735,11 @@ mod tests {
             ("ci/heyo-public/default/CI_HOST_HEYVM_BOOTSTRAP_TARGETS", vec![], "bootstrap spoof"),
         ]).await;
         let secrets = Secrets {
-            http: reqwest::Client::new(), base_url: Some(base), token: Some("test".into()),
+            http: reqwest::Client::new(),
+            base_url: Some(base),
+            token: Some("test".into()),
+            app_lb_url: None,
+            plugin_token: None,
         };
         assert!(secrets.host_app_lb_targets().await.is_err());
         assert!(secrets.host_maintenance_targets().await.is_err());
@@ -649,6 +825,8 @@ mod tests {
             http: reqwest::Client::new(),
             base_url: Some(base.to_string()),
             token: Some("test-token".into()),
+            app_lb_url: None,
+            plugin_token: None,
         }
     }
 

@@ -7080,6 +7080,12 @@ fn router(state: AdminState) -> Router {
         plugin_crud
     };
 
+    // Routes the services behind plugins call, under
+    // `/api/plugins/<id>/machine/…`. Deliberately outside every gate above:
+    // the caller holds the plugin's own token, not an app-lb credential, and
+    // each route checks it itself. See `Plugin::machine_routes`.
+    let plugin_machine = state.plugins.machine_router();
+
     Router::new()
         .route("/healthz", get(healthz))
         // Embedded static assets contain no fleet state. Sign-in needs them
@@ -7102,6 +7108,7 @@ fn router(state: AdminState) -> Router {
         .with_state(state)
         .merge(plugin_view)
         .merge(plugin_crud)
+        .merge(plugin_machine)
 }
 
 #[async_trait]
@@ -7933,7 +7940,9 @@ mod tests {
                 Arc::new(crate::plugins::PluginHost::new(
                     vec![
                         crate::plugins::obs::ObsPlugin::new(plugin_secrets.clone()),
-                        crate::plugins::ci::CiPlugin::new(plugin_secrets),
+                        crate::plugins::ci::CiPlugin::new(plugin_secrets.clone()),
+                        crate::plugins::secrets::SecretsPlugin::new(),
+                        crate::plugins::postgres::PostgresPlugin::new(plugin_secrets, root.join("plugins").join("state")),
                     ],
                     crate::plugins::PluginStore::new(root.join("plugins")),
                 )),
@@ -8978,6 +8987,97 @@ mod tests {
             assert_eq!((status, v["dashboard"].as_str()), (StatusCode::OK, Some("ui")));
         }
 
+        /// The native plugins' dashboards: framed by the console like a
+        /// proxied one, and served by app-lb itself for the namespace.
+        #[tokio::test]
+        async fn the_plugin_console_frames_the_secrets_and_postgres_pages() {
+            let f = fixture(true).await;
+            for (id, name) in [("secrets", "Secrets"), ("postgres", "Postgres")] {
+                let (status, html) = page(&f, &format!("/namespaces/team-a/plugin-console/{id}")).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(html.contains(&format!(r#"<meta name="plugin-id" content="{id}">"#)));
+                assert!(html.contains(name));
+                let (status, _, v) = send(&f, "GET", &format!("/namespaces/team-a/plugins/{id}"), "").await;
+                assert_eq!((status, v["dashboard"].as_str()), (StatusCode::OK, Some("ui")));
+            }
+
+            f.state.plugins.set("secrets", true, None).await.unwrap();
+            assert!(f.state.plugins.auto_install("team-a", None).await.contains(&"secrets"));
+            let (status, html) = page(&f, "/namespaces/team-a/plugins/secrets/ui").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(html.contains(r#"<meta name="plugin-namespace" content="team-a">"#));
+            assert!(!html.contains("{{"), "an unfilled placeholder shipped");
+            f.state.plugins.set("secrets", false, None).await.unwrap();
+        }
+
+        /// A machine route is reached with the plugin's own token through a
+        /// gated admin API — no app-lb credential needed or accepted — and a
+        /// view-tier session cannot create a namespace's database.
+        #[tokio::test]
+        async fn machine_routes_sit_outside_the_gate_and_the_view_tier_cannot_create() {
+            use crate::tokens::{AdminScope, NewToken};
+            let mut f = fixture(true).await;
+            f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
+            f.state.gate_admin = true;
+            f.state.gate_view = true;
+            let token = |admin: AdminScope| {
+                f.state.tokens.mint(NewToken {
+                    fleet: false, name: "plugin test".into(), admin,
+                    namespace: Some("team-a".into()), deployments: vec![], expires_in_secs: None,
+                }, now_secs()).unwrap().1
+            };
+            let (viewer, admin) = (token(AdminScope::View), token(AdminScope::Admin));
+            let call = |method: &str, uri: &str, bearer: &str, body: &str| {
+                let req = Request::builder().method(method).uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string())).unwrap();
+                let mut app = router(f.state.clone());
+                async move {
+                    std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+                    let resp = app.call(req).await.unwrap();
+                    let status = resp.status();
+                    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                    (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default())
+                }
+            };
+
+            for (ns, id, data) in [
+                (crate::config::DEFAULT_NAMESPACE, "ci", ("plugin_api_token", "plugin-token")),
+                ("team-a", "ci", ("GREETING", "hello-team-a")),
+            ] {
+                f.state.secrets.put(crate::secrets::SecretSpec {
+                    id: id.into(), namespace: ns.into(), description: None,
+                    data: [(data.0.to_string(), data.1.to_string())].into(), updated_at: 0,
+                });
+            }
+            let resolve = r#"{"namespace": "team-a", "workflow": "app", "environment": "default"}"#;
+            let path = "/api/plugins/ci/machine/secrets/resolve";
+            let (status, _) = call("POST", path, "plugin-token", resolve).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "disabled is absent");
+
+            f.state.plugins.set("ci", true, Some(serde_json::json!({"url": "http://127.0.0.1:9",
+                "tenant_network": "tenants", "api_token": {"secret": "ci", "key": "plugin_api_token"}}))).await.unwrap();
+            f.state.plugins.install("ci", "team-a", serde_json::json!({}), None).await.unwrap();
+            let (status, v) = call("POST", path, "plugin-token", resolve).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["secrets"], serde_json::json!({"GREETING": "hello-team-a"}));
+            let (status, _) = call("POST", path, &admin, resolve).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "an app-lb token is not ci's");
+
+            f.state.plugins.set("postgres", true, Some(serde_json::json!({"url": "http://127.0.0.1:9"}))).await.unwrap();
+            f.state.plugins.install("postgres", "team-a", serde_json::json!({}), None).await.unwrap();
+            let create = "/namespaces/team-a/plugins/postgres/api/databases";
+            let (status, v) = call("POST", create, &viewer, r#"{"name": "app"}"#).await;
+            assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED), "{status} {v}");
+            // The admin passes the gate and reaches the plugin, which cannot
+            // reach this pg-fc.
+            let (status, v) = call("POST", create, &admin, r#"{"name": "app"}"#).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{v}");
+            f.state.plugins.set("ci", false, None).await.unwrap();
+            f.state.plugins.set("postgres", false, None).await.unwrap();
+        }
+
         async fn remove(f: &Fixture, etag: Option<&str>) -> StatusCode {
             let mut request = Request::builder().method("DELETE").uri("/deployments/obsolete/record");
             if let Some(etag) = etag { request = request.header(header::IF_MATCH, etag); }
@@ -9873,6 +9973,30 @@ mod tests {
                 ("namespace plugins", NAMESPACE_PLUGINS_HTML),
                 ("plugin frame", PLUGIN_FRAME_HTML),
             ]
+        }
+
+        /// The native plugins' pages sit inside the plugin console's frame, so
+        /// they carry no bar of their own; everything else about them is the
+        /// shared UI, and the plugin's page helper fills every placeholder.
+        #[test]
+        fn native_plugin_pages_use_the_shared_ui_and_render_completely() {
+            for (name, html) in [
+                ("secrets plugin", crate::plugins::secrets::PAGE_HTML),
+                ("postgres plugin", crate::plugins::postgres::PAGE_HTML),
+            ] {
+                assert!(html.contains("{{HTML_ATTRS}}"), "{name} lost the theme attributes");
+                assert!(html.contains(r#"href="/__ui/heyo.css""#), "{name} does not load the shared sheet");
+                assert!(html.contains(r#"src="/__ui/theme.js""#), "{name} does not load the shared toggle");
+                assert!(!html.contains("localStorage"), "{name} keeps state of its own");
+                assert!(!html.contains("prefers-color-scheme"), "{name} redeclares a palette");
+                assert!(!html.contains("src=\"http"), "{name} loads an external asset");
+                let req = axum::http::Request::get("/ui").header(axum::http::header::COOKIE, "heyo_theme=light")
+                    .body(axum::body::Body::empty()).unwrap();
+                let resp = crate::plugins::page(html, "team-a", &req);
+                assert_eq!(resp.headers()["x-frame-options"], "SAMEORIGIN");
+                let rendered = html.replace("{{HTML_ATTRS}}", "").replace("{{NAMESPACE}}", "team-a");
+                assert!(!rendered.contains("{{"), "{name} has a placeholder the helper does not fill");
+            }
         }
 
         /// Every page links every other: a page missing from one nav bar is
