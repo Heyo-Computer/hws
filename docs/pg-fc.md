@@ -160,6 +160,7 @@ Every variable is optional. Values are read at startup. A few can also be change
 | `PG_VM_POOL_IMAGE` | `pg` | heyvm image for every schema VM. |
 | `PG_VM_POOL_SIZE_CLASS` | `micro` | VM size: `micro` (0.25 CPU, 512 MB), `mini` (0.5, 1 GB), `small` (1, 2 GB), `medium` (2, 4 GB), `large` (4, 8 GB). |
 | `PG_VM_POOL_DAEMON_URL` | `http://127.0.0.1:34099` | heyvmd API base URL. |
+| `PG_VM_POOL_DAEMON_API_KEY` | `HEYO_API_KEY` | Bearer for a daemon that requires one (`heyvm --api` with a key). Sent on every daemon call, including resize, the create gate and create-on-image. |
 | `PG_VM_POOL_USER` | `postgres` | Role the pooler uses for probes and bootstrap. |
 | `PG_VM_POOL_PASSWORD` | unset | Password for that role, and the password the pooler **requires from clients** when set. Unset means no client auth. |
 | `PG_VM_POOL_STATE_FILE` | `~/.heyo/pg-vm-pool/registry.tsv` | Schema-to-VM registry. Its directory is the "state dir" below. |
