@@ -2540,8 +2540,10 @@ pub fn namespace_repos_page(
                     None => "no network yet — an operator has to configure one",
                 }
                 ", in a fresh VM per job; they may upload and download artifacts, and \
-                 cannot deploy. Secrets are read from "
-                code .mono { "ci/ns/<namespace>/<repository>/<environment>" } "."
+                 cannot deploy. Secrets are this namespace's own secrets "
+                code .mono { "ci" } ", " code .mono { "ci.<repository>" } " and "
+                code .mono { "ci.<repository>.<environment>" }
+                ", later ones winning — the Secrets plugin manages them."
             }
             @if can_manage {
                 form .row method="post" action=(scope.ui("/repos")) {
@@ -3599,7 +3601,10 @@ mod page_tests {
         assert!(!admin.contains("name=\"network\""), "{admin}");
         assert!(!admin.contains("CI_WEBHOOK_SECRET"));
         assert!(admin.contains("tenants"));
-        assert!(admin.contains("ci/ns/&lt;namespace&gt;"), "{admin}");
+        assert!(
+            admin.contains("ci.&lt;repository&gt;.&lt;environment&gt;"),
+            "{admin}"
+        );
         assert!(admin.contains("<form"));
         assert!(admin.contains("/revoke"));
         let viewer = page(false);

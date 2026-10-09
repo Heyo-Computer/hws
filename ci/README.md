@@ -1425,12 +1425,18 @@ Each rule has a second door at execution: the step-action check in
 `run_steps`, the native enqueue and poll, and `authorize_publication`, which
 every merge, publish, deploy, rollout and host-maintenance flow calls first.
 
-**Secrets** resolve under `ci/ns/<ns>/<workflow>/<environment>/`
-(`Secrets::prefix_for`), where `<workflow>` is the registration's name. The
-namespace segment is forced, so a tenant repository named after a fleet
-workflow reads `ci/ns/<ns>/deploy/prod`, never `ci/deploy/prod`. heyosecret
-has no per-namespace authorization, so an operator writes a namespace's
-secrets under its prefix; there is no self-service writer yet.
+**Secrets** for a tenant run never come from heyosecret
+(`Secrets::resolve_for`). They are the namespace's own app-lb secrets `ci`,
+`ci.<workflow>` and `ci.<workflow>.<environment>`, merged with later ones
+winning, where `<workflow>` is the registration's name. ci asks app-lb for
+them per job on the `ci` plugin's machine route, `POST
+/api/plugins/ci/machine/secrets/resolve` at `CI_APP_LB_URL`, with
+`CI_PLUGIN_API_TOKEN` as the bearer; app-lb answers only for the namespace
+named and only while it has `ci` installed. So a tenant repository named after
+a fleet workflow cannot read `ci/deploy/prod`, and a namespace manages its own
+secrets on its Secrets plugin page. Every value is a masked `secrets.*`; a
+tenant has no `vars.*`. Without `CI_APP_LB_URL` and `CI_PLUGIN_API_TOKEN` a
+tenant run gets no secrets, and an app-lb error fails the job.
 
 ## Deploying it
 

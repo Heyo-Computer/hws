@@ -1713,7 +1713,7 @@ impl Dispatcher {
             (path.clone(), hex::encode(sha2::Sha256::digest(yaml.as_bytes())))
         }).collect();
         let environment = plan.env.get("CI_ENVIRONMENT").cloned().unwrap_or_else(|| "default".into());
-        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, &environment))
+        let resolved = self.secrets.resolve_run(&run, &environment)
             .await.map_err(|e| DispatchError::Secrets(format!("resolving source credential: {e}")))?;
         let git_auth_token = resolved.secrets.get("CI_GIT_AUTH_TOKEN")
             .or_else(|| resolved.secrets.get("GITHUB_TOKEN")).cloned();
@@ -2410,7 +2410,7 @@ impl Dispatcher {
             let run = self.store.get_run(&msg.run_id).await?
                 .ok_or_else(|| anyhow::anyhow!("run no longer exists"))?;
             let environment = plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default");
-            let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, environment)).await?;
+            let resolved = self.secrets.resolve_run(&run, environment).await?;
             let masker = resolved.masker();
             let mut text = match vm.info().await {
                 Ok(info) => format!("[ci] VM {} status={:?} size={:?}\n", info.id, info.status, info.size_class),
@@ -2655,7 +2655,7 @@ impl Dispatcher {
         // steps. They travel only in exec env; neither the persisted command nor
         // the descriptor contains them.
         let environment = plan.env.get("CI_ENVIRONMENT").cloned().unwrap_or_else(|| "default".into());
-        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, &environment))
+        let resolved = self.secrets.resolve_run(&run, &environment)
             .await.map_err(|e| DispatchError::Secrets(format!("resolving checkout credential: {e}")))?;
         let masker = resolved.masker();
         let mut checkout_env = HashMap::new();
@@ -2753,12 +2753,15 @@ impl Dispatcher {
             .get("CI_ENVIRONMENT")
             .cloned()
             .unwrap_or_else(|| "default".to_string());
-        let prefix = crate::secrets::Secrets::prefix_in(&namespace, &workflow_id, &environment);
         let resolved = self
             .secrets
-            .resolve(&prefix)
+            .resolve_for(&namespace, &workflow_id, &environment)
             .await
-            .map_err(|e| DispatchError::Secrets(format!("resolving {prefix}: {e}")))?;
+            .map_err(|e| {
+                DispatchError::Secrets(format!(
+                    "resolving the secrets of {workflow_id}/{environment}: {e}"
+                ))
+            })?;
         let masker = resolved.masker();
         let (secret_scope, vars_scope) = resolved.scopes();
 

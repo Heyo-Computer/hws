@@ -619,6 +619,13 @@ fn main() {
             plugins::obs::ObsPlugin::new(secrets.clone()),
             plugins::ci::CiPlugin::new(secrets.clone()),
             plugins::remote::RemotePlugin::new(secrets.clone()),
+            plugins::secrets::SecretsPlugin::new(),
+            // Its ownership file sits beside the plugin records, in a
+            // directory of its own so the record loader never reads it.
+            plugins::postgres::PostgresPlugin::new(
+                secrets.clone(),
+                plugin_store.dir().join("state"),
+            ),
         ],
         plugin_store,
     ));

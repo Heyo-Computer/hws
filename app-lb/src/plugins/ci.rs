@@ -18,6 +18,18 @@
 //!
 //! Unlike obs, ci does not install itself: a build is the right to run code
 //! on the operator's hosts, so each namespace opts in.
+//!
+//! ## Tenant secrets
+//!
+//! A tenant run's `${{ secrets.* }}` come from the namespace's own app-lb
+//! secrets — the store the secrets plugin manages and a deployment's
+//! `env_from` reads — rather than from a store of ci's. ci asks for them on
+//! the plugin's one machine route, `POST
+//! /api/plugins/ci/machine/secrets/resolve`, authenticating with the same
+//! `CI_PLUGIN_API_TOKEN` app-lb holds for it (compared in constant time). The
+//! answer merges the namespace's secrets `ci`, `ci.<workflow>` and
+//! `ci.<workflow>.<environment>`, later ones winning, and is only ever about
+//! the namespace named in the request, which must have ci installed.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,12 +38,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::Router;
 use axum::extract::Request;
-use axum::response::Response;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::ns_proxy::{NsProxy, Upstream, check_url};
-use super::{Plugin, PluginMeta};
+use super::ns_proxy::{NsProxy, Upstream, check_url, fail};
+use super::{Installs, Plugin, PluginMeta};
 use crate::secrets::{SecretRef, SecretStore};
 
 const DEFAULT_POLL_SECS: u64 = 30;
@@ -104,6 +117,7 @@ fn parse_config(config: &Value) -> Result<CiConfig, String> {
 
 pub struct CiPlugin {
     proxy: Arc<NsProxy>,
+    secrets: Arc<SecretStore>,
     tenant_network: std::sync::RwLock<Option<String>>,
 }
 
@@ -112,10 +126,138 @@ impl CiPlugin {
         Arc::new(Self {
             // ci has several pages, and records who registered a repository
             // or started a run.
-            proxy: NsProxy::new("ci", "ci", secrets, true, true),
+            proxy: NsProxy::new("ci", "ci", secrets.clone(), true, true),
+            secrets,
             tenant_network: std::sync::RwLock::new(None),
         })
     }
+}
+
+/// Reduce a workflow or environment to the secret-id alphabet. Like ci's own
+/// `sanitize`, except that `.` is folded too: it is the separator in
+/// `ci.<workflow>.<environment>`, and a workflow called `app.prod` must not
+/// read workflow `app`'s `prod` secrets.
+fn id_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// The secrets a run reads, least specific first; later ones win.
+fn secret_ids(workflow: &str, environment: &str) -> Vec<String> {
+    let mut ids = vec!["ci".to_string()];
+    let workflow = id_segment(workflow.trim());
+    if !workflow.is_empty() {
+        ids.push(format!("ci.{workflow}"));
+        let environment = id_segment(environment.trim());
+        if !environment.is_empty() {
+            ids.push(format!("ci.{workflow}.{environment}"));
+        }
+    }
+    // An id that cannot exist (too long) is skipped rather than refused:
+    // there is nothing to read there.
+    ids.retain(|id| crate::secrets::is_valid_id(id));
+    ids
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveRequest {
+    namespace: String,
+    workflow: String,
+    #[serde(default)]
+    environment: Option<String>,
+}
+
+/// `POST /api/plugins/ci/machine/secrets/resolve` — `{namespace, workflow,
+/// environment}` → `{"secrets": {NAME: value}}`. See the module docs.
+async fn resolve_secrets(
+    axum::extract::State(p): axum::extract::State<Arc<CiPlugin>>,
+    req: Request,
+) -> Response {
+    // Authenticate before anything else is looked at, so an unauthenticated
+    // caller learns nothing — not even which namespaces have ci.
+    let Some(token_ref) = p.proxy.upstream().and_then(|up| up.api_token.clone()) else {
+        return fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the ci plugin is not configured",
+        );
+    };
+    let expected = match p.secrets.resolve(&token_ref) {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the ci plugin's api_token cannot be resolved; no caller can be authenticated",
+            );
+        }
+    };
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !crate::admin::ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            axum::Json(json!({"error": "this route needs ci's plugin api token"})),
+        )
+            .into_response();
+    }
+    let installs = req
+        .extensions()
+        .get::<Installs>()
+        .cloned()
+        .unwrap_or_default();
+    let body = match axum::body::to_bytes(req.into_body(), 16 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return fail(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
+    };
+    let body: ResolveRequest = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                format!("expected {{\"namespace\", \"workflow\", \"environment\"}}: {e}"),
+            );
+        }
+    };
+    if !crate::config::is_valid_namespace(&body.namespace) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("{:?} is not a namespace name", body.namespace),
+        );
+    }
+    if !installs.0.contains(&body.namespace) {
+        return fail(
+            StatusCode::NOT_FOUND,
+            format!("namespace \"{}\" has not installed ci", body.namespace),
+        );
+    }
+    let environment = body.environment.as_deref().unwrap_or("default");
+    let mut merged = BTreeMap::new();
+    for id in secret_ids(&body.workflow, environment) {
+        if let Some(secret) = p.secrets.get(&body.namespace, &id) {
+            merged.extend(secret.data.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+    }
+    // Names and counts, never values, in the log.
+    tracing::info!(namespace = %body.namespace, workflow = %body.workflow,
+        environment = %environment, count = merged.len(), "ci resolved a tenant run's secrets");
+    let mut out = axum::Json(json!({ "secrets": merged })).into_response();
+    out.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    out
 }
 
 #[async_trait]
@@ -215,6 +357,12 @@ impl Plugin for CiPlugin {
 
     fn dashboard_path(&self) -> Option<&'static str> {
         Some("ui")
+    }
+
+    fn machine_routes(self: Arc<Self>) -> Router {
+        Router::new()
+            .route("/secrets/resolve", axum::routing::post(resolve_secrets))
+            .with_state(self)
     }
 }
 
@@ -419,6 +567,132 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let resp = call(&host, "team-a", get("/ui/../../vms")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        plugin.apply(None).await.unwrap();
+    }
+
+    #[test]
+    fn a_runs_secrets_are_read_least_specific_first_and_cannot_cross_a_dot() {
+        assert_eq!(
+            secret_ids("deploy", "prod"),
+            vec!["ci", "ci.deploy", "ci.deploy.prod"]
+        );
+        // `.` is the separator, so a workflow cannot name another's environment.
+        assert_eq!(
+            secret_ids("app.prod", "default"),
+            vec!["ci", "ci.app-prod", "ci.app-prod.default"]
+        );
+        assert_eq!(
+            secret_ids("../x", "a b"),
+            vec!["ci", "ci.---x", "ci.---x.a-b"]
+        );
+        assert_eq!(secret_ids("", "prod"), vec!["ci"]);
+        assert_eq!(secret_ids(&"w".repeat(70), "prod"), vec!["ci"]);
+    }
+
+    fn put(store: &SecretStore, ns: &str, id: &str, data: &[(&str, &str)]) {
+        store.put(crate::secrets::SecretSpec {
+            id: id.into(),
+            namespace: ns.into(),
+            description: None,
+            data: data
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            updated_at: 0,
+        });
+    }
+
+    #[tokio::test]
+    async fn the_machine_route_answers_only_ci_and_only_about_installed_namespaces() {
+        use tower_service::Service;
+        let url = fake_ci("ci-svc").await;
+        let dir = TempDir::new("machine");
+        let secrets = secrets_with("ci-svc");
+        put(
+            &secrets,
+            "team-a",
+            "ci",
+            &[("SHARED", "a-base"), ("TOKEN", "a-base-token")],
+        );
+        put(
+            &secrets,
+            "team-a",
+            "ci.deploy",
+            &[("TOKEN", "a-deploy-token")],
+        );
+        put(&secrets, "team-a", "ci.deploy.prod", &[("DB", "a-prod-db")]);
+        put(&secrets, "team-a", "ci.other", &[("OTHER", "nope")]);
+        put(&secrets, "team-a", "github", &[("token", "not-for-ci")]);
+        put(&secrets, "team-b", "ci", &[("SHARED", "b-base")]);
+        put(&secrets, "team-c", "ci", &[("SHARED", "c-base")]);
+        let plugin = CiPlugin::new(secrets);
+        let host = Arc::new(PluginHost::new(
+            vec![plugin.clone()],
+            PluginStore::new(&dir.0),
+        ));
+        let mut router = host.machine_router();
+
+        let resolve = |bearer: Option<&str>, body: Value| {
+            let mut r = axum::http::Request::post("/api/plugins/ci/machine/secrets/resolve")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(b) = bearer {
+                r = r.header(header::AUTHORIZATION, format!("Bearer {b}"));
+            }
+            r.body(axum::body::Body::from(body.to_string())).unwrap()
+        };
+        let body = json!({"namespace": "team-a", "workflow": "deploy", "environment": "prod"});
+
+        // Disabled: as if there were no such route.
+        let resp = router
+            .call(resolve(Some("ci-svc"), body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        host.set("ci", true, Some(configured(&url))).await.unwrap();
+        host.install("ci", "team-a", json!({}), None).await.unwrap();
+        host.install("ci", "team-b", json!({}), None).await.unwrap();
+
+        for bearer in [None, Some("wrong"), Some("ci-sv"), Some("")] {
+            let resp = router.call(resolve(bearer, body.clone())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{bearer:?}");
+        }
+        // Not installed: refused even with the right token.
+        let resp = router
+            .call(resolve(
+                Some("ci-svc"),
+                json!({"namespace": "team-c", "workflow": "deploy"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = router.call(resolve(Some("ci-svc"), body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["secrets"],
+            json!({"SHARED": "a-base", "TOKEN": "a-deploy-token", "DB": "a-prod-db"}),
+            "later levels win, and nothing outside the three ids is read"
+        );
+
+        // Another installed namespace gets its own, and only its own.
+        let resp = router
+            .call(resolve(
+                Some("ci-svc"),
+                json!({"namespace": "team-b", "workflow": "deploy", "environment": "prod"}),
+            ))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["secrets"], json!({"SHARED": "b-base"}));
         plugin.apply(None).await.unwrap();
     }
 

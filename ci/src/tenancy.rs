@@ -24,8 +24,9 @@
 //! - **No release policy and no workflow objects.** Both are matched by
 //!   repository URL and are operator statements about the fleet's own
 //!   repositories; a tenant registering the same URL does not inherit them.
-//! - **Secrets under the namespace**, at `ci/ns/<ns>/<workflow>/<env>` — see
-//!   [`crate::secrets::Secrets::prefix_for`].
+//! - **Secrets from the namespace**, never heyosecret: its app-lb secrets
+//!   `ci`, `ci.<workflow>` and `ci.<workflow>.<env>` — see
+//!   [`crate::secrets::Secrets::resolve_for`].
 //!
 //! Each rule also has a second door at execution time — the action check in
 //! `run_steps`, the native enqueue, and [`refuse_tenant_run`] in front of every

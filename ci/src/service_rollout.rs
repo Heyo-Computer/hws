@@ -172,9 +172,7 @@ pub async fn recover(store: &Store, secrets: &crate::secrets::Secrets, run_id: &
     let secret = crate::host_maintenance::token_secret(step.with.get("token")
         .ok_or_else(|| anyhow::anyhow!("missing rollout credential reference"))?)?;
     let run = store.get_run(run_id).await?.ok_or_else(|| anyhow::anyhow!("missing rollout run"))?;
-    let prefix = crate::secrets::Secrets::prefix_for(&run,
-        plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));
-    let resolved = secrets.resolve(&prefix).await?;
+    let resolved = secrets.resolve_run(&run, plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default")).await?;
     let token = resolved.secrets.get(&secret).filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("rollout credential unavailable"))?;
     observe(store, id, &intent, token).await
