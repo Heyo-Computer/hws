@@ -11,6 +11,13 @@
 //! twenty-gigabyte image never lands in memory. Downloads stream the same way,
 //! through a [`tokio_util::io::ReaderStream`].
 //!
+//! A client that sends `Accept: application/vnd.art.sparse.v1` gets the blob
+//! as an [`crate::asp`] stream instead — its allocated extents and nothing
+//! else — and knows it did from the `Content-Type`. A heyvm rootfs is mostly
+//! holes, so that is ~23 MB on the wire instead of 512 MiB for the alpine
+//! image. The digest still names the logical bytes, so the client hashes what
+//! it rebuilds exactly as it would a plain body.
+//!
 //! Everything except `/healthz` is behind the API key when one is configured.
 //! `/healthz` stays open because app-lb's health probe has no credentials, and a
 //! deployment whose readiness check needs a secret is a deployment that reports
@@ -519,12 +526,53 @@ async fn head_blob(
     Ok(blob_headers(&info).into_response())
 }
 
+/// The media type of a blob sent as [`crate::asp`], requested with `Accept`.
+pub const SPARSE_MEDIA_TYPE: &str = "application/vnd.art.sparse.v1";
+
+fn accepts_sparse(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| t.split(';').next().map(str::trim) == Some(SPARSE_MEDIA_TYPE))
+}
+
 async fn get_blob(
     State(st): State<ServeState>,
     Path(digest): Path<String>,
+    request: HeaderMap,
 ) -> Result<Response, ApiError> {
     let d = Digest::parse(&digest).map_err(Error::from)?;
     let info = st.registry.ensure_blob(&d).await?;
+    if accepts_sparse(&request) {
+        let enc = st.store().encode_blob(&d).await?;
+        let len = enc.len();
+        // The encoder reads with `pread`; each chunk is a blocking read, done
+        // off the runtime, and never more than one in flight.
+        let stream = futures_util::stream::try_unfold(enc, |mut enc| async move {
+            let (enc, chunk) = tokio::task::spawn_blocking(move || {
+                let mut buf = vec![0u8; 1024 * 1024];
+                let n = std::io::Read::read(&mut enc, &mut buf)?;
+                buf.truncate(n);
+                Ok::<_, std::io::Error>((enc, buf))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            Ok::<_, std::io::Error>((!chunk.is_empty()).then_some((chunk, enc)))
+        });
+        let mut resp = Body::from_stream(stream).into_response();
+        let mut h = blob_headers(&info);
+        h.insert(header::CONTENT_LENGTH, len.into());
+        h.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(SPARSE_MEDIA_TYPE));
+        // Another representation of the same digest: a cache must not hand
+        // it to a client that asked for the plain bytes.
+        if let Ok(v) = header::HeaderValue::from_str(&format!("\"{}.asp\"", info.digest)) {
+            h.insert(header::ETAG, v);
+        }
+        *resp.headers_mut() = h;
+        return Ok(resp);
+    }
     let file = st.store().open_blob(&d).await?;
     // Reads through the holes of a sparsified blob, which is exactly right: the
     // digest covers the logical stream, and that is what a caller expects.
@@ -594,6 +642,8 @@ fn blob_headers(info: &BlobInfo) -> HeaderMap {
     if let Ok(v) = header::HeaderValue::from_str(&format!("\"{}\"", info.digest)) {
         h.insert(header::ETAG, v);
     }
+    // `GET` answers in two encodings, chosen by `Accept`.
+    h.insert(header::VARY, header::HeaderValue::from_static("accept"));
     h
 }
 
@@ -1170,6 +1220,52 @@ mod tests {
             let r = app.clone().oneshot(req).await.unwrap();
             assert_eq!(r.status(), StatusCode::OK);
         }
+    }
+
+    /// `Accept: application/vnd.art.sparse.v1` gets the allocated extents,
+    /// which decode to the very bytes the digest names; without it the plain
+    /// body is unchanged. Both say `Vary: Accept`, and their ETags differ.
+    #[tokio::test]
+    async fn a_blob_is_sent_without_its_holes_to_a_client_that_asks() {
+        use sha2::Digest as _;
+        let d = tmpdir();
+        let (app, store) = app(&d, None, false);
+        let mut data = vec![0u8; 8 << 20];
+        data[..4096].fill(7);
+        data[(6 << 20)..(6 << 20) + 8192].fill(9);
+        let info = store
+            .insert_async(std::io::Cursor::new(data.clone()), crate::Shape::SQUASH)
+            .await
+            .unwrap();
+        let get = |accept: Option<&str>| {
+            let mut req = HttpRequest::get(format!("/blobs/{}", info.digest.as_str()));
+            if let Some(a) = accept {
+                req = req.header(header::ACCEPT, a);
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        let sparse = get(Some("application/octet-stream;q=0.5, application/vnd.art.sparse.v1")).await.unwrap();
+        assert_eq!(sparse.status(), StatusCode::OK);
+        assert_eq!(sparse.headers()[header::CONTENT_TYPE], SPARSE_MEDIA_TYPE);
+        assert_eq!(sparse.headers()[header::VARY], "accept");
+        let etag = sparse.headers()[header::ETAG].to_str().unwrap().to_string();
+        assert!(etag.ends_with(".asp\""), "{etag}");
+        let body = to_bytes(sparse.into_body(), usize::MAX).await.unwrap();
+        if info.allocated < info.size {
+            assert!((body.len() as u64) < info.size, "{} bytes for an {} byte blob", body.len(), info.size);
+        }
+        let out = tempfile::tempfile_in(d.path()).unwrap();
+        let mut hasher = sha2::Sha256::new();
+        let (size, _) = crate::asp::decode_into(&body[..], std::os::fd::AsRawFd::as_raw_fd(&out), |b| hasher.update(b)).unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(format!("{:x}", hasher.finalize()), info.digest.as_str());
+
+        let plain = get(None).await.unwrap();
+        assert_eq!(plain.headers()[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(plain.headers()[header::VARY], "accept");
+        assert_ne!(plain.headers()[header::ETAG].to_str().unwrap(), etag);
+        assert_eq!(to_bytes(plain.into_body(), usize::MAX).await.unwrap(), data);
     }
 
     /// The whole meaning of `PUT /public/{ref}`: an anonymous download of that

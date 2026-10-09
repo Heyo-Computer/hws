@@ -394,6 +394,8 @@ Pulls bytes that already exist in an [artifacts](artifacts.md) store. Nothing is
 
 A deployment with an `artifact` block boots nothing until its image is on heyvm. Registering one, or scaling one whose image was offloaded, starts the pull (or the thaw) automatically; the first VM is created once it lands.
 
+A remote pull asks the store for the blob as `application/vnd.art.sparse.v1` and, when the store answers that way, receives only the extents that hold data and writes them into a sparse file (`heyo/alpine:3.24` is 512 MiB logical and ~23 MB of data). The digest is checked against the full logical bytes, holes included, exactly as for a plain body. A store that predates the encoding sends plain bytes, which are read as before.
+
 ### `site`
 
 | Field | Default | Meaning |
@@ -572,7 +574,7 @@ app-lb fronts the [global artifact store](#global-artifact-store) so that nobody
 | `GET …/tags` | `[{"tag", "digest"}]`, only tags under `<namespace>/`. |
 | `GET`/`PUT`/`DELETE …/tags/<namespace>/<repo>:<tag>` | Read, point (body: the manifest digest as text) or remove a tag. |
 | `GET …/manifests/<digest or ref>`, `PUT …/manifests` | Read a manifest by digest or by a ref the namespace owns; create one (JSON). |
-| `GET`/`HEAD`/`PUT …/blobs/<digest>` | Download or upload content by sha256. Streamed both ways, no size cap. |
+| `GET`/`HEAD`/`PUT …/blobs/<digest>` | Download or upload content by sha256. Streamed both ways, no size cap. A `GET` with `Accept: application/vnd.art.sparse.v1` returns only the allocated extents. |
 | `GET`/`PUT …/repos/<namespace>/<repo>` | A repository's `{"public", "description"}`. `public: true` makes it anonymously pullable. |
 
 Reads need the view tier in the namespace; writes need an admin credential for the whole namespace (a token narrowed to particular deployments is read-only). Store-wide routes (`/usage`, blob and manifest listings) do not exist here. A tag or repository outside `<namespace>/` is a 403 before anything reaches the store. A tag may be sent as one percent-encoded segment (`tags/acme%2Fweb%3Av2`). Errors: 503 when there is no global store (or no key for a write), 502 when the store is unreachable or refuses app-lb's key, otherwise the store's own status.

@@ -212,7 +212,7 @@ Uploads and downloads stream, so large images never sit in memory. Small request
 | --- | --- |
 | `GET /healthz` | Always open. `ok` |
 | `HEAD /blobs/{digest}` | Size and allocation headers, no body |
-| `GET /blobs/{digest}` | Stream the blob |
+| `GET /blobs/{digest}` | Stream the blob. With `Accept: application/vnd.art.sparse.v1`, sent as `artsparse v1` (only the allocated extents; `Content-Type` says so, `Vary: Accept`); the digest still covers the logical bytes |
 | `PUT /blobs/{digest}` | Upload (stored squashed). `201` stored, `200` already present, `409` body's digest doesn't match the URL |
 | `GET /blobs` | All blobs, with labels and tags |
 | `GET /manifests` | All manifests, with labels and tags |
