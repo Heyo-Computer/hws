@@ -3,6 +3,9 @@
   "routes": [
     {
       "host": "git.us5.heyo.work"
+    },
+    {
+      "host": "remote.heyo.work"
     }
   ],
   "vm": {
@@ -14,7 +17,7 @@
     "disk_size_gb": 20,
     "env_vars": {
       "REMOTE_LISTEN": "0.0.0.0:9700",
-      "REMOTE_PUBLIC_URL": "https://git.us5.heyo.work",
+      "REMOTE_PUBLIC_URL": "https://remote.heyo.work",
       "REMOTE_S3_REGION": "us-east-2",
       "REMOTE_AUTH_URL": "https://auth.heyo.computer",
       "REMOTE_APPLB_URL": "https://admin.us5.heyo.work",
@@ -37,6 +40,11 @@
         "secret": "remote",
         "key": "admin-token",
         "as": "REMOTE_ADMIN_TOKEN"
+      },
+      {
+        "secret": "remote-plugin",
+        "key": "api-token",
+        "as": "REMOTE_PLUGIN_API_TOKEN"
       }
     ],
     "ttl_seconds": 0

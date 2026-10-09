@@ -1510,9 +1510,11 @@ impl Dispatcher {
                 Ok(source) => Some(source),
                 Err(error) => {
                     // At this first preparation call no image request exists.
+                    // Credential resolution happens before contacting the runner,
+                    // so even a secret transport failure leaves no host work.
                     // A terminal source failure or unsupported endpoint is
-                    // conclusive; expiry/transport/protocol errors are not.
-                    preparation_quiescent = matches!(&error, DispatchError::Image(
+                    // conclusive; runner expiry/transport/protocol errors are not.
+                    preparation_quiescent = matches!(&error, DispatchError::Secrets(_) | DispatchError::Image(
                         crate::image::ImageError::Source(_) | crate::image::ImageError::Capability));
                     return Err(error);
                 }

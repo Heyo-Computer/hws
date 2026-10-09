@@ -216,7 +216,9 @@ impl Secrets {
             .bearer_auth(token)
             .send()
             .await
-            .map_err(|e| SecretsError::Transport(e.to_string()))?
+            // Display omits the underlying timeout/TLS/connection cause.
+            // Keep that cause without logging URLs or secret-prefix queries.
+            .map_err(|e| SecretsError::Transport(format!("list: {:?}", e.without_url())))?
             .error_for_status()
             .map_err(|e| SecretsError::Api(e.to_string()))?
             .json()
@@ -286,7 +288,7 @@ impl Secrets {
             .json(&serde_json::json!({ "path": meta.path }))
             .send()
             .await
-            .map_err(|e| SecretsError::Transport(e.to_string()))?
+            .map_err(|e| SecretsError::Transport(format!("read: {:?}", e.without_url())))?
             .error_for_status()
             // heyosecret answers 404 for *every* read failure — no such path, no
             // active version, decrypt failed — so the path is named here or the
@@ -507,6 +509,31 @@ mod tests {
     // is exercised: the two route spellings, the camelCase `valueBase64`, the
     // base64 decode, and the `tags[]` classification. A hand-rolled fake of the
     // *client* would only test the fake.
+
+    #[tokio::test]
+    async fn transport_errors_keep_timeout_cause_without_credentials_or_paths() {
+        // Hold the listener open without accepting/responding, so both calls
+        // expire rather than depending on an unavailable port or external DNS.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secrets = Secrets {
+            http: reqwest::Client::builder().no_proxy()
+                .timeout(Duration::from_millis(100)).build().unwrap(),
+            base_url: Some(format!("http://{}", listener.local_addr().unwrap())),
+            token: Some("private-bearer-value".into()),
+        };
+        let list = secrets.resolve("ci/private-prefix/default").await.unwrap_err();
+        let read = secrets.read(&SecretMetadata {
+            path: "private-secret-path".into(), tags: Vec::new(),
+        }).await.unwrap_err();
+        for (operation, error) in [("list", list), ("read", read)] {
+            assert!(matches!(error, SecretsError::Transport(_)));
+            let message = error.to_string();
+            assert!(message.contains(operation) && message.contains("TimedOut"), "{message}");
+            for private in ["private-bearer-value", "private-prefix", "private-secret-path", "127.0.0.1"] {
+                assert!(!message.contains(private), "{message}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn host_targets_only_read_operator_path() {

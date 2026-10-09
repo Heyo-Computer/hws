@@ -53,6 +53,7 @@ use crate::auth::{self, MintError, Principal, Tier};
 use crate::browse::{self, CommitSummary, EntryKind, LineKind, RefKind, Resolved};
 use crate::git::{ReadView, RepoRef};
 use crate::heyo_ui;
+use crate::plugin;
 use crate::registry::{self, RepoMeta, RepoState};
 use crate::sigv4::now_unix;
 
@@ -67,6 +68,14 @@ pub fn routes() -> Router<AppState> {
         .route("/-/login", get(login_page).post(login))
         .route("/-/handoff", post(handoff))
         .route("/-/logout", get(logout_page).post(logout))
+        .merge(namespace_routes())
+        .layer(middleware::from_fn(page_headers))
+}
+
+/// A namespace's pages and its repos': what the native UI serves at `/<ns>`,
+/// and what app-lb's plugin console reaches at `/-/ns/<ns>`.
+fn namespace_routes() -> Router<AppState> {
+    Router::new()
         .route("/{ns}", get(namespace_page))
         .route("/{ns}/-/new", get(new_repo_page).post(new_repo))
         .route("/{ns}/-/tokens", get(tokens_page).post(mint_token))
@@ -82,6 +91,16 @@ pub fn routes() -> Router<AppState> {
         .route("/{ns}/{repo}/tags", get(tags_page))
         .route("/{ns}/{repo}/settings", get(settings_page))
         .route("/{ns}/{repo}/settings/delete", post(delete_repo))
+}
+
+/// The pages app-lb's `remote` plugin proxies to, relative to `/-/ns`; see
+/// [`plugin`]. app-lb sends its dashboard (`…/remote/ui`) to `/<ns>/`, and
+/// the shared stylesheet and fonts are served under the namespace so a
+/// proxied page never asks app-lb's root for anything.
+pub fn plugin_pages() -> Router<AppState> {
+    namespace_routes()
+        .route("/{ns}/", get(namespace_page))
+        .route("/{ns}/-/__ui/{*path}", get(namespace_ui_asset))
         .layer(middleware::from_fn(page_headers))
 }
 
@@ -115,6 +134,25 @@ async fn ui_asset(Path(path): Path<String>) -> Response {
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn namespace_ui_asset(Path((_, path)): Path<(String, String)>) -> Response {
+    ui_asset(Path(path)).await
+}
+
+/// The URL of namespace `ns`'s page. Every namespace and repo URL is this plus
+/// a suffix, so under the plugin surface each is spelled under app-lb's base.
+fn ns_url(ns: &str) -> String {
+    match plugin::current() {
+        Some(m) => m.root(),
+        None => format!("/{ns}"),
+    }
+}
+
+/// Where "your repositories" is: the dashboard, or under the plugin surface
+/// the one namespace it serves.
+fn home_url() -> String {
+    plugin::current().map_or_else(|| "/".into(), |m| m.root())
 }
 
 // ---------------------------------------------------------------------------
@@ -162,14 +200,18 @@ fn clear_cookie(s: &AppState) -> String {
 /// The caller: an explicit `Authorization` header first (so a script can read
 /// a page with a token), else the session cookie.
 async fn viewer(s: &AppState, headers: &HeaderMap) -> Option<Arc<Principal>> {
+    if let Some(m) = plugin::current() {
+        return Some(m.principal);
+    }
     let bearer = auth::bearer(headers).or_else(|| cookie_value(headers, cookie_name(s)))?;
     s.auth.authenticate(&bearer).await
 }
 
 /// Whether a form post came from this origin. A post carrying its own
-/// `Authorization` header is not a browser's ambient credential, so it passes.
+/// `Authorization` header is not a browser's ambient credential, so it passes;
+/// so does one through the plugin surface, whose browser posted to app-lb.
 fn same_origin(s: &AppState, headers: &HeaderMap) -> bool {
-    if headers.contains_key(header::AUTHORIZATION) {
+    if headers.contains_key(header::AUTHORIZATION) || plugin::current().is_some() {
         return true;
     }
     let origin = headers
@@ -230,6 +272,9 @@ const ICON_COMMIT: &str = r#"<svg class="ico" viewBox="0 0 16 16" aria-hidden="t
 const ICON_TAG: &str = r#"<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M1 7.78V2.75C1 1.78 1.78 1 2.75 1h5.03c.46 0 .9.18 1.23.51l5.5 5.5a1.75 1.75 0 0 1 0 2.48l-5.03 5.03a1.75 1.75 0 0 1-2.48 0l-5.5-5.5A1.75 1.75 0 0 1 1 7.78Zm1.5-5.03v5.03c0 .07.03.13.07.18l5.5 5.5c.1.1.26.1.36 0l5.03-5.03a.25.25 0 0 0 0-.36l-5.5-5.5a.25.25 0 0 0-.18-.07H2.75a.25.25 0 0 0-.25.25ZM6 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"/></svg>"#;
 
 fn shell(ctx: &Ctx, title: &str, current: &str, body: Markup) -> Markup {
+    if let Some(m) = plugin::current() {
+        return mounted_shell(ctx, &m, title, body);
+    }
     let nav: Vec<(&str, &str, bool)> = if ctx.p.is_some() {
         vec![
             ("Repositories", "/", current == "home"),
@@ -260,6 +305,46 @@ fn shell(ctx: &Ctx, title: &str, current: &str, body: Markup) -> Markup {
     }
 }
 
+/// The shell under the plugin surface. There is no sign-in or sign-out —
+/// app-lb owns the session — and the top bar is built here rather than by
+/// `heyo_ui::topbar_html`, whose brand link is this host's `/`, which under
+/// the proxy is app-lb's root. Inside app-lb's plugin console the page sits
+/// under app-lb's own bar, so a one-line script marks `<html>` `embedded`
+/// before first paint and the bar is hidden; opened on its own, it stays.
+fn mounted_shell(ctx: &Ctx, m: &plugin::Mount, title: &str, body: Markup) -> Markup {
+    let root = m.root();
+    let assets = format!("{root}/-/__ui/");
+    html! {
+        (DOCTYPE)
+        (PreEscaped(format!("<html lang=\"en\" {}>", ctx.attrs)))
+        head {
+            meta charset="utf-8";
+            meta name="viewport" content="width=device-width, initial-scale=1";
+            title { (title) " · heyo git" }
+            script { (PreEscaped(EMBEDDED_JS)) }
+            link rel="stylesheet" href={ (assets) "heyo.css" };
+            script defer src={ (assets) "theme.js" } {}
+            style { (PreEscaped(STYLE)) (PreEscaped(".embedded .topbar { display: none; }")) }
+        }
+        body {
+            header.topbar {
+                a.topbar-brand href=(root) { span { "heyo" } span.topbar-app { "git" } }
+                nav.topbar-nav { a href=(root) aria-current="page" { "Repositories" } }
+                div.topbar-right {
+                    span.topbar-user title=(m.principal.display()) { (m.principal.display()) }
+                    (PreEscaped(heyo_ui::theme_toggle_html()))
+                }
+            }
+            main.wrap { (body) }
+            script { (PreEscaped(COPY_JS)) }
+        }
+        (PreEscaped("</html>"))
+    }
+}
+
+const EMBEDDED_JS: &str =
+    "if (window.self !== window.top) document.documentElement.classList.add('embedded');";
+
 /// Copy buttons: `data-copy` names the text to copy. Progressive: without
 /// script the URL is still a selectable input.
 const COPY_JS: &str = r#"document.addEventListener('click',function(e){var b=e.target.closest('[data-copy]');if(!b)return;navigator.clipboard&&navigator.clipboard.writeText(b.getAttribute('data-copy')).then(function(){var t=b.textContent;b.textContent='copied';setTimeout(function(){b.textContent=t},1200)})});"#;
@@ -288,7 +373,7 @@ fn not_found(ctx: &Ctx) -> Response {
                 div.empty {
                     h1 { "404" }
                     p { "There is nothing here, or this sign-in cannot see it." }
-                    p { a href="/" { "Back to your repositories" } }
+                    p { a href=(home_url()) { "Back to your repositories" } }
                 }
             },
         ),
@@ -780,7 +865,7 @@ fn repo_list(items: &[Listed], show_ns: bool) -> Markup {
                     div.row.spread {
                         div.grow {
                             (PreEscaped(ICON_REPO)) " "
-                            a.repo-name href=(format!("/{}/{}", m.namespace, m.name)) {
+                            a.repo-name href=(format!("{}/{}", ns_url(&m.namespace), m.name)) {
                                 @if show_ns { span.meta { (m.namespace) " / " } }
                                 strong { (m.name) }
                             }
@@ -870,6 +955,7 @@ fn kind_label(p: &Principal) -> &'static str {
         auth::Kind::Federated => "Heyo account",
         auth::Kind::AppToken => "app-lb token",
         auth::Kind::RepoToken => "repo token",
+        auth::Kind::Plugin => "app-lb namespace",
     }
 }
 
@@ -878,11 +964,11 @@ fn ns_header(ns: &str, p: &Principal, tab: &str) -> Markup {
     let admin = p.allows(ns, None, Tier::Admin);
     html! {
         div.repo-head {
-            h1.repo-title { a href=(format!("/{ns}")) { (ns) } }
+            h1.repo-title { a href=(ns_url(ns)) { (ns) } }
             nav.tabs {
-                a href=(format!("/{ns}")) aria-current=[(tab == "repos").then_some("page")] { (PreEscaped(ICON_REPO)) " Repositories" }
+                a href=(ns_url(ns)) aria-current=[(tab == "repos").then_some("page")] { (PreEscaped(ICON_REPO)) " Repositories" }
                 @if admin {
-                    a href=(format!("/{ns}/-/tokens")) aria-current=[(tab == "tokens").then_some("page")] { "Tokens" }
+                    a href=(format!("{}/-/tokens", ns_url(ns))) aria-current=[(tab == "tokens").then_some("page")] { "Tokens" }
                 }
             }
         }
@@ -912,7 +998,7 @@ async fn namespace_page(
             (ns_header(&ns, &p, "repos"))
             div.row.spread.section-head {
                 span.meta { (repos.len()) " repositories · you have " (p.tier_in(&ns).map_or("no", Tier::as_str)) " access" }
-                @if admin { a.btn.btn-primary href=(format!("/{ns}/-/new")) { "New repository" } }
+                @if admin { a.btn.btn-primary href=(format!("{}/-/new", ns_url(&ns))) { "New repository" } }
             }
             @if repos.is_empty() {
                 div.empty { p { "No repositories in " (ns) " yet." } }
@@ -939,7 +1025,7 @@ fn new_repo_form(
             div.narrow {
                 h2 { "Create a new repository" }
                 @if let Some(e) = error { div.banner.banner-error { (e) } }
-                form.card method="post" action=(format!("/{ns}/-/new")) {
+                form.card method="post" action=(format!("{}/-/new", ns_url(ns))) {
                     div.field {
                         label for="name" { "Repository name" }
                         div.row.row-tight { span.meta { (ns) " /" } input id="name".grow type="text" name="name" value=(f.name) required pattern="[A-Za-z0-9_][A-Za-z0-9._\\-]{0,99}" autofocus; }
@@ -1002,7 +1088,7 @@ async fn new_repo(
         default_branch: Some(f.default_branch.trim().to_string()),
     };
     match api::new_repo(&s, &p, &ns, body).await {
-        Ok(m) => Redirect::to(&format!("/{ns}/{}", m.name)).into_response(),
+        Ok(m) => Redirect::to(&format!("{}/{}", ns_url(&ns), m.name)).into_response(),
         Err(e) => render(
             e.status(),
             new_repo_form(&ctx, &p, &ns, &f, Some(&e.message())),
@@ -1072,7 +1158,7 @@ async fn tokens_view(
                                         }
                                     }
                                     td.num {
-                                        form method="post" action=(format!("/{ns}/-/tokens/{}/revoke", t.id)) {
+                                        form method="post" action=(format!("{}/-/tokens/{}/revoke", ns_url(ns), t.id)) {
                                             button.btn.btn-sm.btn-danger type="submit" { "Revoke" }
                                         }
                                     }
@@ -1082,7 +1168,7 @@ async fn tokens_view(
                     } }
                 }
             }
-            form.card method="post" action=(format!("/{ns}/-/tokens")) {
+            form.card method="post" action=(format!("{}/-/tokens", ns_url(ns))) {
                 div.card-head { h3 { "Mint a token" } }
                 div.grid {
                     div.field { label for="tname" { "Name" } input id="tname" type="text" name="name" placeholder="ci-build"; }
@@ -1203,7 +1289,7 @@ async fn revoke_token(
             if let Err(e) = s.auth.revoke(&id).await {
                 return failure(&ctx, StatusCode::BAD_GATEWAY, &e.to_string());
             }
-            Redirect::to(&format!("/{ns}/-/tokens")).into_response()
+            Redirect::to(&format!("{}/-/tokens", ns_url(&ns))).into_response()
         }
         _ => not_found(&ctx),
     }
@@ -1225,7 +1311,7 @@ struct RepoCtx {
 
 impl RepoCtx {
     fn base(&self) -> String {
-        format!("/{}/{}", self.r.ns, self.r.name)
+        format!("{}/{}", ns_url(&self.r.ns), self.r.name)
     }
 
     fn admin(&self) -> bool {
@@ -1289,7 +1375,7 @@ fn repo_header(rc: &RepoCtx, tab: Tab) -> Markup {
         div.repo-head {
             h1.repo-title {
                 (PreEscaped(ICON_REPO)) " "
-                a href=(format!("/{}", rc.r.ns)) { (rc.r.ns) }
+                a href=(ns_url(&rc.r.ns)) { (rc.r.ns) }
                 span.sep { " / " }
                 a href=(base) { strong { (rc.r.name) } }
                 " " span.pill.pill-muted { (rc.p.tier_in(&rc.r.ns).map_or("read", Tier::as_str)) }
@@ -1427,7 +1513,7 @@ async fn repo_home(
     headers: HeaderMap,
 ) -> Response {
     if let Some(bare) = repo.strip_suffix(".git") {
-        return Redirect::permanent(&format!("/{ns}/{bare}")).into_response();
+        return Redirect::permanent(&format!("{}/{bare}", ns_url(&ns))).into_response();
     }
     let rc = match open_repo(&s, &headers, &ns, &repo, &format!("/{ns}/{repo}")).await {
         Ok(rc) => rc,
@@ -1464,7 +1550,8 @@ async fn tree_page(
     };
     match browse::kind_at(&s.git, &rc.view, &res.commit, &res.path).await {
         Some(EntryKind::Tree) => tree_view(&s, rc, res).await,
-        Some(_) => Redirect::to(&format!("/{ns}/{repo}/blob/{}", enc_path(&rest))).into_response(),
+        Some(_) => Redirect::to(&format!("{}/{repo}/blob/{}", ns_url(&ns), enc_path(&rest)))
+            .into_response(),
         None => not_found(&rc.ctx),
     }
 }
@@ -1610,7 +1697,8 @@ async fn blob_page(
     match browse::kind_at(&s.git, &rc.view, &res.commit, &res.path).await {
         Some(EntryKind::Blob) => {}
         Some(EntryKind::Tree) => {
-            return Redirect::to(&format!("/{ns}/{repo}/tree/{}", enc_path(&rest))).into_response();
+            return Redirect::to(&format!("{}/{repo}/tree/{}", ns_url(&ns), enc_path(&rest)))
+                .into_response();
         }
         _ => return not_found(&rc.ctx),
     }
@@ -2135,7 +2223,7 @@ async fn delete_repo(
         );
     }
     match api::remove_repo(&s, &p, &ns, &repo).await {
-        Ok(_) => Redirect::to(&format!("/{ns}")).into_response(),
+        Ok(_) => Redirect::to(&ns_url(&ns)).into_response(),
         Err(e) => failure(&ctx, e.status(), &e.message()),
     }
 }

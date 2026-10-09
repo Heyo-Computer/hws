@@ -6,8 +6,9 @@ through `hub.heyo.work`, anonymously for public repositories, or through
 `art.us2.heyo.work` with the store key. The bucket is the system of record
 either way.
 
-`remote.json` runs a second git remote at `git.us5.heyo.work`, backed by the
-same buckets as git.us2:
+`remote.json` runs a second git remote at `git.us5.heyo.work`, also served as
+`remote.heyo.work` (its canonical name, so clone URLs say `remote.heyo.work`),
+backed by the same buckets as git.us2:
 
 - `applb_` tokens resolve against us5's own app-lb (`REMOTE_APPLB_URL`), so a
   us2 namespace token does not work here.
@@ -16,6 +17,17 @@ same buckets as git.us2:
 
 They use the canonical `remote`, `remote-s3`, `artifacts` and `github` secrets, loaded into
 us5's app-lb under the same names as on us2.
+
+us5's app-lb runs the `remote` plugin against it, so each namespace's repos
+appear in app-lb's plugin console. The `remote-plugin` secret's `api-token`
+is the plugin's bearer: remote reads it as `REMOTE_PLUGIN_API_TOKEN`, and
+app-lb's plugin configuration references the same key. It is a role of its
+own (app-lb speaking to remote), so it is not a key on `remote`.
+
+```sh
+heyctl --context us5 plugins set remote '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}'
+heyctl --context us5 plugins enable remote
+```
 
 `heyo-mcp.json` runs the hosted MCP server at `mcp.heyo.work`. It is the same
 image and gate as mcp.us2, wired to us5's own app-lb (`admin.us5`) and git
