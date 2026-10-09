@@ -2450,6 +2450,16 @@ pub struct ImageInventory {
     pub offload: bool,
     pub disk_used_pct: Option<f64>,
     pub pressure_pct: u8,
+    /// Bytes of unreferenced pulled images, the host's image cache; `None`
+    /// when the references could not be read.
+    pub cache_bytes: Option<u64>,
+    /// `APP_LB_IMAGE_CACHE_BUDGET_GB` in bytes; `None` when only disk
+    /// pressure evicts the cache.
+    pub cache_budget_bytes: Option<u64>,
+    /// Pulls since app-lb started that found their image on heyvm.
+    pub cache_hits: u64,
+    /// Pulls since app-lb started that fetched their image.
+    pub cache_misses: u64,
     pub local_bytes: u64,
     pub images: Vec<ImageEntry>,
     #[serde(flatten)]

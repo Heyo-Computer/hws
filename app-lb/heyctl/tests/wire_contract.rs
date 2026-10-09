@@ -497,6 +497,8 @@ fn the_image_inventory_reads_every_field() {
     assert!(inv.extra.is_empty(), "unmodelled: {:?}", inv.extra.keys().collect::<Vec<_>>());
     assert!(inv.complete);
     assert_eq!(inv.delete_supported, Some(true));
+    assert_eq!((inv.cache_bytes, inv.cache_budget_bytes), (Some(0), Some(21_474_836_480)));
+    assert_eq!((inv.cache_hits, inv.cache_misses), (4, 1));
     for i in &inv.images {
         assert!(i.extra.is_empty(), "{}: unmodelled {:?}", i.name, i.extra.keys().collect::<Vec<_>>());
     }
