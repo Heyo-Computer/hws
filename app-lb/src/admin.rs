@@ -7941,7 +7941,7 @@ mod tests {
                     vec![
                         crate::plugins::obs::ObsPlugin::new(plugin_secrets.clone()),
                         crate::plugins::ci::CiPlugin::new(plugin_secrets.clone()),
-                        crate::plugins::secrets::SecretsPlugin::new(),
+                        crate::plugins::secrets::SecretsPlugin::new(plugin_secrets.clone()),
                         crate::plugins::postgres::PostgresPlugin::new(plugin_secrets, root.join("plugins").join("state")),
                     ],
                     crate::plugins::PluginStore::new(root.join("plugins")),
@@ -9074,6 +9074,24 @@ mod tests {
             // reach this pg-fc.
             let (status, v) = call("POST", create, &admin, r#"{"name": "app"}"#).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{v}");
+            // Nested under `/namespaces/:name/plugins/:id`, the delete route
+            // still finds its database: an unowned one is a 404, not a failed
+            // path extraction.
+            let (status, v) = call("DELETE", &format!("{create}/app"), &admin, "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+
+            // The secrets page's listing is view tier and confined to the
+            // namespace: names and keys, never a value, never another namespace.
+            f.state.plugins.set("secrets", true, Some(serde_json::json!({}))).await.unwrap();
+            f.state.plugins.install("secrets", "team-a", serde_json::json!({}), None).await.unwrap();
+            let (status, v) = call("GET", "/namespaces/team-a/plugins/secrets/api/secrets", &viewer, "").await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let text = v.to_string();
+            assert!(text.contains("GREETING") && !text.contains("hello-team-a"), "{text}");
+            assert!(!text.contains("plugin_api_token"), "another namespace's secret leaked: {text}");
+            let (status, _) = call("GET", "/secrets?namespace=team-a", &viewer, "").await;
+            assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED), "the fleet listing stays CRUD tier");
+            f.state.plugins.set("secrets", false, None).await.unwrap();
             f.state.plugins.set("ci", false, None).await.unwrap();
             f.state.plugins.set("postgres", false, None).await.unwrap();
         }
