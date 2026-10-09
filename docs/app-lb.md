@@ -177,6 +177,9 @@ HTTP-01 validation needs the proxy on port 80. To bind 80/443 as a non-root user
 | --- | --- | --- |
 | `APP_LB_IMAGE_OFFLOAD` | `true` | Offload unreferenced images: built ones after `APP_LB_IMAGE_IDLE_SECS`, pulled ones under disk pressure or over `APP_LB_IMAGE_CACHE_BUDGET_GB`. Off leaves `GET /images` and the explicit routes. |
 | `APP_LB_IMAGE_IDLE_SECS` | `86400` | How long a **built** image must go unreferenced before the pacer offloads it. Pulled images are cache and ignore it. |
+| `APP_LB_IMAGE_WARM` | unset | Images pulled at startup and held so their first VM never waits on a fetch: `<ref>` (from `APP_LB_IMAGE_WARM_STORE`) or `<store>\|<ref>`, separated by commas. Public stores only; no key is sent. Example: `heyo/alpine:3.24,heyo/postgres:18`. |
+| `APP_LB_IMAGE_WARM_STORE` | `https://hub.heyo.work` | Store a bare `APP_LB_IMAGE_WARM` entry is pulled from. |
+| `APP_LB_IMAGE_WARM_SECS` | `900` | How often the warm set's tags are re-resolved. A tag that moved is pulled and held; its old image becomes ordinary cache. `0` warms once at startup. |
 | `APP_LB_IMAGE_CACHE_BUDGET_GB` | unset | Bytes of unreferenced pulled images kept as cache; above it the least recently used are offloaded until it fits. Unset: only disk pressure removes a pulled image. `0`: keep no cache. |
 | `APP_LB_IMAGE_SWEEP_SECS` | `600` | Interval between offload passes. `0` stops the pacer. |
 | `APP_LB_IMAGE_PRESSURE_PCT` | `85` | Disk use (from heyvm's `GET /storage`) at which idle age stops protecting an unreferenced image. |
@@ -735,6 +738,9 @@ Unreferenced images are offloaded by a pacer that runs one at a time and stands 
 - **Built** images: offloaded once nothing has held them for `APP_LB_IMAGE_IDLE_SECS`, pushed to `APP_LB_IMAGE_OFFLOAD_STORE` first; never offloaded without it.
 - **Built** images: pushed to `APP_LB_IMAGE_OFFLOAD_STORE` first; never offloaded without it.
 - Images app-lb did not make are listed and never removed.
+- The **warm set** (`APP_LB_IMAGE_WARM`) is pulled at startup and re-resolved every `APP_LB_IMAGE_WARM_SECS`; the image each entry currently resolves to is held by a `warm` reference and never offloaded. A restart restores the held set from the image records before the first pass.
+
+A pull that cannot reach its store falls back on the digest that reference last resolved to (remembered from earlier pulls and from the image records), but only to reuse an image heyvm already holds — it never fetches on a remembered digest, and forced pulls and rollout candidates never fall back. A hub outage therefore does not stop VMs from being created from images already on the host.
 
 A failed offload backs off (30 minutes, doubling, up to a day). Above `APP_LB_IMAGE_PRESSURE_PCT` disk use the idle age is ignored, but references, pins and verification still hold. Nothing is removed when the references cannot be determined. A deployment that needs an offloaded image gets it pulled back under its own name before its next VM is created.
 

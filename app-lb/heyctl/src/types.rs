@@ -2502,8 +2502,8 @@ pub struct ImageEntry {
     pub extra: Extra,
 }
 
-/// Something that holds an image: `deployment`, `rollout`, `sandbox`, `job`
-/// or `pinned`, with the fields that kind carries.
+/// Something that holds an image: `deployment`, `rollout`, `sandbox`, `job`,
+/// `pinned` or `warm`, with the fields that kind carries.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ImageReference {
@@ -2512,6 +2512,9 @@ pub struct ImageReference {
     pub deployment: Option<String>,
     pub operation: Option<String>,
     pub job: Option<String>,
+    /// The warm-set entry (`<store>/<ref>`) holding a `warm` image.
+    #[serde(rename = "ref")]
+    pub artifact_ref: Option<String>,
 }
 
 impl std::fmt::Display for ImageReference {
@@ -2521,6 +2524,9 @@ impl std::fmt::Display for ImageReference {
             ("sandbox", Some(id), _) => write!(f, "sandbox/{id}"),
             ("rollout", _, Some(d)) => write!(f, "rollout of {d}"),
             ("job", _, Some(d)) => write!(f, "job {} of {d}", self.job.as_deref().unwrap_or("?")),
+            ("warm", _, _) if self.artifact_ref.is_some() => {
+                write!(f, "warm {}", self.artifact_ref.as_deref().unwrap_or_default())
+            }
             (kind, _, _) => f.write_str(kind),
         }
     }
