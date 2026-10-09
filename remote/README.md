@@ -144,7 +144,7 @@ plugin both reference:
 openssl rand -hex 32 > /tmp/remote-plugin-token
 heyctl create secret remote-plugin --from-file api-token=/tmp/remote-plugin-token
 rm /tmp/remote-plugin-token
-heyctl plugins set remote '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}'
+echo '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}' | heyctl plugins set remote -f -
 heyctl plugins enable remote
 ```
 
