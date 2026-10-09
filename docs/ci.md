@@ -252,6 +252,7 @@ Integrations:
 | `CI_APP_LB_URL`, `CI_APP_LB_TOKEN` | unset | app-lb admin API for `workflow` objects and for the `ci` plugin's namespace installs (`GET /api/plugins/ci`). Without it, ci uses repository registrations and `CI_WORKFLOW_PATH` only, and no namespace can use ci. |
 | `CI_PLUGIN_API_TOKEN` | unset | Bearer app-lb's `ci` plugin presents on every `/ns/{ns}/` request. The namespace routes are not mounted without it. See [Namespaces](#namespaces). |
 | `CI_REQUIRE_INSTALL` | `true` | Namespace pages and submits need the namespace in app-lb's install list. `false` treats every namespace as installed while the plugin is enabled. |
+| `CI_TENANT_ONLY` | `false` | Build only for namespaces: every fleet submit answers `403`, and the default network may be a tenant network. Requires `CI_PLUGIN_API_TOKEN` and `CI_APP_LB_URL`. See [A tenant-only instance](#a-tenant-only-instance). |
 | `CI_NATIVE_RUNNER_SECRET` | unset | Bearer for `/api/native/*`. Native runners are disabled without it. |
 
 Release, deployment and host-maintenance variables (`CI_RELEASE_POLICIES`, `CI_HOST_APP_LB_TARGETS`, `CI_HOST_MAINTENANCE_TARGETS`, `CI_HOST_HEYVM_BOOTSTRAP_TARGETS`, `CI_CONTROLLER_*`, `CI_APPLICATION_*`, `CI_EXPECTED_SHA`) are operator configuration for the built-in release actions. They are documented with those actions in the [ci README](../ci/README.md#operator-owned-release-policy).
@@ -367,11 +368,17 @@ Pages: runs (`/ns/<ns>/`), a run, a job with its live log, repositories and work
 
 A namespace's token submits through the ordinary `git submit` endpoint; register the repository on the namespace's repositories page and run the two `git config` lines it shows.
 
+### A tenant-only instance
+
+A region whose app-lb has no fleet CI of its own runs a separate ci with `CI_TENANT_ONLY=true`, its own database and NATS subject prefix, and `CI_APP_LB_URL` pointing at that region's app-lb. It refuses every fleet submit (shared-secret or a fleet registration's token) with `403`, so the only builds on it are namespaces'.
+
+Such an instance may drive its own host's daemon directly instead of joining a heyvm network: `CI_LOCAL_RUNNER=<daemon URL>` with `CI_LOCAL_RUNNER_TOKEN` set to the daemon's bearer. Local-runner mode serves one network, `local`, which is also the default; tenant-only lifts the rule that keeps tenants off the default network, so the plugin's `tenant_network` is `local`.
+
 ### Tenant limits
 
 A namespace submit is planned under a narrower policy than a fleet one, and a workflow that breaks it is refused at submit with the rule it broke:
 
-- **One network.** Jobs run in the network app-lb's plugin config names for the namespace (`namespace_networks[<ns>]`, else `tenant_network`). It must be a network this instance serves and must not be the fleet default (the first entry of `CI_NETWORK`). A job may pin a host in that network (`uses: <network>/<host>`), but not another network, `uses: default`, or an existing VM.
+- **One network.** Jobs run in the network app-lb's plugin config names for the namespace (`namespace_networks[<ns>]`, else `tenant_network`). It must be a network this instance serves and must not be the fleet default (the first entry of `CI_NETWORK`), unless the instance is [tenant-only](#a-tenant-only-instance). A job may pin a host in that network (`uses: <network>/<host>`), but not another network, `uses: default`, or an existing VM.
 - **No native runners.** `runs-on` is refused.
 - **No release.** `on: release` is refused, and release policies and `workflow` objects never apply to a namespace's repositories, even when they name the same URL.
 - **Two actions.** Only `ci/upload-artifact` and `ci/download-artifact`; every deploy, publish, merge and host-maintenance action is refused, and refused again at execution.

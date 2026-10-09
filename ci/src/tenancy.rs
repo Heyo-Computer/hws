@@ -82,10 +82,14 @@ fn refuse(message: impl Into<String>) -> TenancyError {
 /// the pool is this instance's: a network this instance does not serve would
 /// queue jobs nobody consumes, and the fleet default would put tenant code next
 /// to the fleet's own builds.
+///
+/// `tenant_only` lifts the default-network rule: on an instance that runs no
+/// fleet builds (`CI_TENANT_ONLY`) the default network is tenant-only too.
 pub fn resolve_network<'a>(
     pool: &'a Pool,
     namespace: &str,
     configured: Option<&str>,
+    tenant_only: bool,
 ) -> Result<&'a RunnerSet, TenancyError> {
     let Some(wanted) = configured else {
         return Err(refuse(format!(
@@ -102,9 +106,10 @@ pub fn resolve_network<'a>(
             )));
         }
     };
-    if pool
-        .default_set()
-        .is_some_and(|d| d.network_id == set.network_id)
+    if !tenant_only
+        && pool
+            .default_set()
+            .is_some_and(|d| d.network_id == set.network_id)
     {
         return Err(refuse(format!(
             "namespace {namespace} is configured to build in {}, the fleet's default \
@@ -270,40 +275,54 @@ mod tests {
     fn the_tenant_network_must_be_served_and_not_the_fleet_default() {
         let p = pool();
         assert_eq!(
-            resolve_network(&p, "team-a", Some("tenants"))
+            resolve_network(&p, "team-a", Some("tenants"), false)
                 .unwrap()
                 .network_id,
             "n-ten"
         );
         assert_eq!(
-            resolve_network(&p, "team-a", Some("n-ten"))
+            resolve_network(&p, "team-a", Some("n-ten"), false)
                 .unwrap()
                 .network_name,
             "tenants"
         );
         assert!(
-            resolve_network(&p, "team-a", None)
+            resolve_network(&p, "team-a", None, false)
                 .unwrap_err()
                 .0
                 .contains("no network is configured")
         );
         assert!(
-            resolve_network(&p, "team-a", Some("elsewhere"))
+            resolve_network(&p, "team-a", Some("elsewhere"), false)
                 .unwrap_err()
                 .0
                 .contains("does not serve")
         );
         assert!(
-            resolve_network(&p, "team-a", Some("missing"))
+            resolve_network(&p, "team-a", Some("missing"), false)
                 .unwrap_err()
                 .0
                 .contains("does not serve")
         );
         assert!(
-            resolve_network(&p, "team-a", Some("fleet"))
+            resolve_network(&p, "team-a", Some("fleet"), false)
                 .unwrap_err()
                 .0
                 .contains("fleet's default")
+        );
+        // A tenant-only instance has no fleet builds to keep apart from, so its
+        // default network — local-runner mode's only one — is the tenants'.
+        assert_eq!(
+            resolve_network(&p, "team-a", Some("fleet"), true)
+                .unwrap()
+                .network_name,
+            "fleet"
+        );
+        assert!(
+            resolve_network(&p, "team-a", Some("missing"), true)
+                .unwrap_err()
+                .0
+                .contains("does not serve")
         );
     }
 
