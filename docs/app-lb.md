@@ -808,7 +808,7 @@ Plugins are compiled in and switched on at runtime from `/plugins` or with `heyc
 Some plugins (today, `obs`, `ci` and `remote`) are installed per namespace. The operator enables and configures the plugin once for the host; then a namespace administrator installs it:
 
 ```sh
-heyctl plugins enable obs   # operator, after `heyctl plugins set obs '{"url": "http://127.0.0.1:9600", "api_token": {"secret": "app-obs", "key": "api_token"}}'`
+heyctl plugins enable obs   # operator, after `echo '{"url": "http://127.0.0.1:9600", "api_token": {"secret": "app-obs", "key": "api_token"}}' | heyctl plugins set obs -f -`
 heyctl plugins install obs -n team-a   # an admin token for all of team-a
 ```
 
@@ -821,7 +821,7 @@ For `obs`, `/namespaces/<ns>/plugins/obs/ui` is the app-obs dashboard narrowed t
 For `ci`, the operator gives ci's URL, a secret reference to ci's `CI_PLUGIN_API_TOKEN`, and the heyvm network tenant builds run on. That network must be one ci serves and not ci's own default. `namespace_networks` gives particular namespaces a network of their own. A namespace installs `ci` with `{}`: it cannot pick its network. `ci` never installs itself unless `"auto_install": true`, because installing grants the right to run builds.
 
 ```sh
-heyctl plugins set ci '{"url": "http://127.0.0.1:9500", "api_token": {"secret": "ci", "key": "plugin_api_token"}, "tenant_network": "tenants"}'
+echo '{"url": "http://127.0.0.1:9500", "api_token": {"secret": "ci", "key": "plugin_api_token"}, "tenant_network": "tenants"}' | heyctl plugins set ci -f -
 heyctl plugins enable ci
 heyctl plugins install ci -n team-a
 ```
@@ -831,7 +831,7 @@ ci polls `GET /api/plugins/ci` for the install list and the network settings. `/
 For `remote`, the operator gives remote's URL and a secret reference to remote's `REMOTE_PLUGIN_API_TOKEN`. `/namespaces/<ns>/plugins/remote/ui` is the namespace's repositories, and `…/remote/ui/<page>` every other page (`<repo>`, `<repo>/tree/<ref>/<path>`, `<repo>/commits`, `-/new`, `-/tokens`, …). They are forwarded to remote's `/-/ns/<ns>/…`, because remote's own root belongs to namespaces. app-lb sends the caller's identity, and remote gives a namespace admin admin in the namespace and anyone else read. Like `obs`, it installs itself unless `"auto_install": false`.
 
 ```sh
-heyctl plugins set remote '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}'
+echo '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugin", "key": "api-token"}}' | heyctl plugins set remote -f -
 heyctl plugins enable remote
 ```
 
