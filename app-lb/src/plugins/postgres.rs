@@ -546,7 +546,7 @@ impl Plugin for PostgresPlugin {
         Router::new()
             .route("/ui", get(ui))
             .route("/api/databases", get(list_databases).post(create_database))
-            .route("/api/databases/:name", delete(delete_database))
+            .route("/api/databases/:database", delete(delete_database))
             .fallback(|| async { fail(StatusCode::NOT_FOUND, "no postgres plugin route here") })
             .with_state(self)
     }
@@ -884,9 +884,16 @@ async fn create_database(State(p): State<Arc<PostgresPlugin>>, req: Request) -> 
 /// the database. Data stays on pg-fc; the secret stays in the namespace.
 async fn delete_database(
     State(p): State<Arc<PostgresPlugin>>,
-    Path(name): Path<String>,
+    Path(params): Path<std::collections::HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    // By name, not position: nested under `/namespaces/:name/plugins/:id`, the
+    // request carries the outer parameters too, so a bare `Path<String>` fails
+    // to extract (a 500) on every real request. The segment is `:database`
+    // because `:name` is already the namespace.
+    let Some(name) = params.get("database").cloned() else {
+        return fail(StatusCode::BAD_REQUEST, "no database named in the path");
+    };
     let ns = match scope(&req) {
         Ok(ns) => ns,
         Err(r) => return r,

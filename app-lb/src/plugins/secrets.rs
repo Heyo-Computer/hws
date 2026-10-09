@@ -18,14 +18,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::Router;
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::ns_proxy::fail;
+use crate::secrets::SecretStore;
 use super::{NamespaceScope, Plugin, PluginMeta};
 
 pub(crate) const PAGE_HTML: &str = include_str!("../secrets_plugin.html");
@@ -53,12 +54,13 @@ fn parse_config(config: &Value) -> Result<SecretsConfig, String> {
     serde_json::from_value(config).map_err(|e| e.to_string())
 }
 
-#[derive(Default)]
-pub struct SecretsPlugin;
+pub struct SecretsPlugin {
+    secrets: Arc<SecretStore>,
+}
 
 impl SecretsPlugin {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self)
+    pub fn new(secrets: Arc<SecretStore>) -> Arc<Self> {
+        Arc::new(Self { secrets })
     }
 }
 
@@ -113,14 +115,37 @@ impl Plugin for SecretsPlugin {
     }
 
     fn namespace_routes(self: Arc<Self>) -> Router {
-        Router::new().route("/ui", get(ui)).fallback(|| async {
-            fail(StatusCode::NOT_FOUND, "the secrets plugin serves /ui only")
-        })
+        Router::new()
+            .route("/ui", get(ui))
+            .route("/api/secrets", get(list_secrets))
+            .fallback(|| async {
+                fail(StatusCode::NOT_FOUND, "no secrets plugin route here")
+            })
+            .with_state(self)
     }
 
     fn dashboard_path(&self) -> Option<&'static str> {
         Some("ui")
     }
+}
+
+/// `GET …/secrets/api/secrets` — this namespace's secrets: ids, descriptions
+/// and key names, never values.
+///
+/// On the namespace surface, so it is view tier: the admin API's `GET
+/// /secrets` is CRUD tier for the whole fleet, and lowering it would show every
+/// fleet view token every namespace's secret names. Here a caller sees only the
+/// namespace the gate already admitted it to.
+async fn list_secrets(State(p): State<Arc<SecretsPlugin>>, req: Request) -> Response {
+    let Some(NamespaceScope(ns)) = req.extensions().get::<NamespaceScope>().cloned() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "no namespace on this request");
+    };
+    let mut out = axum::Json(p.secrets.list(Some(&ns))).into_response();
+    out.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    out
 }
 
 /// `GET …/secrets/ui` — the page.
@@ -159,7 +184,7 @@ mod tests {
 
     #[test]
     fn a_config_is_checked_before_it_is_stored() {
-        let p = SecretsPlugin::new();
+        let p = SecretsPlugin::new(Arc::new(SecretStore::new(std::env::temp_dir().join("app-lb-secrets-plugin-unused.json"), None)));
         assert!(p.validate(&json!({})).is_ok());
         assert!(p.validate(&Value::Null).is_ok());
         assert!(p.auto_install(&json!({})), "on by default");
@@ -171,7 +196,8 @@ mod tests {
     #[tokio::test]
     async fn it_installs_itself_and_serves_its_page_for_the_namespace() {
         let dir = TempDir::new("page");
-        let host = PluginHost::new(vec![SecretsPlugin::new()], PluginStore::new(&dir.0));
+        let store = Arc::new(SecretStore::new(dir.0.join("secrets.json"), None));
+        let host = PluginHost::new(vec![SecretsPlugin::new(store)], PluginStore::new(&dir.0));
         host.set("secrets", true, Some(json!({}))).await.unwrap();
         assert_eq!(host.auto_install("team-a", None).await, vec!["secrets"]);
 
