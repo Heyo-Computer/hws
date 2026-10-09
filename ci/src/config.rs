@@ -342,6 +342,13 @@ pub struct Config {
     /// namespace as installed while the plugin is enabled — for an app-lb that
     /// installs implicitly, or a development loop with one namespace.
     pub require_install: bool,
+    /// Whether this instance builds only for namespaces (`CI_TENANT_ONLY`).
+    /// Every fleet submit is refused, and a tenant may then build in the one
+    /// network this instance serves even though it is the default — there are
+    /// no fleet builds beside it to keep tenant code away from. This is what
+    /// lets a regional instance drive its own host's daemon in local-runner
+    /// mode, whose single `local` network is necessarily the default.
+    pub tenant_only: bool,
     /// Dedicated bearer for native runner machine routes. Never inferred from
     /// app-lb forwarded identity or the submit credential.
     pub native_runner_secret: Option<String>,
@@ -553,6 +560,22 @@ impl Config {
         // S3 is also used for debug reports when another primary artifact sink
         // is selected, so resolve it whenever a bucket is present. Selecting S3
         // as the primary sink still makes the bucket mandatory at startup.
+        // Tenant-only with nothing to serve tenants through would refuse every
+        // submit while looking healthy, so it is a startup error instead.
+        let tenant_only = flag("CI_TENANT_ONLY", false)?;
+        if tenant_only && opt("CI_PLUGIN_API_TOKEN").is_none() {
+            return Err(ConfigError::Missing {
+                var: "CI_PLUGIN_API_TOKEN",
+                purpose: "the bearer app-lb's ci plugin presents, required by CI_TENANT_ONLY",
+            });
+        }
+        if tenant_only && opt("CI_APP_LB_URL").is_none() {
+            return Err(ConfigError::Missing {
+                var: "CI_APP_LB_URL",
+                purpose: "the app-lb whose ci plugin installs namespaces, required by CI_TENANT_ONLY",
+            });
+        }
+
         let s3_bucket = opt("CI_S3_BUCKET");
         if matches!(artifact_sink, ArtifactSinkKind::S3) && s3_bucket.is_none() {
             return Err(ConfigError::Missing {
@@ -685,6 +708,7 @@ impl Config {
             require_repo_token: flag("CI_REQUIRE_REPO_TOKEN", false)?,
             plugin_api_token: opt("CI_PLUGIN_API_TOKEN"),
             require_install: flag("CI_REQUIRE_INSTALL", true)?,
+            tenant_only,
             native_runner_secret: opt("CI_NATIVE_RUNNER_SECRET"),
             default_workflow_path: opt("CI_WORKFLOW_PATH")
                 .unwrap_or_else(|| ".ci/workflows/*.yml".to_string()),
@@ -709,7 +733,7 @@ impl Config {
     pub fn summary(&self) -> String {
         format!(
             "instance={} listen={} public={} network={} nats={} prefix={} sink={} logs={} \
-             heyosecret={} app-lb={} admins={} submit={}",
+             heyosecret={} app-lb={} admins={} submit={}{}",
             self.instance_id,
             self.listen_addr,
             self.public_url,
@@ -730,6 +754,7 @@ impl Config {
             } else {
                 "repo-token-or-shared-secret"
             },
+            if self.tenant_only { " tenant-only" } else { "" },
         )
     }
 }

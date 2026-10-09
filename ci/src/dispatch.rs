@@ -252,6 +252,9 @@ impl Dispatcher {
         // release policies and workflow objects are matched by URL, and a
         // tenant registering a fleet repository's URL must not inherit them.
         let namespace = repo.map(|r| r.namespace.clone()).unwrap_or_default();
+        if namespace.is_empty() && self.config.tenant_only {
+            return Err(DispatchError::TenantOnly);
+        }
         let tenant_network = if namespace.is_empty() {
             None
         } else {
@@ -260,7 +263,7 @@ impl Dispatcher {
             }
             let pool = self.runners.snapshot();
             let tenants = self.tenants.snapshot();
-            let set = crate::tenancy::resolve_network(&pool, &namespace, tenants.network_for(&namespace))
+            let set = crate::tenancy::resolve_network(&pool, &namespace, tenants.network_for(&namespace), self.config.tenant_only)
                 .map_err(|e| DispatchError::Tenancy(e.to_string()))?;
             if req.workflow_id.is_some() {
                 return Err(DispatchError::Tenancy(
@@ -5033,6 +5036,8 @@ pub enum DispatchError {
     /// A namespace that has not installed the `ci` plugin, or whose install
     /// app-lb has since withdrawn. The submit route answers 403 for it.
     NotInstalled(String),
+    /// A fleet submit to an instance that builds only for namespaces.
+    TenantOnly,
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
     Bus(crate::bus::BusError),
@@ -5220,6 +5225,7 @@ impl std::fmt::Display for DispatchError {
         match self {
             Self::Native(e) => write!(f, "native runner: {e}"),
             Self::Tenancy(e) => write!(f, "namespace policy: {e}"),
+            Self::TenantOnly => write!(f, "this ci builds only for namespaces; submit with a token minted on your namespace's CI page"),
             Self::NotInstalled(ns) => write!(f, "namespace {ns} has not installed ci; install it from its plugins page in app-lb"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Pool(e) => write!(f, "{e}"),

@@ -1400,6 +1400,12 @@ a transport error keeps the last answer. An uninstalled namespace's pages
 counts every namespace as installed while the plugin is enabled, for an app-lb
 that installs implicitly or a one-namespace development loop.
 
+`CI_TENANT_ONLY=true` makes an instance namespace-only: fleet submits answer
+`403` (checked in `submit` before unpacking, and again in the dispatcher), and
+`tenancy::resolve_network` accepts the default network, which is what lets a
+regional instance build in local-runner mode's single `local` network. It
+refuses to start without `CI_PLUGIN_API_TOKEN` and `CI_APP_LB_URL`.
+
 **Tenant limits** (`src/tenancy.rs`), checked at submit so the refusal reaches
 the terminal that ran `git submit`:
 
