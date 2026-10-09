@@ -175,8 +175,9 @@ HTTP-01 validation needs the proxy on port 80. To bind 80/443 as a non-root user
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `APP_LB_IMAGE_OFFLOAD` | `true` | Offload images nothing has used for `APP_LB_IMAGE_IDLE_SECS`. Off leaves `GET /images` and the explicit routes. |
-| `APP_LB_IMAGE_IDLE_SECS` | `86400` | How long an image must go unreferenced before the pacer offloads it. |
+| `APP_LB_IMAGE_OFFLOAD` | `true` | Offload unreferenced images: built ones after `APP_LB_IMAGE_IDLE_SECS`, pulled ones under disk pressure or over `APP_LB_IMAGE_CACHE_BUDGET_GB`. Off leaves `GET /images` and the explicit routes. |
+| `APP_LB_IMAGE_IDLE_SECS` | `86400` | How long a **built** image must go unreferenced before the pacer offloads it. Pulled images are cache and ignore it. |
+| `APP_LB_IMAGE_CACHE_BUDGET_GB` | unset | Bytes of unreferenced pulled images kept as cache; above it the least recently used are offloaded until it fits. Unset: only disk pressure removes a pulled image. `0`: keep no cache. |
 | `APP_LB_IMAGE_SWEEP_SECS` | `600` | Interval between offload passes. `0` stops the pacer. |
 | `APP_LB_IMAGE_PRESSURE_PCT` | `85` | Disk use (from heyvm's `GET /storage`) at which idle age stops protecting an unreferenced image. |
 | `APP_LB_IMAGE_OFFLOAD_STORE` | unset | `art serve` URL or store root a **built** image is pushed to (tag `app-lb-offload:<name>`) before it is deleted. Unset: built images are never offloaded. |
@@ -728,9 +729,10 @@ Unclaimed disks expire after `APP_LB_DISK_TTL_SECS` (7 days). Disks the daemon h
 
 `GET /images` (view tier, fleet scope) lists heyvm's image catalog with what holds each image: a deployment's `vm.image`, a kept rollout operation's spec, a live or inactive sandbox, a running job, or a pin. Records live in `app-lb-images.d/`. The **Images** section of `/storage` and `heyctl images` show the same.
 
-An image nothing has held for `APP_LB_IMAGE_IDLE_SECS` is offloaded by a pacer that runs one at a time and stands down while any pool is booting:
+Unreferenced images are offloaded by a pacer that runs one at a time and stands down while any pool is booting:
 
-- **Pulled** images: the store they came from is checked to still serve the blob (`HEAD /blobs/<digest>`, or `art stat`), the record is marked offloaded, then the image is deleted from heyvm.
+- **Pulled** images are the host's image cache: every deployment of the same digest shares one, so removing it only saves disk and the next VM that wants it pays a full fetch. They are never offloaded for idle age — only above `APP_LB_IMAGE_PRESSURE_PCT` disk use or while unreferenced pulled images exceed `APP_LB_IMAGE_CACHE_BUDGET_GB`, least recently used first, until the cache fits. Before deletion the store they came from is checked to still serve the blob (`HEAD /blobs/<digest>`, or `art stat`) and the record is marked offloaded. `GET /images` reports `cache_bytes`, `cache_budget_bytes`, and `cache_hits`/`cache_misses` (pulls since start that found their image on heyvm, and those that fetched it).
+- **Built** images: offloaded once nothing has held them for `APP_LB_IMAGE_IDLE_SECS`, pushed to `APP_LB_IMAGE_OFFLOAD_STORE` first; never offloaded without it.
 - **Built** images: pushed to `APP_LB_IMAGE_OFFLOAD_STORE` first; never offloaded without it.
 - Images app-lb did not make are listed and never removed.
 

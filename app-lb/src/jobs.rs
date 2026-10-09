@@ -1740,7 +1740,7 @@ impl Jobs {
             r.reused = pulled.reused;
         });
         if let Some(images) = self.images.get() {
-            images.note_pulled(&pulled.image, &pulled.digest, spec, pulled.size);
+            images.note_pulled(&pulled.image, &pulled.digest, spec, pulled.size, pulled.reused);
         }
         self.log(
             job_id,

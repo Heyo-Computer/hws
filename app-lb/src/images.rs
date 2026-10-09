@@ -121,6 +121,10 @@ pub struct ImagesConfig {
     /// `APP_LB_IMAGE_OFFLOAD_STORE_KEY`: the store's API key, as a secret id
     /// (`<secret>` or `<secret>/<key>`), resolved per use.
     pub offload_store_key: Option<SecretRef>,
+    /// `APP_LB_IMAGE_CACHE_BUDGET_GB`: how many bytes of unreferenced pulled
+    /// images may stay as cache before the least recently used go. Unset:
+    /// only disk pressure removes a pulled image.
+    pub cache_budget_bytes: Option<u64>,
 }
 
 impl Default for ImagesConfig {
@@ -132,6 +136,7 @@ impl Default for ImagesConfig {
             pressure_pct: DEFAULT_PRESSURE_PCT,
             offload_store: None,
             offload_store_key: None,
+            cache_budget_bytes: None,
         }
     }
 }
@@ -176,6 +181,7 @@ impl ImagesConfig {
                         namespace: None,
                     }
                 }),
+            cache_budget_bytes: num("APP_LB_IMAGE_CACHE_BUDGET_GB").map(|gb| gb.saturating_mul(1 << 30)),
         }
     }
 }
@@ -482,6 +488,8 @@ pub struct Policy {
     pub pressure: bool,
     /// Whether a built image has somewhere to go.
     pub offload_store: bool,
+    /// Unreferenced pulled images are over `APP_LB_IMAGE_CACHE_BUDGET_GB`.
+    pub cache_over_budget: bool,
 }
 
 /// Why `record` may not be offloaded right now, or `Ok` if it may. Pure.
@@ -520,6 +528,15 @@ pub fn eligibility(
     }
     if p.now < record.next_attempt_at {
         return Err(format!("backing off after {} failure(s)", record.failures));
+    }
+    // A pulled image is the cache: removing it saves only disk, and the next
+    // VM that wants it pays a full fetch. So idle age alone never removes
+    // one; pressure or the cache budget does, least recently used first.
+    if record.source == ImageSource::Pull {
+        if p.pressure || p.cache_over_budget {
+            return Ok(());
+        }
+        return Err("kept as cache until the disk is under pressure or the cache is over budget".into());
     }
     if !p.pressure && p.now.saturating_sub(record.last_used) < p.idle_secs {
         return Err("used recently".into());
@@ -580,6 +597,15 @@ pub struct InventoryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_used_pct: Option<f64>,
     pub pressure_pct: u8,
+    /// Bytes of unreferenced pulled images: the cache. `None` when the
+    /// references could not be read.
+    pub cache_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_budget_bytes: Option<u64>,
+    /// Pulls since app-lb started that found their image already on heyvm,
+    /// and those that fetched it.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
     pub local_bytes: u64,
     pub images: Vec<ImageView>,
 }
@@ -677,6 +703,8 @@ pub struct ImageCatalog {
     present_cache: Mutex<HashMap<String, Instant>>,
     thaws: Mutex<HashMap<String, ThawState>>,
     thawing: Mutex<HashSet<String>>,
+    cache_hits: std::sync::atomic::AtomicU64,
+    cache_misses: std::sync::atomic::AtomicU64,
 }
 
 impl ImageCatalog {
@@ -701,6 +729,8 @@ impl ImageCatalog {
             present_cache: Mutex::new(HashMap::new()),
             thaws: Mutex::new(HashMap::new()),
             thawing: Mutex::new(HashSet::new()),
+            cache_hits: Default::default(),
+            cache_misses: Default::default(),
         })
     }
 
@@ -723,7 +753,9 @@ impl ImageCatalog {
     }
 
     /// A pull put `image` in the catalog from `spec.store`.
-    pub fn note_pulled(&self, image: &str, digest: &str, spec: &ArtifactSpec, bytes: u64) {
+    pub fn note_pulled(&self, image: &str, digest: &str, spec: &ArtifactSpec, bytes: u64, reused: bool) {
+        let counter = if reused { &self.cache_hits } else { &self.cache_misses };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = now_secs();
         let mut r = self
             .store
@@ -860,7 +892,24 @@ impl ImageCatalog {
             min_age_secs: MIN_AGE_SECS,
             pressure,
             offload_store: self.cfg.offload_store.is_some(),
+            cache_over_budget: false,
         }
+    }
+
+    /// Bytes of pulled images on heyvm that nothing references or pins:
+    /// what the cache budget is measured against.
+    fn cache_bytes(&self, snapshot: &Snapshot) -> u64 {
+        self.store
+            .all()
+            .iter()
+            .filter(|r| r.source == ImageSource::Pull && !r.pinned)
+            .filter(|r| !snapshot.refs.contains_key(&r.name))
+            .filter_map(|r| snapshot.present.get(&r.name))
+            .sum()
+    }
+
+    fn over_budget(&self, cache_bytes: u64) -> bool {
+        self.cfg.cache_budget_bytes.is_some_and(|b| cache_bytes > b)
     }
 
     /// `GET /images`.
@@ -871,7 +920,9 @@ impl ImageCatalog {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
         };
-        let policy = self.policy(pressure);
+        let cache_bytes = snapshot.as_ref().map(|s| self.cache_bytes(s));
+        let mut policy = self.policy(pressure);
+        policy.cache_over_budget = cache_bytes.is_some_and(|b| self.over_budget(b));
         let mut images: Vec<ImageView> = self
             .store
             .all()
@@ -905,6 +956,10 @@ impl ImageCatalog {
             offload: self.cfg.offload,
             disk_used_pct: disk.map(|d| (d * 10.0).round() / 10.0),
             pressure_pct: self.cfg.pressure_pct,
+            cache_bytes,
+            cache_budget_bytes: self.cfg.cache_budget_bytes,
+            cache_hits: self.cache_hits.load(std::sync::atomic::Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(std::sync::atomic::Ordering::Relaxed),
             local_bytes: images
                 .iter()
                 .filter(|i| i.present)
@@ -947,15 +1002,21 @@ impl ImageCatalog {
             }
         };
         let present: HashSet<String> = snapshot.present.keys().cloned().collect();
-        let picks = pick_offload(
-            &self.store.all(),
-            &present,
-            &snapshot.refs,
-            &self.policy(pressure),
-        );
+        let mut cache_bytes = self.cache_bytes(&snapshot);
+        let mut policy = self.policy(pressure);
+        policy.cache_over_budget = self.over_budget(cache_bytes);
+        let records = self.store.all();
+        let picks = pick_offload(&records, &present, &snapshot.refs, &policy);
+        let mut routine = 0;
         for name in picks {
-            if !pressure && report.offloaded.len() >= ROUTINE_PER_PASS {
-                break;
+            let pulled = records.iter().any(|r| r.name == name && r.source == ImageSource::Pull);
+            // Below pressure a pulled image goes only to bring the cache
+            // back under budget, and that is not rationed per pass.
+            if !pressure && pulled && !self.over_budget(cache_bytes) {
+                continue;
+            }
+            if !pressure && !pulled && routine >= ROUTINE_PER_PASS {
+                continue;
             }
             if pressure
                 && let Some(d) = self.disk_used_pct().await
@@ -964,7 +1025,14 @@ impl ImageCatalog {
                 break;
             }
             match self.offload(&name, false).await {
-                Ok(()) => report.offloaded.push(name),
+                Ok(()) => {
+                    if pulled {
+                        cache_bytes = cache_bytes.saturating_sub(snapshot.present.get(&name).copied().unwrap_or(0));
+                    } else {
+                        routine += 1;
+                    }
+                    report.offloaded.push(name)
+                }
                 Err(ImageError::Unsupported) => {
                     report
                         .failed
@@ -1000,11 +1068,11 @@ impl ImageCatalog {
         }
         let mut policy = self.policy(true);
         if !explicit {
-            policy.pressure = false;
             policy.pressure = self
                 .disk_used_pct()
                 .await
                 .is_some_and(|d| d >= f64::from(self.cfg.pressure_pct));
+            policy.cache_over_budget = self.over_budget(self.cache_bytes(&snapshot));
         }
         if explicit {
             policy.min_age_secs = 0;
@@ -1407,6 +1475,7 @@ mod tests {
             min_age_secs: 600,
             pressure: false,
             offload_store: false,
+            cache_over_budget: false,
         }
     }
 
@@ -1435,8 +1504,12 @@ mod tests {
 
     #[test]
     fn eligibility_keeps_anything_referenced_pinned_unknown_new_or_recent() {
-        let p = policy(10_000);
-        let ok = rec("a", ImageSource::Pull);
+        // A build with somewhere to go: the image idle age still governs.
+        let p = Policy {
+            offload_store: true,
+            ..policy(10_000)
+        };
+        let ok = rec("a", ImageSource::Build);
         assert_eq!(eligibility(&ok, true, &[], &p), Ok(()));
         assert!(eligibility(&ok, false, &[], &p).is_err(), "not present");
         assert!(
@@ -1463,17 +1536,20 @@ mod tests {
             eligibility(
                 &ImageRecord {
                     digest: None,
-                    ..ok.clone()
+                    ..rec("a", ImageSource::Pull)
                 },
                 true,
                 &[],
-                &p
+                &Policy {
+                    pressure: true,
+                    ..p
+                }
             )
             .is_err(),
             "pull without digest"
         );
         assert!(
-            eligibility(&rec("b", ImageSource::Build), true, &[], &p).is_err(),
+            eligibility(&rec("b", ImageSource::Build), true, &[], &policy(10_000)).is_err(),
             "build with nowhere to go"
         );
         assert_eq!(
@@ -1563,8 +1639,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pulled_image_is_cache_that_only_pressure_or_the_budget_removes() {
+        let p = policy(1_000_000);
+        let idle = rec("a", ImageSource::Pull);
+        let why = eligibility(&idle, true, &[], &p).unwrap_err();
+        assert!(why.contains("cache"), "{why}");
+        for p in [
+            Policy { pressure: true, ..p },
+            Policy { cache_over_budget: true, ..p },
+        ] {
+            assert_eq!(eligibility(&idle, true, &[], &p), Ok(()));
+            let recent = ImageRecord { last_used: p.now - 1, ..idle.clone() };
+            assert_eq!(eligibility(&recent, true, &[], &p), Ok(()), "LRU order, not idle age, decides");
+            let new = ImageRecord { first_seen: p.now - 1, ..idle.clone() };
+            assert!(eligibility(&new, true, &[], &p).is_err(), "the minimum age still holds");
+            assert!(eligibility(&idle, true, &[Reference::Pinned], &p).is_err(), "references still hold");
+        }
+    }
+
+    #[test]
     fn picks_least_recently_used_first_then_largest() {
-        let p = policy(100_000);
+        let p = Policy {
+            cache_over_budget: true,
+            ..policy(100_000)
+        };
         let records = vec![
             ImageRecord {
                 last_used: 50,
@@ -1769,6 +1867,16 @@ mod tests {
     }
 
     async fn harness(images: &[&str]) -> Harness {
+        // A zero budget: every unreferenced pulled image is over it, so the
+        // sweep tests see pulls go as idle builds would.
+        harness_with(images, ImagesConfig {
+            cache_budget_bytes: Some(0),
+            ..ImagesConfig::default()
+        })
+        .await
+    }
+
+    async fn harness_with(images: &[&str], cfg: ImagesConfig) -> Harness {
         let f = Arc::new(Fake::default());
         *f.images.lock().unwrap() = images.iter().map(|s| s.to_string()).collect();
         f.blob.store(200, Ordering::SeqCst);
@@ -1792,7 +1900,7 @@ mod tests {
         let secrets = Arc::new(SecretStore::new(dir.path().join("secrets.json"), None));
         let puller = Puller::new("art".into(), dir.path().join("scratch"), None, vms.clone());
         let catalog = ImageCatalog::new(
-            ImagesConfig::default(),
+            cfg,
             ImageStore::new(dir.path().join("images.d")),
             vms,
             registry,
@@ -1873,6 +1981,39 @@ mod tests {
             vec![Reference::Deployment { id: "web".into() }]
         );
         assert!(held.kept_because.as_deref().unwrap().contains("in use"));
+    }
+
+    #[tokio::test]
+    async fn without_pressure_or_a_budget_an_idle_pulled_image_stays_as_cache() {
+        let h = harness_with(&["img-idle0000000000"], ImagesConfig::default()).await;
+        h.catalog.store().put(pulled(&h, "img-idle0000000000")).unwrap();
+        let report = h.catalog.sweep().await;
+        assert!(report.offloaded.is_empty() && report.failed.is_empty(), "{report:?}");
+        assert!(h.fake.log.lock().unwrap().is_empty(), "nothing verified or deleted");
+        let inv = h.catalog.inventory().await;
+        assert_eq!(inv.cache_bytes, Some(100));
+        let kept = inv.images.iter().find(|i| i.record.name == "img-idle0000000000").unwrap();
+        assert!(kept.kept_because.as_deref().unwrap().contains("cache"));
+    }
+
+    #[tokio::test]
+    async fn over_budget_the_least_recently_used_pulls_go_until_the_cache_fits() {
+        let names = ["img-aaaa000000000000", "img-bbbb000000000000", "img-cccc000000000000"];
+        let h = harness_with(&names, ImagesConfig {
+            cache_budget_bytes: Some(150),
+            ..ImagesConfig::default()
+        })
+        .await;
+        for (i, name) in names.iter().enumerate() {
+            h.catalog
+                .store()
+                .put(ImageRecord { last_used: i as u64 + 1, ..pulled(&h, name) })
+                .unwrap();
+        }
+        let report = h.catalog.sweep().await;
+        assert_eq!(report.offloaded, vec![names[0], names[1]], "300 bytes over a 150 budget: two go, oldest first");
+        assert_eq!(h.catalog.store().get(names[2]).unwrap().tier, Tier::Local);
+        assert_eq!(h.catalog.inventory().await.cache_bytes, Some(100));
     }
 
     #[tokio::test]
