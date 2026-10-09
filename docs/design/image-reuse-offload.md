@@ -57,7 +57,8 @@ Measured on us5 on 2026-10-06, after a day of the hws live E2E (five alpine VMs 
 
 **Lifecycle.**
 - `local, referenced` is never touched.
-- `local, unreferenced for >= APP_LB_IMAGE_IDLE_SECS` (default 1 day) becomes an offload candidate.
+- `local, unreferenced` **build** for >= `APP_LB_IMAGE_IDLE_SECS` (default 1 day) becomes an offload candidate.
+- `local, unreferenced` **pull** is cache: a candidate only under disk pressure or while unreferenced pulls exceed `APP_LB_IMAGE_CACHE_BUDGET_GB`, least recently used first (2026-10-09; it used to follow the idle age too, which made every daily-idle hub image a cold fetch).
 - **Offload** works per source:
   1. A pull: verify the store still serves the digest (`HEAD /blobs/<digest>`, matching size). Only then delete it from heyvm. The store is the offload tier; nothing is uploaded.
   2. A build: push the image to `APP_LB_IMAGE_OFFLOAD_STORE` (an art store) as `offload/<name>`, verify the digest the store reports, and only then delete it.

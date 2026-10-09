@@ -1573,6 +1573,10 @@ fn image_inventory_is_stable() {
             offload: true,
             disk_used_pct: Some(41.3),
             pressure_pct: 85,
+            cache_bytes: Some(0),
+            cache_budget_bytes: Some(21_474_836_480),
+            cache_hits: 4,
+            cache_misses: 1,
             local_bytes: 2_684_354_560,
             images: vec![
                 ImageView {

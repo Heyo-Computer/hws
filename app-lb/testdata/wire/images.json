@@ -5,6 +5,10 @@
   "offload": true,
   "disk_used_pct": 41.3,
   "pressure_pct": 85,
+  "cache_bytes": 0,
+  "cache_budget_bytes": 21474836480,
+  "cache_hits": 4,
+  "cache_misses": 1,
   "local_bytes": 2684354560,
   "images": [
     {
