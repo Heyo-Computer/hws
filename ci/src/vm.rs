@@ -777,7 +777,8 @@ impl Vm {
         }
     }
 
-    /// One request on the exec route, re-sent on a transport failure up to
+    /// One request on the exec route, re-sent on a transport or temporary
+    /// upstream dependency failure (502/503/504) up to
     /// [`TRANSPORT_RETRIES`] times. Only for requests that are safe to repeat —
     /// see the constant for why both of this route's are.
     ///
@@ -812,7 +813,9 @@ impl Vm {
             };
             let retry_lands_in_time =
                 deadline.is_none_or(|d| Instant::now() + TRANSPORT_RETRY_DELAY < d);
-            if !is_transport(&e) || attempt >= TRANSPORT_RETRIES || !retry_lands_in_time {
+            let retryable = is_transport(&e)
+                || matches!(&e, HeyoError::Api { status: 502 | 503 | 504, .. });
+            if !retryable || attempt >= TRANSPORT_RETRIES || !retry_lands_in_time {
                 return Err(VmError::Daemon {
                     sandbox: self.id.clone(),
                     what,
@@ -824,7 +827,7 @@ impl Vm {
                 sandbox = %self.id,
                 attempt,
                 of = TRANSPORT_RETRIES,
-                "{what} hit a transport error, retrying: {e}"
+                "{what} hit a transient transport or dependency error, retrying: {e}"
             );
             tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
         }
@@ -1873,6 +1876,46 @@ mod tests {
         assert!(vm.ensure_running(Duration::from_secs(1)).await.is_err());
         assert_eq!(vm.id(), "sb-failed-boot", "failed boot must retain the deletion handle");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_retries_temporary_dependencies_but_not_rejected_credentials() {
+        use axum::{Json, Router, routing::{get, post}, response::IntoResponse};
+        for (status, failures, succeeds) in [(502, 1, true), (503, 2, true),
+            (504, 1, true), (503, 3, false), (401, 1, false), (403, 1, false)] {
+            let polls = Arc::new(AtomicU64::new(0));
+            let app = Router::new()
+                .route("/sandboxes/{id}/exec-operations", post(|| async {
+                    Json(serde_json::json!({"status":"queued"}))
+                }))
+                .route("/sandboxes/{id}/exec-operations/{operation}", get(move || {
+                    let polls = polls.clone();
+                    async move {
+                        if polls.fetch_add(1, Ordering::SeqCst) < failures {
+                            (axum::http::StatusCode::from_u16(status).unwrap(),
+                                Json(serde_json::json!({"error":"dependency or credential failure"}))).into_response()
+                        } else {
+                            Json(serde_json::json!({"status":"completed",
+                                "result":{"output":"finished once", "exit_code":0}})).into_response()
+                        }
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let vm = Vms::new().open(HeyoClientOptions {
+                base_url: Some(base), api_key: None, timeout: None,
+            }, "sb-retry".into()).await.unwrap();
+            let result = vm.exec("dependency-retry", "true", &HashMap::new(), Duration::from_secs(5)).await;
+            server.abort();
+            if succeeds {
+                let output = result.unwrap_or_else(|e| panic!("HTTP {status}: {e}"));
+                assert_eq!(output.exit_code, 0);
+                assert_eq!(output.output, "finished once");
+            } else {
+                assert!(result.is_err(), "HTTP {status} must stop without reaching the later success");
+            }
+        }
     }
 
     #[test]
