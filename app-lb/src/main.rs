@@ -1171,7 +1171,9 @@ fn main() {
     // them on shutdown. Not a dependency of the proxy, like the others.
     server.add_service(background_service("plugins", plugins::PluginService::new(plugin_host)));
     // Offloads idle images one at a time, standing down while pools boot.
-    server.add_service(background_service("images", images::ImagePacer::new(image_catalog)));
+    server.add_service(background_service("images", images::ImagePacer::new(image_catalog.clone())));
+    // Pulls and holds APP_LB_IMAGE_WARM, so its first VM is never a cold fetch.
+    server.add_service(background_service("image-warmer", images::ImageWarmer::new(image_catalog)));
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and
     // built the warm pool; otherwise the first requests all eat a cold start.

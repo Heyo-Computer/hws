@@ -1582,8 +1582,12 @@ fn image_inventory_is_stable() {
                 ImageView {
                     record: unknown,
                     present: true,
-                    references: vec![Reference::Pinned, Reference::Sandbox { id: "sb-1a2b3c4d".into() }],
-                    kept_because: Some("in use by 2 reference(s)".into()),
+                    references: vec![
+                        Reference::Pinned,
+                        Reference::Sandbox { id: "sb-1a2b3c4d".into() },
+                        Reference::Warm { artifact_ref: "https://hub.heyo.work/heyo/ubuntu:24.04".into() },
+                    ],
+                    kept_because: Some("in use by 3 reference(s)".into()),
                 },
                 ImageView {
                     record: pulled,

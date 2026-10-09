@@ -997,14 +997,36 @@ impl Puller {
         log: &mut (dyn FnMut(String) + Send),
     ) -> Result<Pulled, String> {
         let base = spec.store.trim().trim_end_matches('/');
-        let (digest, expected_size) = self
+        // `unresolved` is the store's failure when the digest came from
+        // memory instead: good enough to reuse an image already here, never
+        // to fetch one, and never for a candidate or a forced pull, which
+        // exist to check the store.
+        let (digest, expected_size, unresolved) = match self
             .resolve_remote(base, &spec.artifact_ref, api_key, Some(ROOTFS_FILENAME))
-            .await?;
-        log(format!(
-            "{} resolves to {digest} ({}) at {base}",
-            spec.artifact_ref,
-            human(expected_size),
-        ));
+            .await
+        {
+            Ok((digest, size)) => {
+                if !self.candidate {
+                    remember_resolution(base, &spec.artifact_ref, &digest, size);
+                }
+                log(format!(
+                    "{} resolves to {digest} ({}) at {base}",
+                    spec.artifact_ref,
+                    human(size),
+                ));
+                (digest, size, None)
+            }
+            Err(e) => match recall_resolution(base, &spec.artifact_ref).filter(|_| !self.candidate && !force) {
+                Some((digest, size)) => {
+                    log(format!(
+                        "{e}; {} last resolved to {digest}, which is used if that image is still here",
+                        spec.artifact_ref
+                    ));
+                    (digest, size, Some(e))
+                }
+                None => return Err(e),
+            },
+        };
 
         let image = name.map(str::to_string).unwrap_or_else(|| spec.image_for(deployment_id, &digest));
         let _held = hold_image(&image, log).await;
@@ -1024,6 +1046,9 @@ impl Puller {
                 bytes_written: 0,
                 reused: true,
             });
+        }
+        if let Some(e) = unresolved {
+            return Err(e);
         }
 
         let tmp = TempImage::new(dir, &image);
@@ -1683,6 +1708,37 @@ fn image_is_usable(size: u64, expected_size: u64, grow_gb: Option<u64>) -> bool 
     required == 0 || size >= required
 }
 
+/// Lowercase hex sha256 of `bytes`.
+#[cfg(test)]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+/// What each `(store, reference)` last resolved to: `(digest, size)`.
+///
+/// A pull that finds the store unreachable falls back on this, but only to
+/// reuse an image heyvm already holds, so a hub outage does not stop VMs
+/// being created from images that are on this host. Seeded at startup from
+/// the image records, which keep the store, reference and digest of every
+/// pull.
+static RESOLVED: std::sync::LazyLock<std::sync::Mutex<Resolutions>> = std::sync::LazyLock::new(Default::default);
+
+/// `(store, reference)` → `(digest, size)`.
+type Resolutions = std::collections::HashMap<(String, String), (String, u64)>;
+
+pub fn remember_resolution(store: &str, reference: &str, digest: &str, size: u64) {
+    let key = (store.trim().trim_end_matches('/').to_string(), reference.to_string());
+    RESOLVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (digest.to_string(), size));
+}
+
+fn recall_resolution(store: &str, reference: &str) -> Option<(String, u64)> {
+    let key = (store.trim().trim_end_matches('/').to_string(), reference.to_string());
+    RESOLVED.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
+}
+
 /// The catalog names a pull of this process is putting into the daemon,
 /// one lock each.
 ///
@@ -2207,7 +2263,13 @@ mod tests {
             counts.blob.len()
         );
         let app = Router::new()
-            .route("/manifests/:id", get(move || { let m = manifest.clone(); async move { m } }))
+            .route("/manifests/:id", get(move |State(c): State<Arc<Counts>>| {
+                let m = manifest.clone();
+                async move {
+                    if c.down.load(Ordering::SeqCst) { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+                    m.into_response()
+                }
+            }))
             .route("/blobs/:id", get(|State(c): State<Arc<Counts>>| async move {
                 // Slow enough that every concurrent pull is queued behind it.
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2237,6 +2299,8 @@ mod tests {
     struct Counts {
         blob: Vec<u8>,
         fail_first: usize,
+        /// The store answers 503 to everything that resolves a reference.
+        down: std::sync::atomic::AtomicBool,
         fetches: std::sync::atomic::AtomicUsize,
         uploads: std::sync::atomic::AtomicUsize,
         catalog: std::sync::Mutex<std::collections::HashMap<String, u64>>,
@@ -2265,6 +2329,29 @@ mod tests {
         assert_eq!(pulled.iter().filter(|p| !p.reused).count(), 1);
         assert!(pulled.iter().all(|p| p.image == pulled[0].image && p.image.starts_with("img-")));
         assert_eq!(pulled.iter().map(|p| p.bytes_written).sum::<u64>(), counts.blob.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_store_still_lets_an_image_already_here_be_reused() {
+        use std::sync::atomic::Ordering;
+        let (base, counts) = store_and_daemon(b"the hub goes down after this".to_vec(), 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some(base.clone()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let puller = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let spec: ArtifactSpec = serde_json::from_value(serde_json::json!({"store": format!("{base}/"), "ref": "alpine"})).unwrap();
+        let first = puller.pull("web-0", &spec, None, false, &mut |_| {}).await.unwrap();
+
+        counts.down.store(true, Ordering::SeqCst);
+        let mut lines = Vec::new();
+        let again = puller.pull("web-1", &spec, None, false, &mut |l| lines.push(l)).await.unwrap();
+        assert!(again.reused && again.image == first.image);
+        assert!(lines.iter().any(|l| l.contains("last resolved to")), "{lines:?}");
+        assert!(puller.pull("web-2", &spec, None, true, &mut |_| {}).await.is_err(), "a forced pull exists to check the store");
+        assert!(puller.for_candidate().unwrap().pull("web-3", &spec, None, false, &mut |_| {}).await.is_err(), "nor does a candidate trust memory");
+
+        counts.catalog.lock().unwrap().clear();
+        assert!(puller.pull("web-4", &spec, None, false, &mut |_| {}).await.is_err(), "a remembered digest is never fetched blind");
+        assert_eq!(counts.fetches.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
