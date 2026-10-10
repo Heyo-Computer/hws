@@ -61,11 +61,12 @@ revision. Successful jobs and receipts carried into a retry retain their origina
 evidence. Failure elsewhere in the run does not erase a successful service
 deployment. Unknown or still-running deployment effects do not advance history.
 
-Admission uses the existing environment/service `active_run` fence; concurrent
-deployments of the same service/environment are refused until settlement.
-Different services and environments remain independent. This is not a global
-CI execution lock. Ordinary deployment evidence never grants promotion authority
-or changes a run's source/artifact authorization.
+Ordinary admission records history without claiming or blocking execution.
+Only promotions use the existing environment/service `active_run` ownership;
+ordinary settlement never clears it. Current and previous versions follow
+original receipt completion order, not admission or reconciliation order.
+Carried-only retries retain the original deployment position. Ordinary evidence
+never grants promotion authority or changes source/artifact authorization.
 
 The panel reads current and previous deployment records independently of the
 candidate catalog. A verified revision remains visible without a retained

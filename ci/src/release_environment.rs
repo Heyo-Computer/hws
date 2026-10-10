@@ -588,7 +588,7 @@ async fn persist(
                 == Some(request.bundle_id.as_str()),
             "recovery must restore the last complete successful release"
         );
-        let failed: bool = sqlx::query_scalar("SELECT coalesce((SELECT status IN ('failure','cancelled') FROM ci_release_service_deployment WHERE environment=$1 AND service=$2 AND completed_at IS NOT NULL AND status<>'skipped' ORDER BY created_at DESC,id DESC LIMIT 1),
+        let failed: bool = sqlx::query_scalar("SELECT coalesce((SELECT status IN ('failure','cancelled') FROM ci_release_service_deployment WHERE environment=$1 AND service=$2 AND completed_at IS NOT NULL AND status<>'skipped' ORDER BY completed_at DESC,effect_key DESC,created_at,id LIMIT 1),
             (SELECT r.status IN ('failure','cancelled') FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.service=$2 AND p.completed_at IS NOT NULL ORDER BY p.created_at DESC,p.run_id DESC LIMIT 1),false)")
             .bind(&request.environment).bind(&service).fetch_one(&mut *tx).await?;
         ensure!(failed, "recovery requires a settled failed service deployment");

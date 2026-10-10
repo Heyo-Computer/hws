@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS ci_release_service_deployment (
     error TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     completed_at TIMESTAMPTZ,
+    effect_key TEXT NOT NULL DEFAULT '',
     UNIQUE(run_id,environment,service),
     FOREIGN KEY(environment,service) REFERENCES ci_release_service_environment(name,service)
         ON DELETE RESTRICT
