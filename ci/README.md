@@ -2096,8 +2096,14 @@ is a region-neutral example for the private Heyo repository. Region names, count
 endpoints, coordinator placements and sequence are operator configuration, not
 built-in US/EU choices. Adding China or another region requires its target mappings
 and jobs in this operator policy, not Rust changes or candidate workflow edits.
-The example completes Cloud, heyvm and heyvmd in each configured region, followed
-by mandatory public-health sampling before the next region starts.
+The example completes Cloud in every configured region before entering a separate
+host-maintenance chain. The first maintenance job has a job-level changed-path
+guard and requires successful Cloud rollout. On service-only changes it and its
+dependent heyvm/heyvmd/host-verification jobs are skipped before runner allocation;
+step-level guards alone cannot prevent an unused job waiting for an offline runner.
+Actual host maintenance remains sequential, with mandatory public-health sampling
+before proceeding to the next host. Its cross-host coordinator requirement remains
+in force; do not solve a stale coordinator mapping by running on the upgrade target.
 The sampling requires HTTP 200, not redirects;
 it supplements the existing exact deployment receipts and is not proof of
 zero-downtime failover. It uses normal maintenance, not the legacy bootstrap flag.

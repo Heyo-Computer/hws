@@ -399,7 +399,7 @@ mod tests {
         china.url = "https://admin.china.example".into();
         china.deployment = "cloud-china".into();
         policy.service_targets.insert("cloud-china".into(), china);
-        policy.workflow.push_str("  cloud-china:\n    needs: [verify-region-b]\n    steps:\n      - uses: ci/rollout-service\n        with:\n          target: cloud-china\n          token: ${{ secrets.APP_LB_CHINA_TOKEN }}\n          workflow: .ci/workflows/cloud.yml\n          artifact: cloud\n");
+        policy.workflow.push_str("  cloud-china:\n    needs: [cloud-region-b]\n    steps:\n      - uses: ci/rollout-service\n        with:\n          target: cloud-china\n          token: ${{ secrets.APP_LB_CHINA_TOKEN }}\n          workflow: .ci/workflows/cloud.yml\n          artifact: cloud\n");
         let mut snap = snapshot();
         let mut first = snap.maintenance.remove("us3").unwrap();
         first.repository = repo.into();
@@ -423,7 +423,25 @@ mod tests {
         let mut plan = original.clone();
         bind(&mut plan, repo, &policy, &snap).unwrap();
         let job = |id: &str| plan.jobs.iter().find(|j| j.base_id == id).unwrap();
-        assert_eq!(job("cloud-region-b").needs, ["verify-region-a"]);
+        assert_eq!(job("cloud-region-b").needs, ["cloud-region-a"]);
+        assert_eq!(job("heyvm-region-a").needs, ["cloud-region-b"]);
+        assert_eq!(job("heyvm-region-b").needs, ["verify-region-a"]);
+        // Cloud-only releases must skip maintenance before a pinned runner is
+        // requested. Actual host changes still require a successful service rollout.
+        let guard = job("heyvm-region-a").condition.as_ref().unwrap();
+        for (path, result, expected) in [
+            ("cloud/src/main.rs", "success", false),
+            ("mvm-ctrl/src/main.rs", "success", true),
+            ("local-proxy/src/lib.rs", "success", true),
+            ("mvm-ctrl/src/main.rs", "failure", false),
+            ("mvm-ctrl/src/main.rs", "skipped", false),
+            ("mvm-ctrl/src/main.rs", "cancelled", false),
+        ] {
+            let mut context = crate::expr::Context::new();
+            context.set("ci", serde_json::json!({"changed_files": [path], "changes_known": true}));
+            context.set("needs", serde_json::json!({"cloud-region-b": {"result": result}}));
+            assert_eq!(context.eval_condition(guard).unwrap(), expected, "{path}: {result}");
+        }
         assert_eq!(job("verify-region-a").needs, ["heyvmd-region-a"]);
         assert!(job("verify-region-a").condition.is_none());
         assert!(job("verify-region-a").steps[0].condition.is_none());
@@ -432,7 +450,7 @@ mod tests {
         assert_eq!(job("cloud-region-a").steps[0].with["deployment"], "cloud-region-a");
         assert_eq!(job("cloud-region-b").steps[0].with["url"], "https://admin.region-b.example");
         assert_eq!(job("heyvm-region-a").steps[2].with["url"], "https://cloud.eu.example");
-        assert_eq!(job("cloud-china").needs, ["verify-region-b"]);
+        assert_eq!(job("cloud-china").needs, ["cloud-region-b"]);
         assert_eq!(job("cloud-china").steps[0].with["url"], "https://admin.china.example");
 
         let mut wrong = policy.clone();
