@@ -6,6 +6,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+/// Operator attribution uses persisted plan indices, never action target names.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceDeploymentObligation {
+    pub job: String,
+    pub step: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceDeploymentScope {
+    pub environment: String,
+    pub service: String,
+    pub obligations: Vec<ServiceDeploymentObligation>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionMode {
@@ -33,11 +49,15 @@ pub struct Policy {
     /// Job ID -> existing maintenance target alias of its coordinator host.
     #[serde(default)]
     pub placements: BTreeMap<String, String>,
+    #[serde(default)]
+    pub service_deployments: Vec<ServiceDeploymentScope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Snapshot {
     pub digest: String,
+    #[serde(default)]
+    pub service_deployments: Vec<ServiceDeploymentScope>,
     pub maintenance: BTreeMap<String, host_maintenance::Target>,
     pub hosts: BTreeMap<String, host_heyvm_bootstrap_coordinator::Target>,
     #[serde(default)]
@@ -72,7 +92,9 @@ pub fn select(raw: Option<&str>, repository: &str) -> Result<Option<Policy>> {
             let workflow = Workflow::parse(&policy.workflow_path, &policy.workflow)?;
             ensure!(workflow.on == ["release"], "operator policy must use only on: release");
             ensure!(!policy.workflow_path.trim().is_empty(), "operator policy needs a workflow path");
-            crate::submission::validate_release_plan(&Plan::build(&workflow)?).map_err(anyhow::Error::msg)?;
+            let plan = Plan::build(&workflow)?;
+            crate::submission::validate_release_plan(&plan).map_err(anyhow::Error::msg)?;
+            validate_service_deployments(&plan, &policy.service_deployments)?;
             selected = Some(policy);
         }
     }
@@ -103,6 +125,38 @@ fn exclusive(step: &crate::workflow::Step, keys: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Validate against the fully expanded plan before binding removes aliases.
+/// Matrix base IDs are not selectors: operators must enumerate stable cell keys.
+pub(crate) fn validate_service_deployments(plan: &Plan, scopes: &[ServiceDeploymentScope]) -> Result<()> {
+    let mut identities = std::collections::BTreeSet::new();
+    let mut owners = std::collections::BTreeSet::new();
+    for scope in scopes {
+        ensure!(!scope.environment.trim().is_empty() && !scope.service.trim().is_empty(),
+            "service deployment scope requires nonempty environment and service");
+        ensure!(scope.environment.trim() == scope.environment && scope.service.trim() == scope.service,
+            "service deployment scope identities must not contain surrounding whitespace");
+        ensure!(identities.insert((&scope.environment, &scope.service)),
+            "duplicate service deployment scope {}/{}", scope.environment, scope.service);
+        ensure!(!scope.obligations.is_empty(), "service deployment scope {}/{} has no obligations",
+            scope.environment, scope.service);
+        for obligation in &scope.obligations {
+            ensure!(plan.jobs.iter().filter(|job| job.base_id == obligation.job).count() <= 1,
+                "ambiguous matrix base job {}; enumerate stable expanded job keys", obligation.job);
+            let job = plan.jobs.iter().find(|job| job.key == obligation.job)
+                .ok_or_else(|| anyhow::anyhow!("service deployment obligation names unknown stable job key {}", obligation.job))?;
+            ensure!(obligation.step < job.steps.len(),
+                "service deployment obligation {} step {} is outside the persisted plan (indices are zero-based)",
+                obligation.job, obligation.step);
+            // Fail closed for every obligation, including verification and bake.
+            // Sharing a step between scopes makes independent settlement ambiguous.
+            ensure!(owners.insert((&obligation.job, obligation.step)),
+                "duplicate or multiply owned service deployment obligation {} step {}",
+                obligation.job, obligation.step);
+        }
+    }
+    Ok(())
+}
+
 pub async fn prepare(d: &Dispatcher, repository: &str, policy: &Policy) -> Result<Plan> {
     let plan = submission_plan(policy)?;
     let plan = prepare_plan(d, repository, policy, plan).await?;
@@ -115,7 +169,11 @@ pub async fn prepare(d: &Dispatcher, repository: &str, policy: &Policy) -> Resul
 pub(crate) async fn prepare_plan(d: &Dispatcher, repository: &str, policy: &Policy, mut plan: Plan) -> Result<Plan> {
     let mut effective = policy.clone();
     effective.placements.retain(|id, _| plan.jobs.iter().any(|job| &job.base_id == id));
-    let mut snapshot = Snapshot { digest: String::new(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, token_expressions: Vec::new() };
+    validate_service_deployments(&plan, &effective.service_deployments)?;
+    if effective.service_deployments.is_empty() {
+        tracing::warn!(repository, "release policy has no service_deployments: declare environment/service obligations with stable job keys and zero-based step indices; this run cannot establish scoped ordinary deployment history");
+    }
+    let mut snapshot = Snapshot { digest: String::new(), service_deployments: effective.service_deployments.clone(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, token_expressions: Vec::new() };
     let mut aliases: Vec<String> = effective.placements.values().cloned().collect();
     for job in &plan.jobs {
         for step in &job.steps {
@@ -166,7 +224,10 @@ fn submission_plan(policy: &Policy) -> Result<Plan> {
     // Validate placements before filtering so typos still fail admission.
     ensure!(policy.placements.keys().all(|id| plan.jobs.iter().any(|j| &j.base_id == id)),
         "release placement names an unknown job");
+    validate_service_deployments(&plan, &policy.service_deployments)?;
     if policy.submission_mode == SubmissionMode::MergeOnly {
+        ensure!(policy.service_deployments.is_empty(),
+            "merge_only policy cannot declare deployment obligations; declare scopes on deployment workflows instead");
         // validate_release_plan proves this is one unconditional, single-step
         // job. Existing submission membership still gates its publication.
         plan.jobs.retain(|job| job.steps.iter().any(|s| s.uses.as_deref() == Some("ci/merge-release")));
@@ -282,8 +343,94 @@ mod tests {
     fn policy() -> Policy {
         Policy { workflow_path: ".ci/workflows/regional-release.yml".into(), workflow: RELEASE.into(),
             submission_mode: SubmissionMode::MergeAndDeploy,
+            service_deployments: Vec::new(),
             service_targets: BTreeMap::new(), pooler_targets: BTreeMap::new(),
             site_targets: BTreeMap::new(), stateful_targets: BTreeMap::new(), placements: BTreeMap::new() }
+    }
+
+    fn scope(job: &str, step: usize) -> ServiceDeploymentScope {
+        ServiceDeploymentScope { environment: "production".into(), service: "cloud".into(),
+            obligations: vec![ServiceDeploymentObligation { job: job.into(), step }] }
+    }
+
+    fn selected(policy: &Policy) -> Result<Option<Policy>> {
+        select(Some(&serde_json::to_string(&BTreeMap::from([(REPO, policy)]))?), REPO)
+    }
+
+    #[test]
+    fn public_policy_admission_validates_scoped_obligations() {
+        let mut policy = policy();
+        policy.service_deployments = vec![scope("us", 0)];
+        policy.service_deployments[0].obligations.push(ServiceDeploymentObligation {
+            job: "eu".into(), step: 0,
+        });
+        let admitted = selected(&policy).unwrap().unwrap();
+        assert_eq!(admitted.service_deployments, policy.service_deployments);
+        for invalid in [scope("unknown", 0), scope("us", 2), scope("us", usize::MAX)] {
+            policy.service_deployments = vec![invalid];
+            assert!(selected(&policy).is_err());
+        }
+        let mut invalid = scope("us", 0);
+        invalid.obligations.clear();
+        policy.service_deployments = vec![invalid];
+        assert!(selected(&policy).is_err());
+        let mut invalid = scope("us", 0);
+        invalid.service = " ".into();
+        policy.service_deployments = vec![invalid];
+        assert!(selected(&policy).is_err());
+    }
+
+    #[test]
+    fn public_policy_admission_rejects_duplicate_and_multiply_owned_steps() {
+        let mut policy = policy();
+        let first = scope("us", 0);
+        policy.service_deployments = vec![first.clone(), first.clone()];
+        assert!(selected(&policy).is_err());
+        let mut other = first.clone();
+        other.service = "other".into();
+        policy.service_deployments = vec![first.clone(), other];
+        assert!(selected(&policy).is_err());
+        let mut duplicate = first;
+        duplicate.obligations.push(duplicate.obligations[0].clone());
+        policy.service_deployments = vec![duplicate];
+        assert!(selected(&policy).is_err());
+        let mut other = scope("eu", 0);
+        other.service = "other".into();
+        policy.service_deployments = vec![scope("us", 0), other];
+        assert!(selected(&policy).is_ok());
+    }
+
+    #[test]
+    fn public_policy_admission_requires_explicit_matrix_cell_keys() {
+        let mut policy = policy();
+        policy.workflow = RELEASE.replace("  eu:\n    needs: [us]\n",
+            "  eu:\n    needs: [us]\n    strategy:\n      matrix:\n        region: [first, second]\n");
+        policy.service_deployments = vec![scope("eu", 0)];
+        assert!(selected(&policy).unwrap_err().to_string().contains("ambiguous matrix base"));
+        let expanded = Plan::build(&Workflow::parse(&policy.workflow_path, &policy.workflow).unwrap()).unwrap();
+        policy.service_deployments[0].obligations = expanded.jobs.iter()
+            .filter(|job| job.base_id == "eu")
+            .map(|job| ServiceDeploymentObligation { job: job.key.clone(), step: 0 }).collect();
+        assert_eq!(policy.service_deployments[0].obligations.len(), 2);
+        assert!(selected(&policy).is_ok());
+    }
+
+    #[test]
+    fn persisted_scope_survives_operator_changes_and_legacy_snapshot_decodes() {
+        let mut frozen = snapshot();
+        frozen.service_deployments = vec![scope("us", 0)];
+        let bytes = serde_json::to_vec(&frozen).unwrap();
+        let mut current = policy();
+        current.service_deployments = vec![scope("eu", 0)];
+        let restored: Snapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.service_deployments, vec![scope("us", 0)]);
+        assert_ne!(restored.service_deployments, current.service_deployments);
+        let mut legacy = serde_json::to_value(&frozen).unwrap();
+        legacy.as_object_mut().unwrap().remove("service_deployments");
+        assert!(serde_json::from_value::<Snapshot>(legacy).unwrap().service_deployments.is_empty());
+        let mut legacy = serde_json::to_value(policy()).unwrap();
+        legacy.as_object_mut().unwrap().remove("service_deployments");
+        assert!(serde_json::from_value::<Policy>(legacy).unwrap().service_deployments.is_empty());
     }
 
     #[test]
@@ -310,7 +457,7 @@ mod tests {
     }
 
     fn snapshot() -> Snapshot {
-        Snapshot { digest: "frozen-policy".into(), token_expressions: Vec::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, maintenance: BTreeMap::from([
+        Snapshot { digest: "frozen-policy".into(), service_deployments: Vec::new(), token_expressions: Vec::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, maintenance: BTreeMap::from([
             ("us3".into(), host_maintenance::Target { repository: REPO.into(), runner_hd_id: "us-runner".into(),
                 backend_server_id: "us-backend".into(), cloud_url: "https://cloud.eu.example".into(),
                 orchestrator_url: "https://archive.eu.example".into(), artifact_user_id: "archive-owner".into(),

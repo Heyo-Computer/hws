@@ -50,9 +50,14 @@
       #service-releases tr { display:grid; grid-template-columns:1fr 1fr; border-bottom:1px solid var(--border-color); }
       #service-releases td { display:block; min-width:0; overflow-wrap:anywhere; border:0; }
       #service-releases td::before { display:block; color:var(--text-secondary); font-size:11px; margin-bottom:6px; }
-      #service-releases td:nth-child(2)::before { content:'Last successful release'; }
-      #service-releases td:nth-child(3)::before { content:'Previous release'; }
+      #service-releases td:nth-child(2)::before { content:'Last successful recorded deployment'; }
+      #service-releases td:nth-child(3)::before { content:'Previous recorded deployment'; }
       #service-releases td:nth-child(4)::before { content:'Candidates / status'; }
+      #catalog table,#catalog tbody { display:block; }
+      #catalog thead { display:none; }
+      #catalog tr { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); border-bottom:1px solid var(--border-color); }
+      #catalog td { min-width:0; overflow-wrap:anywhere; border:0; }
+      #catalog td:last-child { grid-column:1/-1; }
     }
     @media(max-width:650px) { main { padding:0 14px 32px; } .topbar { position:static; height:auto; flex-wrap:wrap; padding:12px; gap:12px; } .topbar-nav { display:flex; position:static; width:auto; } .topbar-right { margin-left:0; } .toolbar>*,#environment,#search { width:100%; } th,td { padding:12px; } .facts { grid-template-columns:1fr; } }
   </style>
@@ -63,7 +68,7 @@
     <nav class="topbar-nav"><a href="/dashboard">Dashboard</a><a href="/releases" aria-current="page">Releases</a></nav>
     <div class="topbar-right"><span>{{WHO}}</span><button class="theme-toggle" data-theme-toggle>Theme</button></div>
   </header>
-  <div class="page-head"><div><span class="eyebrow">Deployment workspace</span><h1>Releases</h1><p class="muted">Know what is running. See exactly what a release will change.</p></div><button id="refresh" class="btn">Refresh status</button></div>
+  <div class="page-head"><div><span class="eyebrow">Deployment workspace</span><h1>Releases</h1><p class="muted">Review recorded deployments. See exactly what a release will change.</p></div><button id="refresh" class="btn">Refresh status</button></div>
   <div class="toolbar"><label>Deployment environment<select id="environment" aria-label="Deployment environment"></select></label><label>Service<select id="service" aria-label="Service"></select></label><div id="policy"></div><span id="updated" class="sub">Not refreshed</span></div>
   <p id="message" role="status" aria-live="polite">Loading release catalog…</p>
   <div class="workspace">
@@ -90,7 +95,16 @@
   const scope = r => components(r).length === 1 ? `${components(r)[0]} only` : components(r).length ? `${components(r).length} components` : 'Contents unknown';
   const chips = r => components(r).map(c => `<span class="tag">${esc(c)}</span>`).join('') || '<span class="bad">No component manifest</span>';
   const release = id => releases.find(r => r.id === id);
-  const label = id => release(id)?.name || id || 'None recorded';
+  // Presence, including explicit null, is authoritative on repaired backends.
+  const deployment = (service, kind) => {
+    const key = kind + '_deployment';
+    if (Object.prototype.hasOwnProperty.call(service || {}, key)) return service[key];
+    const bundle = service?.state?.[kind + '_bundle'];
+    return bundle ? {bundle_id:bundle,revision:release(bundle)?.manifest?.revision} : null;
+  };
+  const deploymentLabel = d => d ? release(d.bundle_id)?.name || d.revision || d.bundle_id || 'Revision not recorded' : 'None recorded';
+  const deploymentDetails = (service, d) => !d ? '' : `<span class="sub"><code>${esc(d.revision || 'Revision not recorded')}</code></span>${!candidates(service.service).some(r => r.id === d.bundle_id) ? '<span class="sub">Retained artifact unavailable</span>' : ''}`;
+  const origin = p => p.source === 'ordinary' ? 'Ordinary CI deployment' : p.source === 'legacy_import' ? 'Imported deployment record' : p.source === 'promotion' ? (p.automatic ? 'Automatic promotion' : 'Manual promotion') : (p.automatic ? 'Automatic' : 'Manual');
   const selectedEnv = () => environments.find(e => e.name === $('environment').value);
   const selectedService = () => selectedEnv()?.services?.find(s => s.service === $('service').value);
   const policy = service => ({repository:service?.repository ?? selectedEnv()?.repository,mode:service?.mode ?? selectedEnv()?.mode,requires:service?.requires ?? selectedEnv()?.requires ?? []});
@@ -155,15 +169,15 @@
     const e = selectedEnv(), service = selectedService(), r = selectedRelease();
     $('candidate').title = r ? candidateTitle(r) : '';
     if (!e || !service) { $('selection').innerHTML = '<p class="empty">No service release policy available. Configure service-scoped releases before deploying.</p>'; return; }
-    const s = service.state || {}, previous = release(s.previous_bundle), current = release(s.current_bundle);
+    const s = service.state || {}, previous = deployment(service, 'previous'), current = deployment(service, 'current');
     $('selection').innerHTML = `${r ? `<p class="release-name" style="overflow-wrap:anywhere">${esc(r.name)}</p><div class="notice"><strong>Scoped release · ${esc(scope(r))}</strong>This release updates only this service. Other services keep their current versions.</div>${chips(r)}<p class="sub">Candidate source revision</p><code>${esc(revision(r))}</code>` : '<p class="empty">No retained release available for this service.</p>'}
-      <div class="facts"><div><span class="eyebrow">Last successful release</span><strong>${esc(label(s.current_bundle))}</strong><span class="sub">${esc(current ? scope(current) : 'Scope not available')}</span><code>${esc(short(current?.manifest?.revision))}</code></div><div><span class="eyebrow">Rollback target</span><strong>${esc(label(s.previous_bundle))}</strong><span class="sub">${esc(previous ? scope(previous) : 'Scope not available')}</span><code>${esc(short(previous?.manifest?.revision))}</code></div></div>
+      <div class="facts"><div><span class="eyebrow">Last successful recorded deployment</span><strong>${esc(deploymentLabel(current))}</strong>${deploymentDetails(service, current)}</div><div><span class="eyebrow">Rollback target</span><strong>${esc(deploymentLabel(previous))}</strong>${deploymentDetails(service, previous)}</div></div>
       <p class="sub">These are rollout records, not observed running versions.</p>
       ${policy(service).requires.length ? `<p class="sub">Requires this release to pass: ${policy(service).requires.map(esc).join(', ')}</p>` : ''}
       ${!configured(service) ? '<p class="warn">This service is no longer configured. Historical rollout records are read-only.</p>' : ''}
       ${service.recovery_required ? '<div class="notice"><strong>Recovery required</strong>This service deployment failed. Regions may contain different versions. Other services retain their own release state.</div>' : ''}
       ${s.active_run ? `<p class="warn">Deployment in progress</p><code>${esc(s.active_run)}</code>` : ''}
-      <div class="actions" style="margin-top:20px"><button class="btn primary" data-action="deploy" ${s.active_run || !r || !components(r).length ? 'disabled' : ''}>Deploy ${esc(service.service)}</button><button class="btn" data-action="rollback" ${s.active_run || service.recovery_required || !previous || !candidates(service.service).some(r => r.id === previous.id) ? 'disabled' : ''}>Roll back ${esc(service.service)}…</button></div>
+      <div class="actions" style="margin-top:20px"><button class="btn primary" data-action="deploy" ${s.active_run || !r || !components(r).length ? 'disabled' : ''}>Deploy ${esc(service.service)}</button><button class="btn" data-action="rollback" ${s.active_run || service.recovery_required || !previous || !candidates(service.service).some(r => r.id === previous.bundle_id) ? 'disabled' : ''}>Roll back ${esc(service.service)}…</button></div>
       ${service.recovery_required ? `<button class="btn" data-action="recover" ${s.active_run || !candidates(service.service).some(r => r.id === service.recovery_bundle) ? 'disabled' : ''}>Recover ${esc(service.service)}…</button>` : ''}
       <p class="sub">Manual deployment holds automation until explicitly resumed.</p>
       <button class="btn" data-action="automation" ${!configured(service) || policy(service).mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button>`;
@@ -175,7 +189,7 @@
     $('catalog-title').textContent = service ? `${service.service} releases` : 'Available releases';
     $('catalog-help').textContent = choices.length ? 'Choose a version below, review its target, then confirm deployment.' : configured(service) ? 'Build the first candidate for this service.' : 'No deployment actions are available until release policies are configured.';
     $('release-count').textContent = `${choices.length} candidates`;
-    $('catalog').innerHTML = !service ? '<p class="empty">Release deployment is not configured for this environment. An operator must install its service release policies; the inventory is not a release catalog.</p>' : choices.length ? `<table><thead><tr><th>Version / source revision</th><th>Deployment record</th><th>Action</th></tr></thead><tbody>${choices.map(r => `<tr><td><span class="release-name">${esc(r.name)}</span><code title="${esc(revision(r))}">${esc(short(revision(r)))}</code><span class="sub">${esc(date(r.created_at))}</span></td><td><span class="tag">${r.id === service.state?.current_bundle ? 'Last successful' : r.id === service.state?.previous_bundle ? 'Rollback target' : 'Available'}</span></td><td><button class="btn" data-release="${esc(r.id)}" ${service.state?.active_run ? 'disabled' : ''}>Review &amp; deploy</button></td></tr>`).join('')}</tbody></table>` : `<p class="empty">No retained candidates for ${esc(service.service)}. Build a candidate using the form beside this list. Building does not deploy it.</p>`;
+    $('catalog').innerHTML = !service ? '<p class="empty">Release deployment is not configured for this environment. An operator must install its service release policies; the inventory is not a release catalog.</p>' : choices.length ? `<table><thead><tr><th>Version / source revision</th><th>Deployment record</th><th>Action</th></tr></thead><tbody>${choices.map(r => `<tr><td><span class="release-name">${esc(r.name)}</span><code title="${esc(revision(r))}">${esc(short(revision(r)))}</code><span class="sub">${esc(date(r.created_at))}</span></td><td><span class="tag">${r.id === deployment(service, 'current')?.bundle_id ? 'Last successful recorded' : r.id === deployment(service, 'previous')?.bundle_id ? 'Rollback target' : 'Available'}</span></td><td><button class="btn" data-release="${esc(r.id)}" ${service.state?.active_run ? 'disabled' : ''}>Review &amp; deploy</button></td></tr>`).join('')}</tbody></table>` : `<p class="empty">No retained candidates for ${esc(service.service)}. Build a candidate using the form beside this list. Building does not deploy it.</p>`;
     $('candidate').innerHTML = choices.map(r => `<option value="${esc(r.id)}" title="${esc(candidateTitle(r))}">${esc(r.name)}</option>`).join('');
     if (choices.some(r => r.id === selected)) $('candidate').value = selected;
     $('candidate').disabled = !choices.length;
@@ -186,7 +200,7 @@
     $('build').closest('details').open = configured(service) && !choices.length;
     $('builds').innerHTML = builds.filter(b => b.repository === policy(service).repository && Object.keys(b.policy?.components || {}).includes(service?.service)).map(b => `<div class="history-item"><strong>${esc(b.name)}</strong><span class="sub">${esc(b.status)} · ${esc(short(b.revision))}</span>${b.error ? `<p class="bad">${esc(b.error)}</p>` : ''}</div>`).join('');
     $('history-title').textContent = service ? `${service.service} deployment history` : 'Deployment history';
-    $('history').innerHTML = (service?.history || []).map(p => `<div class="history-item"><div class="section-head" style="padding:0;border:0"><strong>${esc(label(p.bundle_id))}</strong><span class="tag ${p.status === 'success' ? 'good' : ['failure','cancelled'].includes(p.status) ? 'bad' : ''}">${esc(p.status)}</span></div><span class="sub">${esc(date(p.created_at))} · ${p.automatic ? 'Automatic' : 'Manual'}</span>${(p.deployments || []).map(d => `<p><code>${esc(d.service)}</code> · ${esc(d.status)}<span class="sub"><code>${esc(d.revision)}</code></span></p>`).join('')}<span class="sub">Run ${esc(p.run_id)}</span>${p.error ? `<p class="bad">${esc(p.error)}</p>` : ''}</div>`).join('') || '<p class="empty">No deployment recorded for this service.</p>';
+    $('history').innerHTML = (service?.history || []).map(p => `<div class="history-item"><div class="section-head" style="padding:0;border:0"><strong>${esc(deploymentLabel(p))}</strong><span class="tag ${p.status === 'success' ? 'good' : ['failure','cancelled'].includes(p.status) ? 'bad' : ''}">${esc(p.status)}</span></div><span class="sub">${esc(date(p.created_at))} · ${esc(origin(p))}</span>${p.revision ? `<span class="sub"><code>${esc(p.revision)}</code></span>` : ''}${(p.deployments || []).map(d => `<p><code>${esc(d.service)}</code> · ${esc(d.status)}<span class="sub"><code>${esc(d.revision)}</code></span></p>`).join('')}<span class="sub">Run ${esc(p.run_id)}</span>${p.error ? `<p class="bad">${esc(p.error)}</p>` : ''}</div>`).join('') || '<p class="empty">No deployment recorded for this service.</p>';
     for (const row of $('catalog').querySelectorAll('tr')) {
       const candidate = release(row.querySelector('[data-release]')?.dataset.release);
       if (candidate) row.title = candidateTitle(candidate);
@@ -198,7 +212,7 @@
     $('service').innerHTML = (e?.services || []).map(s => `<option>${esc(s.service)}</option>`).join('');
     if (e?.services?.some(s => s.service === selected)) $('service').value = selected;
     $('service').disabled = !e?.services?.length;
-    $('service-releases').innerHTML = e?.services?.length ? `<table><thead><tr><th>Service</th><th>Last successful release</th><th>Previous release</th><th>Candidates / status</th></tr></thead><tbody>${e.services.map(s => `<tr><td><button class="btn" data-service="${esc(s.service)}">${esc(s.service)}</button></td><td>${esc(label(s.state?.current_bundle))}<span class="sub">${esc(short(release(s.state?.current_bundle)?.manifest?.revision))}</span></td><td>${esc(label(s.state?.previous_bundle))}</td><td>${candidates(s.service).length} candidates<span class="sub">${s.state?.active_run ? 'Deploying' : s.recovery_required ? 'Recovery required' : 'No active rollout'}</span></td></tr>`).join('')}</tbody></table>` : '<p class="empty">No service-scoped release policies reported. The regional inventory below remains visible.</p>';
+    $('service-releases').innerHTML = e?.services?.length ? `<table><thead><tr><th>Service</th><th>Last successful recorded deployment</th><th>Previous recorded deployment</th><th>Candidates / status</th></tr></thead><tbody>${e.services.map(s => `<tr><td><button class="btn" data-service="${esc(s.service)}">${esc(s.service)}</button></td><td>${esc(deploymentLabel(deployment(s, 'current')))}${deploymentDetails(s, deployment(s, 'current'))}</td><td>${esc(deploymentLabel(deployment(s, 'previous')))}${deploymentDetails(s, deployment(s, 'previous'))}</td><td>${candidates(s.service).length} candidates<span class="sub">${s.state?.active_run ? 'Deploying' : s.recovery_required ? 'Recovery required' : 'No active rollout'}</span></td></tr>`).join('')}</tbody></table>` : '<p class="empty">No service-scoped release policies reported. The regional inventory below remains visible.</p>';
     renderService();
   }
   async function refresh() {
@@ -236,7 +250,7 @@
       if (!s.automation_held || confirm(`Resume automatic deployment of ${service.service} to ${e.name}?`)) perform(() => api('release-automation',{environment:e.name,service:service.service,held:!s.automation_held}));
       return;
     }
-    const recover = action === 'recover', bundle = recover ? service.recovery_bundle : action === 'rollback' ? s.previous_bundle : $('candidate').value, r = release(bundle);
+    const recover = action === 'recover', bundle = recover ? service.recovery_bundle : action === 'rollback' ? deployment(service, 'previous')?.bundle_id : $('candidate').value, r = release(bundle);
     if (!r || !candidates(service.service).some(candidate => candidate.id === bundle)) return;
     confirmation = {environment:e.name,service:service.service,bundle,recover};
     $('confirm-title').textContent = action === 'rollback' ? 'Roll back this service?' : recover ? 'Recover this service?' : 'Deploy this service release?';

@@ -22,6 +22,87 @@ workflow's worth of them per commit.
 - Optionally **app-lb** for workflow objects and sign-in, **heyosecret** for
   secrets, and the **artifacts** store.
 
+### Operator-owned service deployment attribution
+
+Release policies accept an optional `service_deployments` declaration alongside
+`workflow`, `service_targets`, and `placements`:
+
+```yaml
+service_deployments:
+  - environment: production
+    service: cloud
+    obligations:
+      - {job: cloud-us, step: 0}
+      - {job: cloud-eu, step: 0}
+      - {job: verify, step: 0}
+      - {job: bake, step: 0}
+```
+
+`job` selects the stable, matrix-expanded persisted job key, not its display
+label. For a matrix, enumerate each cell key explicitly; an ambiguous base ID
+is rejected, never expanded implicitly. `step` is the zero-based persisted plan
+step index, not a step ID or a one-based UI number. Include every deployment,
+verification, and bake obligation for the service. Target aliases, repository
+names, and infrastructure deployment IDs do not establish service ownership.
+
+Admission rejects unknown job keys, out-of-range indices, empty scope identities
+or obligations, duplicate scopes, and duplicate/multiply owned obligations.
+The declaration is copied into the policy snapshot before infrastructure target
+aliases are bound away and participates in the frozen policy digest. Promotion
+plans declare their already-selected environment/service and every selected
+plan step. Legacy policies and persisted snapshots without the field still
+decode with an empty declaration; admission emits a diagnostic explaining how
+to add attribution. A `merge_only` policy cannot declare deployment obligations.
+
+Admission records these obligations in `ci_release_service_deployment`. The
+existing release reconciler settles each service independently: all declared
+steps must succeed and all deployment receipts must pass with one source
+revision. Successful jobs and receipts carried into a retry retain their original
+evidence. Failure elsewhere in the run does not erase a successful service
+deployment. Unknown or still-running deployment effects do not advance history.
+
+Admission uses the existing environment/service `active_run` fence; concurrent
+deployments of the same service/environment are refused until settlement.
+Different services and environments remain independent. This is not a global
+CI execution lock. Ordinary deployment evidence never grants promotion authority
+or changes a run's source/artifact authorization.
+
+The panel reads current and previous deployment records independently of the
+candidate catalog. A verified revision remains visible without a retained
+artifact. Rollback is available only when that deployment matches a ready,
+integrity-checked, single-service candidate by repository, revision, and artifact
+digest. A repeated deployment of the same verified artifact preserves the
+previous distinct version. These are recorded rollout results, not live probes.
+
+**Existing history requires explicit attribution before activating scoped
+deployments.** Deploy the schema/recorder first, review the persisted jobs and
+typed deployment intents, then run `ci --import-service-history reviewed.json`
+in the configured CI environment. The file is a JSON array:
+
+```json
+[{
+  "run_id": "existing-terminal-run",
+  "scope": {
+    "environment": "stage",
+    "service": "cloud",
+    "obligations": [{"job": "cloud-us", "step": 0}, {"job": "cloud-eu", "step": 0}]
+  },
+  "expected_receipts": {
+    "existing-us-receipt-id": "its-immutable-request-hash",
+    "existing-eu-receipt-id": "its-immutable-request-hash"
+  }
+}]
+```
+
+Import accepts terminal runs and settled receipts only, checks the exact receipt
+set and request hashes, and refuses overlapping/out-of-order deployment history
+or a service already using scoped promotions/deployments. Each entry commits
+atomically; exact replay is safe after a partial import. Include verification and
+bake steps in the reviewed obligations too. It neither executes deployments nor
+creates candidates, and does not copy old environment-wide history into every
+service. Install `service_deployments` in operator policies for future ordinary
+deployments; changing today's policy does not attribute old runs retroactively.
+
 ### SDK package
 
 CI pins our public `heyo-sdk` 0.1.12 release, including the proxy

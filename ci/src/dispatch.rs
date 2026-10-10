@@ -836,6 +836,8 @@ impl Dispatcher {
         run_id: &str,
         actor: Option<&crate::web::identity::Identity>,
     ) -> Result<Submitted, DispatchError> {
+        crate::release_history::settle(&self.store).await
+            .map_err(|e| DispatchError::Workflow(format!("settle service history before retry: {e}")))?;
         let retry = crate::vm::new_id();
         let mut tx = self.store.pool().begin().await
             .map_err(|e| DispatchError::Workflow(format!("begin release retry: {e}")))?;
@@ -974,6 +976,8 @@ impl Dispatcher {
              SELECT $2,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,'published',NULL FROM ci_release WHERE run_id=$1",
         ).bind(run_id).bind(&retry).execute(&mut *tx).await
             .map_err(|e| DispatchError::Workflow(format!("copy published release: {e}")))?;
+        crate::release_history::enroll_retry(&mut tx, &retry).await
+            .map_err(|e| DispatchError::Workflow(format!("record retried service history: {e}")))?;
         Store::add_event(&mut tx, &retry, None, None, None, "ci.run.status.v1", "queued", None).await?;
         for job in jobs {
             let key: String = job.get("job_key");

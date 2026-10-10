@@ -480,6 +480,15 @@ pub async fn admit(
         workflow_path: plan.workflow_path.clone(),
         workflow: policy.workflow.clone(),
         submission_mode: Default::default(),
+        service_deployments: vec![crate::release_policy::ServiceDeploymentScope {
+            environment: request.environment.clone(),
+            service: candidate_service(&bundle["manifest"], request.service.as_deref())?,
+            obligations: plan.jobs.iter().flat_map(|job| {
+                (0..job.steps.len()).map(move |step| crate::release_policy::ServiceDeploymentObligation {
+                    job: job.key.clone(), step,
+                })
+            }).collect(),
+        }],
         service_targets: policy.service_targets.clone(),
         pooler_targets: policy.pooler_targets.clone(),
         site_targets: policy.site_targets.clone(),
@@ -579,12 +588,13 @@ async fn persist(
                 == Some(request.bundle_id.as_str()),
             "recovery must restore the last complete successful release"
         );
-        let failed: bool = sqlx::query_scalar("SELECT coalesce((SELECT r.status IN ('failure','cancelled') FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.service=$2 AND p.completed_at IS NOT NULL ORDER BY p.created_at DESC,p.run_id DESC LIMIT 1),false)")
+        let failed: bool = sqlx::query_scalar("SELECT coalesce((SELECT status IN ('failure','cancelled') FROM ci_release_service_deployment WHERE environment=$1 AND service=$2 AND completed_at IS NOT NULL AND status<>'skipped' ORDER BY created_at DESC,id DESC LIMIT 1),
+            (SELECT r.status IN ('failure','cancelled') FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.service=$2 AND p.completed_at IS NOT NULL ORDER BY p.created_at DESC,p.run_id DESC LIMIT 1),false)")
             .bind(&request.environment).bind(&service).fetch_one(&mut *tx).await?;
-        ensure!(failed, "recovery requires a settled failed promotion");
+        ensure!(failed, "recovery requires a settled failed service deployment");
     } else {
         for prerequisite in &policy.requires {
-            let passed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.bundle_id=$2 AND p.service=$3 AND p.completed_at IS NOT NULL AND r.status='success')")
+            let passed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_deployment WHERE environment=$1 AND bundle_id=$2 AND service=$3 AND status='success') OR EXISTS(SELECT 1 FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.bundle_id=$2 AND p.service=$3 AND p.completed_at IS NOT NULL AND r.status='success' AND NOT EXISTS(SELECT 1 FROM ci_release_service_deployment h WHERE h.run_id=p.run_id AND h.environment=p.environment AND h.service=p.service))")
                 .bind(prerequisite).bind(&request.bundle_id).bind(&service).fetch_one(&mut *tx).await?;
             ensure!(
                 passed,
@@ -620,6 +630,9 @@ async fn persist(
     .await?;
     sqlx::query("UPDATE ci_release_service_environment SET active_run=$2,automation_held=automation_held OR $3,updated_at=now() WHERE name=$1 AND service=$4")
         .bind(&request.environment).bind(&run_id).bind(!automatic).bind(&service).execute(&mut *tx).await?;
+    let scopes = crate::release_history::scopes(plan)?;
+    crate::release_history::enroll(&mut tx, &run_id, repository, &scopes,
+        "promotion", Some(&request.bundle_id), automatic).await?;
     tx.commit().await?;
     Ok(
         json!({"run_id":run_id,"environment":request.environment,"service":service,"bundle_id":request.bundle_id,"request_id":request.request_id}),
@@ -661,6 +674,12 @@ fn service_names(d: &Dispatcher, policy: &Policy) -> Result<Vec<String>> {
 }
 
 async fn service_view(store: &Store, name: &str, service: &str) -> Result<Value> {
+    if !service.is_empty() {
+        if let Some(mut view) = crate::release_history::view(store, name, service).await? {
+            view["service"] = json!(service);
+            return Ok(view);
+        }
+    }
     let (environment_table, promotion_table, predicate) = if service.is_empty() {
         (
             "ci_release_environment",
@@ -825,6 +844,7 @@ async fn set_automation(
 }
 
 async fn finish(store: &Store) -> Result<()> {
+    crate::release_history::settle(store).await?;
     let mut tx = store.pool().begin().await?;
     // Both formats settle in their own original state; no inferred attribution.
     for (environment_table, promotion_table, service_column, service_join, service_filter) in [
@@ -847,6 +867,7 @@ async fn finish(store: &Store) -> Result<()> {
         JOIN {promotion_table} p ON p.run_id=e.active_run AND p.environment=e.name {service_join}
         JOIN ci_run r ON r.id=p.run_id
         WHERE r.status IN ('success','failure','cancelled')
+        AND NOT EXISTS(SELECT 1 FROM ci_release_service_deployment h WHERE h.run_id=r.id)
         AND NOT EXISTS(SELECT 1 FROM ci_service_deployment d WHERE d.run_id=r.id AND d.status NOT IN ('passed','failed'))
         FOR UPDATE OF e SKIP LOCKED");
         let rows = sqlx::query(&rows_sql).fetch_all(&mut *tx).await?;
@@ -930,7 +951,7 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
             }
             let id = latest_ready(&d.store, &resolved.repository, &service).await?;
             let Some(id) = id else { continue };
-            let attempted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_promotion WHERE environment=$1 AND bundle_id=$2 AND service=$3)")
+            let attempted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_deployment WHERE environment=$1 AND bundle_id=$2 AND service=$3) OR EXISTS(SELECT 1 FROM ci_release_service_promotion WHERE environment=$1 AND bundle_id=$2 AND service=$3)")
             .bind(&environment).bind(&id).bind(&service).fetch_one(d.store.pool()).await?;
             if attempted {
                 continue;
