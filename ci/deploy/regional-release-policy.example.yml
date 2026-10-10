@@ -67,7 +67,7 @@ https://github.com/Heyo-Computer/heyo.git:
         # Finish ordinary service rollout before starting host maintenance.
         # A job guard is evaluated before runner allocation; step guards are not.
         needs: [cloud-region-b]
-        if: ${{ needs['cloud-region-b'].result == 'success' && changed('mvm-ctrl/**', 'local-proxy/**', 'kvmbind/**', 'avfbind/**', 'rust-toolchain.toml', '.ci/cargo-lock-sync.sh', '.ci/workflows/mvm-ctrl.yml', '.ci/image/rust/**', '.ci/workflows/regional-release.yml') }}
+        if: ${{ needs.cloud-region-b.result == 'success' && changed('mvm-ctrl/**', 'local-proxy/**', 'kvmbind/**', 'avfbind/**', 'rust-toolchain.toml', '.ci/cargo-lock-sync.sh', '.ci/workflows/mvm-ctrl.yml', '.ci/image/rust/**', '.ci/workflows/regional-release.yml') }}
         vm: *release_vm
         timeout-minutes: 60
         steps:
