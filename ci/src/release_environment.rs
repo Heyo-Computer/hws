@@ -762,19 +762,19 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
         );
         // These reads are independent. Preserve service ordering while bounding
         // concurrent reads instead of accumulating a database round trip per service.
-        let services: Vec<Value> = futures::stream::iter(names.iter().map(|service| {
+        let services: Vec<Value> = futures::stream::iter(names.into_iter().map(|service| {
             let name = &name;
             let policy = &policy;
             async move {
-                let mut view = service_view(&d.store, name, service).await?;
+                let mut view = service_view(&d.store, name, &service).await?;
                 let configured =
-                    policy.services.is_empty() || policy.services.contains_key(service);
+                    policy.services.is_empty() || policy.services.contains_key(&service);
                 view["configured"] = json!(configured);
                 if configured {
                     let resolved = if policy.services.is_empty() {
                         policy.clone()
                     } else {
-                        select(policy, Some(service))?.1
+                        select(policy, Some(&service))?.1
                     };
                     view["repository"] = json!(resolved.repository);
                     view["mode"] = json!(resolved.mode);
