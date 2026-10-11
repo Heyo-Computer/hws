@@ -43,7 +43,7 @@
     dialog { width:min(540px,calc(100vw - 32px)); padding:24px; color:var(--text-primary); background:var(--bg-panel); border:1px solid var(--border-accent); border-radius:12px; }
     dialog::backdrop { background:#0009; } dialog .actions { margin-top:24px; } dialog h2 { font-size:21px; }
     a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
-    @media(max-width:1000px) { .workspace { grid-template-columns:1fr; } .release-sidebar { grid-row:1; } }
+    @media(max-width:1000px) { .workspace { grid-template-columns:1fr; } }
     @media(max-width:650px) { .actions { flex-direction:column; align-items:stretch; } #inventory { max-height:360px; } .section-head label { width:100%; } #search { box-sizing:border-box; }
       #service-releases table,#service-releases tbody { display:block; }
       #service-releases thead { display:none; }
@@ -79,7 +79,7 @@
       <details class="panel"><summary>Regional inventory · all gateway deployments</summary><div class="section-head"><p class="sub">Fleet observations, including maintenance records. These are not release candidates.</p><label>Filter deployments<input id="search" type="search" placeholder="Service or namespace…"></label></div><div id="inventory" class="scroll"></div></details>
     </div>
     <aside class="release-sidebar">
-      <section class="panel" aria-labelledby="selection-title"><div class="section-head"><h2 id="selection-title">Deploy a release</h2></div><div class="panel-body"><label>Release candidate<select id="candidate"></select></label><div id="selection"></div></div></section>
+      <section class="panel" aria-labelledby="selection-title"><div class="section-head"><h2 id="selection-title">Selected version</h2></div><div class="panel-body"><input id="candidate" type="hidden"><p class="sub">Select a version from the release list. Its details appear here.</p><div id="selection"></div></div></section>
       <details class="panel"><summary>Build a candidate for the selected service</summary><form id="build" class="build-form"><label>Repository<input name="repository" readonly required placeholder="Select an environment"></label><label>Candidate name<input name="name" required maxlength="128" placeholder="2026-10-07.1"></label><label>Merged revision (optional)<input name="revision" placeholder="Full SHA; blank uses branch tip"></label><button class="btn" type="submit">Build service candidate</button><p class="sub">Unchanged declared inputs reuse a retained candidate. Other services are not rebuilt.</p></form><div id="builds"></div></details>
     </aside>
   </div>
@@ -115,6 +115,8 @@
   };
   const selectedRelease = () => release($('candidate').value);
   const rollbackVersions = service => (service?.rollback_versions || []).filter(d => d.bundle_id !== deployment(service, 'current')?.bundle_id);
+  const isRollback = (service, r) => rollbackVersions(service).some(d => d.bundle_id === r?.id);
+  const versionAction = (service, r) => isRollback(service, r) ? 'Roll back to this version' : r?.id === deployment(service, 'current')?.bundle_id ? 'Redeploy this version' : 'Deploy this version';
   const prLink = r => r?.latest_pr?.url?.startsWith('https://github.com/') ? `<a href="${esc(r.latest_pr.url)}" target="_blank" rel="noopener noreferrer">PR #${esc(r.latest_pr.number)} · ${esc(r.latest_pr.title)}</a>` : '';
   const revision = r => r?.manifest?.revision || 'Not recorded';
   const description = r => r?.commit_message?.trim() || 'No commit message was recorded for this candidate.';
@@ -171,15 +173,15 @@
     const e = selectedEnv(), service = selectedService(), r = selectedRelease();
     $('candidate').title = r ? candidateTitle(r) : '';
     if (!e || !service) { $('selection').innerHTML = '<p class="empty">No service release policy available. Configure service-scoped releases before deploying.</p>'; return; }
-    const s = service.state || {}, previous = deployment(service, 'previous'), current = deployment(service, 'current');
-    $('selection').innerHTML = `${r ? `<p class="release-name" style="overflow-wrap:anywhere">${esc(r.name)}</p><div class="notice"><strong>Scoped release · ${esc(scope(r))}</strong>This release updates only this service. Other services keep their current versions.</div>${chips(r)}<p class="sub">Candidate source revision</p><code>${esc(revision(r))}</code>` : '<p class="empty">No retained release available for this service.</p>'}
-      <div class="facts"><div><span class="eyebrow">Last successful recorded deployment</span><strong>${esc(deploymentLabel(current))}</strong>${deploymentDetails(service, current)}</div><div><span class="eyebrow">Rollback target</span><strong>${esc(deploymentLabel(previous))}</strong>${deploymentDetails(service, previous)}</div></div>
+    const s = service.state || {}, current = deployment(service, 'current');
+    $('selection').innerHTML = `${r ? `<p class="release-name" style="overflow-wrap:anywhere">${esc(r.name)}</p><div class="notice"><strong>Scoped release · ${esc(scope(r))}</strong>This release updates only this service. Other services keep their current versions.</div>${chips(r)}<p class="sub">Selected source revision</p><code>${esc(revision(r))}</code>` : '<p class="empty">No version selected.</p>'}
+      <div class="facts"><div><span class="eyebrow">Last successful recorded deployment</span><strong>${esc(deploymentLabel(current))}</strong>${deploymentDetails(service, current)}</div><div><span class="eyebrow">Selected target version</span><strong>${esc(r?.name || 'Select a version from the list')}</strong></div></div>
       <p class="sub">These are rollout records, not observed running versions.</p>
       ${policy(service).requires.length ? `<p class="sub">Requires this release to pass: ${policy(service).requires.map(esc).join(', ')}</p>` : ''}
       ${!configured(service) ? '<p class="warn">This service is no longer configured. Historical rollout records are read-only.</p>' : ''}
       ${service.recovery_required ? '<div class="notice"><strong>Recovery required</strong>This service deployment failed. Regions may contain different versions. Other services retain their own release state.</div>' : ''}
       ${s.active_run ? `<p class="warn">Deployment in progress</p><code>${esc(s.active_run)}</code>` : ''}
-      <p>${prLink(r)}</p><div class="actions" style="margin-top:20px"><button class="btn primary" data-action="deploy" ${s.active_run || !r || !components(r).length ? 'disabled' : ''}>Deploy ${esc(service.service)}</button><button class="btn" data-action="rollback" ${s.active_run || service.recovery_required || !rollbackVersions(service).some(d => candidates(service.service).some(r => r.id === d.bundle_id)) ? 'disabled' : ''}>Roll back ${esc(service.service)}…</button></div>
+      <p>${prLink(r)}</p><div class="actions" style="margin-top:20px"><button class="btn primary" data-action="${isRollback(service, r) ? 'rollback' : 'deploy'}" ${s.active_run || !r || !components(r).length || (isRollback(service, r) && service.recovery_required) ? 'disabled' : ''}>${versionAction(service, r)}</button></div>
       ${service.recovery_required ? `<button class="btn" data-action="recover" ${s.active_run || !candidates(service.service).some(r => r.id === service.recovery_bundle) ? 'disabled' : ''}>Recover ${esc(service.service)}…</button>` : ''}
       <p class="sub">Manual deployment holds automation until explicitly resumed.</p>
       <button class="btn" data-action="automation" ${!configured(service) || policy(service).mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button>`;
@@ -187,13 +189,12 @@
   function renderService() {
     const e = selectedEnv(), selected = $('candidate').value;
     const service = selectedService(), choices = candidates(service?.service);
-    $('selection-title').textContent = service ? `Deploy ${service.service}` : 'Deploy a release';
+    $('selection-title').textContent = service ? `${service.service} · selected version` : 'Selected version';
     $('catalog-title').textContent = service ? `${service.service} releases` : 'Available releases';
-    $('catalog-help').textContent = choices.length ? 'Choose a version below, review its target, then confirm deployment.' : configured(service) ? 'Build the first candidate for this service.' : 'No deployment actions are available until release policies are configured.';
-    $('release-count').textContent = `${choices.length} candidates`;
-    $('catalog').innerHTML = !service ? '<p class="empty">Release deployment is not configured for this environment. An operator must install its service release policies; the inventory is not a release catalog.</p>' : choices.length ? `<table><thead><tr><th>Version / source revision</th><th>Deployment record</th><th>Action</th></tr></thead><tbody>${choices.map(r => `<tr><td><span class="release-name">${esc(r.name)}</span><code title="${esc(revision(r))}">${esc(short(revision(r)))}</code><span class="sub">${esc(date(r.created_at))}</span></td><td><span class="tag">${r.id === deployment(service, 'current')?.bundle_id ? 'Last successful recorded' : r.id === deployment(service, 'previous')?.bundle_id ? 'Rollback target' : 'Available'}</span></td><td><button class="btn" data-release="${esc(r.id)}" ${service.state?.active_run ? 'disabled' : ''}>Review &amp; deploy</button></td></tr>`).join('')}</tbody></table>` : `<p class="empty">No retained candidates for ${esc(service.service)}. Build a candidate using the form beside this list. Building does not deploy it.</p>`;
-    $('candidate').innerHTML = choices.map(r => `<option value="${esc(r.id)}" title="${esc(candidateTitle(r))}">${esc(r.name)}</option>`).join('');
-    if (choices.some(r => r.id === selected)) $('candidate').value = selected;
+    $('catalog-help').textContent = choices.length ? 'To roll back, find a previously deployed version and click “Roll back to this version”. Review and confirm before anything changes.' : configured(service) ? 'Build the first candidate for this service.' : 'No deployment actions are available until release policies are configured.';
+    $('release-count').textContent = `${choices.length} retained versions`;
+    $('catalog').innerHTML = !service ? '<p class="empty">Release deployment is not configured for this environment. An operator must install its service release policies; the inventory is not a release catalog.</p>' : choices.length ? `<table><thead><tr><th>Version / source revision</th><th>Deployment record</th><th>Action</th></tr></thead><tbody>${choices.map(r => `<tr><td><span class="release-name">${esc(r.name)}</span><code title="${esc(revision(r))}">${esc(short(revision(r)))}</code><span class="sub">${esc(date(r.created_at))}</span></td><td><span class="tag">${r.id === deployment(service, 'current')?.bundle_id ? 'Last successful recorded' : isRollback(service, r) ? 'Previously deployed' : 'Not previously deployed'}</span></td><td><button class="btn" data-release="${esc(r.id)}" ${service.state?.active_run || (isRollback(service, r) && service.recovery_required) ? 'disabled' : ''}>${versionAction(service, r)}</button></td></tr>`).join('')}</tbody></table>` : `<p class="empty">No retained candidates for ${esc(service.service)}. Build a candidate using the form beside this list. Building does not deploy it.</p>`;
+    $('candidate').value = choices.some(r => r.id === selected) ? selected : '';
     $('candidate').disabled = !choices.length;
     if (service && !configured(service)) $('catalog').innerHTML = '<p class="empty">This service is not configured for this environment. Historical rollout records remain available; builds and deployments are disabled.</p>';
     $('policy').innerHTML = e ? !configured(service) ? '<span class="tag">Service not configured</span>' : `<span class="tag">${esc(policy(service).mode)} policy</span><span class="tag">Service automation ${service?.state?.automation_held ? 'held' : policy(service).mode === 'automatic' ? 'enabled' : 'off'}</span>` : 'No environments configured';
@@ -260,7 +261,7 @@
     if (!button || button.disabled || busy) return;
     $('candidate').value = button.dataset.release;
     renderSelection();
-    $('selection').querySelector('[data-action="deploy"]').click();
+    $('selection').querySelector('[data-action="deploy"], [data-action="rollback"]').click();
   };
   $('build').onsubmit = event => { event.preventDefault(); if (!configured(selectedService())) return; const data = Object.fromEntries(new FormData(event.target)); data.repository = policy(selectedService()).repository; data.service = selectedService().service; if (!data.revision.trim()) delete data.revision; perform(() => api('release-builds',data)); };
   $('selection').onclick = event => {
@@ -271,29 +272,14 @@
       if (!s.automation_held || confirm(`Resume automatic deployment of ${service.service} to ${e.name}?`)) perform(() => api('release-automation',{environment:e.name,service:service.service,held:!s.automation_held}));
       return;
     }
-    const rollback = rollbackVersions(service).filter(d => candidates(service.service).some(r => r.id === d.bundle_id));
-    const defaultRollback = rollback.find(d => d.bundle_id === deployment(service, 'previous')?.bundle_id) || rollback[0];
-    const recover = action === 'recover', bundle = recover ? service.recovery_bundle : action === 'rollback' ? defaultRollback?.bundle_id : $('candidate').value, r = release(bundle);
+    const recover = action === 'recover', bundle = recover ? service.recovery_bundle : $('candidate').value, r = release(bundle);
     if (!r || !candidates(service.service).some(candidate => candidate.id === bundle)) return;
     confirmation = {environment:e.name,service:service.service,bundle,recover};
     $('confirm-title').textContent = action === 'rollback' ? 'Roll back this service?' : recover ? 'Recover this service?' : 'Deploy this service release?';
     $('confirm-body').innerHTML = `<p>Environment: <strong>${esc(e.name)}</strong></p><p>Service: <strong>${esc(service.service)}</strong></p><p>Release: <strong>${esc(r.name)}</strong></p><div class="notice"><strong>${esc(scope(r))}</strong>${chips(r)}</div><code>${esc(revision(r))}</code><p class="sub">Only this service's configured targets will change. Other services retain their versions. Automation for this service will remain held.</p>`;
-    if (action === 'rollback') {
-      const versions = rollbackVersions(service);
-      $('confirm-body').innerHTML = `<p>Environment: <strong>${esc(e.name)}</strong> · Service: <strong>${esc(service.service)}</strong></p><label>Previously deployed version<select id="rollback-version">${versions.map(d => `<option value="${esc(d.bundle_id || '')}" ${candidates(service.service).some(r => r.id === d.bundle_id) ? '' : 'disabled'}>${esc(deploymentLabel(d))} · ${esc(date(d.completed_at))}${candidates(service.service).some(r => r.id === d.bundle_id) ? '' : ' — artifact unavailable'}</option>`).join('')}</select></label><div id="rollback-details"></div><p>Only this service will change. Automation remains held.</p>`;
-      const picker = $('rollback-version');
-      if (versions.some(d => d.bundle_id === bundle) && candidates(service.service).some(r => r.id === bundle)) picker.value = bundle;
-      picker.onchange = () => {
-        const chosen = candidates(service.service).find(r => r.id === picker.value);
-        confirmation.bundle = chosen?.id;
-        $('confirm').disabled = !chosen;
-        $('rollback-details').innerHTML = chosen ? `<p><strong>${esc(chosen.name)}</strong></p><code>${esc(revision(chosen))}</code><p>${prLink(chosen)}</p>` : '<p>Retained artifact unavailable.</p>';
-      };
-      picker.onchange();
-    } else {
-      $('confirm').disabled = false;
-      $('confirm-body').insertAdjacentHTML('beforeend', `<p>${prLink(r)}</p>`);
-    }
+    $('confirm').disabled = false;
+    $('confirm').textContent = action === 'rollback' ? 'Confirm rollback' : 'Confirm deployment';
+    $('confirm-body').insertAdjacentHTML('beforeend', `<p>${prLink(r)}</p>`);
     $('confirmation').showModal();
   };
   $('cancel').onclick = () => $('confirmation').close();
