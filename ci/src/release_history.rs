@@ -134,12 +134,12 @@ pub(crate) async fn enroll_retry(tx: &mut Transaction<'_, Postgres>, run: &str) 
 // suffixes. Legacy receipts without an artifact stay visible, but cannot prove
 // equivalence to a retained candidate.
 const EFFECTIVE_STEPS: &str = "WITH RECURSIVE lineage AS (
-    SELECT j.id,j.job_key,j.carried_from,j.status,j.plan,j.finished_at FROM ci_job j WHERE j.run_id=$1
+    SELECT j.id,j.job_key,j.carried_from,j.status,j.plan,j.started_at,j.finished_at FROM ci_job j WHERE j.run_id=$1
     UNION
-    SELECT p.id,p.job_key,p.carried_from,p.status,p.plan,p.finished_at FROM lineage j
+    SELECT p.id,p.job_key,p.carried_from,p.status,p.plan,p.started_at,p.finished_at FROM lineage j
         JOIN ci_job p ON p.run_id=j.carried_from AND p.job_key=j.job_key
 ), obligations AS (
-    SELECT j.id AS job_id,j.status AS job_status,j.finished_at AS job_finished_at,
+    SELECT j.id AS job_id,j.status AS job_status,j.started_at AS job_started_at,j.finished_at AS job_finished_at,
         s.id AS step_id,s.status AS step_status,s.finished_at,
         j.plan->'steps'->((o->>'step')::int)->>'uses' AS action,c.deployment_id
     FROM jsonb_array_elements($2::jsonb) o JOIN lineage j ON j.job_key=o->>'job'
@@ -167,8 +167,16 @@ const RECEIPTS: &str =
 
 pub(crate) async fn settle(store: &Store) -> Result<()> {
     let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM ci_release_service_deployment
-        WHERE status='running' ORDER BY created_at,id",
+        "SELECT h.id FROM ci_release_service_deployment h
+        WHERE h.status='running' OR (
+            h.status='failure' AND h.source='ordinary'
+            AND EXISTS(SELECT 1 FROM ci_run r WHERE r.id=h.run_id AND r.status IN ('failure','cancelled'))
+            AND NOT EXISTS(SELECT 1 FROM ci_job j WHERE j.run_id=h.run_id
+                AND (j.started_at IS NOT NULL OR j.carried_from IS NOT NULL
+                    OR j.status NOT IN ('failure','cancelled','skipped')))
+            AND NOT EXISTS(SELECT 1 FROM ci_step s JOIN ci_job j ON j.id=s.job_id WHERE j.run_id=h.run_id)
+            AND NOT EXISTS(SELECT 1 FROM ci_service_deployment d WHERE d.run_id=h.run_id)
+        ) ORDER BY h.created_at,h.id",
     )
     .fetch_all(store.pool())
     .await?;
@@ -205,7 +213,9 @@ async fn settle_in(mut tx: Transaction<'_, Postgres>, id: &str) -> Result<()> {
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-    if attempt.get::<&str, _>("status") != "running" {
+    let repairing = attempt.get::<&str, _>("status") == "failure"
+        && attempt.get::<&str, _>("source") == "ordinary";
+    if attempt.get::<&str, _>("status") != "running" && !repairing {
         return Ok(());
     }
     let run: &str = attempt.get("run_id");
@@ -250,7 +260,25 @@ async fn settle_in(mut tx: Transaction<'_, Postgres>, id: &str) -> Result<()> {
         && steps.iter().all(|s| {
             s.get::<Option<&str>, _>("step_status") == Some("skipped")
                 || s.get::<&str, _>("job_status") == "skipped"
+                || (s.get::<Option<String>, _>("step_id").is_none()
+                    && s.get::<Option<chrono::DateTime<chrono::Utc>>, _>("job_started_at")
+                        .is_none()
+                    && matches!(s.get::<&str, _>("job_status"), "failure" | "cancelled"))
         });
+    if repairing {
+        // Correct only a proven pre-execution failure. Preserve CI's failed
+        // run, deployment positions, active-run fences and operator holds.
+        if skipped {
+            sqlx::query(
+                "UPDATE ci_release_service_deployment SET status='skipped',error=NULL WHERE id=$1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+        return Ok(());
+    }
     let success = !receipts.is_empty()
         && steps.iter().all(|s| {
             s.get::<Option<&str>, _>("step_status") == Some("success")
@@ -820,6 +848,67 @@ mod tests {
         assert_eq!(final_state["current_deployment"]["run_id"], "later");
         assert_eq!(final_state["previous_deployment"]["run_id"], "earlier");
         assert_eq!(final_state["state"]["active_run"], "old");
+
+        // Validation rejection never started deployment. Repair old false
+        // failures too, but do not infer safety once a job has started.
+        for run in ["blocked", "legacy-blocked", "started"] {
+            sqlx::query(
+                "INSERT INTO ci_run(id,workflow_id,workflow_path,repo_url,sha,status)
+                VALUES($1,'release','release.yml','repo','unused','failure')",
+            )
+            .bind(run)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO ci_job(id,run_id,job_key,base_id,display,status,plan,finished_at)
+                SELECT $1||'.'||job_key,$1,job_key,base_id,display,'failure',plan,now()+interval '3 minutes'
+                FROM ci_job WHERE run_id='new' AND job_key IN ('west','east')")
+                .bind(run).execute(store.pool()).await.unwrap();
+            let mut tx = store.pool().begin().await.unwrap();
+            enroll_retry(&mut tx, run).await.unwrap();
+            tx.commit().await.unwrap();
+            if run == "legacy-blocked" {
+                sqlx::query("UPDATE ci_release_service_deployment SET status='failure',completed_at=now()+interval '3 minutes' WHERE run_id=$1")
+                    .bind(run).execute(store.pool()).await.unwrap();
+                assert_eq!(
+                    view(&store, "stage", "cloud").await.unwrap().unwrap()["recovery_required"],
+                    true
+                );
+            }
+            if run == "started" {
+                sqlx::query("UPDATE ci_job SET started_at=now() WHERE id='started.west'")
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+            }
+            settle(&store).await.unwrap();
+            settle(&store).await.unwrap();
+            let state = view(&store, "stage", "cloud").await.unwrap().unwrap();
+            let record = state["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["run_id"] == run)
+                .unwrap();
+            assert_eq!(
+                record["status"],
+                if run == "started" {
+                    "failure"
+                } else {
+                    "skipped"
+                }
+            );
+            assert_eq!(state["recovery_required"], run == "started");
+            assert_eq!(state["current_deployment"]["run_id"], "later");
+            assert_eq!(state["previous_deployment"]["run_id"], "earlier");
+            assert_eq!(state["state"]["active_run"], "old");
+            let status: String = sqlx::query_scalar("SELECT status FROM ci_run WHERE id=$1")
+                .bind(run)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+            assert_eq!(status, "failure");
+        }
 
         store.pool().close().await;
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
