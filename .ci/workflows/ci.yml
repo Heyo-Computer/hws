@@ -286,6 +286,7 @@ jobs:
           export CI_TEST_NATS_URL=nats://127.0.0.1:44222
           export CI_NATS_URL="$CI_TEST_NATS_URL"
           cargo test --release --locked --bin ci release_build::tests:: -- --ignored --test-threads=1
+          cargo test --release --locked --bin ci submission::tests::ordinary_deployment_retains_a_promotable_release_before_completion -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci release_environment::tests::promotion_persistence_is_idempotent_scoped_and_tracks_completion -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci release_history::tests::history_preserves_real_revisions_across_import_deployment_and_retry -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci dispatch::tests::published_release_failed_only_retry_preserves_identity_and_single_flight -- --ignored --exact --test-threads=1

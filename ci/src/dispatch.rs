@@ -3035,6 +3035,15 @@ impl Dispatcher {
             }
         }
 
+        if matches!(action, "ci/rollout-service" | "ci/rollout-host-app-lb" |
+            "ci/rollout-pooler" | "ci/rollout-site" | "ci/rollout-stateful-service" |
+            "ci/deploy-controller" | "ci/bootstrap-host-heyvm" | "ci/rollout-host-heyvmd")
+            && !(action == "ci/deploy-controller" && self.config.managed_deployment.is_some()) {
+            crate::release_build::retain_submission(&self.store, self.artifacts.as_ref(), &msg.run_id, sid,
+                &with("workflow").unwrap_or_default(), &required("artifact")?).await
+                .map_err(|e| DispatchError::StepFailed(format!("retain service release before deployment: {e}")))?;
+        }
+
         match action {
             "ci/merge-release" => {
                 if let Some(policy) = &plan.release_policy {

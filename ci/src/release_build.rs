@@ -403,6 +403,119 @@ async fn persist(
     Ok(saved)
 }
 
+/// Adopt an ordinary submission's already validated producer before its first
+/// deployment effect. Use the same retention, manifest and promotion contracts
+/// as a separately requested build; never rebuild or invent a publication.
+pub(crate) async fn retain_submission(
+    store: &Store,
+    sink: &dyn crate::artifacts::ArtifactSink,
+    run_id: &str,
+    step_id: &str,
+    workflow: &str,
+    artifact: &str,
+) -> Result<()> {
+    if crate::release_environment::bundle_for_run(store, run_id).await?.is_some() {
+        return Ok(());
+    }
+    let scopes = sqlx::query("SELECT h.id,h.service,h.status,h.release_identity FROM ci_release_service_deployment h
+        JOIN ci_step s ON s.id=$2 JOIN ci_job j ON j.id=s.job_id AND j.run_id=h.run_id
+        WHERE h.run_id=$1 AND h.source='ordinary' AND EXISTS(
+            SELECT 1 FROM jsonb_array_elements(h.obligations) o
+            WHERE o->>'job'=j.job_key AND (o->>'step')::int=s.idx)")
+        .bind(run_id).bind(step_id).fetch_all(store.pool()).await?;
+    if scopes.is_empty() {
+        return Ok(());
+    }
+    let (revision, git_ref) = crate::release::deployment_source(store, run_id)
+        .await.map_err(anyhow::Error::msg)?;
+    let run = store.get_run(run_id).await?.ok_or_else(|| anyhow::anyhow!("missing submission"))?;
+    ensure!(revision == run.sha, "release must use the exact published revision");
+    let stored = crate::submission::artifact(store, run_id, workflow, artifact, None)
+        .await.map_err(anyhow::Error::msg)?;
+    let producer_run = crate::submission::artifact_run(store, run_id, workflow)
+        .await.map_err(anyhow::Error::msg)?;
+    // The source must survive so a future rollback can use the normal promotion
+    // admission path, including workflow and secret scope validation.
+    let source_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_run_source WHERE run_id=$1)")
+        .bind(&producer_run).fetch_one(store.pool()).await?;
+    ensure!(source_exists, "release producer has no retained source descriptor");
+    let producer = sqlx::query("SELECT a.id,j.job_key FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id
+        WHERE a.run_id=$1 AND a.name=$2 AND j.status='success' AND a.digest=$3 AND a.uri=$4")
+        .bind(&producer_run).bind(artifact).bind(&stored.digest).bind(&stored.uri)
+        .fetch_one(store.pool()).await?;
+    for scope in scopes {
+        if scope.get::<&str,_>("status") != "running" {
+            let identity: Value = scope.get::<Option<Value>,_>("release_identity").unwrap_or(Value::Null);
+            ensure!(scope.get::<&str,_>("status") == "success"
+                && identity["revision"] == revision
+                && identity["artifacts"] == json!([stored.digest])
+                && identity["unverified_receipts"] == json!([]),
+                "historical deployment does not prove this exact retained artifact");
+        }
+        let service: String = scope.get("service");
+        let id = format!("submission-{}", hex::encode(Sha256::digest(serde_json::to_vec(
+            &json!([run.repo_url,service,revision,producer.get::<String,_>("id"),stored.digest])
+        )?)));
+        let name = format!("{}-{}-{}", service.chars().take(90).collect::<String>(),
+            run.created_at.format("%Y%m%d"), &id[11..23]);
+        let policy = Policy {
+            workflow_id: run.workflow_id.clone(), git_ref: git_ref.clone(),
+            components: BTreeMap::from([(service.clone(), Selection {
+                workflow: workflow.into(), artifact: artifact.into(), job: producer.get("job_key"),
+            })]), network: None, daily_utc_minute: None, input_identity: None,
+        };
+        let mut tx = store.pool().begin().await?;
+        sqlx::query("INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,source_deployment_id,created_at)
+            VALUES($1,$2,$3,$4,$5,$6,'submission',$7,$8) ON CONFLICT(id) DO NOTHING")
+            .bind(&id).bind(&run.repo_url).bind(&name).bind(&revision).bind(&git_ref)
+            .bind(serde_json::to_value(&policy)?).bind(scope.get::<String,_>("id"))
+            .bind(run.created_at).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO ci_release_build_run(build_id,workflow_path,run_id)
+            VALUES($1,$2,$3) ON CONFLICT(build_id,workflow_path) DO NOTHING")
+            .bind(&id).bind(workflow).bind(&producer_run).execute(&mut *tx).await?;
+        tx.commit().await?;
+        let build: Value = sqlx::query_scalar("SELECT to_jsonb(b) FROM ci_release_build b WHERE id=$1")
+            .bind(&id).fetch_one(store.pool()).await?;
+        if build["status"] != "ready" {
+            ensure!(build["status"] == "building", "retained release preparation failed");
+            let manifest = collect(store, &build).await?
+                .ok_or_else(|| anyhow::anyhow!("release producer has not completed"))?;
+            finalize(store, sink, &build, manifest).await?;
+        }
+        let retained: Value = sqlx::query_scalar("SELECT manifest FROM ci_release_bundle WHERE id=$1")
+            .bind(&id).fetch_one(store.pool()).await?;
+        let selected = crate::release_environment::artifact(&retained, workflow, artifact, None)?;
+        ensure!(selected.digest == stored.digest && selected.size_bytes == stored.size_bytes,
+            "retained release differs from the deployment artifact");
+        // Every region and replay must agree on the same release. Attach it
+        // before deployment; completion still depends on real rollout receipts.
+        let mut tx = store.pool().begin().await?;
+        link_submission_release(&mut tx, scope.get("id"), &id).await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
+async fn link_submission_release(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, deployment: &str, release: &str,
+) -> Result<()> {
+    // Follow history settlement's environment-then-deployment lock order.
+    sqlx::query("SELECT e.name FROM ci_release_service_environment e
+        JOIN ci_release_service_deployment h ON h.environment=e.name AND h.service=e.service
+        WHERE h.id=$1 FOR UPDATE OF e")
+        .bind(deployment).fetch_one(&mut **tx).await?;
+    let linked = sqlx::query("UPDATE ci_release_service_deployment SET bundle_id=$2
+        WHERE id=$1 AND (bundle_id IS NULL OR bundle_id=$2)")
+        .bind(deployment).bind(release).execute(&mut **tx).await?.rows_affected();
+    ensure!(linked == 1, "service deployment selected different release artifacts");
+    sqlx::query("UPDATE ci_release_service_environment SET
+        current_bundle=CASE WHEN current_deployment=$1 THEN $2 ELSE current_bundle END,
+        previous_bundle=CASE WHEN previous_deployment=$1 THEN $2 ELSE previous_bundle END
+        WHERE current_deployment=$1 OR previous_deployment=$1")
+        .bind(deployment).bind(release).execute(&mut **tx).await?;
+    Ok(())
+}
+
 /// Return None while work is active. Terminal failures never become a bundle.
 async fn collect(store: &Store, build: &Value) -> Result<Option<Value>> {
     let id = build["id"]
@@ -531,6 +644,9 @@ async fn finalize(
         sqlx::query("INSERT INTO ci_release_bundle_artifact(bundle_id,component,artifact_id) VALUES($1,$2,$3)")
             .bind(id).bind(component).bind(artifact["id"].as_str()).execute(&mut *tx).await?;
     }
+    if let Some(deployment) = build["source_deployment_id"].as_str() {
+        link_submission_release(&mut tx, deployment, id).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -557,6 +673,35 @@ pub fn spawn(d: Arc<Dispatcher>) {
 }
 
 async fn reconcile(d: &Dispatcher) -> Result<()> {
+    // Repair only the displayed successful deployments whose receipts prove
+    // exact bytes. Missing artifacts or provenance never become rollback targets.
+    let historical = sqlx::query("SELECT DISTINCT h.run_id,s.id AS step_id,
+        j.plan->'steps'->s.idx->'with'->>'workflow' AS workflow,
+        j.plan->'steps'->s.idx->'with'->>'artifact' AS artifact
+        FROM ci_release_service_environment e
+        JOIN ci_release_service_deployment h ON h.id IN (e.current_deployment,e.previous_deployment)
+        JOIN ci_job j ON j.run_id=h.run_id
+        JOIN ci_step s ON s.job_id=j.id
+        WHERE h.source='ordinary' AND h.status='success' AND h.bundle_id IS NULL
+        AND h.release_identity->'unverified_receipts'='[]'::jsonb
+        AND jsonb_array_length(h.release_identity->'artifacts')=1
+        AND EXISTS(SELECT 1 FROM jsonb_array_elements(h.obligations) o
+            WHERE o->>'job'=j.job_key AND (o->>'step')::int=s.idx)
+        AND j.plan->'steps'->s.idx->'with' ? 'workflow'
+        AND j.plan->'steps'->s.idx->'with' ? 'artifact'")
+        .fetch_all(d.store.pool()).await?;
+    for row in historical {
+        let workflow: String = row.get("workflow");
+        let artifact: String = row.get("artifact");
+        if workflow.contains("${{") || artifact.contains("${{") {
+            continue;
+        }
+        if let Err(error) = retain_submission(&d.store, d.artifacts.as_ref(),
+            row.get("run_id"), row.get("step_id"), &workflow, &artifact).await {
+            tracing::warn!(run = row.get::<&str,_>("run_id"), %error,
+                "historical release retention unavailable; keeping deployment evidence unchanged");
+        }
+    }
     let builds: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(b) FROM ci_release_build b WHERE status='building' ORDER BY created_at LIMIT 100")
         .fetch_all(d.store.pool()).await?;
     for build in builds {

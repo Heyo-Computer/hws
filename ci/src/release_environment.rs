@@ -571,6 +571,11 @@ async fn persist(
         return Ok(json!({"run_id":saved["run_id"],"environment":request.environment,
             "service":service,"bundle_id":request.bundle_id,"request_id":request.request_id}));
     }
+    let ordinary_active: bool = sqlx::query_scalar("SELECT EXISTS(
+        SELECT 1 FROM ci_release_service_deployment WHERE environment=$1 AND service=$2
+        AND source='ordinary' AND status='running')")
+        .bind(&request.environment).bind(&service).fetch_one(&mut *tx).await?;
+    ensure!(!ordinary_active, "ordinary service deployment must settle before promotion");
     // Historical unscoped work must settle before a new service-scoped run
     // can safely begin. Do not attribute its current/previous/hold to a service.
     let legacy_active: Option<Option<String>> = sqlx::query_scalar(
