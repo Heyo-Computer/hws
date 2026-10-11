@@ -681,6 +681,23 @@ jobs:
         let artifact = artifact(&store, "rollback", "cloud.yml", "cloud", None).await.unwrap();
         assert_eq!(artifact.digest.as_deref(), Some("a".repeat(64).as_str()));
         assert_eq!(artifact.uri, "retained-cloud");
+        // Repair imported history only when its original effect proves the
+        // selected bytes. A same-revision but different artifact is insufficient.
+        sqlx::query("UPDATE ci_release_service_deployment SET bundle_id=NULL,source='legacy_import',
+            status='success',release_identity=$1 WHERE id='cloud'")
+            .bind(serde_json::json!({"revision":"source","artifacts":["b".repeat(64)],"unverified_receipts":[]}))
+            .execute(store.pool()).await.unwrap();
+        assert!(retain(false).await.is_err());
+        sqlx::query("UPDATE ci_release_service_deployment SET release_identity=$1 WHERE id='cloud'")
+            .bind(serde_json::json!({"revision":"source","artifacts":["a".repeat(64)],"unverified_receipts":[]}))
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_release_service_environment SET current_deployment='cloud',current_bundle=NULL WHERE service='cloud'")
+            .execute(store.pool()).await.unwrap();
+        retain(false).await.unwrap();
+        let repaired = crate::release_history::view(&store, "stage", "cloud").await.unwrap().unwrap();
+        assert_eq!(repaired["current_deployment"]["version"], cloud["name"]);
+        assert_eq!(repaired["current_deployment"]["source"], "legacy_import");
+        assert_eq!(repaired["state"]["current_bundle"], cloud["id"]);
     }
 
     #[tokio::test]

@@ -419,7 +419,7 @@ pub(crate) async fn retain_submission(
     }
     let scopes = sqlx::query("SELECT h.id,h.service,h.status,h.release_identity FROM ci_release_service_deployment h
         JOIN ci_step s ON s.id=$2 JOIN ci_job j ON j.id=s.job_id AND j.run_id=h.run_id
-        WHERE h.run_id=$1 AND h.source='ordinary' AND EXISTS(
+        WHERE h.run_id=$1 AND h.source IN ('ordinary','legacy_import') AND EXISTS(
             SELECT 1 FROM jsonb_array_elements(h.obligations) o
             WHERE o->>'job'=j.job_key AND (o->>'step')::int=s.idx)")
         .bind(run_id).bind(step_id).fetch_all(store.pool()).await?;
@@ -682,7 +682,7 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
         JOIN ci_release_service_deployment h ON h.id IN (e.current_deployment,e.previous_deployment)
         JOIN ci_job j ON j.run_id=h.run_id
         JOIN ci_step s ON s.job_id=j.id
-        WHERE h.source='ordinary' AND h.status='success' AND h.bundle_id IS NULL
+        WHERE h.source IN ('ordinary','legacy_import') AND h.status='success' AND h.bundle_id IS NULL
         AND h.release_identity->'unverified_receipts'='[]'::jsonb
         AND jsonb_array_length(h.release_identity->'artifacts')=1
         AND EXISTS(SELECT 1 FROM jsonb_array_elements(h.obligations) o
