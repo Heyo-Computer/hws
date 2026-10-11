@@ -771,7 +771,7 @@ impl DiskStore {
             // registry does not authorize reclaiming another app-lb's disk,
             // nor a disk whose daemon record (and ownership) has been lost.
             let managed_here = deployment.as_ref()
-                .and_then(|id| deployments.get(id))
+                .and_then(|id| deployments.get(id.as_str()))
                 .is_some_and(|d| d.spec.is_managed());
             let held_by = hold_reason(state, is_claimed, policy.retain)
                 .or_else(|| (!managed_here).then_some("ownership is not established by this app-lb"));
