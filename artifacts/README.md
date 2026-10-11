@@ -247,7 +247,7 @@ twenty-gigabyte image never lands in memory.
 ```
 GET    /healthz              always open, no auth — this is the readiness probe
 HEAD   /blobs/{digest}       size and allocation without transferring anything
-GET    /blobs/{digest}       stream the content
+GET    /blobs/{digest}       stream the content; `Accept: application/vnd.art.sparse.v1` sends only its allocated extents (artsparse v1)
 PUT    /blobs/{digest}       201 stored · 200 already had it · 409 digest mismatch
 GET    /blobs                what is in the store, with labels and tags
 GET    /manifests/{ref}      by digest or tag

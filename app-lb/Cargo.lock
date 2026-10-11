@@ -186,6 +186,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower-service",
  "tracing",
  "tracing-subscriber",

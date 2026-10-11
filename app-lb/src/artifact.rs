@@ -90,6 +90,41 @@ const ANN_SIZE_MB: &str = "heyvm.size_mb";
 /// able to `COPY`.
 const CONTEXT_DIR: &str = "context";
 
+/// The media type `art serve` sends a blob as when asked for it, and the
+/// encoding's framing (`asp.rs` in the artifacts crate). Copied for the same
+/// reason as [`KIND_DOCKERFILE`]: the decoder is a few lines.
+const SPARSE_MEDIA_TYPE: &str = "application/vnd.art.sparse.v1";
+const SPARSE_MAGIC: &[u8; 4] = b"ASP1";
+/// The encoder's own ceiling; a larger header is corruption.
+const SPARSE_MAX_HEADER: u32 = 64 * 1024 * 1024;
+
+/// `{"size": <logical length>, "extents": [[offset, length], ...]}`.
+#[derive(serde::Deserialize)]
+struct SparseHeader {
+    size: u64,
+    extents: Vec<(u64, u64)>,
+}
+
+impl SparseHeader {
+    /// Ascending, disjoint, inside `size`, and `size` the length the
+    /// manifest promised. The digest would catch any of these too, but only
+    /// after the whole body had been read and written.
+    fn validate(&self, expected_size: u64) -> Result<(), String> {
+        if expected_size != 0 && self.size != expected_size {
+            return Err(format!("describes {} bytes, but {expected_size} were expected", self.size));
+        }
+        let mut end = 0u64;
+        for &(off, len) in &self.extents {
+            let stop = off.checked_add(len).ok_or("has an extent that overflows")?;
+            if off < end || stop > self.size {
+                return Err("has extents out of order or past the end".into());
+            }
+            end = stop;
+        }
+        Ok(())
+    }
+}
+
 /// A sha256 in the only spelling the store accepts.
 const DIGEST_HEX_LEN: usize = 64;
 
@@ -1216,8 +1251,12 @@ impl Puller {
     ) -> Result<u64, String> {
         self.preparation_stage("blob_request");
         let url = format!("{base}/blobs/{digest}");
+        // Offered, not required: a store that predates the sparse encoding
+        // answers with the plain bytes, and the Content-Type says which.
+        let accept = format!("{SPARSE_MEDIA_TYPE}, application/octet-stream;q=0.5");
         let resp = self
-            .get(&url, api_key)
+            .authed(self.http.get(&url).header(reqwest::header::ACCEPT, accept), api_key)
+            .send()
             .await
             .map_err(|e| {
                 self.preparation_stage(if e.is_timeout() { "blob_request_timeout" } else { "blob_request_failed" });
@@ -1231,29 +1270,23 @@ impl Puller {
         }
 
         self.preparation_stage("blob_download");
-        log(format!("fetching {} from {url}", human(expected_size)));
+        let sparse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .is_some_and(|t| t.trim() == SPARSE_MEDIA_TYPE);
         let mut file = tokio::fs::File::create(dest)
             .await
             .map_err(|e| format!("could not create {}: {e}", dest.display()))?;
         let mut hasher = Sha256::new();
-        let mut written: u64 = 0;
-        let mut stream = resp.bytes_stream();
+        let written = if sparse {
+            self.read_sparse(resp, &mut file, &mut hasher, expected_size, &url, log).await?
+        } else {
+            log(format!("fetching {} from {url}", human(expected_size)));
+            self.read_plain(resp, &mut file, &mut hasher, dest, expected_size).await?
+        };
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                self.preparation_stage(if e.is_timeout() { "blob_read_timeout" } else { "blob_read_failed" });
-                format!(
-                    "the transfer failed after {} of {}: {e}",
-                    human(written),
-                    human(expected_size)
-                )
-            })?;
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| format!("writing {}: {e}", dest.display()))?;
-            written += chunk.len() as u64;
-        }
         // Flush before the digest is pronounced good: a buffered tail that never
         // reached the kernel would make the check describe memory, not the file
         // that is about to be renamed into place and booted.
@@ -1276,6 +1309,126 @@ impl Puller {
             ));
         }
         Ok(written)
+    }
+
+    /// A plain body: every logical byte, written and hashed as it lands.
+    async fn read_plain(
+        &self,
+        resp: reqwest::Response,
+        file: &mut tokio::fs::File,
+        hasher: &mut Sha256,
+        dest: &Path,
+        expected_size: u64,
+    ) -> Result<u64, String> {
+        let mut written: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                self.preparation_stage(if e.is_timeout() { "blob_read_timeout" } else { "blob_read_failed" });
+                format!(
+                    "the transfer failed after {} of {}: {e}",
+                    human(written),
+                    human(expected_size)
+                )
+            })?;
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("writing {}: {e}", dest.display()))?;
+            written += chunk.len() as u64;
+        }
+        Ok(written)
+    }
+
+    /// An `artsparse v1` body (the artifacts crate's `asp.rs`): a header
+    /// listing the extents that hold data, then those extents. Each is
+    /// written at its offset and everything between is left a hole, so a
+    /// 512 MiB rootfs with 23 MB of data costs 23 MB of transfer and disk.
+    /// The hasher is fed the **logical** stream, holes as zeros, because that
+    /// is what the digest covers; the header is never trusted on its own.
+    /// Returns the bytes transferred.
+    async fn read_sparse(
+        &self,
+        resp: reqwest::Response,
+        file: &mut tokio::fs::File,
+        hasher: &mut Sha256,
+        expected_size: u64,
+        url: &str,
+        log: &mut (dyn FnMut(String) + Send),
+    ) -> Result<u64, String> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let body = resp.bytes_stream().map(|c| c.map_err(std::io::Error::other));
+        let mut r = tokio_util::io::StreamReader::new(body);
+        let fail = |what: &str, e: std::io::Error| {
+            self.preparation_stage("blob_read_failed");
+            format!("the sparse body from {url} failed {what}: {e}")
+        };
+
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic).await.map_err(|e| fail("in its header", e))?;
+        if &magic[..4] != SPARSE_MAGIC {
+            return Err(format!("{url} said it was sparse but did not start with {SPARSE_MAGIC:?}"));
+        }
+        let head_len = u32::from_le_bytes(magic[4..].try_into().expect("four bytes"));
+        if head_len > SPARSE_MAX_HEADER {
+            return Err(format!("{url} sent a {head_len}-byte sparse header"));
+        }
+        let mut head = vec![0u8; head_len as usize];
+        r.read_exact(&mut head).await.map_err(|e| fail("in its header", e))?;
+        let header: SparseHeader = serde_json::from_slice(&head)
+            .map_err(|e| format!("the sparse header from {url} was not readable: {e}"))?;
+        header.validate(expected_size).map_err(|e| format!("the sparse header from {url} {e}"))?;
+        let data: u64 = header.extents.iter().map(|(_, len)| len).sum();
+        log(format!(
+            "fetching {} of data ({} logical, {} extent(s)) from {url}",
+            human(data),
+            human(header.size),
+            header.extents.len()
+        ));
+
+        let zeros = vec![0u8; 1 << 20];
+        let feed_zeros = |hasher: &mut Sha256, mut n: u64| {
+            while n > 0 {
+                let k = n.min(zeros.len() as u64) as usize;
+                hasher.update(&zeros[..k]);
+                n -= k as u64;
+            }
+        };
+        let mut buf = vec![0u8; 1 << 20];
+        let mut pos = 0u64;
+        let mut moved = 8 + u64::from(head_len);
+        for &(off, len) in &header.extents {
+            feed_zeros(hasher, off - pos);
+            file.seek(std::io::SeekFrom::Start(off))
+                .await
+                .map_err(|e| format!("seeking the scratch image: {e}"))?;
+            let mut left = len;
+            while left > 0 {
+                let want = left.min(buf.len() as u64) as usize;
+                let n = r.read(&mut buf[..want]).await.map_err(|e| {
+                    fail(&format!("after {} of {}", human(moved), human(data)), e)
+                })?;
+                if n == 0 {
+                    self.preparation_stage("blob_read_failed");
+                    return Err(format!("{url} ended {} into a sparse body of {}", human(moved), human(data)));
+                }
+                hasher.update(&buf[..n]);
+                file.write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("writing the scratch image: {e}"))?;
+                left -= n as u64;
+                moved += n as u64;
+            }
+            pos = off + len;
+        }
+        feed_zeros(hasher, header.size - pos);
+        if r.read(&mut buf[..1]).await.map_err(|e| fail("at its end", e))? != 0 {
+            return Err(format!("{url} sent bytes after the last extent of a sparse body"));
+        }
+        file.set_len(header.size)
+            .await
+            .map_err(|e| format!("sizing the scratch image: {e}"))?;
+        Ok(moved)
     }
 
     // -- local: a store root on this host ----------------------------------
@@ -2367,6 +2520,109 @@ mod tests {
         assert_eq!(results.iter().filter(|r| matches!(r, Ok(p) if p.reused)).count(), 1);
     }
 
+    /// `logical` as `art serve` sends it to a client that accepts sparse
+    /// bodies: the extents that are not all zeros, at 4 KiB granularity.
+    fn asp_encode(logical: &[u8], size_override: Option<u64>) -> Vec<u8> {
+        let mut extents: Vec<(u64, u64)> = Vec::new();
+        for (i, block) in logical.chunks(4096).enumerate() {
+            if block.iter().all(|&b| b == 0) {
+                continue;
+            }
+            let off = (i * 4096) as u64;
+            match extents.last_mut() {
+                Some((o, l)) if *o + *l == off => *l += block.len() as u64,
+                _ => extents.push((off, block.len() as u64)),
+            }
+        }
+        let head = serde_json::to_vec(&serde_json::json!({
+            "size": size_override.unwrap_or(logical.len() as u64), "extents": extents
+        }))
+        .unwrap();
+        let mut out = b"ASP1".to_vec();
+        out.extend_from_slice(&(head.len() as u32).to_le_bytes());
+        out.extend_from_slice(&head);
+        for (off, len) in extents {
+            out.extend_from_slice(&logical[off as usize..(off + len) as usize]);
+        }
+        out
+    }
+
+    async fn sparse_store(body: Vec<u8>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{Router, routing::get, http::HeaderMap};
+        let accepts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = accepts.clone();
+        let app = Router::new().route("/blobs/:id", get(move |h: HeaderMap| {
+            let (body, seen) = (body.clone(), seen.clone());
+            async move {
+                seen.lock().unwrap().push(h.get("accept").and_then(|v| v.to_str().ok()).unwrap_or("").to_string());
+                ([("content-type", "application/vnd.art.sparse.v1")], body)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, accepts)
+    }
+
+    fn sparse_image() -> Vec<u8> {
+        let mut logical = vec![0u8; 4 << 20];
+        logical[..4096].fill(1);
+        logical[(3 << 20)..(3 << 20) + 10_000].fill(2);
+        logical
+    }
+
+    #[tokio::test]
+    async fn a_sparse_body_is_rebuilt_with_its_holes_and_verified_against_the_logical_digest() {
+        use std::os::unix::fs::MetadataExt;
+        let logical = sparse_image();
+        let digest = hex(&Sha256::digest(&logical));
+        let body = asp_encode(&logical, None);
+        let (base, accepts) = sparse_store(body.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let puller = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let dest = dir.path().join("rootfs.ext4");
+        let mut lines = Vec::new();
+        let moved = puller.fetch_blob(&base, &digest, None, &dest, logical.len() as u64, &mut |l| lines.push(l)).await.unwrap();
+
+        assert!(accepts.lock().unwrap()[0].contains("application/vnd.art.sparse.v1"));
+        assert_eq!(moved, body.len() as u64, "what crossed the wire, not the logical size");
+        assert_eq!(std::fs::read(&dest).unwrap(), logical);
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert!(meta.blocks() * 512 < logical.len() as u64, "the holes stay holes: {} blocks", meta.blocks());
+        assert!(lines.iter().any(|l| l.contains("of data") && l.contains("2 extent(s)")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_sparse_body_that_lies_is_refused() {
+        let logical = sparse_image();
+        let digest = hex(&Sha256::digest(&logical));
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let puller = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let mut corrupt = asp_encode(&logical, None);
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut truncated = asp_encode(&logical, None);
+        truncated.truncate(truncated.len() - 100);
+        let mut trailing = asp_encode(&logical, None);
+        trailing.push(0);
+        let cases = [
+            (corrupt, "hash to"),
+            (asp_encode(&logical, Some(1 << 20)), "were expected"),
+            (truncated, "ended"),
+            (trailing, "after the last extent"),
+            (b"GZIPnope".to_vec(), "did not start with"),
+        ];
+        for (body, why) in cases {
+            let (base, _) = sparse_store(body).await;
+            let err = puller
+                .fetch_blob(&base, &digest, None, &dir.path().join("x.ext4"), logical.len() as u64, &mut |_| {})
+                .await
+                .unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        }
+    }
+
     #[tokio::test]
     async fn rollout_rootfs_manifest_is_verified_before_its_blob_is_trusted() {
         use axum::{Router, routing::get, extract::{Path, State}, http::StatusCode, response::IntoResponse};
@@ -2484,6 +2740,39 @@ mod tests {
         assert_eq!(legacy.get(&url, Some("test-credential")).await.unwrap().status(), StatusCode::OK);
         assert_eq!(leaks.load(Ordering::SeqCst), 1, "legacy client retains its existing policy");
         server.abort();
+    }
+
+    /// A rootfs from a real `art serve`, timed, through whichever encoding
+    /// it answers with:
+    ///
+    /// ```sh
+    /// APP_LB_TEST_ART_URL=https://hub.heyo.work APP_LB_TEST_ART_REF=heyo/alpine:3.24 \
+    ///   cargo test --bin app-lb fetches_a_rootfs_from_a_real_store -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a live artifact store; see the doc comment"]
+    async fn fetches_a_rootfs_from_a_real_store() {
+        let (Ok(base), Ok(reference)) = (std::env::var("APP_LB_TEST_ART_URL"), std::env::var("APP_LB_TEST_ART_REF")) else {
+            eprintln!("set APP_LB_TEST_ART_URL and APP_LB_TEST_ART_REF to run this");
+            return;
+        };
+        let key = std::env::var("APP_LB_TEST_ART_KEY").ok();
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let puller = Puller::new("art".into(), dir.path().join("scratch"), None, vms);
+        let base = base.trim_end_matches('/');
+        let (digest, size) = puller.resolve_remote(base, &reference, key.as_deref(), Some(ROOTFS_FILENAME)).await.unwrap();
+        let dest = dir.path().join("rootfs.ext4");
+        let started = std::time::Instant::now();
+        let moved = puller.fetch_blob(base, &digest, key.as_deref(), &dest, size, &mut |l| eprintln!("{l}")).await.unwrap();
+        let blocks = std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(&dest).unwrap());
+        eprintln!(
+            "{reference}: {} logical, {} over the wire, {} on disk, in {:.2}s",
+            human(size),
+            human(moved),
+            human(blocks * 512),
+            started.elapsed().as_secs_f64()
+        );
     }
 
     /// Both transports, against a real store, laying out a real recipe.
