@@ -755,7 +755,6 @@ impl DiskStore {
             };
             let policy = policies.get(&sandbox_id).cloned().unwrap_or_default();
             let is_claimed = claimed.contains(&sandbox_id);
-            let held_by = hold_reason(state, is_claimed, policy.retain);
 
             let deployment = info
                 .and_then(|i| crate::vm::owner_of(&i.name).map(str::to_string))
@@ -768,6 +767,14 @@ impl DiskStore {
                         .find(|d| d.state().suspended.contains(&sandbox_id))
                         .map(|d| d.spec.id.clone())
                 });
+            // The daemon's storage inventory is host-wide. Absence from this
+            // registry does not authorize reclaiming another app-lb's disk,
+            // nor a disk whose daemon record (and ownership) has been lost.
+            let managed_here = deployment.as_ref()
+                .and_then(|id| deployments.get(id))
+                .is_some_and(|d| d.spec.is_managed());
+            let held_by = hold_reason(state, is_claimed, policy.retain)
+                .or_else(|| (!managed_here).then_some("ownership is not established by this app-lb"));
 
             disks.push(DiskInfo {
                 sandbox_id,
@@ -2101,6 +2108,36 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             format!("http://{addr}")
+        }
+
+        #[tokio::test]
+        async fn unidentified_disks_are_not_automatically_reclaimed() {
+            let url = fake_daemon(serde_json::json!({
+                "removed": ["/data/run/sb-1"], "failed": [], "bytes": 4096,
+            })).await;
+            let root = tempfile::tempdir().unwrap();
+            let registry = Arc::new(Registry::new(root.path().join("state.json")));
+            let vms = VmManager::new(
+                Some(url), None,
+                crate::mounts::MountStore::new(root.path().join("mounts"), 0),
+            ).unwrap();
+            let store = Arc::new(DiskStore::new(cfg_at(root.path()), vms, registry.clone()));
+            for populated in [false, true] {
+                if populated {
+                    registry.upsert(serde_json::from_value(serde_json::json!({
+                        "id": "another-service", "routes": [],
+                        "vm": {"driver": "kvm", "port": 8080}
+                    })).unwrap());
+                }
+                let inventory = store.inventory().await;
+                assert!(inventory.complete);
+                assert_eq!(inventory.disks.len(), 1);
+                let disk = &inventory.disks[0];
+                assert!(disk.held_by.is_some());
+                assert!(!disk.expired(u64::MAX / 2, 1, 1));
+                assert!(matches!(store.purge("sb-1", false).await,
+                    Err(DiskError::Held { .. })));
+            }
         }
 
         /// The whole failed-purge path, end to end.
