@@ -2,6 +2,7 @@
 //! and managed rollout actions execute it; there is no second rollout engine.
 use crate::{dispatch::Dispatcher, plan::Plan, store::Store};
 use anyhow::{Result, ensure};
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -335,13 +336,15 @@ pub async fn bundle_for_run(store: &Store, run_id: &str) -> Result<Option<Value>
             .fetch_optional(store.pool())
             .await?;
     let Some(promotion) = promotion else {
-        let historical: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM ci_release_promotion WHERE run_id=$1)",
-        )
-        .bind(run_id)
-        .fetch_one(store.pool())
-        .await?;
-        ensure!(!historical, "legacy bundled deployments are archived and cannot execute; select a service release");
+        let historical: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_promotion WHERE run_id=$1)")
+                .bind(run_id)
+                .fetch_one(store.pool())
+                .await?;
+        ensure!(
+            !historical,
+            "legacy bundled deployments are archived and cannot execute; select a service release"
+        );
         return Ok(None);
     };
     let id: String = promotion.get("bundle_id");
@@ -483,11 +486,18 @@ pub async fn admit(
         service_deployments: vec![crate::release_policy::ServiceDeploymentScope {
             environment: request.environment.clone(),
             service: candidate_service(&bundle["manifest"], request.service.as_deref())?,
-            obligations: plan.jobs.iter().flat_map(|job| {
-                (0..job.steps.len()).map(move |step| crate::release_policy::ServiceDeploymentObligation {
-                    job: job.key.clone(), step,
+            obligations: plan
+                .jobs
+                .iter()
+                .flat_map(|job| {
+                    (0..job.steps.len()).map(move |step| {
+                        crate::release_policy::ServiceDeploymentObligation {
+                            job: job.key.clone(),
+                            step,
+                        }
+                    })
                 })
-            }).collect(),
+                .collect(),
         }],
         service_targets: policy.service_targets.clone(),
         pooler_targets: policy.pooler_targets.clone(),
@@ -591,7 +601,10 @@ async fn persist(
         let failed: bool = sqlx::query_scalar("SELECT coalesce((SELECT status IN ('failure','cancelled') FROM ci_release_service_deployment WHERE environment=$1 AND service=$2 AND completed_at IS NOT NULL AND status<>'skipped' ORDER BY completed_at DESC,effect_key DESC,created_at,id LIMIT 1),
             (SELECT r.status IN ('failure','cancelled') FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.service=$2 AND p.completed_at IS NOT NULL ORDER BY p.created_at DESC,p.run_id DESC LIMIT 1),false)")
             .bind(&request.environment).bind(&service).fetch_one(&mut *tx).await?;
-        ensure!(failed, "recovery requires a settled failed service deployment");
+        ensure!(
+            failed,
+            "recovery requires a settled failed service deployment"
+        );
     } else {
         for prerequisite in &policy.requires {
             let passed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_deployment WHERE environment=$1 AND bundle_id=$2 AND service=$3 AND status='success') OR EXISTS(SELECT 1 FROM ci_release_service_promotion p JOIN ci_run r ON r.id=p.run_id WHERE p.environment=$1 AND p.bundle_id=$2 AND p.service=$3 AND p.completed_at IS NOT NULL AND r.status='success' AND NOT EXISTS(SELECT 1 FROM ci_release_service_deployment h WHERE h.run_id=p.run_id AND h.environment=p.environment AND h.service=p.service))")
@@ -631,8 +644,16 @@ async fn persist(
     sqlx::query("UPDATE ci_release_service_environment SET active_run=$2,automation_held=automation_held OR $3,updated_at=now() WHERE name=$1 AND service=$4")
         .bind(&request.environment).bind(&run_id).bind(!automatic).bind(&service).execute(&mut *tx).await?;
     let scopes = crate::release_history::scopes(plan)?;
-    crate::release_history::enroll(&mut tx, &run_id, repository, &scopes,
-        "promotion", Some(&request.bundle_id), automatic).await?;
+    crate::release_history::enroll(
+        &mut tx,
+        &run_id,
+        repository,
+        &scopes,
+        "promotion",
+        Some(&request.bundle_id),
+        automatic,
+    )
+    .await?;
     tx.commit().await?;
     Ok(
         json!({"run_id":run_id,"environment":request.environment,"service":service,"bundle_id":request.bundle_id,"request_id":request.request_id}),
@@ -727,7 +748,6 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
     let configured = policies(d.config.release_environments.as_deref())?;
     let mut environments = Vec::new();
     for (name, policy) in configured {
-        let mut services = Vec::new();
         let mut names: std::collections::BTreeSet<String> =
             policy.services.keys().cloned().collect();
         // Also show already admitted scoped state for a legacy singleton policy,
@@ -740,22 +760,32 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
             .fetch_all(d.store.pool())
             .await?,
         );
-        for service in names {
-            let mut view = service_view(&d.store, &name, &service).await?;
-            let configured = policy.services.is_empty() || policy.services.contains_key(&service);
-            view["configured"] = json!(configured);
-            if configured {
-                let resolved = if policy.services.is_empty() {
-                    policy.clone()
-                } else {
-                    select(&policy, Some(&service))?.1
-                };
-                view["repository"] = json!(resolved.repository);
-                view["mode"] = json!(resolved.mode);
-                view["requires"] = json!(resolved.requires);
+        // These reads are independent. Preserve service ordering while bounding
+        // concurrent reads instead of accumulating a database round trip per service.
+        let services: Vec<Value> = futures::stream::iter(names.iter().map(|service| {
+            let name = &name;
+            let policy = &policy;
+            async move {
+                let mut view = service_view(&d.store, name, service).await?;
+                let configured =
+                    policy.services.is_empty() || policy.services.contains_key(service);
+                view["configured"] = json!(configured);
+                if configured {
+                    let resolved = if policy.services.is_empty() {
+                        policy.clone()
+                    } else {
+                        select(policy, Some(service))?.1
+                    };
+                    view["repository"] = json!(resolved.repository);
+                    view["mode"] = json!(resolved.mode);
+                    view["requires"] = json!(resolved.requires);
+                }
+                Ok::<_, anyhow::Error>(view)
             }
-            services.push(view);
-        }
+        }))
+        .buffered(8)
+        .try_collect()
+        .await?;
         environments.push(json!({"name":name,"mode":policy.mode,"repository":policy.repository,"requires":policy.requires,
             "services":services}));
     }
@@ -2043,9 +2073,17 @@ mod tests {
             .bind(&historical_manifest)
             .bind(hex::encode(Sha256::digest(serde_json::to_vec(&historical_manifest).unwrap())))
             .execute(store.pool()).await.unwrap();
-        assert!(bundle_for_run(&store, "legacy-run").await.unwrap_err()
-            .to_string().contains("archived and cannot execute"));
-        assert_eq!(super::bundle(&store, "legacy-bundle").await.unwrap()["manifest"], historical_manifest);
+        assert!(
+            bundle_for_run(&store, "legacy-run")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("archived and cannot execute")
+        );
+        assert_eq!(
+            super::bundle(&store, "legacy-bundle").await.unwrap()["manifest"],
+            historical_manifest
+        );
         let visible = crate::release_catalog::list(&store, None).await.unwrap();
         assert!(visible.iter().any(|r| r["id"] == "old"));
         assert!(!visible.iter().any(|r| r["id"] == "legacy-bundle"));
