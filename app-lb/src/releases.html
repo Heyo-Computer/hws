@@ -102,8 +102,8 @@
     const bundle = service?.state?.[kind + '_bundle'];
     return bundle ? {bundle_id:bundle,revision:release(bundle)?.manifest?.revision} : null;
   };
-  const deploymentLabel = d => d ? release(d.bundle_id)?.name || d.revision || d.bundle_id || 'Revision not recorded' : 'None recorded';
-  const deploymentDetails = (service, d) => !d ? '' : `<span class="sub"><code>${esc(d.revision || 'Revision not recorded')}</code></span>${!candidates(service.service).some(r => r.id === d.bundle_id) ? '<span class="sub">Retained artifact unavailable</span>' : ''}`;
+  const deploymentLabel = d => d ? d.version || release(d.bundle_id)?.name || 'Version not recorded' : 'None recorded';
+  const deploymentDetails = (service, d) => !d ? '' : `<span class="sub"><code title="${esc(d.revision)}">${esc(short(d.revision))}</code></span>${!candidates(service.service).some(r => r.id === d.bundle_id) ? '<span class="sub">Retained artifact unavailable</span>' : ''}`;
   const origin = p => p.source === 'ordinary' ? 'Ordinary CI deployment' : p.source === 'legacy_import' ? 'Imported deployment record' : p.source === 'promotion' ? (p.automatic ? 'Automatic promotion' : 'Manual promotion') : (p.automatic ? 'Automatic' : 'Manual');
   const selectedEnv = () => environments.find(e => e.name === $('environment').value);
   const selectedService = () => selectedEnv()?.services?.find(s => s.service === $('service').value);
@@ -216,13 +216,28 @@
     renderService();
   }
   async function refresh() {
-    const [available, env, buildResult, fleetResult, serviceResult] = await Promise.all([catalog(),api('release-environments'),api('release-builds'),get('/fleet/deployments').then(value => ({value}),error => ({error})),observations().then(value => ({value}),error => ({error}))]);
+    const [available, env, buildResult] = await Promise.all([catalog(),api('release-environments'),api('release-builds')]);
     releases = available; environments = env.environments; builds = buildResult.builds;
-    fleet = fleetResult.value; services = serviceResult.value || []; inventoryError = fleetResult.error?.message || ''; serviceError = serviceResult.error?.message || '';
     const selected = $('environment').value;
     $('environment').innerHTML = environments.map(e => `<option>${esc(e.name)}</option>`).join('');
     if (environments.some(e => e.name === selected)) $('environment').value = selected;
-    renderEnvironment(); renderInventory(); $('updated').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
+    renderEnvironment(); $('updated').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
+    if ($('inventory').closest('details').open) void refreshInventory();
+  }
+  let inventoryLoading = false;
+  async function refreshInventory() {
+    if (inventoryLoading) return;
+    inventoryLoading = true;
+    $('inventory').textContent = 'Loading regional inventory…';
+    try {
+      const [fleetResult, serviceResult] = await Promise.all([
+        get('/fleet/deployments').then(value => ({value}),error => ({error})),
+        observations().then(value => ({value}),error => ({error}))
+      ]);
+      fleet = fleetResult.value; services = serviceResult.value || [];
+      inventoryError = fleetResult.error?.message || ''; serviceError = serviceResult.error?.message || '';
+      renderInventory();
+    } finally { inventoryLoading = false; }
   }
   async function perform(operation) {
     if (busy) return;
@@ -232,6 +247,7 @@
     finally { busy = false; $('refresh').disabled = false; }
   }
   $('refresh').onclick = () => perform(async () => {});
+  $('inventory').closest('details').ontoggle = event => { if (event.target.open) void refreshInventory(); };
   $('environment').onchange = renderEnvironment; $('service').onchange = renderService; $('candidate').onchange = renderSelection; $('search').oninput = renderInventory;
   $('service-releases').onclick = event => { const button = event.target.closest('[data-service]'); if (button) { $('service').value = button.dataset.service; renderService(); } };
   $('catalog').onclick = event => {

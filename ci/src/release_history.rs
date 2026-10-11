@@ -418,56 +418,45 @@ async fn settle_in(mut tx: Transaction<'_, Postgres>, id: &str) -> Result<()> {
 }
 
 pub(crate) async fn view(store: &Store, environment: &str, service: &str) -> Result<Option<Value>> {
-    let found: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_release_service_deployment WHERE environment=$1 AND service=$2)")
-        .bind(environment).bind(service).fetch_one(store.pool()).await?;
-    if !found {
-        return Ok(None);
-    }
-    let state: Value = sqlx::query_scalar(
-        "SELECT to_jsonb(e) FROM ci_release_service_environment e WHERE name=$1 AND service=$2",
-    )
-    .bind(environment)
-    .bind(service)
-    .fetch_one(store.pool())
-    .await?;
-    let mut result = json!({"state":state,"current_deployment":null,"previous_deployment":null});
-    for key in ["current_deployment", "previous_deployment"] {
-        if let Some(id) = state[key].as_str() {
-            result[key] = sqlx::query_scalar("SELECT to_jsonb(h)-'obligations'-'release_identity' FROM ci_release_service_deployment h WHERE id=$1")
-                .bind(id).fetch_one(store.pool()).await?;
-        }
-    }
-    let mut history: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(h)-'release_identity'
-        FROM ci_release_service_deployment h WHERE environment=$1 AND service=$2
-        ORDER BY (status='running') DESC,completed_at DESC NULLS LAST,effect_key DESC,created_at,id LIMIT 20")
-        .bind(environment).bind(service).fetch_all(store.pool()).await?;
-    for entry in &mut history {
-        let receipts = sqlx::query(&format!("{EFFECTIVE_STEPS}{RECEIPTS}"))
-            .bind(entry["run_id"].as_str())
-            .bind(&entry["obligations"])
-            .fetch_all(store.pool())
-            .await?;
-        entry["deployments"] = json!(
-            receipts
-                .iter()
-                .map(|r| json!({"service":r.get::<&str,_>("service_id"),
-            "revision":r.get::<&str,_>("sha"),"status":r.get::<&str,_>("status")}))
-                .collect::<Vec<_>>()
-        );
-        entry.as_object_mut().unwrap().remove("obligations");
-    }
-    let recovery: bool = sqlx::query_scalar("SELECT COALESCE((SELECT status IN ('failure','cancelled')
-        FROM ci_release_service_deployment WHERE environment=$1 AND service=$2 AND completed_at IS NOT NULL
-        AND status<>'skipped' ORDER BY completed_at DESC,effect_key DESC,created_at,id LIMIT 1),false)")
-        .bind(environment).bind(service).fetch_one(store.pool()).await?;
-    result["history"] = json!(history);
-    result["recovery_required"] = json!(recovery);
-    result["recovery_bundle"] = if recovery {
-        state["current_bundle"].clone()
-    } else {
-        Value::Null
-    };
-    Ok(Some(result))
+    // One database round trip per service, not one per history entry. Reuse
+    // retry lineage, but do not join artifact-verification tables for display.
+    let steps = EFFECTIVE_STEPS
+        .replace("$1", "h.run_id")
+        .replace("$2", "h.obligations");
+    let sql = format!("SELECT jsonb_build_object(
+        'state',to_jsonb(e),
+        'current_deployment',CASE WHEN current.id IS NOT NULL THEN
+            to_jsonb(current)-'obligations'-'release_identity' || jsonb_build_object('version',cb.name) END,
+        'previous_deployment',CASE WHEN previous.id IS NOT NULL THEN
+            to_jsonb(previous)-'obligations'-'release_identity' || jsonb_build_object('version',pb.name) END,
+        'history',COALESCE((SELECT jsonb_agg(item ORDER BY running DESC,completed_at DESC NULLS LAST,effect_key DESC,created_at,id)
+            FROM (SELECT h.id,h.status='running' AS running,h.completed_at,h.effect_key,h.created_at,
+                to_jsonb(h)-'obligations'-'release_identity' || jsonb_build_object('version',b.name,
+                'deployments',({steps}
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object('service',d.service_id,'revision',d.sha,'status',d.status) ORDER BY d.id),'[]'::jsonb)
+                    FROM ci_service_deployment d WHERE EXISTS(SELECT 1 FROM obligations o
+                        WHERE d.step_id=o.step_id OR d.id=o.deployment_id))) AS item
+                FROM (SELECT * FROM ci_release_service_deployment
+                    WHERE environment=$1 AND service=$2
+                    ORDER BY (status='running') DESC,completed_at DESC NULLS LAST,effect_key DESC,created_at,id LIMIT 20) h
+                LEFT JOIN ci_release_bundle b ON b.id=h.bundle_id) entries),'[]'::jsonb),
+        'recovery_required',COALESCE(latest.status IN ('failure','cancelled'),false),
+        'recovery_bundle',CASE WHEN latest.status IN ('failure','cancelled') THEN e.current_bundle END)
+        FROM ci_release_service_environment e
+        LEFT JOIN ci_release_service_deployment current ON current.id=e.current_deployment
+        LEFT JOIN ci_release_bundle cb ON cb.id=current.bundle_id
+        LEFT JOIN ci_release_service_deployment previous ON previous.id=e.previous_deployment
+        LEFT JOIN ci_release_bundle pb ON pb.id=previous.bundle_id
+        LEFT JOIN LATERAL (SELECT status FROM ci_release_service_deployment
+            WHERE environment=e.name AND service=e.service AND completed_at IS NOT NULL AND status<>'skipped'
+            ORDER BY completed_at DESC,effect_key DESC,created_at,id LIMIT 1) latest ON true
+        WHERE e.name=$1 AND e.service=$2 AND EXISTS(SELECT 1 FROM ci_release_service_deployment
+            WHERE environment=e.name AND service=e.service)");
+    Ok(sqlx::query_scalar(&sql)
+        .bind(environment)
+        .bind(service)
+        .fetch_optional(store.pool())
+        .await?)
 }
 
 /// Explicit operator attribution for old receipts. Never inferred from today's
