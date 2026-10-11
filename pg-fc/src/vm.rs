@@ -82,12 +82,44 @@ pub(crate) fn daemon_base_url() -> &'static str {
     })
 }
 
+/// The bearer the daemon wants, if it wants one: `PG_VM_POOL_DAEMON_API_KEY`,
+/// else `HEYO_API_KEY` (what heyo-sdk falls back to on its own).
+///
+/// A keyless `heyvm --api` needs neither. A daemon that requires one — us5's
+/// runs with `CLOUD_INTERNAL_API_KEY` — answers 401 to every call that does not
+/// carry it, and the calls below that go around the SDK (resize, the create
+/// gate, the capability probe, create-on-image) would otherwise never send it.
+pub(crate) fn daemon_api_key() -> Option<&'static str> {
+    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        ["PG_VM_POOL_DAEMON_API_KEY", "HEYO_API_KEY"]
+            .iter()
+            .filter_map(|v| std::env::var(v).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty())
+    })
+    .as_deref()
+}
+
+/// `request` with the daemon's bearer attached, when one is configured.
+fn daemon_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    with_bearer(request, daemon_api_key())
+}
+
+fn with_bearer(request: reqwest::RequestBuilder, key: Option<&str>) -> reqwest::RequestBuilder {
+    match key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
+}
+
 /// Fresh options targeting the local heyvmd daemon. Built per call so we don't
 /// rely on `HeyoClientOptions: Clone`. Shared with the dashboard so its control
 /// actions hit the same daemon.
 pub(crate) fn local_opts() -> HeyoClientOptions {
     HeyoClientOptions {
         base_url: Some(daemon_base_url().to_string()),
+        api_key: daemon_api_key().map(str::to_string),
         ..Default::default()
     }
 }
@@ -3163,8 +3195,8 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
         .timeout(Duration::from_secs(600))
         .build()
         .context("building HTTP client for daemon resize")?;
-    let resp = client
-        .post(&url)
+    let resp = daemon_auth(client
+        .post(&url))
         .header("content-type", "application/json")
         .body(format!("{{\"disk_size_gb\":{target_gb}}}"))
         .send()
@@ -3230,8 +3262,8 @@ async fn resize_disk_online_at(
         .timeout(Duration::from_secs(240))
         .build()
         .context("building HTTP client for daemon online resize")?;
-    let resp = match client
-        .post(&url)
+    let resp = match daemon_auth(client
+        .post(&url))
         .header("content-type", "application/json")
         .body(format!("{{\"disk_size_gb\":{target_gb}}}"))
         .send()
@@ -3288,7 +3320,7 @@ pub(crate) async fn refresh_create_gate() {
             .timeout(Duration::from_secs(5))
             .build()
             .ok()?;
-        let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        let body: serde_json::Value = daemon_auth(client.get(&url)).send().await.ok()?.json().await.ok()?;
         body.get("createGate")?.get("available")?.as_i64()
     };
     let value = read.await.unwrap_or(-1);
@@ -3323,7 +3355,7 @@ pub(crate) async fn daemon_adopts_data_images() -> bool {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .ok()?;
-            let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+            let body: serde_json::Value = daemon_auth(client.get(&url)).send().await.ok()?.json().await.ok()?;
             Some(
                 body.get("capabilities")?
                     .as_array()?
@@ -3385,8 +3417,8 @@ pub(crate) async fn create_vm_on_image(
         .timeout(DEPLOY_HTTP_TIMEOUT)
         .build()
         .context("building HTTP client for the adopt-image create")?;
-    let resp = client
-        .post(&url)
+    let resp = daemon_auth(client
+        .post(&url))
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
@@ -5312,6 +5344,19 @@ mod tests {
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
     }
 
+
+    /// The calls that go around the SDK carry the daemon's bearer when one is
+    /// configured, and nothing when it is not (a keyless `heyvm --api`).
+    #[test]
+    fn raw_daemon_calls_carry_the_bearer_only_when_configured() {
+        let client = reqwest::Client::new();
+        let with = super::with_bearer(client.post("http://daemon/sandboxes/x/resize"), Some("k-1"))
+            .build()
+            .unwrap();
+        assert_eq!(with.headers()["authorization"], "Bearer k-1");
+        let without = super::with_bearer(client.get("http://daemon/health"), None).build().unwrap();
+        assert!(without.headers().get("authorization").is_none());
+    }
     #[tokio::test]
     async fn resize_disk_rejects_out_of_range_sizes_without_calling_out() {
         let (base, seen) = resize_stub(axum::http::StatusCode::OK, "{}").await;

@@ -1072,6 +1072,12 @@ impl Store {
 
         Self::add_event(tx, run_id, None, None, None, "ci.run.status.v1", "queued", None).await?;
 
+        if req.source != "release-promotion" {
+            let scopes = crate::release_history::scopes(plan)
+                .map_err(|e| StoreError::source(run_id, e))?;
+            crate::release_history::enroll(tx, run_id, &req.repo_url, &scopes, "ordinary", None, false)
+                .await.map_err(|e| StoreError::source(run_id, e))?;
+        }
         Ok(())
     }
 

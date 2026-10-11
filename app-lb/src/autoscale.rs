@@ -2077,8 +2077,7 @@ impl Autoscaler {
         // Replicas of a deployment this LB still has: unroutable or unhealthy,
         // so destroyed and replaced exactly as before.
         let mut orphans = Vec::new();
-        // Sandboxes named for a deployment this LB does *not* have. Stopped,
-        // never destroyed — see `leave_unowned`.
+        // Missing registry membership is not permission to touch a sandbox.
         let mut unowned = Vec::new();
 
         let indexed = vm::index_by_id(fleet.clone());
@@ -2162,54 +2161,19 @@ impl Autoscaler {
             }
         }
 
-        self.leave_unowned(deployments.is_empty(), unowned).await;
+        self.leave_unowned(unowned);
     }
 
-    /// Deal with sandboxes named for deployments this LB does not have.
-    ///
-    /// They used to be destroyed — `kill_unknown`, which purges the disk — on
-    /// the theory that "ours, but not in the state file" can only mean a
-    /// deployment deleted while this LB was down. It can also mean this is not
-    /// the LB that owns them. On 2026-09-29 `app-lb --version`, run on a host
-    /// whose app-lb was live, started a second instance with an empty state
-    /// file (arguments were ignored then; see `cli`), and this sweep purged
-    /// every sandbox the first one was serving — workspaces uncaptured.
-    ///
-    /// So, two rules:
-    ///
-    /// - **An LB with no deployments touches nothing.** Empty state is
-    ///   indistinguishable from "the wrong state file", and a fresh install on
-    ///   a host with leftovers loses nothing by leaving them: each still has
-    ///   the daemon's TTL, which nobody is renewing.
-    /// - **Otherwise stop, never destroy.** A stopped sandbox keeps its disk;
-    ///   `/disks` lists it and the disk sweep reclaims it after
-    ///   `APP_LB_DISK_TTL_SECS`, the same as any other unclaimed disk. A
-    ///   mistake becomes an outage a person can undo, not data loss.
-    async fn leave_unowned(&self, registry_empty: bool, unowned: Vec<(String, String)>) {
-        if unowned.is_empty() {
-            return;
-        }
-        if registry_empty {
-            tracing::warn!(
-                count = unowned.len(),
-                "this LB has no deployments but the daemon runs sandboxes named for some; \
-                 leaving every one of them alone (another app-lb may own them, or this is \
-                 the wrong APP_LB_STATE_PATH)",
-            );
-            return;
-        }
+    /// Another app-lb may own these sandboxes even when this registry is not
+    /// empty. Stopping them is an outage, and exposes their disks to expiry.
+    /// Removal requires an explicit retirement or operator action instead.
+    fn leave_unowned(&self, unowned: Vec<(String, String)>) {
         for (id, owner) in unowned {
-            if self.registry.allocation_protects(&id) { continue; }
-            if self.workspaces.source_retained(&id) { continue; }
             tracing::warn!(
                 deployment = %owner,
                 sandbox = %id,
-                "stopping a VM whose deployment this LB does not have; its disk is kept \
-                 until the disk sweep's TTL",
+                "leaving a VM whose deployment this LB does not manage untouched",
             );
-            if let Err(e) = self.runtime.stop_unknown(&id).await {
-                tracing::warn!(sandbox = %id, error = %e, "failed to stop unowned VM");
-            }
         }
     }
 
@@ -4035,17 +3999,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_sandbox_of_an_unknown_deployment_is_stopped_never_destroyed() {
+        async fn a_nonempty_registry_leaves_another_deployments_sandbox_untouched() {
             let (url, daemon, server) = daemon().await;
             let (scaler, _registry) = autoscaler_against(&url, spec());
             scaler.adopt_existing().await;
-            assert_eq!(*daemon.stopped.lock().unwrap(), vec!["sb-running".to_string()]);
-            assert!(daemon.deleted.lock().unwrap().is_empty(), "its disk is kept");
+            assert!(daemon.stopped.lock().unwrap().is_empty(), "another deployment must keep serving");
+            assert!(daemon.deleted.lock().unwrap().is_empty(), "another deployment keeps its disk");
             server.abort();
         }
 
         #[tokio::test]
-        async fn the_suspended_sweep_leaves_unknown_stopped_sandboxes_to_the_disk_ttl() {
+        async fn the_suspended_sweep_leaves_unknown_stopped_sandboxes_untouched() {
             let (url, daemon, server) = daemon().await;
             let (scaler, _registry) = autoscaler_against(&url, spec());
             scaler.sweep_suspended().await;

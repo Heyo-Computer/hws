@@ -616,6 +616,92 @@ jobs:
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn ordinary_deployment_retains_a_promotable_release_before_completion() {
+        use crate::artifacts::{ArtifactSink, ArtifactError, ArtifactRef, StoredArtifact};
+        struct Sink { fail: bool }
+        #[async_trait::async_trait]
+        impl ArtifactSink for Sink {
+            fn kind(&self) -> &'static str { "artifacts" }
+            async fn put(&self, _: &ArtifactRef, _: Vec<u8>) -> Result<StoredArtifact, ArtifactError> { unreachable!() }
+            async fn get(&self, _: &StoredArtifact) -> Result<Vec<u8>, ArtifactError> { unreachable!() }
+            async fn retain(&self, stored: &StoredArtifact, _: &str) -> Result<StoredArtifact, ArtifactError> {
+                if self.fail { return Err(ArtifactError::Transport("unavailable".into())); }
+                Ok(StoredArtifact { uri: "retained-cloud".into(), ..stored.clone() })
+            }
+        }
+        let (store, _, _dir) = fixture().await;
+        add_run(&store, "release", "release.yml", "success").await;
+        add_run(&store, "build", "cloud.yml", "success").await;
+        let mut tx = store.pool().begin().await.unwrap();
+        record(&mut tx, "release", &["build".into()]).await.unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='running' WHERE id='release'")
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_run_source(run_id,descriptor) VALUES('build',$1)")
+            .bind(b"retained source descriptor".as_slice()).execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status)
+            VALUES('release','hash','source','base','refs/heads/main','{}','source',$1,'published')")
+            .bind(serde_json::json!({"source_sha":"source","release_sha":"source","git_ref":"refs/heads/main","versions":{}}))
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri)
+            VALUES('artifact','build','build.check','cloud','artifacts',$1,37,'original-cloud')")
+            .bind("a".repeat(64)).execute(store.pool()).await.unwrap();
+        for (service, step) in [("cloud",0),("worker",1)] {
+            sqlx::query("INSERT INTO ci_release_service_environment(name,service,repository) VALUES('stage',$1,'repo')")
+                .bind(service).execute(store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_release_service_deployment(id,run_id,environment,service,source,obligations,created_at)
+                VALUES($1,'release','stage',$1,'ordinary',$2,now())")
+                .bind(service).bind(serde_json::json!([{"job":"check","step":step}]))
+                .execute(store.pool()).await.unwrap();
+        }
+        let unavailable = Sink { fail: true };
+        let available = Sink { fail: false };
+        let retain = |fail| crate::release_build::retain_submission(
+            &store, if fail { &unavailable } else { &available },
+            "release", "release.check.0", "cloud.yml", "cloud");
+        assert!(retain(true).await.is_err());
+        assert!(crate::release_catalog::list(&store, None).await.unwrap().is_empty());
+        retain(false).await.unwrap();
+        retain(false).await.unwrap();
+        crate::release_build::retain_submission(&store, &Sink { fail: false },
+            "release", "release.check.1", "cloud.yml", "cloud").await.unwrap();
+        let catalog = crate::release_catalog::list(&store, None).await.unwrap();
+        assert_eq!(catalog.len(), 2, "services may retain one producer without rebuilding");
+        let cloud = catalog.iter().find(|r| r["manifest"]["components"].get("cloud").is_some()).unwrap();
+        assert!(cloud["name"].as_str().unwrap().starts_with("cloud-"));
+        assert_eq!(cloud["manifest"]["components"]["cloud"]["uri"], "retained-cloud");
+        assert_eq!(store.get_run("release").await.unwrap().unwrap().status, "running");
+        assert_eq!(crate::release_history::view(&store, "stage", "cloud").await.unwrap().unwrap()["history"][0]["version"], cloud["name"]);
+        add_run(&store, "rollback", "promotion.yml", "running").await;
+        sqlx::query("INSERT INTO ci_release_service_promotion(run_id,environment,service,request_id,bundle_id,automatic,policy)
+            VALUES('rollback','stage','cloud','rollback',$1,false,'{}')")
+            .bind(cloud["id"].as_str()).execute(store.pool()).await.unwrap();
+        let selected = crate::release_environment::bundle_for_run(&store, "rollback").await.unwrap().unwrap();
+        assert_eq!(selected["manifest"], cloud["manifest"]);
+        let artifact = artifact(&store, "rollback", "cloud.yml", "cloud", None).await.unwrap();
+        assert_eq!(artifact.digest.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(artifact.uri, "retained-cloud");
+        // Repair imported history only when its original effect proves the
+        // selected bytes. A same-revision but different artifact is insufficient.
+        sqlx::query("UPDATE ci_release_service_deployment SET bundle_id=NULL,source='legacy_import',
+            status='success',release_identity=$1 WHERE id='cloud'")
+            .bind(serde_json::json!({"revision":"source","artifacts":["b".repeat(64)],"unverified_receipts":[]}))
+            .execute(store.pool()).await.unwrap();
+        assert!(retain(false).await.is_err());
+        sqlx::query("UPDATE ci_release_service_deployment SET release_identity=$1 WHERE id='cloud'")
+            .bind(serde_json::json!({"revision":"source","artifacts":["a".repeat(64)],"unverified_receipts":[]}))
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_release_service_environment SET current_deployment='cloud',current_bundle=NULL WHERE service='cloud'")
+            .execute(store.pool()).await.unwrap();
+        retain(false).await.unwrap();
+        let repaired = crate::release_history::view(&store, "stage", "cloud").await.unwrap().unwrap();
+        assert_eq!(repaired["current_deployment"]["version"], cloud["name"]);
+        assert_eq!(repaired["current_deployment"]["source"], "legacy_import");
+        assert_eq!(repaired["state"]["current_bundle"], cloud["id"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
     async fn release_catalog_pins_provenance_and_rejects_replacement() {
         use crate::release_catalog::{self, Request, Selection};
         let (store, _, _dir) = fixture().await;

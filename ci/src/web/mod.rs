@@ -643,6 +643,15 @@ async fn submit(
             &crate::dispatch::DispatchError::NotInstalled(repo.namespace.clone()).to_string(),
         );
     }
+    // A tenant-only instance has no fleet repositories: a shared-secret submit
+    // or a fleet registration's token is refused here, before the source is
+    // unpacked, and again by the dispatcher.
+    if state.config.tenant_only && !repo.is_some_and(|r| r.is_tenant()) {
+        return error(
+            StatusCode::FORBIDDEN,
+            &crate::dispatch::DispatchError::TenantOnly.to_string(),
+        );
+    }
 
     // Present only when a browser reached this through app-lb's gate; `git
     // submit` arrives with a token and no identity, so the payload's `pusher` is
@@ -679,6 +688,8 @@ async fn submit(
         Err(crate::dispatch::DispatchError::ControllerUnavailable(message)) =>
             error(StatusCode::SERVICE_UNAVAILABLE, &message),
         Err(e @ crate::dispatch::DispatchError::NotInstalled(_)) =>
+            error(StatusCode::FORBIDDEN, &e.to_string()),
+        Err(e @ crate::dispatch::DispatchError::TenantOnly) =>
             error(StatusCode::FORBIDDEN, &e.to_string()),
         Err(e) => {
             tracing::warn!("submit failed: {e}");
@@ -2669,6 +2680,46 @@ mod tests {
         let text = String::from_utf8(to_bytes(res.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
         assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
         assert!(text.contains("has not installed ci"), "{text}");
+
+        // On a tenant-only instance a fleet registration's token is refused,
+        // and an installed namespace's is not refused for that reason.
+        let fleet = store.register_repo(&format!("{url}-fleet"), "fleet", None, None, None).await.unwrap();
+        let (_, fleet_token) = store.create_repo_token(&fleet.id, "f", None).await.unwrap();
+        let (_, a_token) = store.create_repo_token(&a.id, "a", None).await.unwrap();
+        let mut only = Arc::try_unwrap(test_config()).unwrap();
+        only.plugin_api_token = Some(PLUGIN.into());
+        only.tenant_only = true;
+        let only_tenants = Arc::new(crate::tenants::Tenants::fixed(
+            crate::tenants::TenantSet {
+                enabled: true,
+                installed_in: vec!["team-a".into()],
+                tenant_network: Some("tenants".into()),
+                ..Default::default()
+            },
+            true,
+        ));
+        let (only_app, _) = test_router_with(Arc::new(only), only_tenants).await;
+        for (token, refused) in [(&fleet_token, true), (&a_token, false)] {
+            let res = only_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/submit")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::from(r#"{"source":{"format":"git-patch","contentBase64":""}}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let text = String::from_utf8(to_bytes(res.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+            assert_eq!(text.contains("builds only for namespaces"), refused, "{status} {text}");
+            if refused {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+            }
+        }
+        store.delete_repo(&fleet.id).await.unwrap();
 
         for r in store.repos_in("team-a").await.unwrap() {
             store.delete_repo(&r.id).await.unwrap();

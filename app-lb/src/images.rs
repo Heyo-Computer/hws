@@ -63,6 +63,9 @@ use crate::vm::{ImageDelete, VmManager};
 pub const DEFAULT_IDLE_SECS: u64 = 86_400;
 pub const DEFAULT_SWEEP_SECS: u64 = 600;
 pub const DEFAULT_PRESSURE_PCT: u8 = 85;
+pub const DEFAULT_WARM_SECS: u64 = 900;
+/// Where a warm-set entry without a `<store>|` prefix is pulled from.
+pub const DEFAULT_WARM_STORE: &str = "https://hub.heyo.work";
 /// No image is offloaded within this long of being first seen: a pull's
 /// upload lands before the rollout that references it.
 pub const MIN_AGE_SECS: u64 = 600;
@@ -125,6 +128,49 @@ pub struct ImagesConfig {
     /// images may stay as cache before the least recently used go. Unset:
     /// only disk pressure removes a pulled image.
     pub cache_budget_bytes: Option<u64>,
+    /// `APP_LB_IMAGE_WARM`: images pulled ahead of any deployment asking,
+    /// and held so nothing removes them.
+    pub warm: Vec<WarmEntry>,
+    /// `APP_LB_IMAGE_WARM_SECS`: how often the warm set's tags are
+    /// re-resolved; `0` warms once at startup.
+    pub warm_secs: u64,
+}
+
+/// One entry of the warm set: a reference in a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmEntry {
+    pub store: String,
+    pub artifact_ref: String,
+}
+
+impl WarmEntry {
+    /// `<store>|<ref>`, or a bare `<ref>` in `default_store`. Entries are
+    /// separated by commas or whitespace.
+    pub fn parse_list(list: &str, default_store: &str) -> Vec<Self> {
+        list.split(|c: char| c == ',' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .filter_map(|e| {
+                let (store, r) = e.split_once('|').unwrap_or((default_store, e));
+                let (store, r) = (store.trim().trim_end_matches('/'), r.trim());
+                (!store.is_empty() && !r.is_empty()).then(|| Self {
+                    store: store.to_string(),
+                    artifact_ref: r.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// `<store>/<ref>`: how the warm set names an entry in logs and on
+    /// [`Reference::Warm`].
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.store, self.artifact_ref)
+    }
+
+    fn holds(&self, record: &ImageRecord) -> bool {
+        record.store.as_deref().map(|s| s.trim().trim_end_matches('/')) == Some(self.store.as_str())
+            && record.artifact_ref.as_deref() == Some(self.artifact_ref.as_str())
+    }
 }
 
 impl Default for ImagesConfig {
@@ -137,6 +183,8 @@ impl Default for ImagesConfig {
             offload_store: None,
             offload_store_key: None,
             cache_budget_bytes: None,
+            warm: Vec::new(),
+            warm_secs: DEFAULT_WARM_SECS,
         }
     }
 }
@@ -182,6 +230,15 @@ impl ImagesConfig {
                     }
                 }),
             cache_budget_bytes: num("APP_LB_IMAGE_CACHE_BUDGET_GB").map(|gb| gb.saturating_mul(1 << 30)),
+            warm: WarmEntry::parse_list(
+                &std::env::var("APP_LB_IMAGE_WARM").unwrap_or_default(),
+                std::env::var("APP_LB_IMAGE_WARM_STORE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .as_deref()
+                    .unwrap_or(DEFAULT_WARM_STORE),
+            ),
+            warm_secs: num("APP_LB_IMAGE_WARM_SECS").unwrap_or(d.warm_secs),
         }
     }
 }
@@ -404,6 +461,11 @@ pub enum Reference {
         job: String,
     },
     Pinned,
+    /// The current digest of an `APP_LB_IMAGE_WARM` entry.
+    Warm {
+        #[serde(rename = "ref")]
+        artifact_ref: String,
+    },
 }
 
 /// The catalog name a sandbox listing's `image` field names: heyvm reports
@@ -611,6 +673,21 @@ pub struct InventoryView {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct WarmReport {
+    pub warmed: Vec<WarmOutcome>,
+    /// `(entry, why)`.
+    pub failed: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WarmOutcome {
+    pub entry: String,
+    pub image: String,
+    /// Whether this pass fetched it, rather than finding it on heyvm.
+    pub fetched: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SweepReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
@@ -673,6 +750,7 @@ fn describe(r: &Reference) -> String {
         Reference::Sandbox { id } => format!("sandbox {id}"),
         Reference::Job { deployment, job } => format!("job {job} of {deployment}"),
         Reference::Pinned => "an operator pin".into(),
+        Reference::Warm { artifact_ref } => format!("the warm set ({artifact_ref})"),
     }
 }
 
@@ -705,6 +783,8 @@ pub struct ImageCatalog {
     thawing: Mutex<HashSet<String>>,
     cache_hits: std::sync::atomic::AtomicU64,
     cache_misses: std::sync::atomic::AtomicU64,
+    /// Warm-set label → the image its reference last resolved to.
+    warm: Mutex<BTreeMap<String, String>>,
 }
 
 impl ImageCatalog {
@@ -716,7 +796,7 @@ impl ImageCatalog {
         secrets: Arc<SecretStore>,
         puller: Puller,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let catalog = Arc::new(Self {
             cfg,
             store,
             vms,
@@ -731,7 +811,71 @@ impl ImageCatalog {
             thawing: Mutex::new(HashSet::new()),
             cache_hits: Default::default(),
             cache_misses: Default::default(),
-        })
+            warm: Mutex::new(BTreeMap::new()),
+        });
+        catalog.recall_from_records();
+        catalog
+    }
+
+    /// What the records already say, so a restart holds the warm set and
+    /// can fall back on known digests before the first warm pass or pull.
+    fn recall_from_records(&self) {
+        let mut records = self.store.all();
+        records.retain(|r| r.source == ImageSource::Pull && r.tier == Tier::Local);
+        // Oldest first, so the newest pull of a reference is the one kept.
+        records.sort_by_key(|r| r.first_seen);
+        let mut warm = self.warm.lock().unwrap();
+        for r in &records {
+            if let (Some(store), Some(reference), Some(digest)) = (&r.store, &r.artifact_ref, &r.digest) {
+                crate::artifact::remember_resolution(store, reference, digest, r.bytes);
+            }
+            for entry in self.cfg.warm.iter().filter(|e| e.holds(r)) {
+                warm.insert(entry.label(), r.name.clone());
+            }
+        }
+    }
+
+    /// Pull every warm-set entry that is not on heyvm yet, and hold the
+    /// image each one currently resolves to. A tag that moved releases its
+    /// old image to the cache; an entry that fails keeps what it held.
+    pub async fn warm(&self) -> WarmReport {
+        let mut report = WarmReport::default();
+        for entry in &self.cfg.warm {
+            let label = entry.label();
+            let spec = ArtifactSpec {
+                store: entry.store.clone(),
+                artifact_ref: entry.artifact_ref.clone(),
+                auth: None,
+                grow_gb: None,
+                image_name: None,
+                strip_components: None,
+            };
+            let mut log = |line: String| tracing::debug!(entry = %label, "warm: {line}");
+            match self.puller.pull("warm", &spec, None, false, &mut log).await {
+                Ok(pulled) => {
+                    self.note_pulled(&pulled.image, &pulled.digest, &spec, pulled.size, pulled.reused);
+                    let before = self.warm.lock().unwrap().insert(label.clone(), pulled.image.clone());
+                    if before.as_deref() != Some(pulled.image.as_str()) {
+                        tracing::info!(entry = %label, image = %pulled.image, previous = ?before, fetched = !pulled.reused, "warm set holds a new image");
+                    }
+                    report.warmed.push(WarmOutcome { entry: label, image: pulled.image, fetched: !pulled.reused });
+                }
+                Err(e) => {
+                    tracing::warn!(entry = %label, error = %e, "could not warm an image; keeping what the entry held");
+                    report.failed.push((label, e));
+                }
+            }
+        }
+        report
+    }
+
+    fn warm_images(&self) -> Vec<(String, String)> {
+        self.warm
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(label, image)| (image.clone(), label.clone()))
+            .collect()
     }
 
     pub fn config(&self) -> &ImagesConfig {
@@ -837,7 +981,7 @@ impl ImageCatalog {
         let jobs = self.jobs().map(|j| j.records(None)).unwrap_or_default();
         let deployments = self.registry.deployments();
         let pinned = self.pinned_names();
-        let refs = references(
+        let mut refs = references(
             deployments.values(),
             live.iter()
                 .chain(inactive.iter())
@@ -845,6 +989,9 @@ impl ImageCatalog {
             &jobs,
             pinned.iter().map(String::as_str),
         );
+        for (image, label) in self.warm_images() {
+            refs.entry(image).or_default().push(Reference::Warm { artifact_ref: label });
+        }
 
         let now = now_secs();
         let present: HashMap<String, u64> = images
@@ -1451,6 +1598,45 @@ impl pingora_core::services::background::BackgroundService for ImagePacer {
     }
 }
 
+/// Keeps the warm set on heyvm: once at startup, then every
+/// `APP_LB_IMAGE_WARM_SECS`.
+pub struct ImageWarmer {
+    catalog: Arc<ImageCatalog>,
+}
+
+impl ImageWarmer {
+    pub fn new(catalog: Arc<ImageCatalog>) -> Self {
+        Self { catalog }
+    }
+}
+
+#[async_trait]
+impl pingora_core::services::background::BackgroundService for ImageWarmer {
+    async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
+        let cfg = self.catalog.config().clone();
+        if cfg.warm.is_empty() {
+            return;
+        }
+        tracing::info!(entries = ?cfg.warm.iter().map(WarmEntry::label).collect::<Vec<_>>(), "warming images");
+        loop {
+            let report = self.catalog.warm().await;
+            tracing::info!(
+                warmed = report.warmed.len(),
+                fetched = report.warmed.iter().filter(|w| w.fetched).count(),
+                failed = report.failed.len(),
+                "warm pass",
+            );
+            if cfg.warm_secs == 0 {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(cfg.warm_secs)) => {}
+                _ = shutdown.changed() => return,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1817,6 +2003,13 @@ mod tests {
         images: Mutex<Vec<String>>,
         blob: AtomicU16,
         delete: AtomicU16,
+        /// What every manifest resolves to and `GET /blobs` serves; at most
+        /// 100 bytes, the size the fake catalog reports for every image.
+        content: Mutex<Vec<u8>>,
+    }
+
+    fn content_digest(f: &Fake) -> String {
+        crate::artifact::sha256_hex(&f.content.lock().unwrap())
     }
 
     async fn fake(f: Arc<Fake>) -> String {
@@ -1833,6 +2026,10 @@ mod tests {
                 } else {
                     StatusCode::NOT_FOUND.into_response()
                 }
+            }).put(|State(f): State<Arc<Fake>>, AxPath(n): AxPath<String>, _body: axum::body::Bytes| async move {
+                f.log.lock().unwrap().push(format!("upload {n}"));
+                f.images.lock().unwrap().push(n.clone());
+                axum::Json(serde_json::json!({"name": n, "path": format!("/imgs/{n}.ext4"), "size_bytes": 100, "modified_at": 1}))
             }).delete(|State(f): State<Arc<Fake>>, AxPath(n): AxPath<String>| async move {
                 f.log.lock().unwrap().push(format!("delete {n}"));
                 let status = f.delete.load(Ordering::SeqCst);
@@ -1851,6 +2048,16 @@ mod tests {
                 f.log.lock().unwrap().push("verify".into());
                 let status = f.blob.load(Ordering::SeqCst);
                 (StatusCode::from_u16(status).unwrap(), [(axum::http::header::CONTENT_LENGTH, "100")]).into_response()
+            }).get(|State(f): State<Arc<Fake>>| async move {
+                f.log.lock().unwrap().push("fetch".into());
+                f.content.lock().unwrap().clone()
+            }))
+            .route("/manifests/*reference", get(|State(f): State<Arc<Fake>>| async move {
+                let size = f.content.lock().unwrap().len();
+                axum::Json(serde_json::json!({
+                    "schema": 1, "kind": "heyvm.rootfs.v1", "annotations": {},
+                    "entries": [{"name": "rootfs.ext4", "digest": content_digest(&f), "size": size}]
+                }))
             }))
             .with_state(f);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1869,19 +2076,22 @@ mod tests {
     async fn harness(images: &[&str]) -> Harness {
         // A zero budget: every unreferenced pulled image is over it, so the
         // sweep tests see pulls go as idle builds would.
-        harness_with(images, ImagesConfig {
+        harness_with(images, |_| ImagesConfig {
             cache_budget_bytes: Some(0),
             ..ImagesConfig::default()
         })
         .await
     }
 
-    async fn harness_with(images: &[&str], cfg: ImagesConfig) -> Harness {
+    /// `cfg` is handed the fake's URL, so a warm set can point at it.
+    async fn harness_with(images: &[&str], cfg: impl FnOnce(&str) -> ImagesConfig) -> Harness {
         let f = Arc::new(Fake::default());
         *f.images.lock().unwrap() = images.iter().map(|s| s.to_string()).collect();
         f.blob.store(200, Ordering::SeqCst);
         f.delete.store(204, Ordering::SeqCst);
+        *f.content.lock().unwrap() = b"first".to_vec();
         let url = fake(f.clone()).await;
+        let cfg = cfg(&url);
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(Registry::new(dir.path().join("state.json")));
         let mut held: crate::config::DeploymentSpec = serde_json::from_value(serde_json::json!({
@@ -1985,7 +2195,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_pressure_or_a_budget_an_idle_pulled_image_stays_as_cache() {
-        let h = harness_with(&["img-idle0000000000"], ImagesConfig::default()).await;
+        let h = harness_with(&["img-idle0000000000"], |_| ImagesConfig::default()).await;
         h.catalog.store().put(pulled(&h, "img-idle0000000000")).unwrap();
         let report = h.catalog.sweep().await;
         assert!(report.offloaded.is_empty() && report.failed.is_empty(), "{report:?}");
@@ -1999,7 +2209,7 @@ mod tests {
     #[tokio::test]
     async fn over_budget_the_least_recently_used_pulls_go_until_the_cache_fits() {
         let names = ["img-aaaa000000000000", "img-bbbb000000000000", "img-cccc000000000000"];
-        let h = harness_with(&names, ImagesConfig {
+        let h = harness_with(&names, |_| ImagesConfig {
             cache_budget_bytes: Some(150),
             ..ImagesConfig::default()
         })
@@ -2014,6 +2224,78 @@ mod tests {
         assert_eq!(report.offloaded, vec![names[0], names[1]], "300 bytes over a 150 budget: two go, oldest first");
         assert_eq!(h.catalog.store().get(names[2]).unwrap().tier, Tier::Local);
         assert_eq!(h.catalog.inventory().await.cache_bytes, Some(100));
+    }
+
+    #[test]
+    fn warm_entries_name_a_store_or_take_the_default() {
+        assert_eq!(
+            WarmEntry::parse_list(" heyo/alpine:3.24, https://art.example/|team/web:v1\nheyo/postgres:18 ,,", DEFAULT_WARM_STORE),
+            vec![
+                WarmEntry { store: DEFAULT_WARM_STORE.into(), artifact_ref: "heyo/alpine:3.24".into() },
+                WarmEntry { store: "https://art.example".into(), artifact_ref: "team/web:v1".into() },
+                WarmEntry { store: DEFAULT_WARM_STORE.into(), artifact_ref: "heyo/postgres:18".into() },
+            ]
+        );
+        assert!(WarmEntry::parse_list("|x, y|", DEFAULT_WARM_STORE).is_empty());
+    }
+
+    /// A warm image is otherwise the first thing a zero budget removes.
+    fn warm_harness(url: &str) -> ImagesConfig {
+        ImagesConfig {
+            cache_budget_bytes: Some(0),
+            warm: vec![WarmEntry { store: url.into(), artifact_ref: "heyo/alpine:3.24".into() }],
+            ..ImagesConfig::default()
+        }
+    }
+
+    fn age(h: &Harness, name: &str) {
+        h.catalog.store().update(name, |r| { r.first_seen = 0; r.last_used = 0; }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_warm_set_is_pulled_once_held_and_follows_a_moved_tag() {
+        let h = harness_with(&[], warm_harness).await;
+        let first = h.catalog.warm().await;
+        assert!(first.failed.is_empty(), "{first:?}");
+        let old = first.warmed[0].image.clone();
+        assert!(first.warmed[0].fetched && old.starts_with("img-"));
+        let again = h.catalog.warm().await;
+        assert!(!again.warmed[0].fetched, "a second pass finds it on heyvm");
+        assert_eq!(h.fake.log.lock().unwrap().iter().filter(|l| l.starts_with("upload")).count(), 1);
+
+        age(&h, &old);
+        assert!(h.catalog.sweep().await.offloaded.is_empty(), "held by the warm set, even over budget");
+        let inv = h.catalog.inventory().await;
+        let held = inv.images.iter().find(|i| i.record.name == old).unwrap();
+        assert!(matches!(&held.references[..], [Reference::Warm { artifact_ref }] if artifact_ref.ends_with("/heyo/alpine:3.24")));
+
+        // The tag moves: the new digest is held, the old one is cache again.
+        *h.fake.content.lock().unwrap() = b"second".to_vec();
+        let moved = h.catalog.warm().await;
+        let new = moved.warmed[0].image.clone();
+        assert!(moved.warmed[0].fetched && new != old);
+        age(&h, &old);
+        age(&h, &new);
+        assert_eq!(h.catalog.sweep().await.offloaded, vec![old]);
+        assert_eq!(h.catalog.store().get(&new).unwrap().tier, Tier::Local);
+    }
+
+    #[tokio::test]
+    async fn a_restart_holds_the_warm_set_from_its_records_before_any_pass() {
+        let h = harness_with(&[], warm_harness).await;
+        let image = h.catalog.warm().await.warmed[0].image.clone();
+        let store = ImageStore::new(h.catalog.store().dir());
+        store.load();
+        let c = &h.catalog;
+        let restarted = ImageCatalog::new(
+            c.cfg.clone(),
+            store,
+            c.vms.clone(),
+            c.registry.clone(),
+            c.secrets.clone(),
+            Puller::new("art".into(), h._dir.path().join("scratch"), None, c.vms.clone()),
+        );
+        assert_eq!(restarted.warm_images(), vec![(image, format!("{}/heyo/alpine:3.24", h.url))]);
     }
 
     #[tokio::test]

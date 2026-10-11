@@ -375,8 +375,9 @@ impl NsProxy {
     }
 }
 
-/// The headers every proxied response carries. See the module docs.
-fn harden(h: &mut axum::http::HeaderMap) {
+/// The headers every proxied response carries, and every page a native plugin
+/// serves itself ([`super::page`]). See the module docs.
+pub(super) fn harden(h: &mut axum::http::HeaderMap) {
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert(
         header::X_FRAME_OPTIONS,

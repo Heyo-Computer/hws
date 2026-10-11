@@ -50,6 +50,7 @@ mod release;
 mod release_build;
 mod release_catalog;
 mod release_environment;
+mod release_history;
 mod release_git;
 mod release_policy;
 mod repos;
@@ -86,6 +87,22 @@ async fn main() {
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !args.is_empty() {
+        if args[0] == "--import-service-history" && args.len() == 2 {
+            let result: anyhow::Result<()> = async {
+                let entries = serde_json::from_slice(&std::fs::read(&args[1])?)?;
+                let config = Config::from_env()?;
+                let store = Store::connect(&config.database_url, config.log_dir.clone(), config.db_statement_timeout).await?;
+                release_history::import(&store, entries).await
+            }.await;
+            match result {
+                Ok(()) => println!("Reviewed service history imported. No deployments executed."),
+                Err(error) => {
+                    eprintln!("service history import stopped: {error}; earlier entries may have committed, exact replay is safe");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         if matches!(args[0].as_str(), "--hold-executor-recovery" | "--transfer-executor-recovery") {
             eprintln!("{} is no longer supported; executor ownership is scoped to each process boot", args[0]);
             std::process::exit(2);

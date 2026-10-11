@@ -1180,6 +1180,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_S3_ACCESS_KEY_ID",
     "PG_VM_POOL_S3_SECRET_ACCESS_KEY",
     "PG_VM_POOL_DAEMON_URL",
+    "PG_VM_POOL_DAEMON_API_KEY",
     // Read by `CompactConfig::from_env` and `vm.rs`, set by the shipped
     // supervisor conf, but historically missing here — so a correctly
     // configured production host logged five "ignoring unknown env var"

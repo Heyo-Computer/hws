@@ -653,6 +653,7 @@ function describeRef(r) {
     case "sandbox": return "sandbox " + r.id;
     case "job": return "job " + r.job;
     case "pinned": return "pinned";
+    case "warm": return "warm set (" + r.ref + ")";
     default: return r.kind;
   }
 }

@@ -751,14 +751,12 @@ pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<()> {
         .get_run(run_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("missing rollout run"))?;
-    let prefix = crate::secrets::Secrets::prefix_for(
-        &run,
-        plan.env
-            .get("CI_ENVIRONMENT")
-            .map(String::as_str)
-            .unwrap_or("default"),
-    );
-    let resolved = d.secrets.resolve(&prefix).await?;
+    let environment = plan
+        .env
+        .get("CI_ENVIRONMENT")
+        .map(String::as_str)
+        .unwrap_or("default");
+    let resolved = d.secrets.resolve_run(&run, environment).await?;
     let token = resolved
         .secrets
         .get(&secret)

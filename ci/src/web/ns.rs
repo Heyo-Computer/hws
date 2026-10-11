@@ -481,7 +481,7 @@ async fn render_repos(
     let tenants = state.dispatcher.tenants.snapshot();
     let pool = state.runners.snapshot();
     let network =
-        crate::tenancy::resolve_network(&pool, &ctx.namespace, tenants.network_for(&ctx.namespace))
+        crate::tenancy::resolve_network(&pool, &ctx.namespace, tenants.network_for(&ctx.namespace), state.config.tenant_only)
             .ok()
             .map(|set| set.network_name.clone());
     pages::namespace_repos_page(

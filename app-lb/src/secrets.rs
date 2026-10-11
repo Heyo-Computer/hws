@@ -175,6 +175,12 @@ fn validate_id(id: &str) -> Result<(), SecretError> {
     }
 }
 
+/// Whether `id` could name a secret. For a caller that builds an id from parts
+/// and would rather skip one that cannot exist than report it.
+pub fn is_valid_id(id: &str) -> bool {
+    validate_id(id).is_ok()
+}
+
 fn validate_key(key: &str) -> Result<(), SecretError> {
     let ok = !key.is_empty()
         && key.len() <= 128

@@ -177,6 +177,9 @@ HTTP-01 validation needs the proxy on port 80. To bind 80/443 as a non-root user
 | --- | --- | --- |
 | `APP_LB_IMAGE_OFFLOAD` | `true` | Offload unreferenced images: built ones after `APP_LB_IMAGE_IDLE_SECS`, pulled ones under disk pressure or over `APP_LB_IMAGE_CACHE_BUDGET_GB`. Off leaves `GET /images` and the explicit routes. |
 | `APP_LB_IMAGE_IDLE_SECS` | `86400` | How long a **built** image must go unreferenced before the pacer offloads it. Pulled images are cache and ignore it. |
+| `APP_LB_IMAGE_WARM` | unset | Images pulled at startup and held so their first VM never waits on a fetch: `<ref>` (from `APP_LB_IMAGE_WARM_STORE`) or `<store>\|<ref>`, separated by commas. Public stores only; no key is sent. Example: `heyo/alpine:3.24,heyo/postgres:18`. |
+| `APP_LB_IMAGE_WARM_STORE` | `https://hub.heyo.work` | Store a bare `APP_LB_IMAGE_WARM` entry is pulled from. |
+| `APP_LB_IMAGE_WARM_SECS` | `900` | How often the warm set's tags are re-resolved. A tag that moved is pulled and held; its old image becomes ordinary cache. `0` warms once at startup. |
 | `APP_LB_IMAGE_CACHE_BUDGET_GB` | unset | Bytes of unreferenced pulled images kept as cache; above it the least recently used are offloaded until it fits. Unset: only disk pressure removes a pulled image. `0`: keep no cache. |
 | `APP_LB_IMAGE_SWEEP_SECS` | `600` | Interval between offload passes. `0` stops the pacer. |
 | `APP_LB_IMAGE_PRESSURE_PCT` | `85` | Disk use (from heyvm's `GET /storage`) at which idle age stops protecting an unreferenced image. |
@@ -737,6 +740,9 @@ Unreferenced images are offloaded by a pacer that runs one at a time and stands 
 - **Built** images: offloaded once nothing has held them for `APP_LB_IMAGE_IDLE_SECS`, pushed to `APP_LB_IMAGE_OFFLOAD_STORE` first; never offloaded without it.
 - **Built** images: pushed to `APP_LB_IMAGE_OFFLOAD_STORE` first; never offloaded without it.
 - Images app-lb did not make are listed and never removed.
+- The **warm set** (`APP_LB_IMAGE_WARM`) is pulled at startup and re-resolved every `APP_LB_IMAGE_WARM_SECS`; the image each entry currently resolves to is held by a `warm` reference and never offloaded. A restart restores the held set from the image records before the first pass.
+
+A pull that cannot reach its store falls back on the digest that reference last resolved to (remembered from earlier pulls and from the image records), but only to reuse an image heyvm already holds — it never fetches on a remembered digest, and forced pulls and rollout candidates never fall back. A hub outage therefore does not stop VMs from being created from images already on the host.
 
 A failed offload backs off (30 minutes, doubling, up to a day). Above `APP_LB_IMAGE_PRESSURE_PCT` disk use the idle age is ignored, but references, pins and verification still hold. Nothing is removed when the references cannot be determined. A deployment that needs an offloaded image gets it pulled back under its own name before its next VM is created.
 
@@ -797,11 +803,13 @@ Plugins are compiled in and switched on at runtime from `/plugins` or with `heyc
 | `vapi` | Monitors vapi inference gateways and exposes their admission settings and a test prompt box. |
 | `remote` | Per-namespace git from [remote](../remote/README.md): installed in every namespace by default, it serves the namespace's repositories, history, branches and repo tokens in the plugin console. |
 | `obs` | Per-namespace observability from [app-obs](app-obs.md): installed by each namespace, it starts collection for that namespace's apps and serves their logs, metrics and alerts to the namespace's own tokens. |
-| `ci` | Per-namespace CI on the region's [ci](ci.md) service: installed by each namespace, it admits the namespace to register repositories, mint submit tokens and run builds on the operator's tenant network, and serves its runs and live logs to the namespace. |
+| `ci` | Per-namespace CI on the region's [ci](ci.md) service: installed by each namespace, it admits the namespace to register repositories, mint submit tokens and run builds on the operator's tenant network, and serves its runs and live logs to the namespace. Tenant runs read their secrets from the namespace's app-lb secrets through its machine route. |
+| `secrets` | A page over each namespace's own [secrets](#secrets): key names, create, set and rotate keys, delete. No storage of its own; installed in every namespace by default. |
+| `postgres` | Per-namespace dedicated databases on [pg-fc](pg-fc.md): installed by each namespace, it creates databases named and owned per namespace and writes their credentials to a namespace secret. |
 
 ### Installing a plugin in a namespace
 
-Some plugins (today, `obs`, `ci` and `remote`) are installed per namespace. The operator enables and configures the plugin once for the host; then a namespace administrator installs it:
+Some plugins (today, `obs`, `ci`, `remote`, `secrets` and `postgres`) are installed per namespace. The operator enables and configures the plugin once for the host; then a namespace administrator installs it:
 
 ```sh
 heyctl plugins enable obs   # operator, after `echo '{"url": "http://127.0.0.1:9600", "api_token": {"secret": "app-obs", "key": "api_token"}}' | heyctl plugins set obs -f -`
@@ -822,7 +830,7 @@ heyctl plugins enable ci
 heyctl plugins install ci -n team-a
 ```
 
-ci polls `GET /api/plugins/ci` for the install list and the network settings. `/namespaces/<ns>/plugins/ci/ui` is the namespace's runs page, `…/ci/ui/<page>` its other pages (`repos`, `runs/<id>`, `runs/<id>/jobs/<job>`, `workflows`), and `…/ci/api/…` its JSON API and log streams, all forwarded to ci's `/ns/<ns>/…` routes. app-lb also sends ci the caller's identity (`x-heyo-actor`, `x-heyo-actor-email`, `x-heyo-actor-admin`), which ci records and uses to restrict changes to the namespace's admins. See [ci](ci.md#namespaces) for what a tenant workflow may do.
+ci polls `GET /api/plugins/ci` for the install list and the network settings, and resolves a tenant run's secrets on the plugin's [machine route](#machine-routes). `/namespaces/<ns>/plugins/ci/ui` is the namespace's runs page, `…/ci/ui/<page>` its other pages (`repos`, `runs/<id>`, `runs/<id>/jobs/<job>`, `workflows`), and `…/ci/api/…` its JSON API and log streams, all forwarded to ci's `/ns/<ns>/…` routes. app-lb also sends ci the caller's identity (`x-heyo-actor`, `x-heyo-actor-email`, `x-heyo-actor-admin`), which ci records and uses to restrict changes to the namespace's admins. See [ci](ci.md#namespaces) for what a tenant workflow may do.
 
 For `remote`, the operator gives remote's URL and a secret reference to remote's `REMOTE_PLUGIN_API_TOKEN`. `/namespaces/<ns>/plugins/remote/ui` is the namespace's repositories, and `…/remote/ui/<page>` every other page (`<repo>`, `<repo>/tree/<ref>/<path>`, `<repo>/commits`, `-/new`, `-/tokens`, …). They are forwarded to remote's `/-/ns/<ns>/…`, because remote's own root belongs to namespaces. app-lb sends the caller's identity, and remote gives a namespace admin admin in the namespace and anyone else read. Like `obs`, it installs itself unless `"auto_install": false`.
 
@@ -831,9 +839,48 @@ echo '{"url": "https://git.us5.heyo.work", "api_token": {"secret": "remote-plugi
 heyctl plugins enable remote
 ```
 
+For `secrets`, there is nothing to configure: `heyctl plugins enable secrets` switches it on and installs it in every namespace (`{"auto_install": false}` makes installs explicit). `/namespaces/<ns>/plugins/secrets/ui` is a page over the namespace's own secrets that calls the existing `/secrets?namespace=<ns>` routes with the caller's session, so those routes' rules apply unchanged: listing and every change need admin access to the namespace, and no value is ever shown. A view-tier session gets a read-only page. The page also explains the CI naming convention below and marks the `pg-*` secrets the `postgres` plugin writes.
+
+For `postgres`, the operator gives pg-fc's dashboard URL (where its admin API is), the dashboard user, a secret reference to its password, and the public name clients connect to:
+
+```sh
+echo '{"url": "http://127.0.0.1:8080", "user": "admin", "password": {"secret": "pg-fc", "key": "password"}, "pg_host": "pg.us5.heyo.work"}' > postgres.json
+heyctl plugins set postgres -f postgres.json
+heyctl plugins enable postgres
+heyctl plugins install postgres -n team-a
+```
+
+Optional fields: `pg_port` (6432), `sslmode` (`require`), `max_per_namespace` (10) and `poll_secs` (30, for the `/api/health` poll shown on `/plugins`). `postgres` never installs itself: each database is a VM on the region's hosts.
+
+A namespace then manages its databases at `/namespaces/<ns>/plugins/postgres/…`:
+
+| Route | Tier | Does |
+| --- | --- | --- |
+| `GET ui` | view | The page. |
+| `GET api/databases` | view | The namespace's databases, with whether pg-fc still has each. |
+| `POST api/databases` `{"name": "app", "secret": true}` | admin | Creates `ns_<namespace>_app` at pg-fc with its own role, and returns the credentials once. With `secret` (the default) it also writes them to the namespace secret `pg-app`: `url` (`postgres://…?sslmode=require`), `host`, `port`, `database`, `user`, `password`. |
+| `DELETE api/databases/<name>` | admin | Revokes the credential at pg-fc and forgets the database. |
+
+A name is 1–31 lowercase letters, digits or `_`, starting with a letter. The physical name lowercases the namespace and turns `-` and `.` into `_`, so two namespaces can fold to the same name; app-lb records every database's owner in `app-lb-plugins.d/state/postgres.json` and refuses a name that is already recorded, whichever namespace holds it. A namespace lists and deletes only what that file says it owns. Deleting is not destructive: the database's data stays on pg-fc until an operator purges it there, and the `pg-<name>` secret stays until the namespace deletes it. A `401` from pg-fc means app-lb's stored password is wrong and is answered as `502`.
+
+### Machine routes
+
+A plugin can also be called by the service behind it. Those routes are at `/api/plugins/<id>/machine/…`, **outside** the admin gate: the caller holds the plugin's own shared token, not an app-lb credential, and each route checks that token itself in constant time. While the plugin is disabled they answer `404`.
+
+`ci` has one, which is where a tenant run's `${{ secrets.* }}` come from:
+
+```
+POST /api/plugins/ci/machine/secrets/resolve
+Authorization: Bearer <CI_PLUGIN_API_TOKEN>
+{"namespace": "team-a", "workflow": "app", "environment": "prod"}
+→ {"secrets": {"NAME": "value", …}}
+```
+
+The bearer must equal the value the `ci` plugin's `api_token` resolves to (`401` otherwise), and the namespace must have `ci` installed (`404` otherwise). The answer merges three of that namespace's secrets, later ones winning: `ci`, `ci.<workflow>` and `ci.<workflow>.<environment>`. In the workflow and environment parts every character other than a letter, digit, `-` or `_` becomes `-`, so a workflow called `app.prod` cannot read workflow `app`'s `prod` secrets. Nothing outside the named namespace is ever read.
+
 ### Plugin dashboards
 
-A plugin with a dashboard on its namespace surface says where it is in the `dashboard` field of `GET /namespaces/<ns>/plugins` and `GET /api/plugins` (`"ui"` for `obs`). `/namespaces/<ns>/plugin-console` lists the namespace's plugins, and `/namespaces/<ns>/plugin-console/<id>` frames that dashboard under app-lb's own bar, so a namespace user moves between the dashboard and a plugin without leaving app-lb. Both pages sit behind the same namespace wall as the plugin's routes. The frame is same-origin and carries the browser's session.
+A plugin with a dashboard on its namespace surface says where it is in the `dashboard` field of `GET /namespaces/<ns>/plugins` and `GET /api/plugins` (`"ui"` for `obs`). `secrets` and `postgres` serve their own page rather than an upstream's, with the same headers. `/namespaces/<ns>/plugin-console` lists the namespace's plugins, and `/namespaces/<ns>/plugin-console/<id>` frames that dashboard under app-lb's own bar, so a namespace user moves between the dashboard and a plugin without leaving app-lb. Both pages sit behind the same namespace wall as the plugin's routes. The frame is same-origin and carries the browser's session.
 
 Because a plugin's page is served on app-lb's admin origin, every response from a plugin's namespace surface carries `X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and a `Content-Security-Policy` of `frame-ancestors 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'`. A redirect from the upstream is passed on only when it stays under `/namespaces/<ns>/plugins/<id>/`, and an event stream is passed through as it arrives rather than buffered.
 

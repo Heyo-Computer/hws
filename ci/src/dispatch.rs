@@ -252,6 +252,9 @@ impl Dispatcher {
         // release policies and workflow objects are matched by URL, and a
         // tenant registering a fleet repository's URL must not inherit them.
         let namespace = repo.map(|r| r.namespace.clone()).unwrap_or_default();
+        if namespace.is_empty() && self.config.tenant_only {
+            return Err(DispatchError::TenantOnly);
+        }
         let tenant_network = if namespace.is_empty() {
             None
         } else {
@@ -260,7 +263,7 @@ impl Dispatcher {
             }
             let pool = self.runners.snapshot();
             let tenants = self.tenants.snapshot();
-            let set = crate::tenancy::resolve_network(&pool, &namespace, tenants.network_for(&namespace))
+            let set = crate::tenancy::resolve_network(&pool, &namespace, tenants.network_for(&namespace), self.config.tenant_only)
                 .map_err(|e| DispatchError::Tenancy(e.to_string()))?;
             if req.workflow_id.is_some() {
                 return Err(DispatchError::Tenancy(
@@ -833,6 +836,8 @@ impl Dispatcher {
         run_id: &str,
         actor: Option<&crate::web::identity::Identity>,
     ) -> Result<Submitted, DispatchError> {
+        crate::release_history::settle(&self.store).await
+            .map_err(|e| DispatchError::Workflow(format!("settle service history before retry: {e}")))?;
         let retry = crate::vm::new_id();
         let mut tx = self.store.pool().begin().await
             .map_err(|e| DispatchError::Workflow(format!("begin release retry: {e}")))?;
@@ -971,6 +976,8 @@ impl Dispatcher {
              SELECT $2,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,'published',NULL FROM ci_release WHERE run_id=$1",
         ).bind(run_id).bind(&retry).execute(&mut *tx).await
             .map_err(|e| DispatchError::Workflow(format!("copy published release: {e}")))?;
+        crate::release_history::enroll_retry(&mut tx, &retry).await
+            .map_err(|e| DispatchError::Workflow(format!("record retried service history: {e}")))?;
         Store::add_event(&mut tx, &retry, None, None, None, "ci.run.status.v1", "queued", None).await?;
         for job in jobs {
             let key: String = job.get("job_key");
@@ -1710,7 +1717,7 @@ impl Dispatcher {
             (path.clone(), hex::encode(sha2::Sha256::digest(yaml.as_bytes())))
         }).collect();
         let environment = plan.env.get("CI_ENVIRONMENT").cloned().unwrap_or_else(|| "default".into());
-        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, &environment))
+        let resolved = self.secrets.resolve_run(&run, &environment)
             .await.map_err(|e| DispatchError::Secrets(format!("resolving source credential: {e}")))?;
         let git_auth_token = resolved.secrets.get("CI_GIT_AUTH_TOKEN")
             .or_else(|| resolved.secrets.get("GITHUB_TOKEN")).cloned();
@@ -2407,7 +2414,7 @@ impl Dispatcher {
             let run = self.store.get_run(&msg.run_id).await?
                 .ok_or_else(|| anyhow::anyhow!("run no longer exists"))?;
             let environment = plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default");
-            let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, environment)).await?;
+            let resolved = self.secrets.resolve_run(&run, environment).await?;
             let masker = resolved.masker();
             let mut text = match vm.info().await {
                 Ok(info) => format!("[ci] VM {} status={:?} size={:?}\n", info.id, info.status, info.size_class),
@@ -2652,7 +2659,7 @@ impl Dispatcher {
         // steps. They travel only in exec env; neither the persisted command nor
         // the descriptor contains them.
         let environment = plan.env.get("CI_ENVIRONMENT").cloned().unwrap_or_else(|| "default".into());
-        let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix_for(&run, &environment))
+        let resolved = self.secrets.resolve_run(&run, &environment)
             .await.map_err(|e| DispatchError::Secrets(format!("resolving checkout credential: {e}")))?;
         let masker = resolved.masker();
         let mut checkout_env = HashMap::new();
@@ -2750,12 +2757,15 @@ impl Dispatcher {
             .get("CI_ENVIRONMENT")
             .cloned()
             .unwrap_or_else(|| "default".to_string());
-        let prefix = crate::secrets::Secrets::prefix_in(&namespace, &workflow_id, &environment);
         let resolved = self
             .secrets
-            .resolve(&prefix)
+            .resolve_for(&namespace, &workflow_id, &environment)
             .await
-            .map_err(|e| DispatchError::Secrets(format!("resolving {prefix}: {e}")))?;
+            .map_err(|e| {
+                DispatchError::Secrets(format!(
+                    "resolving the secrets of {workflow_id}/{environment}: {e}"
+                ))
+            })?;
         let masker = resolved.masker();
         let (secret_scope, vars_scope) = resolved.scopes();
 
@@ -3023,6 +3033,15 @@ impl Dispatcher {
             if let Some(id) = completed {
                 return Ok((format!("[ci] retained completed deployment {id}; no deployment repeated\n"), json!({})));
             }
+        }
+
+        if matches!(action, "ci/rollout-service" | "ci/rollout-host-app-lb" |
+            "ci/rollout-pooler" | "ci/rollout-site" | "ci/rollout-stateful-service" |
+            "ci/deploy-controller" | "ci/bootstrap-host-heyvm" | "ci/rollout-host-heyvmd")
+            && !(action == "ci/deploy-controller" && self.config.managed_deployment.is_some()) {
+            crate::release_build::retain_submission(&self.store, self.artifacts.as_ref(), &msg.run_id, sid,
+                &with("workflow").unwrap_or_default(), &required("artifact")?).await
+                .map_err(|e| DispatchError::StepFailed(format!("retain service release before deployment: {e}")))?;
         }
 
         match action {
@@ -5033,6 +5052,8 @@ pub enum DispatchError {
     /// A namespace that has not installed the `ci` plugin, or whose install
     /// app-lb has since withdrawn. The submit route answers 403 for it.
     NotInstalled(String),
+    /// A fleet submit to an instance that builds only for namespaces.
+    TenantOnly,
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
     Bus(crate::bus::BusError),
@@ -5220,6 +5241,7 @@ impl std::fmt::Display for DispatchError {
         match self {
             Self::Native(e) => write!(f, "native runner: {e}"),
             Self::Tenancy(e) => write!(f, "namespace policy: {e}"),
+            Self::TenantOnly => write!(f, "this ci builds only for namespaces; submit with a token minted on your namespace's CI page"),
             Self::NotInstalled(ns) => write!(f, "namespace {ns} has not installed ci; install it from its plugins page in app-lb"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Pool(e) => write!(f, "{e}"),

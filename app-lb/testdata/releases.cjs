@@ -20,7 +20,8 @@ const root = path.resolve(__dirname, '../..');
     releases.push({...candidate('legacy-bundle','ci'),manifest:{retained:true,components:{ci:{},auth:{}}}});
     const environments = [stage,{name:'production',repository:'repo',mode:'manual',requires:['stage'],services:[{service:'ci',state:{},history:[]}]},{name:'unconfigured',repository:'repo',mode:'manual',services:[]}];
     const builds = [{name:'auth-build',repository:'another-repo',status:'success',policy:{components:{auth:{}}}},{name:'wrong-repo-auth-build',repository:'repo',status:'success',policy:{components:{auth:{}}}}];
-    let unavailable = false;
+    let unavailable = false, inventoryRequests = 0, releaseInventory;
+    const inventoryGate = new Promise(resolve => { releaseInventory = resolve; });
     await page.route('https://panel.test/**', async route => {
       const request = route.request(), url = new URL(request.url());
       if (url.pathname.startsWith('/api/releases/')) {
@@ -33,7 +34,11 @@ const root = path.resolve(__dirname, '../..');
         }
         return route.fulfill({json:resource === 'releases' ? {releases} : resource === 'release-environments' ? {environments} : {builds}});
       }
-      if (url.pathname === '/fleet/deployments') return route.fulfill({json:{configured:true,gateways:[],rows:[]}});
+      if (url.pathname === '/fleet/deployments') {
+        inventoryRequests++;
+        await inventoryGate;
+        return route.fulfill({json:{configured:true,gateways:[],rows:[]}});
+      }
       if (url.pathname === '/services') return route.fulfill({json:{configured:true,inventory:{services:[],nextCursor:null}}});
       if (url.pathname.startsWith('/__ui/')) return route.fulfill({path:path.join(root,'ui',url.pathname.slice(6))});
       return route.fulfill({contentType:'text/html',body:fs.readFileSync(path.join(root,'app-lb/src/releases.html'),'utf8').replace('{{HTML_ATTRS}}','data-theme="dark"').replace('{{WHO}}','operator@example.test')});
@@ -42,6 +47,14 @@ const root = path.resolve(__dirname, '../..');
     const refresh = async () => { await page.locator('#refresh').click(); await settled(); };
     const screenshot = async name => { if (process.env.SCREENSHOT_DIR) await page.screenshot({path:path.join(process.env.SCREENSHOT_DIR,name+'.png'),fullPage:true}); };
     await page.goto('https://panel.test/releases'); await settled();
+    assert.equal(inventoryRequests,0);
+    await page.locator('#inventory').evaluate(el => el.closest('details').open = true);
+    await page.waitForFunction(() => document.querySelector('#inventory').textContent.includes('Loading regional'));
+    await refresh(); // A stalled inventory must not block release controls.
+    assert.equal(inventoryRequests,1);
+    releaseInventory();
+    await page.waitForFunction(() => document.querySelector('#inventory').textContent.includes('No matching deployments'));
+    await page.locator('#inventory').evaluate(el => el.closest('details').open = false);
     assert.deepEqual(await page.locator('#candidate option').allTextContents(),['ci-new','ci-current','ci-old']);
     assert.equal(await page.locator('#catalog [data-release]').count(),3);
     assert.equal(await page.locator('#candidate').getAttribute('title'), releases[0].manifest.revision+'\n\n'+releases[0].commit_message);
@@ -136,10 +149,71 @@ const root = path.resolve(__dirname, '../..');
     assert.equal(await page.locator('#catalog [data-release]').count(),0);
     assert.match(await page.locator('#catalog').innerText(),/not configured/);
     await screenshot('release-console-unconfigured');
+    // Repaired history is authoritative, even over stale compatible projections.
+    await page.selectOption('#environment','stage');
+    await page.selectOption('#service','ci');
+    const record = (revision, bundle_id=null) => ({revision,bundle_id,run_id:'ordinary-run',status:'success',source:'ordinary',completed_at:'2026-10-08T12:00:00Z'});
+    ci.current_deployment = {...record('durable-current-revision'),version:'2026.10.08.2'};
+    ci.previous_deployment = {...record('durable-previous-revision'),version:'2026.10.08.1'};
+    ci.history = [
+      {...ci.current_deployment,created_at:'2026-10-08T11:00:00Z',deployments:[],automatic:false},
+      {...record('imported-revision','pruned-bundle'),source:'legacy_import'},
+      {...record('promoted-revision','ci-new'),source:'promotion',automatic:true},
+      {...record('manual-revision','ci-old'),source:'promotion',automatic:false}
+    ];
+    await refresh();
+    assert.equal(await page.locator('#selection .facts strong').first().innerText(),'2026.10.08.2');
+    assert.equal(await page.locator('#selection .facts strong').last().innerText(),'2026.10.08.1');
+    assert.equal(await page.locator('#selection .facts code').first().getAttribute('title'),'durable-current-revision');
+    assert.doesNotMatch(await page.locator('#selection .facts').innerText(),/None recorded|ci-current|ci-old/);
+    assert.equal(await page.locator('#selection .facts').getByText('Retained artifact unavailable',{exact:true}).count(),2);
+    assert.match(await page.locator('#service-releases tbody tr').first().innerText(),/2026.10.08.2/);
+    assert(await page.locator('[data-action="rollback"]').isDisabled());
+    assert.deepEqual(await page.locator('#catalog .tag').allTextContents(),['Available','Available','Available']);
+    const history = await page.locator('#history').innerText();
+    for (const text of ['durable-current-revision','imported-revision','Ordinary CI deployment','Imported deployment record','Automatic promotion','Manual promotion']) assert(history.includes(text));
+    assert.doesNotMatch(history,/None recorded/);
+    await screenshot('release-history-durable-fixture-desktop');
+    await page.setViewportSize({width:390,height:844});
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await screenshot('release-history-durable-fixture-mobile');
+    await page.setViewportSize({width:1440,height:1000});
+    ci.current_deployment = null; ci.previous_deployment = null;
+    await refresh();
+    assert.equal(await page.locator('#selection .facts strong').first().innerText(),'None recorded');
+    assert.equal(await page.locator('#selection .facts strong').last().innerText(),'None recorded');
+    assert(await page.locator('[data-action="rollback"]').isDisabled());
+    assert.deepEqual(await page.locator('#catalog .tag').allTextContents(),['Available','Available','Available']);
+    // Neither a pruned bundle nor a candidate from another repository permits rollback.
+    for (const bundle of ['pruned-bundle','foreign-ci']) {
+      ci.previous_deployment = record('previous-revision',bundle); await refresh();
+      assert(await page.locator('[data-action="rollback"]').isDisabled());
+    }
+    ci.current_deployment = record('recorded-revision','ci-new');
+    ci.previous_deployment = record('recorded-previous-revision','ci-current');
+    await refresh();
+    assert.equal(await page.locator('#selection .facts').getByText('Retained artifact unavailable',{exact:true}).count(),0);
+    assert.deepEqual(await page.locator('#catalog .tag').allTextContents(),['Last successful recorded','Rollback target','Available']);
+    await page.locator('[data-action="rollback"]').click();
+    assert.match(await page.locator('#confirm-body').innerText(),/Release: ci-current/);
+    await page.locator('#confirm').click(); await settled();
+    assert.equal(posts.at(-1).data.bundle_id,'ci-current');
+    await screenshot('release-history-retained-fixture');
+    const cloud = stage.services.find(s => s.service === 'cloud');
+    cloud.current_deployment = record('cloud-durable-revision');
+    cloud.previous_deployment = null;
+    cloud.history = [{...cloud.current_deployment,created_at:'2026-10-08T11:00:00Z',deployments:[{service:'cloud',revision:'cloud-durable-revision',status:'success'}]}];
+    await refresh(); await page.selectOption('#service','cloud');
+    assert.equal(await page.locator('#candidate option').count(),0);
+    assert.equal(await page.locator('#selection .facts strong').first().innerText(),'Version not recorded');
+    assert.equal(await page.locator('#selection .facts code').first().getAttribute('title'),'cloud-durable-revision');
+    assert.match(await page.locator('#history').innerText(),/Ordinary CI deployment/);
+    assert(await page.locator('[data-action="rollback"]').isDisabled());
+    await screenshot('release-history-no-candidates-fixture');
     unavailable = true;
     await page.locator('#refresh').click();
     await page.getByText('CI unavailable',{exact:false}).waitFor();
     assert.deepEqual(errors,[]);
-    console.log('PASS: multi-repository Stage, service policy/prerequisite and build filtering, legacy environment fallback, read-only historical services, row-selected confirmation, scoped deployment, rollback/recovery, active guards, hold/resume, empty policies/candidates and mobile layout. APIs are fixtures.');
+    console.log('PASS: service policies, old-backend fallback, authoritative nullable deployment records, durable revisions without candidates, history origins, exact retained rollback target, recovery, active guards, hold/resume and mobile layout. APIs are fixtures.');
   } finally { await browser.close(); }
 })().catch(error=>{console.error(error);process.exitCode=1});

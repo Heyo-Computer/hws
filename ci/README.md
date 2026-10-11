@@ -22,6 +22,88 @@ workflow's worth of them per commit.
 - Optionally **app-lb** for workflow objects and sign-in, **heyosecret** for
   secrets, and the **artifacts** store.
 
+### Operator-owned service deployment attribution
+
+Release policies accept an optional `service_deployments` declaration alongside
+`workflow`, `service_targets`, and `placements`:
+
+```yaml
+service_deployments:
+  - environment: production
+    service: cloud
+    obligations:
+      - {job: cloud-us, step: 0}
+      - {job: cloud-eu, step: 0}
+      - {job: verify, step: 0}
+      - {job: bake, step: 0}
+```
+
+`job` selects the stable, matrix-expanded persisted job key, not its display
+label. For a matrix, enumerate each cell key explicitly; an ambiguous base ID
+is rejected, never expanded implicitly. `step` is the zero-based persisted plan
+step index, not a step ID or a one-based UI number. Include every deployment,
+verification, and bake obligation for the service. Target aliases, repository
+names, and infrastructure deployment IDs do not establish service ownership.
+
+Admission rejects unknown job keys, out-of-range indices, empty scope identities
+or obligations, duplicate scopes, and duplicate/multiply owned obligations.
+The declaration is copied into the policy snapshot before infrastructure target
+aliases are bound away and participates in the frozen policy digest. Promotion
+plans declare their already-selected environment/service and every selected
+plan step. Legacy policies and persisted snapshots without the field still
+decode with an empty declaration; admission emits a diagnostic explaining how
+to add attribution. A `merge_only` policy cannot declare deployment obligations.
+
+Admission records these obligations in `ci_release_service_deployment`. The
+existing release reconciler settles each service independently: all declared
+steps must succeed and all deployment receipts must pass with one source
+revision. Successful jobs and receipts carried into a retry retain their original
+evidence. Failure elsewhere in the run does not erase a successful service
+deployment. Unknown or still-running deployment effects do not advance history.
+
+Ordinary admission records history without claiming or blocking execution.
+Only promotions use the existing environment/service `active_run` ownership;
+ordinary settlement never clears it. Current and previous versions follow
+original receipt completion order, not admission or reconciliation order.
+Carried-only retries retain the original deployment position. Ordinary evidence
+never grants promotion authority or changes source/artifact authorization.
+
+The panel reads current and previous deployment records independently of the
+candidate catalog. A verified revision remains visible without a retained
+artifact. Rollback is available only when that deployment matches a ready,
+integrity-checked, single-service candidate by repository, revision, and artifact
+digest. A repeated deployment of the same verified artifact preserves the
+previous distinct version. These are recorded rollout results, not live probes.
+
+**Existing history requires explicit attribution before activating scoped
+deployments.** Deploy the schema/recorder first, review the persisted jobs and
+typed deployment intents, then run `ci --import-service-history reviewed.json`
+in the configured CI environment. The file is a JSON array:
+
+```json
+[{
+  "run_id": "existing-terminal-run",
+  "scope": {
+    "environment": "stage",
+    "service": "cloud",
+    "obligations": [{"job": "cloud-us", "step": 0}, {"job": "cloud-eu", "step": 0}]
+  },
+  "expected_receipts": {
+    "existing-us-receipt-id": "its-immutable-request-hash",
+    "existing-eu-receipt-id": "its-immutable-request-hash"
+  }
+}]
+```
+
+Import accepts terminal runs and settled receipts only, checks the exact receipt
+set and request hashes, and refuses overlapping/out-of-order deployment history
+or a service already using scoped promotions/deployments. Each entry commits
+atomically; exact replay is safe after a partial import. Include verification and
+bake steps in the reviewed obligations too. It neither executes deployments nor
+creates candidates, and does not copy old environment-wide history into every
+service. Install `service_deployments` in operator policies for future ordinary
+deployments; changing today's policy does not attribute old runs retroactively.
+
 ### SDK package
 
 CI pins our public `heyo-sdk` 0.1.12 release, including the proxy
@@ -1400,6 +1482,12 @@ a transport error keeps the last answer. An uninstalled namespace's pages
 counts every namespace as installed while the plugin is enabled, for an app-lb
 that installs implicitly or a one-namespace development loop.
 
+`CI_TENANT_ONLY=true` makes an instance namespace-only: fleet submits answer
+`403` (checked in `submit` before unpacking, and again in the dispatcher), and
+`tenancy::resolve_network` accepts the default network, which is what lets a
+regional instance build in local-runner mode's single `local` network. It
+refuses to start without `CI_PLUGIN_API_TOKEN` and `CI_APP_LB_URL`.
+
 **Tenant limits** (`src/tenancy.rs`), checked at submit so the refusal reaches
 the terminal that ran `git submit`:
 
@@ -1419,12 +1507,18 @@ Each rule has a second door at execution: the step-action check in
 `run_steps`, the native enqueue and poll, and `authorize_publication`, which
 every merge, publish, deploy, rollout and host-maintenance flow calls first.
 
-**Secrets** resolve under `ci/ns/<ns>/<workflow>/<environment>/`
-(`Secrets::prefix_for`), where `<workflow>` is the registration's name. The
-namespace segment is forced, so a tenant repository named after a fleet
-workflow reads `ci/ns/<ns>/deploy/prod`, never `ci/deploy/prod`. heyosecret
-has no per-namespace authorization, so an operator writes a namespace's
-secrets under its prefix; there is no self-service writer yet.
+**Secrets** for a tenant run never come from heyosecret
+(`Secrets::resolve_for`). They are the namespace's own app-lb secrets `ci`,
+`ci.<workflow>` and `ci.<workflow>.<environment>`, merged with later ones
+winning, where `<workflow>` is the registration's name. ci asks app-lb for
+them per job on the `ci` plugin's machine route, `POST
+/api/plugins/ci/machine/secrets/resolve` at `CI_APP_LB_URL`, with
+`CI_PLUGIN_API_TOKEN` as the bearer; app-lb answers only for the namespace
+named and only while it has `ci` installed. So a tenant repository named after
+a fleet workflow cannot read `ci/deploy/prod`, and a namespace manages its own
+secrets on its Secrets plugin page. Every value is a masked `secrets.*`; a
+tenant has no `vars.*`. Without `CI_APP_LB_URL` and `CI_PLUGIN_API_TOKEN` a
+tenant run gets no secrets, and an app-lb error fails the job.
 
 ## Deploying it
 
@@ -2084,8 +2178,14 @@ is a region-neutral example for the private Heyo repository. Region names, count
 endpoints, coordinator placements and sequence are operator configuration, not
 built-in US/EU choices. Adding China or another region requires its target mappings
 and jobs in this operator policy, not Rust changes or candidate workflow edits.
-The example completes Cloud, heyvm and heyvmd in each configured region, followed
-by mandatory public-health sampling before the next region starts.
+The example completes Cloud in every configured region before entering a separate
+host-maintenance chain. The first maintenance job has a job-level changed-path
+guard and requires successful Cloud rollout. On service-only changes it and its
+dependent heyvm/heyvmd/host-verification jobs are skipped before runner allocation;
+step-level guards alone cannot prevent an unused job waiting for an offline runner.
+Actual host maintenance remains sequential, with mandatory public-health sampling
+before proceeding to the next host. Its cross-host coordinator requirement remains
+in force; do not solve a stale coordinator mapping by running on the upgrade target.
 The sampling requires HTTP 200, not redirects;
 it supplements the existing exact deployment receipts and is not proof of
 zero-downtime failover. It uses normal maintenance, not the legacy bootstrap flag.
