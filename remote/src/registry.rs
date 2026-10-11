@@ -49,6 +49,10 @@ pub struct RepoMeta {
     pub created_by: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Readable without a credential by anyone who has the URL. Never listed:
+    /// a public repo shows up only where its namespace's repos already do.
+    #[serde(default)]
+    pub public: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +290,41 @@ impl Registry {
             .map_err(|e| RegistryError::Invalid(format!("repo {ns}/{name} meta: {e}")))
     }
 
+    /// Change `ns/name`'s meta with `f`, against the version it was read at,
+    /// so a concurrent delete is not undone. `None` when the repo is gone.
+    pub async fn update_repo(
+        &self,
+        b: &NamespaceBinding,
+        ns: &str,
+        name: &str,
+        f: impl Fn(&mut RepoMeta),
+    ) -> Result<Option<RepoMeta>> {
+        for _ in 0..5 {
+            let Some(obj) = self.store.get(&b.bucket, &meta_key(ns, name)).await? else {
+                return Ok(None);
+            };
+            let mut meta: RepoMeta = serde_json::from_slice(&obj.bytes)
+                .map_err(|e| RegistryError::Invalid(format!("repo {ns}/{name} meta: {e}")))?;
+            f(&mut meta);
+            let body = serde_json::to_vec_pretty(&meta).expect("serializable");
+            if let Put::Written(_) = self
+                .store
+                .put(
+                    &b.bucket,
+                    &meta_key(ns, name),
+                    body,
+                    Cond::Matches(obj.etag),
+                )
+                .await?
+            {
+                return Ok(Some(meta));
+            }
+        }
+        Err(RegistryError::Conflict(format!(
+            "repo {ns}/{name} kept changing; try again"
+        )))
+    }
+
     pub async fn list_repos(&self, b: &NamespaceBinding, ns: &str) -> Result<Vec<RepoMeta>> {
         let keys = self
             .store
@@ -386,6 +425,7 @@ mod tests {
             created_at: 1,
             created_by: None,
             description: None,
+            public: false,
         };
         reg.create_repo(&b1, meta.clone()).await.unwrap();
         assert!(matches!(
@@ -393,6 +433,19 @@ mod tests {
             Err(RegistryError::Conflict(_))
         ));
         assert_eq!(reg.list_repos(&b1, "team-a").await.unwrap().len(), 1);
+        let m = reg
+            .update_repo(&b1, "team-a", "site", |m| m.public = true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(m.public);
+        assert!(
+            reg.repo(&b1, "team-a", "site")
+                .await
+                .unwrap()
+                .unwrap()
+                .public
+        );
         let (s, etag) = reg.state(&b1.bucket, "team-a", "site").await.unwrap();
         assert_eq!(s.head, "refs/heads/main");
         assert!(etag.is_some());

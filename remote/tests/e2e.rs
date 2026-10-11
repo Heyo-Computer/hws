@@ -922,3 +922,105 @@ async fn the_plugin_surface_serves_app_lbs_caller_under_app_lbs_urls() {
         "{page}"
     );
 }
+
+#[tokio::test]
+async fn a_public_repo_reads_by_url_but_is_never_listed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = store_env(&tmp.path().join("store"));
+    let prefix = format!("p{}", rand::random::<u32>());
+    let srv = start(&env, &tmp.path().join("cache"), &prefix);
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let (st, repo) = call(
+        "POST",
+        &format!("{}/api/repos/team-a", srv.url),
+        ADMIN,
+        Some(json!({"name": "site"})),
+    )
+    .await;
+    assert_eq!(st, 201, "{repo}");
+    assert_eq!(repo["public"], false);
+    let clone_url = repo["clone_url"].as_str().unwrap().to_string();
+    let work = tmp.path().join("work");
+    let proj = work.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("README.md"), "# hello\n").unwrap();
+    ok(&proj, &["init", "-q", "-b", "main"]);
+    ok(&proj, &["add", "."]);
+    ok(&proj, &["commit", "-q", "-m", "first"]);
+    ok(
+        &proj,
+        &["push", &with_creds(&clone_url, ADMIN), "HEAD:main"],
+    );
+
+    // Private: a stranger's clone, API read and page are all refused, exactly
+    // as for a repo that does not exist.
+    let (good, _) = git(&work, &["clone", &clone_url, "anon-private"]);
+    assert!(!good);
+    let missing = format!("{}/team-a/nope.git", srv.url);
+    let (good, _) = git(&work, &["clone", &missing, "anon-missing"]);
+    assert!(!good);
+    let get = |path: String| {
+        let anon = anon.clone();
+        async move { anon.get(path).send().await.unwrap().status().as_u16() }
+    };
+    assert_eq!(get(format!("{}/api/repos/team-a/site", srv.url)).await, 401);
+    assert_eq!(get(format!("{}/team-a/site", srv.url)).await, 303);
+
+    // A read token on another namespace may not make it public.
+    let (_, other) = call(
+        "POST",
+        &format!("{}/api/tokens", srv.url),
+        ADMIN,
+        Some(json!({"namespace": "team-b", "access": "write"})),
+    )
+    .await;
+    let other = other["token"].as_str().unwrap().to_string();
+    let url = format!("{}/api/repos/team-a/site", srv.url);
+    let (st, _) = call("PATCH", &url, &other, Some(json!({"public": true}))).await;
+    assert_eq!(st, 403);
+    let (st, body) = call("PATCH", &url, ADMIN, Some(json!({"public": true}))).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["public"], true);
+
+    // Public: cloned, read and browsed without a credential, and by a
+    // credential from another namespace, but still not pushed to.
+    ok(&work, &["clone", &clone_url, "anon-public"]);
+    assert!(work.join("anon-public/README.md").exists());
+    ok(
+        &work,
+        &["clone", &with_creds(&clone_url, &other), "other-public"],
+    );
+    assert_eq!(get(url.clone()).await, 200);
+    assert_eq!(get(format!("{}/team-a/site", srv.url)).await, 200);
+    assert_eq!(
+        get(format!("{}/team-a/site/raw/main/README.md", srv.url)).await,
+        200
+    );
+    let (good, _) = git(
+        &work.join("anon-public"),
+        &["push", &with_creds(&clone_url, &other), "HEAD:x"],
+    );
+    assert!(!good, "a public repo is not writable");
+
+    // Not discoverable: no listing reaches it without access to team-a.
+    assert_eq!(get(format!("{}/api/repos/team-a", srv.url)).await, 401);
+    let (st, _) = call(
+        "GET",
+        &format!("{}/api/repos/team-a", srv.url),
+        &other,
+        None,
+    )
+    .await;
+    assert_eq!(st, 403);
+    assert_eq!(get(format!("{}/team-a", srv.url)).await, 303);
+
+    // Private again: back to refusing strangers.
+    let (st, _) = call("PATCH", &url, ADMIN, Some(json!({"public": false}))).await;
+    assert_eq!(st, 200);
+    let (good, _) = git(&work, &["clone", &clone_url, "anon-again"]);
+    assert!(!good);
+}

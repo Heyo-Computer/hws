@@ -155,9 +155,10 @@ That grants nothing a namespace's own `applb_` tokens cannot already do here.
 
 | | |
 | --- | --- |
-| `POST /api/repos/{ns}` `{name, description?, default_branch?}` | create (admin) |
+| `POST /api/repos/{ns}` `{name, description?, default_branch?, public?}` | create (admin) |
 | `GET /api/repos/{ns}` | list |
 | `GET /api/repos/{ns}/{repo}` | meta, HEAD, refs |
+| `PATCH /api/repos/{ns}/{repo}` `{public}` | make public or private (admin). A public repo is cloned, fetched, read and browsed without a credential by anyone with its URL; it is never listed outside its namespace, and pushing still needs a write token |
 | `DELETE /api/repos/{ns}/{repo}` | delete (admin) |
 | `POST /api/repos/{ns}/{repo}/commits` | JSON `{message, files:[{path, content, encoding?, executable?, delete?}], branch?, base?, replace?}`, or a `application/gzip` tarball with `?message=&branch=&replace=` |
 | `POST /api/tokens` `{namespace, access, repos?, ttl_secs?, name?}` | mint; `ttl_secs: 0` never expires |
