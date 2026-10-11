@@ -120,6 +120,51 @@ pub async fn register(store: &Store, request: Request, actor: &str) -> Result<se
     Ok(serde_json::json!({"id":id,"name":request.name,"manifest_sha256":digest,"manifest":value}))
 }
 
+pub(crate) async fn refresh_pr(d: &crate::dispatch::Dispatcher) -> Result<()> {
+    // One bounded lookup per tick, cached outside the immutable manifest.
+    // Never call GitHub on the page read path.
+    let row = sqlx::query("UPDATE ci_release_bundle SET pr_checked_at=now() WHERE id=(
+        SELECT id FROM ci_release_bundle WHERE latest_pr IS NULL
+        AND (pr_checked_at IS NULL OR pr_checked_at < now()-interval '1 day')
+        ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE SKIP LOCKED)
+        RETURNING id,repository,manifest->>'revision' AS revision")
+        .fetch_optional(d.store.pool()).await?;
+    let Some(row) = row else { return Ok(()); };
+    let repository: String = row.get("repository");
+    let url = reqwest::Url::parse(&repository)?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") { return Ok(()); }
+    let path = url.path().trim_matches('/').trim_end_matches(".git");
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()
+        || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))) { return Ok(()); }
+    let revision: String = row.get("revision");
+    if revision.len() != 40 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) { return Ok(()); }
+    let policies = crate::release_build::policies(d.config.release_builds.as_deref())?;
+    let Some((_, policy)) = policies.iter().find(|(repo,_)| crate::repos::same_repo(repo,&repository)) else { return Ok(()); };
+    let resolved = d.secrets.resolve(&crate::secrets::Secrets::prefix(&policy.workflow_id,"default")).await?;
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() < 3 && attempt.url().scheme() == "https"
+                && attempt.url().host_str() == Some("api.github.com") {
+                attempt.follow()
+            } else { attempt.stop() }
+        })).build()?;
+    let mut request = client.get(format!("https://api.github.com/repos/{path}/commits/{revision}/pulls?per_page=100"))
+        .header("User-Agent","heyo-ci").header("Accept","application/vnd.github+json");
+    if let Some(token) = resolved.secrets.get("CI_GIT_AUTH_TOKEN").or_else(|| resolved.secrets.get("GITHUB_TOKEN")) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    ensure!(response.status().is_success(), "PR metadata lookup returned {}", response.status());
+    let pulls: Vec<serde_json::Value> = response.json().await?;
+    if let Some(pr) = pulls.iter().filter(|p| p["merged_at"].is_string()).max_by_key(|p| p["merged_at"].as_str()) {
+        let value = serde_json::json!({"number":pr["number"],"title":pr["title"],"url":pr["html_url"]});
+        sqlx::query("UPDATE ci_release_bundle SET latest_pr=$2 WHERE id=$1")
+            .bind(row.get::<String,_>("id")).bind(value).execute(d.store.pool()).await?;
+    }
+    Ok(())
+}
+
 pub async fn list(store: &Store, before: Option<&str>) -> Result<Vec<serde_json::Value>> {
     // The ID disambiguates releases with the same timestamp without offsets.
     Ok(sqlx::query_scalar("SELECT to_jsonb(b) || jsonb_build_object('commit_message',

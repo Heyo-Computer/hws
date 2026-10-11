@@ -453,6 +453,13 @@ pub(crate) async fn view(store: &Store, environment: &str, service: &str) -> Res
         .replace("$2", "h.obligations");
     let sql = format!("SELECT jsonb_build_object(
         'state',to_jsonb(e),
+        'rollback_versions',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+            'bundle_id',h.bundle_id,'version',b.name,'revision',h.revision,'completed_at',h.completed_at)
+            ORDER BY h.completed_at DESC) FROM (
+                SELECT DISTINCT ON (COALESCE(bundle_id,revision,id)) bundle_id,revision,completed_at
+                FROM ci_release_service_deployment WHERE environment=$1 AND service=$2 AND status='success'
+                ORDER BY COALESCE(bundle_id,revision,id),completed_at DESC
+            ) h LEFT JOIN ci_release_bundle b ON b.id=h.bundle_id),'[]'::jsonb),
         'current_deployment',CASE WHEN current.id IS NOT NULL THEN
             to_jsonb(current)-'obligations'-'release_identity' || jsonb_build_object('version',cb.name) END,
         'previous_deployment',CASE WHEN previous.id IS NOT NULL THEN
@@ -848,6 +855,10 @@ mod tests {
         assert_eq!(final_state["current_deployment"]["run_id"], "later");
         assert_eq!(final_state["previous_deployment"]["run_id"], "earlier");
         assert_eq!(final_state["state"]["active_run"], "old");
+        let rollback_revisions: BTreeSet<_> = final_state["rollback_versions"].as_array().unwrap()
+            .iter().map(|v| v["revision"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(rollback_revisions, ['a', 'b', 'c', 'd'].into_iter()
+            .map(|c| c.to_string().repeat(40)).collect());
 
         // Validation rejection never started deployment. Repair old false
         // failures too, but do not infer safety once a job has started.

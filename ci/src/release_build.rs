@@ -668,6 +668,9 @@ pub fn spawn(d: Arc<Dispatcher>) {
             if let Err(error) = reconcile(&d).await {
                 tracing::warn!(%error, "release build reconciliation deferred");
             }
+            if let Err(error) = crate::release_catalog::refresh_pr(&d).await {
+                tracing::warn!(%error, "release PR metadata unavailable");
+            }
         }
     });
 }

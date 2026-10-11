@@ -114,6 +114,8 @@
     return configured(service) ? releases.filter(r => r.repository === policy(service).repository && r.manifest.retained === true && components(r).length === 1 && components(r)[0] === name) : [];
   };
   const selectedRelease = () => release($('candidate').value);
+  const rollbackVersions = service => (service?.rollback_versions || []).filter(d => d.bundle_id !== deployment(service, 'current')?.bundle_id);
+  const prLink = r => r?.latest_pr?.url?.startsWith('https://github.com/') ? `<a href="${esc(r.latest_pr.url)}" target="_blank" rel="noopener noreferrer">PR #${esc(r.latest_pr.number)} · ${esc(r.latest_pr.title)}</a>` : '';
   const revision = r => r?.manifest?.revision || 'Not recorded';
   const description = r => r?.commit_message?.trim() || 'No commit message was recorded for this candidate.';
   const candidateTitle = r => `${revision(r)}\n\n${description(r)}`;
@@ -177,7 +179,7 @@
       ${!configured(service) ? '<p class="warn">This service is no longer configured. Historical rollout records are read-only.</p>' : ''}
       ${service.recovery_required ? '<div class="notice"><strong>Recovery required</strong>This service deployment failed. Regions may contain different versions. Other services retain their own release state.</div>' : ''}
       ${s.active_run ? `<p class="warn">Deployment in progress</p><code>${esc(s.active_run)}</code>` : ''}
-      <div class="actions" style="margin-top:20px"><button class="btn primary" data-action="deploy" ${s.active_run || !r || !components(r).length ? 'disabled' : ''}>Deploy ${esc(service.service)}</button><button class="btn" data-action="rollback" ${s.active_run || service.recovery_required || !previous || !candidates(service.service).some(r => r.id === previous.bundle_id) ? 'disabled' : ''}>Roll back ${esc(service.service)}…</button></div>
+      <p>${prLink(r)}</p><div class="actions" style="margin-top:20px"><button class="btn primary" data-action="deploy" ${s.active_run || !r || !components(r).length ? 'disabled' : ''}>Deploy ${esc(service.service)}</button><button class="btn" data-action="rollback" ${s.active_run || service.recovery_required || !rollbackVersions(service).some(d => candidates(service.service).some(r => r.id === d.bundle_id)) ? 'disabled' : ''}>Roll back ${esc(service.service)}…</button></div>
       ${service.recovery_required ? `<button class="btn" data-action="recover" ${s.active_run || !candidates(service.service).some(r => r.id === service.recovery_bundle) ? 'disabled' : ''}>Recover ${esc(service.service)}…</button>` : ''}
       <p class="sub">Manual deployment holds automation until explicitly resumed.</p>
       <button class="btn" data-action="automation" ${!configured(service) || policy(service).mode !== 'automatic' || (s.automation_held && s.active_run) ? 'disabled' : ''}>${s.automation_held ? 'Resume automation' : 'Hold automation'}</button>`;
@@ -203,7 +205,10 @@
     $('history').innerHTML = (service?.history || []).map(p => `<div class="history-item"><div class="section-head" style="padding:0;border:0"><strong>${esc(deploymentLabel(p))}</strong><span class="tag ${p.status === 'success' ? 'good' : ['failure','cancelled'].includes(p.status) ? 'bad' : ''}">${esc(p.status)}</span></div><span class="sub">${esc(date(p.created_at))} · ${esc(origin(p))}</span>${p.revision ? `<span class="sub"><code>${esc(p.revision)}</code></span>` : ''}${(p.deployments || []).map(d => `<p><code>${esc(d.service)}</code> · ${esc(d.status)}<span class="sub"><code>${esc(d.revision)}</code></span></p>`).join('')}<span class="sub">Run ${esc(p.run_id)}</span>${p.error ? `<p class="bad">${esc(p.error)}</p>` : ''}</div>`).join('') || '<p class="empty">No deployment recorded for this service.</p>';
     for (const row of $('catalog').querySelectorAll('tr')) {
       const candidate = release(row.querySelector('[data-release]')?.dataset.release);
-      if (candidate) row.title = candidateTitle(candidate);
+      if (candidate) {
+        row.title = candidateTitle(candidate);
+        row.cells[0].insertAdjacentHTML('beforeend', `<div class="sub">${prLink(candidate)}</div>`);
+      }
     }
     renderSelection();
   }
@@ -266,11 +271,29 @@
       if (!s.automation_held || confirm(`Resume automatic deployment of ${service.service} to ${e.name}?`)) perform(() => api('release-automation',{environment:e.name,service:service.service,held:!s.automation_held}));
       return;
     }
-    const recover = action === 'recover', bundle = recover ? service.recovery_bundle : action === 'rollback' ? deployment(service, 'previous')?.bundle_id : $('candidate').value, r = release(bundle);
+    const rollback = rollbackVersions(service).filter(d => candidates(service.service).some(r => r.id === d.bundle_id));
+    const defaultRollback = rollback.find(d => d.bundle_id === deployment(service, 'previous')?.bundle_id) || rollback[0];
+    const recover = action === 'recover', bundle = recover ? service.recovery_bundle : action === 'rollback' ? defaultRollback?.bundle_id : $('candidate').value, r = release(bundle);
     if (!r || !candidates(service.service).some(candidate => candidate.id === bundle)) return;
     confirmation = {environment:e.name,service:service.service,bundle,recover};
     $('confirm-title').textContent = action === 'rollback' ? 'Roll back this service?' : recover ? 'Recover this service?' : 'Deploy this service release?';
     $('confirm-body').innerHTML = `<p>Environment: <strong>${esc(e.name)}</strong></p><p>Service: <strong>${esc(service.service)}</strong></p><p>Release: <strong>${esc(r.name)}</strong></p><div class="notice"><strong>${esc(scope(r))}</strong>${chips(r)}</div><code>${esc(revision(r))}</code><p class="sub">Only this service's configured targets will change. Other services retain their versions. Automation for this service will remain held.</p>`;
+    if (action === 'rollback') {
+      const versions = rollbackVersions(service);
+      $('confirm-body').innerHTML = `<p>Environment: <strong>${esc(e.name)}</strong> · Service: <strong>${esc(service.service)}</strong></p><label>Previously deployed version<select id="rollback-version">${versions.map(d => `<option value="${esc(d.bundle_id || '')}" ${candidates(service.service).some(r => r.id === d.bundle_id) ? '' : 'disabled'}>${esc(deploymentLabel(d))} · ${esc(date(d.completed_at))}${candidates(service.service).some(r => r.id === d.bundle_id) ? '' : ' — artifact unavailable'}</option>`).join('')}</select></label><div id="rollback-details"></div><p>Only this service will change. Automation remains held.</p>`;
+      const picker = $('rollback-version');
+      if (versions.some(d => d.bundle_id === bundle) && candidates(service.service).some(r => r.id === bundle)) picker.value = bundle;
+      picker.onchange = () => {
+        const chosen = candidates(service.service).find(r => r.id === picker.value);
+        confirmation.bundle = chosen?.id;
+        $('confirm').disabled = !chosen;
+        $('rollback-details').innerHTML = chosen ? `<p><strong>${esc(chosen.name)}</strong></p><code>${esc(revision(chosen))}</code><p>${prLink(chosen)}</p>` : '<p>Retained artifact unavailable.</p>';
+      };
+      picker.onchange();
+    } else {
+      $('confirm').disabled = false;
+      $('confirm-body').insertAdjacentHTML('beforeend', `<p>${prLink(r)}</p>`);
+    }
     $('confirmation').showModal();
   };
   $('cancel').onclick = () => $('confirmation').close();
