@@ -71,55 +71,74 @@ pub async fn reconcile(d: &Dispatcher) -> Result<()> {
         .bind(&runners).fetch_all(d.store.pool()).await?;
     for row in pending {
         let sandbox: String = row.get("sandbox_id");
-        let result = tokio::time::timeout(Duration::from_secs(20), finish(d, &sandbox)).await;
-        let error = match result { Ok(Ok(())) => continue, Ok(Err(e)) => e.to_string(), Err(_) => "cleanup verification timed out".into() };
+        // Keep the phase outside the cancelled future so a deadline identifies
+        // the blocked operation rather than hiding every failure as verification.
+        let mut phase = "begin ownership transaction";
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(20), finish(d, &sandbox, &mut phase)).await;
+        let error = match result { Ok(Ok(())) => continue, Ok(Err(e)) => format!("{phase}: {e}"), Err(_) => format!("cleanup timed out during {phase}") };
         let runner: String = row.get("runner_hd_id");
+        tracing::warn!(%sandbox, %runner, %phase, elapsed_ms = started.elapsed().as_millis() as u64,
+            %error, "VM cleanup unresolved; retaining claim and retrying");
         // Existing operations own their tunnel independently (PR77).
         d.runners.evict(&runner).await;
         sqlx::query("UPDATE ci_vm_cleanup SET last_error=$4,next_attempt_at=now()+interval '30 seconds' WHERE sandbox_id=$1 AND job_id=$2 AND attempt=$3")
             .bind(&sandbox).bind(row.get::<String,_>("job_id")).bind(row.get::<i32,_>("attempt")).bind(&error)
             .execute(d.store.pool()).await?;
-        tracing::warn!(%sandbox, %error, "VM cleanup unresolved; retaining claim and retrying");
     }
     Ok(())
 }
 
-async fn finish(d: &Dispatcher, sandbox: &str) -> Result<()> {
+async fn finish(d: &Dispatcher, sandbox: &str, phase: &mut &'static str) -> Result<()> {
     let mut tx = d.store.pool().begin().await?;
+    *phase = "lock cleanup intent";
     let Some(c) = sqlx::query("SELECT * FROM ci_vm_cleanup WHERE sandbox_id=$1 FOR UPDATE SKIP LOCKED")
         .bind(sandbox).fetch_optional(&mut *tx).await? else { return Ok(()) };
     let job: String = c.get("job_id"); let runner: String = c.get("runner_hd_id"); let attempt: i32 = c.get("attempt");
+    *phase = "verify pool ownership";
     let p = sqlx::query("SELECT status,claimed_by_job,runner_hd_id FROM ci_vm_pool WHERE sandbox_id=$1 FOR UPDATE")
         .bind(sandbox).fetch_one(&mut *tx).await?;
     ensure!(p.get::<String,_>("status") == "claimed"
         && p.get::<Option<String>,_>("claimed_by_job").as_deref() == Some(job.as_str())
         && p.get::<String,_>("runner_hd_id") == runner, "cleanup pool ownership changed");
+    *phase = "verify job ownership";
     let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_job WHERE id=$1 AND attempt=$2 AND status IN ('success','failure','skipped','cancelled')) AND NOT EXISTS(SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=$1)")
         .bind(&job).bind(attempt).fetch_one(&mut *tx).await?;
     ensure!(valid, "cleanup job identity or lifecycle owner changed");
     // Covers cleanup intents created by older controllers that requested a
     // stopped warm cache. CI-owned job VMs are now always ephemeral.
+    *phase = "retain debug report";
     crate::debug_report::enqueue(&mut tx, &job, sandbox).await?;
+    *phase = "open runner connection";
     let vm = d.vms.open(d.runners.options_for(&runner).await?, sandbox.to_string()).await?;
+    *phase = "read initial VM status";
     let already_removed = match vm.info().await {
         Err(VmError::Daemon { source: HeyoError::NotFound(_), .. }) => true,
         result => {
             let info = result?;
             ensure!(info.id == sandbox, "cleanup daemon returned another VM");
-            if info.status != SandboxStatus::Stopped { vm.stop().await?; }
+            if info.status != SandboxStatus::Stopped {
+                *phase = "stop VM";
+                vm.stop().await?;
+            }
+            *phase = "verify stopped VM";
             let stopped = vm.info().await?;
             ensure!(stopped.id == sandbox && stopped.status == SandboxStatus::Stopped, "daemon has not confirmed the exact VM stopped");
             false
         }
     };
     if !already_removed {
+        *phase = "destroy VM";
         vm.destroy().await?;
+        *phase = "verify VM removal";
         ensure!(matches!(vm.info().await, Err(VmError::Daemon { source: HeyoError::NotFound(_), .. })), "daemon has not confirmed VM removal");
     }
+    *phase = "release verified ownership";
     sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(sandbox).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM ci_host_work WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3")
         .bind(&job).bind(&runner).bind(attempt).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM ci_vm_cleanup WHERE sandbox_id=$1").bind(sandbox).execute(&mut *tx).await?;
+    *phase = "commit cleanup";
     tx.commit().await?;
     Ok(())
 }
