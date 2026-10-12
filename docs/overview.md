@@ -16,6 +16,8 @@ the VM.
 | **app-lb** | The edge and control plane. A Pingora-based HTTP/HTTPS proxy that routes by host and path to autoscaled microVM pools, fixed upstreams or static sites. Runs the admin API and dashboard for deployments, secrets, builds, artifact pulls, host updates, ACME certificates, disk reclamation and fleet views, and a built-in SIEM with block rules. | [app-lb](app-lb.md) |
 | **Authentication** | app-lb protects its admin API (Basic auth, scoped `applb_…` app-tokens, federated Heyo bearers) and puts an optional sign-in gate in front of each deployment (Google, app-token or JWT/OIDC). | [Authentication](app-lb-auth.md) |
 | **heyctl** | A kubectl-style CLI and Rust client library for the app-lb admin API, with named contexts for switching between fleets. | [heyctl](heyctl.md) |
+| **Plugins** | Optional capabilities a host enables and each namespace installs: telemetry, git repositories, CI, Postgres databases, the artifact store, a secrets page, and Heyo or Google sign-in for deployments. | [Plugins](plugins.md) |
+| **SDKs** | [`@heyocomputer/hws`](https://www.npmjs.com/package/@heyocomputer/hws) (TypeScript) and [`hws`](https://crates.io/crates/hws) (Rust): deployments, exec, secrets and every plugin from code. | [SDKs](sdk.md) |
 | **Orchestrator** | The Postgres-backed record of what should run where. Provisions CI sandboxes, deploys services (blue/green or rolling), publishes the discovery sets app-lb routes from, and runs durable region-by-region rollouts. | [Orchestrator](orchestrator.md) |
 | **app-obs** | Collects console and application logs from each VM, accepts pushed logs over HTTP and syslog, polls app-lb's metrics, stores it all as compacted Parquet with retention, and serves a query API, dashboard and webhook alerts. | [app-obs](app-obs.md) |
 | **Artifacts (`art`)** | A content-addressed blob store tuned for ext4: VM images stored sparsely, site bundles, build inputs, workspace snapshots and release binaries, served by the `art` CLI and `art serve`. | [Artifacts](artifacts.md) |
@@ -73,6 +75,8 @@ application.
 - **[Installation](installation.md)** — stand up a host and register a first deployment.
 - **[app-lb](app-lb.md)** — the deployment spec, scaling and the admin API.
 - **[heyctl](heyctl.md)** — drive a fleet from the command line.
+- **[SDKs](sdk.md)** — drive it from TypeScript ([npm](https://www.npmjs.com/package/@heyocomputer/hws)) or Rust ([crates.io](https://crates.io/crates/hws)).
+- **[Plugins](plugins.md)** — give namespaces telemetry, git, databases and sign-in.
 - **[MCP server](mcp.md)** — let an agent deploy and debug for you.
 - **[Multi-region](multi-region.md)** — run one platform across regions.
 - **[Contributing](contributing.md)** — build and test the repository.

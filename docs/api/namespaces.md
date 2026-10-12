@@ -34,7 +34,7 @@ On Heyo's managed fleet, namespaces are created in Heyo cloud, not on app-lb.
 
 ## Namespace plugins
 
-Some plugins install per namespace. Two switches decide whether one does anything for a namespace: the operator **enables** it for the fleet ([below](#fleet-plugins)), and a namespace administrator **installs** it into the namespace. Both must be on.
+Some plugins install per namespace; [Plugins](../plugins.md) describes each one and its configuration. Two switches decide whether one does anything for a namespace: the operator **enables** it for the fleet ([below](#fleet-plugins)), and a namespace administrator **installs** it into the namespace. Both must be on.
 
 | Method and path | Tier | Crate |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ From [`namespace-plugins.json`](../../app-lb/testdata/wire/namespace-plugins.jso
 | --- | --- |
 | `enabled` | The fleet-wide switch, which the operator controls. |
 | `installed`, `installed_at`, `installed_by` | This namespace's install. `installed_by` is `token:<id>`, `user:<id>` or `auto`, and absent for the operator. |
-| `config` | The per-namespace configuration. `obs` takes none: send `{}`. |
+| `config` | The per-namespace configuration. Most plugins take none (send `{}`); `auth-heyo` takes `name` and `require`, and `auth-google` its OAuth client. |
 
 `PUT` installs the plugin or replaces its per-namespace config, and is idempotent. The body is `{"config": {…}}`, optional; the crate sends `{}` when `config` is `None`. `DELETE` uninstalls; it is allowed while the plugin is disabled. Both return the plugin as the namespace now sees it.
 
@@ -69,7 +69,7 @@ From [`namespace-plugins.json`](../../app-lb/testdata/wire/namespace-plugins.jso
 | `400` | `Api` | Invalid namespace name, or config the plugin rejects. |
 | `403` | `Forbidden` | Not an administrator of the whole namespace. |
 | `404` | `NotFound` | No such plugin, or one that does not install per namespace. |
-| `409` | `Conflict` | The operator has the plugin switched off (`"code": "plugin_disabled"`). |
+| `409` | `Conflict` | The operator has the plugin switched off (`"code": "plugin_disabled"`), or the install or uninstall clashes with what is there: an auth plugin installing over a provider declared by hand, or uninstalling one a deployment still inherits. |
 
 ## Fleet plugins
 
