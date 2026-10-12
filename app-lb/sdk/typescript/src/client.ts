@@ -8,6 +8,7 @@ import {
 import { ObsClient } from "./obs.js";
 import { PostgresClient } from "./postgres.js";
 import { ArtifactsClient } from "./artifacts.js";
+import { applyGate, pluginFor, type Gate } from "./gate.js";
 import type {
   AdminScope,
   AuthProviderView,
@@ -589,6 +590,32 @@ export class Heyctl {
       name,
       signal,
     });
+  }
+
+  /**
+   * Put deployment `id` behind sign-in with `gate.provider`, keeping the
+   * gate's route-scoped settings `gate` leaves out. Checks first that the
+   * provider is declared in the deployment's namespace, and says which plugin
+   * declares it when it is not. Changing only the gate does not recycle VMs.
+   */
+  async setAuth(id: string, gate: Gate, signal?: AbortSignal): Promise<DeploymentStatus> {
+    const spec = (await this.deployment(id, signal)).spec as unknown as Record<string, unknown>;
+    const ns = typeof spec.namespace === "string" && spec.namespace ? spec.namespace : "default";
+    if (!(await this.authProviderExists(ns, gate.provider))) {
+      const plugin = pluginFor(gate.provider);
+      const how = plugin
+        ? `install the ${plugin} plugin there (installPlugin("${ns}", "${plugin}", …))`
+        : "declare it with createAuthProvider";
+      throw new HeyctlError(`namespace "${ns}" has no auth provider "${gate.provider}"; ${how}`);
+    }
+    return this.replaceDeployment(id, applyGate(spec, gate) as unknown as DeploymentSpec, signal);
+  }
+
+  /** Remove deployment `id`'s sign-in gate: it serves everyone again. */
+  async clearAuth(id: string, signal?: AbortSignal): Promise<DeploymentStatus> {
+    const spec = { ...((await this.deployment(id, signal)).spec as unknown as Record<string, unknown>) };
+    delete spec.auth;
+    return this.replaceDeployment(id, spec as unknown as DeploymentSpec, signal);
   }
 
   async authProviderExists(namespace: string, name: string): Promise<boolean> {

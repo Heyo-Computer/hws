@@ -223,6 +223,15 @@ await store.setTag("team-a/web:latest", v2.digest);   // promote
 await store.setRepo("team-a/web", { public: true });  // publish on the hub
 ```
 
+Once an auth plugin has declared a provider in the namespace (`auth-heyo` does
+by default; `auth-google` with the namespace's OAuth client), a program puts a
+deployment behind it:
+
+```ts
+await lb.setAuth("reports", { provider: "heyo", publicPaths: [{ path: "/healthz" }] });
+await lb.clearAuth("reports");   // serves everyone again
+```
+
 Before a plugin is installed every `obs`, `postgres` or `artifacts` call rejects with a
 `ConflictError` whose `code` is `plugin_not_installed` (or `plugin_disabled`
 while the operator has it off).

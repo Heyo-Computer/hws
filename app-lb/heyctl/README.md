@@ -224,6 +224,17 @@ for d in pg.databases().await?.databases {
 pg.delete_database("app").await?; // revokes the credential; data and secret stay
 ```
 
+### Sign-in for a deployment
+
+Once an auth plugin has declared a provider in the namespace (`auth-heyo` does
+by default; `auth-google` with the namespace's own OAuth client):
+
+```rust
+use hws::Gate;
+lb.set_auth("reports", &Gate::provider("heyo").public("/healthz")).await?;
+lb.clear_auth("reports").await?; // serves everyone again
+```
+
 ### Artifacts
 
 The `artifacts` plugin is the namespace's corner of the global artifact store,

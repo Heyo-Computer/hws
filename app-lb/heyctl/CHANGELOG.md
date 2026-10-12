@@ -4,6 +4,18 @@ All notable changes to the `hws` crate (the Heyo Web Services SDK and the
 `heyctl` CLI). The crate follows [semantic versioning](https://semver.org/);
 while it is `0.x`, a minor bump may break the API.
 
+## Unreleased
+
+### Added
+
+- **Sign-in for a deployment, programmatically.** `Client::set_auth(id,
+  &Gate::provider("heyo").public("/healthz"))` puts a deployment behind a
+  namespace auth provider (`heyo` from the `auth-heyo` plugin, `google` from
+  `auth-google`, or one declared by hand), keeping the gate's route-scoped
+  settings it leaves unset; `Client::clear_auth(id)` removes the gate. It
+  checks the provider exists first and names the plugin that declares it
+  when not. Blocking twins included.
+
 ## 0.3.0 — 2026-10-12
 
 ### Added
