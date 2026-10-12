@@ -23,6 +23,7 @@
 use crate::api::{ExecRequest, Gates, MetricsQuery, NewToken};
 use crate::error::{Error, Result};
 use crate::obs::{LogQuery, NewAlert};
+use crate::postgres::NewDatabase;
 use crate::shell::{ShellEvent, ShellExit, ShellOptions};
 use crate::transport::Auth;
 use crate::types::*;
@@ -551,6 +552,14 @@ impl Client {
         }
     }
 
+    /// One namespace's Postgres databases. See [`crate::Client::postgres`].
+    pub fn postgres(&self, namespace: impl Into<String>) -> PostgresClient<'_> {
+        PostgresClient {
+            client: self,
+            inner: self.inner.postgres(namespace),
+        }
+    }
+
     // -- identity, rollouts, discovery ---------------------------------------
 
     pub fn whoami(&self) -> Result<WhoAmI> {
@@ -609,6 +618,31 @@ impl ObsClient<'_> {
 
     pub fn delete_alert(&self, id: &str) -> Result<()> {
         block_on(&self.client.rt, self.inner.delete_alert(id))?
+    }
+}
+
+/// One namespace's Postgres databases, blocking. See
+/// [`crate::PostgresClient`].
+pub struct PostgresClient<'a> {
+    client: &'a Client,
+    inner: crate::PostgresClient,
+}
+
+impl PostgresClient<'_> {
+    pub fn namespace(&self) -> &str {
+        self.inner.namespace()
+    }
+
+    pub fn databases(&self) -> Result<PostgresDatabases> {
+        block_on(&self.client.rt, self.inner.databases())?
+    }
+
+    pub fn create_database(&self, new: &NewDatabase) -> Result<CreatedPostgresDatabase> {
+        block_on(&self.client.rt, self.inner.create_database(new))?
+    }
+
+    pub fn delete_database(&self, name: &str) -> Result<DeletedPostgresDatabase> {
+        block_on(&self.client.rt, self.inner.delete_database(name))?
     }
 }
 
@@ -827,6 +861,10 @@ impl Raw<'_> {
 
     pub fn obs_alerts(&self, namespace: &str) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().obs_alerts(namespace))?
+    }
+
+    pub fn postgres_databases(&self, namespace: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().postgres_databases(namespace))?
     }
 
     pub fn create_deployment(&self, spec: &Value) -> Result<Value> {

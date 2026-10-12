@@ -35,7 +35,7 @@ fn wire_dir() -> PathBuf {
 ///
 /// Pretty-printed with a trailing newline because these files are read by people
 /// during review — the whole point is that a diff is legible.
-fn golden(name: &str, value: &impl Serialize) {
+pub(crate) fn golden(name: &str, value: &impl Serialize) {
     let path = wire_dir().join(format!("{name}.json"));
     let mut rendered = serde_json::to_string_pretty(value).expect("fixture must serialize");
     rendered.push('\n');

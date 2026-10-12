@@ -3,6 +3,16 @@
 Versioned with the [`hws`](https://crates.io/crates/hws) crate; the two
 releases share a wire contract and are checked against the same app-lb fixtures.
 
+## Unreleased
+
+### Added
+
+- Postgres databases through the `postgres` plugin: `postgres(ns)` returns a
+  `PostgresClient` with `databases()`, `createDatabase({ name, secret? })` and
+  `deleteDatabase(name)`. Mirrors the `hws` crate's `PostgresClient`.
+- `PluginView` and `NamespacePlugin` declare `dashboard`, which app-lb already
+  sent.
+
 ## 0.2.0
 
 First published release.

@@ -1,0 +1,20 @@
+{
+  "databases": [
+    {
+      "created_at": 1760000000,
+      "created_by": "user:team-a-admin",
+      "database": "ns_team_a_app",
+      "live": true,
+      "name": "app",
+      "secret": "pg-app",
+      "tier": "warm",
+      "user": "ns_team_a_app"
+    }
+  ],
+  "error": null,
+  "host": "pg.example",
+  "limit": 2,
+  "namespace": "team-a",
+  "port": 6432,
+  "sslmode": "require"
+}

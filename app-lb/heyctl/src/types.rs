@@ -2433,6 +2433,113 @@ pub struct ObsAlert {
     pub extra: Extra,
 }
 
+// -- the postgres plugin ---------------------------------------------------
+
+/// A namespace's Postgres databases, from
+/// `GET /namespaces/:ns/plugins/postgres/api/databases`. Never carries a
+/// password.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PostgresDatabases {
+    pub namespace: String,
+    /// Where every database is reached: the region's pg-fc pooler.
+    pub host: String,
+    pub port: u16,
+    pub sslmode: String,
+    /// The most databases this host lets one namespace have.
+    pub limit: usize,
+    pub databases: Vec<PostgresDatabase>,
+    /// Why pg-fc could not say which databases are live, if it could not.
+    /// The list itself is still complete.
+    pub error: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One database in [`PostgresDatabases`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PostgresDatabase {
+    /// The name the namespace asked for, e.g. `app`.
+    pub name: String,
+    /// The physical database (and role) on pg-fc, e.g. `ns_team_a_app`.
+    pub database: String,
+    pub user: String,
+    pub created_by: Option<String>,
+    pub created_at: u64,
+    /// The namespace secret holding its credentials (`pg-<name>`), while it
+    /// exists.
+    pub secret: Option<String>,
+    /// Whether pg-fc still has it. `None` when pg-fc could not be asked.
+    pub live: Option<bool>,
+    /// pg-fc's storage tier for it, e.g. `warm`.
+    pub tier: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The reply to creating a database. **`password` (and `url`, which embeds
+/// it) is the only time the credential is ever returned**; unless the
+/// database was created without one, it is also in the namespace secret
+/// named by `secret`. `Debug` leaves both out.
+#[derive(Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct CreatedPostgresDatabase {
+    pub name: String,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    pub host: String,
+    pub port: u16,
+    pub sslmode: String,
+    /// `postgres://user:password@host:port/database?sslmode=…`.
+    pub url: Option<String>,
+    /// The namespace secret the credentials were written to (`pg-<name>`).
+    pub secret: Option<String>,
+    /// Why the secret could not be written, when it was asked for and was not.
+    pub secret_error: Option<String>,
+    /// `provisioning`: the credential works now; the VM comes up in the
+    /// background and the first connection waits for it.
+    pub status: String,
+    pub note: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl std::fmt::Debug for CreatedPostgresDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedPostgresDatabase")
+            .field("name", &self.name)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("sslmode", &self.sslmode)
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("secret", &self.secret)
+            .field("secret_error", &self.secret_error)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The reply to deleting a database: its credential is revoked. The data
+/// stays on pg-fc until an operator purges it, and the `pg-<name>` secret is
+/// left for the namespace to delete.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct DeletedPostgresDatabase {
+    /// The name that was deleted.
+    pub deleted: String,
+    pub database: String,
+    /// The secret left behind, if any.
+    pub secret_kept: Option<String>,
+    pub note: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 // -- heyvm's image catalog ------------------------------------------------
 
 /// `GET /images`: heyvm's image catalog as app-lb manages it. Fleet scope.

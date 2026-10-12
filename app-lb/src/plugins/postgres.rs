@@ -1193,6 +1193,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{v}");
+        // The SDKs' wire contract for these three answers.
+        crate::admin::wire_golden::golden("postgres-database-created", &v);
         assert_eq!(v["database"], "ns_team_a_app");
         assert_eq!(v["user"], "ns_team_a_app");
         assert_eq!(v["password"], "p@ss/w:rd");
@@ -1266,6 +1268,9 @@ mod tests {
             !v.to_string().contains("p@ss"),
             "a list never carries a password"
         );
+        let mut pinned = v.clone();
+        pinned["databases"][0]["created_at"] = json!(1760000000);
+        crate::admin::wire_golden::golden("postgres-databases", &pinned);
 
         // The limit is per namespace.
         let (status, _) = call(
@@ -1293,6 +1298,7 @@ mod tests {
 
         let (status, v) = call(&host, "team-a", "DELETE", "/api/databases/app", Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{v}");
+        crate::admin::wire_golden::golden("postgres-database-deleted", &v);
         assert_eq!(v["secret_kept"], "pg-app");
         assert_eq!(plugin.ownership.of("team-a").len(), 1);
         let (_, v) = call(&host, "team-a", "GET", "/api/databases", Value::Null).await;

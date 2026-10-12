@@ -11769,4 +11769,4 @@ mod tests {
 /// the private response structs and nothing else in this file needs to see it.
 #[cfg(test)]
 #[path = "wire_golden.rs"]
-mod wire_golden;
+pub(crate) mod wire_golden;

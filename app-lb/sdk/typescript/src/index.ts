@@ -55,6 +55,8 @@ export type {
 
 export { ObsClient, OBS_PLUGIN, logQueryString } from "./obs.js";
 export type { LogQuery, NewAlert } from "./obs.js";
+export { PostgresClient, POSTGRES_PLUGIN } from "./postgres.js";
+export type { NewDatabase } from "./postgres.js";
 
 export { Shell, PING_INTERVAL_MS } from "./shell.js";
 export type { ShellExit, ShellOptions } from "./shell.js";

@@ -95,10 +95,14 @@ const KNOWN = {
     FeedSpec: ["announce", "issues", "expose"],
     FeedIndexEntry: ["namespace", "events"],
     FeedEvent: ["id", "ts", "last_ts", "count", "namespace", "deployment", "kind", "title", "detail"],
-    PluginView: ["id", "name", "description", "config_schema", "enabled", "config", "updated_at", "last_error", "status", "per_namespace", "installed_in"],
-    NamespacePlugin: ["id", "name", "description", "enabled", "installed", "installed_at", "installed_by", "config"],
+    PluginView: ["id", "name", "description", "config_schema", "enabled", "config", "updated_at", "last_error", "status", "per_namespace", "installed_in", "dashboard"],
+    NamespacePlugin: ["id", "name", "description", "enabled", "installed", "installed_at", "installed_by", "config", "dashboard"],
     PluginInstalls: ["plugin", "enabled", "namespaces", "installs"],
     NamespaceInstall: ["installed_at", "installed_by", "config"],
+    PostgresDatabases: ["namespace", "host", "port", "sslmode", "limit", "databases", "error"],
+    PostgresDatabase: ["name", "database", "user", "created_by", "created_at", "secret", "live", "tier"],
+    CreatedPostgresDatabase: ["name", "database", "user", "password", "host", "port", "sslmode", "url", "secret", "secret_error", "status", "note"],
+    DeletedPostgresDatabase: ["deleted", "database", "secret_kept", "note"],
   },
 };
 
@@ -140,6 +144,9 @@ const FIXTURES = {
   "plugins": "PluginView",
   "namespace-plugins": "NamespacePlugin",
   "plugin-installs": "PluginInstalls",
+  "postgres-databases": "PostgresDatabases",
+  "postgres-database-created": "CreatedPostgresDatabase",
+  "postgres-database-deleted": "DeletedPostgresDatabase",
   "auth-provider-google": "AuthProviderView",
   "auth-provider-heyo": "AuthProviderView",
   "deployment-inherited-gate": "DeploymentSpec",
@@ -185,6 +192,7 @@ const ELEMENTS = {
   disks: "DiskInfo", archives: "ArchiveView", parts: "DiskPart",
   actions: "SuggestedAction", rules: "RuleView",
   workflows: "WorkflowSpec",
+  databases: "PostgresDatabase",
   // `mounts` is a MountSpec on a VmSpec and a MountOutcome on a JobRecord — the
   // spec's declaration of a mount, and what one pull of it did. Disambiguated
   // below by the declaration we are inside, the same way `vms` and `auth` are.
