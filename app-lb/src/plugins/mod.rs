@@ -58,6 +58,7 @@
 //! the plugin is disabled, and authenticate every request themselves.
 
 pub mod artifacts;
+pub mod auth;
 pub mod ci;
 pub mod ns_proxy;
 pub mod obs;
@@ -139,6 +140,33 @@ pub trait Plugin: Send + Sync + 'static {
 
     /// Reject a namespace's install configuration before it is persisted.
     fn validate_install(&self, _namespace: &str, _config: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The configuration a plugin runs with when no operator has written a
+    /// record for it: `Some` makes it enabled out of the box. Asked once, on
+    /// the boot that finds no record; from then on the record decides, so an
+    /// operator who disables it is not overruled by the next restart.
+    fn default_config(&self) -> Option<Value> {
+        None
+    }
+
+    /// Called when `namespace` installs the plugin (or replaces its install
+    /// configuration), after [`Self::validate_install`] and before the install
+    /// is recorded. An error refuses the install. For a plugin whose install
+    /// *creates* something in the namespace — an auth provider, say.
+    async fn on_install(
+        &self,
+        _namespace: &str,
+        _config: &Value,
+        _fleet_config: &Value,
+    ) -> Result<(), SetError> {
+        Ok(())
+    }
+
+    /// Called before `namespace`'s install is removed. An error refuses the
+    /// uninstall, for a plugin whose install created something still in use.
+    async fn on_uninstall(&self, _namespace: &str, _config: &Value) -> Result<(), SetError> {
         Ok(())
     }
 
@@ -385,6 +413,8 @@ pub enum SetError {
     Io(std::io::Error),
     /// The fleet switch is off, so a namespace cannot install it.
     Disabled(&'static str),
+    /// The install or uninstall would clash with what is already there.
+    Conflict(String),
 }
 
 impl std::fmt::Display for SetError {
@@ -398,6 +428,7 @@ impl std::fmt::Display for SetError {
                 "the {id} plugin is disabled on this host; an operator enables it with \
                  `heyctl plugins enable {id}` before a namespace can install it"
             ),
+            SetError::Conflict(m) => f.write_str(m),
         }
     }
 }
@@ -588,6 +619,7 @@ impl PluginHost {
         slot.plugin
             .validate_install(ns, &config)
             .map_err(SetError::Invalid)?;
+        slot.plugin.on_install(ns, &config, &record.config).await?;
         let installed_at = record
             .installs
             .get(ns)
@@ -613,6 +645,9 @@ impl PluginHost {
         let slot = self.installable(id).ok_or(SetError::NotFound)?.clone();
         let _held = slot.lock.lock().await;
         let mut record = self.store.get(id).unwrap_or_default();
+        if let Some(install) = record.installs.get(ns) {
+            slot.plugin.on_uninstall(ns, &install.config).await?;
+        }
         let removed = record.installs.remove(ns).is_some();
         let newly_declined = record.declined.insert(ns.to_string());
         if removed || newly_declined {
@@ -708,10 +743,31 @@ impl PluginHost {
         *slot.last_error.lock().unwrap() = result.err();
     }
 
-    /// Apply every enabled record — the boot path.
-    pub async fn start_enabled(&self) {
+    /// Apply every enabled record — the boot path. A plugin with no record
+    /// and a [`Plugin::default_config`] gets one, enabled, first. Returns the
+    /// ids enabled that way, so the caller can install them into the
+    /// namespaces that already exist.
+    pub async fn start_enabled(&self) -> Vec<&'static str> {
+        let mut defaulted = Vec::new();
         for slot in &self.slots {
             let id = slot.plugin.meta().id;
+            if self.store.get(id).is_none()
+                && let Some(config) = slot.plugin.default_config()
+            {
+                let record = PluginRecord {
+                    enabled: true,
+                    config,
+                    updated_at: crate::deployment::now_secs(),
+                    ..Default::default()
+                };
+                match self.store.put(id, record) {
+                    Ok(()) => {
+                        tracing::info!(plugin = id, "plugin enabled by default");
+                        defaulted.push(id);
+                    }
+                    Err(e) => tracing::warn!(plugin = id, error = %e, "could not record a default-enabled plugin"),
+                }
+            }
             let Some(record) = self.store.get(id).filter(|r| r.enabled) else {
                 continue;
             };
@@ -723,6 +779,7 @@ impl PluginHost {
             }
             self.apply_slot(slot, Some(record.config)).await;
         }
+        defaulted
     }
 
     /// Stop every plugin — the shutdown path.
@@ -864,21 +921,32 @@ fn disabled(id: &str) -> Response {
         .into_response()
 }
 
+/// Every namespace app-lb knows, for installing a default-enabled plugin on
+/// the boot that enables it.
+pub type KnownNamespaces = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Runs the enabled plugins for the life of the process.
 pub struct PluginService {
     host: Arc<PluginHost>,
+    namespaces: KnownNamespaces,
 }
 
 impl PluginService {
-    pub fn new(host: Arc<PluginHost>) -> Self {
-        Self { host }
+    pub fn new(host: Arc<PluginHost>, namespaces: KnownNamespaces) -> Self {
+        Self { host, namespaces }
     }
 }
 
 #[async_trait]
 impl pingora_core::services::background::BackgroundService for PluginService {
     async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
-        self.host.start_enabled().await;
+        if !self.host.start_enabled().await.is_empty() {
+            // A plugin just switched on by default reaches the namespaces that
+            // already exist, as one an operator enables does.
+            for ns in (self.namespaces)() {
+                self.host.auto_install(&ns, Some("auto".into())).await;
+            }
+        }
         while shutdown.changed().await.is_ok() {
             if *shutdown.borrow() {
                 break;

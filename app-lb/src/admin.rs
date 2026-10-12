@@ -2454,6 +2454,7 @@ fn plugin_set_error(e: crate::plugins::SetError) -> Response {
             Json(serde_json::json!({ "error": e.to_string(), "code": "plugin_disabled" })),
         )
             .into_response(),
+        e @ SetError::Conflict(_) => err(StatusCode::CONFLICT, e.to_string()).into_response(),
     }
 }
 
