@@ -1495,3 +1495,49 @@ export interface DeletedPostgresDatabase {
   note: string;
   [extra: string]: unknown;
 }
+
+// -- artifacts (the artifacts plugin) ----------------------------------------
+
+/** `…/plugins/artifacts/api` — the namespace's view of the store. Never names it. */
+export interface ArtifactStoreInfo {
+  namespace: string;
+  /** Whether this app-lb fronts a global store at all. */
+  available: boolean;
+  /** Whether it holds the store's key, so the namespace can publish. */
+  writable: boolean;
+  /** What every tag and repository of the namespace starts with: `<ns>/`. */
+  prefix: string;
+  [extra: string]: unknown;
+}
+
+/** A tag and the digest it points at. */
+export interface ArtifactTag {
+  /** `<ns>/<repo>:<tag>`. */
+  tag: string;
+  /** A 64-hex sha256 of a manifest (or a blob). */
+  digest: string;
+  [extra: string]: unknown;
+}
+
+/** One tag in an {@link ArtifactRepo}. */
+export interface ArtifactRepoTag {
+  tag: string;
+  /** The part after `:`. */
+  name: string;
+  digest: string;
+  [extra: string]: unknown;
+}
+
+/** A repository: the part of a tag before `:`, with what was said about it. */
+export interface ArtifactRepo {
+  /** `<ns>/<repo>`. */
+  repo: string;
+  /** Public repositories are on the hub and pull without a credential. */
+  public: boolean;
+  description: string | null;
+  /** Unix seconds of the last metadata change. */
+  updated: number;
+  /** Absent in the answer to `setRepo`. */
+  tags?: ArtifactRepoTag[];
+  [extra: string]: unknown;
+}

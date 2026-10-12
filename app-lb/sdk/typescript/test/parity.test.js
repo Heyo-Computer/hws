@@ -3,7 +3,7 @@
 // drift on the wire.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ConflictError, Hws, Heyctl, ObsClient, PostgresClient, logQueryString } from "../dist/index.js";
+import { ArtifactsClient, ConflictError, Hws, Heyctl, ObsClient, PostgresClient, logQueryString } from "../dist/index.js";
 
 function stub(...replies) {
   const seen = [];
@@ -157,6 +157,49 @@ test("postgres databases go through the namespace's plugin route", async () => {
   );
   assert.deepEqual(s.seen[0].body, { name: "app", secret: true });
   assert.deepEqual(s.seen[1].body, { name: "scratch", secret: false });
+});
+
+test("artifacts go through the namespace's plugin route, a tag's digest as text", async () => {
+  const D = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  const replies = [
+    { body: { namespace: "team-a", available: true, writable: true, prefix: "team-a/" } },
+    { body: [{ tag: "team-a/web:v2", digest: D }] },
+    { body: { tag: "team-a/web:v2", digest: D } },
+    { status: 204 },
+    { status: 204 },
+    { body: { kind: "heyvm.rootfs.v1" } },
+    { body: { repo: "team-a/web", public: false, tags: [] } },
+    { body: { repo: "team-a/web", public: true, description: null, updated: 5 } },
+  ];
+  const seen = [];
+  const fetch = async (url, init) => {
+    seen.push({ url, method: init.method, type: init.headers["content-type"], body: init.body });
+    const r = replies.shift();
+    return new Response(r.status === 204 ? null : JSON.stringify(r.body), { status: r.status ?? 200 });
+  };
+  const store = new Heyctl({ server: "http://x:1", fetch }).artifacts("team-a");
+  assert.ok(store instanceof ArtifactsClient);
+  assert.equal((await store.info()).prefix, "team-a/");
+  assert.equal((await store.tags())[0].digest, D);
+  const v2 = await store.tag("team-a/web:v2");
+  await store.setTag("team-a/web:latest", v2.digest);
+  await store.deleteTag("team-a/web:old");
+  assert.equal((await store.manifest(D)).kind, "heyvm.rootfs.v1");
+  await store.repo("team-a/web");
+  assert.equal((await store.setRepo("team-a/web", { public: true })).public, true);
+  const base = "http://x:1/namespaces/team-a/plugins/artifacts/api";
+  assert.deepEqual(seen.map((r) => `${r.method} ${r.url}`), [
+    `GET ${base}`,
+    `GET ${base}/tags`,
+    `GET ${base}/tags/team-a/web%3Av2`,
+    `PUT ${base}/tags/team-a/web%3Alatest`,
+    `DELETE ${base}/tags/team-a/web%3Aold`,
+    `GET ${base}/manifests/${D}`,
+    `GET ${base}/repos/team-a/web`,
+    `PUT ${base}/repos/team-a/web`,
+  ]);
+  assert.deepEqual([seen[3].type, seen[3].body], ["text/plain", D]);
+  assert.deepEqual(JSON.parse(seen[7].body), { public: true, description: null });
 });
 
 test("the log query is written in the crate's order and skips what is unset", () => {
