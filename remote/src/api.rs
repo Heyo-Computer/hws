@@ -40,7 +40,10 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/whoami", get(whoami))
         .route("/api/repos/{ns}", get(list_repos).post(create_repo))
-        .route("/api/repos/{ns}/{repo}", get(get_repo).delete(delete_repo))
+        .route(
+            "/api/repos/{ns}/{repo}",
+            get(get_repo).patch(update_repo).delete(delete_repo),
+        )
         .route(
             "/api/repos/{ns}/{repo}/commits",
             post(create_commit).layer(DefaultBodyLimit::max(commit_limit)),
@@ -230,6 +233,7 @@ fn repo_json(s: &AppState, m: &RepoMeta) -> serde_json::Value {
         "description": m.description,
         "created_at": m.created_at,
         "created_by": m.created_by,
+        "public": m.public,
         "clone_url": clone_url(s, &m.namespace, &m.name),
     })
 }
@@ -274,6 +278,8 @@ pub struct CreateRepo {
     pub description: Option<String>,
     #[serde(default)]
     pub default_branch: Option<String>,
+    #[serde(default)]
+    pub public: bool,
 }
 
 async fn create_repo(
@@ -340,11 +346,18 @@ pub async fn new_repo(
                 created_at: crate::sigv4::now_unix(),
                 created_by: Some(p.subject.clone()),
                 description: body.description.filter(|d| !d.trim().is_empty()),
+                public: body.public,
             },
         )
         .await?;
     tracing::info!(namespace = %ns, repo = %meta.name, by = %p.subject, "created repo");
     Ok(meta)
+}
+
+/// Whether `ns/repo` exists and is public. Any failure reads as "no", so a
+/// caller turned away learns nothing about a private repo.
+pub async fn is_public(s: &AppState, ns: &str, repo: &str) -> bool {
+    existing(s, ns, repo).await.is_ok_and(|(_, m)| m.public)
 }
 
 async fn get_repo(
@@ -354,8 +367,21 @@ async fn get_repo(
 ) -> ApiResult<Json<serde_json::Value>> {
     let repo = registry::repo_from_url(&repo).to_string();
     check_names(&ns, Some(&repo))?;
-    let p = caller(&s, &headers).await?;
-    require(&p, &ns, Some(&repo), Tier::Read)?;
+    // A public repo needs no credential; a credential that is sent must
+    // still be a good one.
+    let p = match auth::bearer(&headers) {
+        Some(_) => Some(caller(&s, &headers).await?),
+        None => None,
+    };
+    let allowed = p
+        .as_ref()
+        .is_some_and(|p| p.allows(&ns, Some(&repo), Tier::Read));
+    if !allowed && !is_public(&s, &ns, &repo).await {
+        return Err(match p {
+            Some(p) => require(&p, &ns, Some(&repo), Tier::Read).expect_err("refused above"),
+            None => ApiError::new(StatusCode::UNAUTHORIZED, "no credential").hint(CREDENTIAL_HINT),
+        });
+    }
     let (b, meta) = existing(&s, &ns, &repo).await?;
     let (state, _) = s.registry.state(&b.bucket, &ns, &repo).await?;
     let mut out = repo_json(&s, &meta);
@@ -365,6 +391,48 @@ async fn get_repo(
     out["version"] = state.version.into();
     out["updated_at"] = state.updated_at.into();
     Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct UpdateRepo {
+    public: bool,
+}
+
+async fn update_repo(
+    State(s): State<AppState>,
+    Path((ns, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateRepo>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let p = caller(&s, &headers).await?;
+    let meta = set_public(&s, &p, &ns, &repo, body.public).await?;
+    Ok(Json(repo_json(&s, &meta)))
+}
+
+/// Make `ns/repo` public (readable by anyone with its URL) or private again,
+/// as `p`. Shared by the API and the web UI.
+pub async fn set_public(
+    s: &AppState,
+    p: &Principal,
+    ns: &str,
+    repo: &str,
+    public: bool,
+) -> ApiResult<RepoMeta> {
+    check_names(ns, Some(repo))?;
+    require(p, ns, None, Tier::Admin)?;
+    let (b, _) = existing(s, ns, repo).await?;
+    let meta = s
+        .registry
+        .update_repo(&b, ns, repo, |m| m.public = public)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("repo {ns}/{repo} does not exist"),
+            )
+        })?;
+    tracing::info!(namespace = %ns, repo = %repo, public, by = %p.subject, "set repo visibility");
+    Ok(meta)
 }
 
 async fn delete_repo(
@@ -580,7 +648,19 @@ async fn git_repo(
 ) -> Result<RepoRef, Response> {
     let repo = registry::repo_from_url(repo_seg);
     check_names(ns, Some(repo)).map_err(|e| e.into_response())?;
+    // A public repo is cloned and fetched without a credential. Pushes, and
+    // anything else, still need one; a private or missing repo answers the
+    // same 401, so the URL alone confirms nothing.
+    let public = want == Tier::Read && is_public(s, ns, repo).await;
     let Some(bearer) = auth::bearer(headers) else {
+        if public {
+            let (b, _) = existing(s, ns, repo).await.map_err(|e| e.into_response())?;
+            return Ok(RepoRef {
+                bucket: b.bucket,
+                ns: ns.to_string(),
+                name: repo.to_string(),
+            });
+        }
         return Err(git_unauthorized("authentication required"));
     };
     let Some(p) = s.auth.authenticate(&bearer).await else {
@@ -588,7 +668,7 @@ async fn git_repo(
             "credential refused (unknown, expired or revoked)",
         ));
     };
-    if !p.allows(ns, Some(repo), want) {
+    if !public && !p.allows(ns, Some(repo), want) {
         return Err((
             StatusCode::FORBIDDEN,
             format!(

@@ -20,6 +20,10 @@
 //! and nothing else. A repo they cannot read is a 404, never a 403: a page
 //! does not confirm that a repo exists to someone who may not see it.
 //!
+//! A repo marked public is the exception: its pages open for anyone, signed
+//! in or not, who has its URL. It is still listed only where its namespace's
+//! repos already are, so the URL is the only way to find it.
+//!
 //! app-lb's deployment gate is not used for this, on purpose. The gate
 //! forwards a name and an email but no namespaces, and git clients reach the
 //! same host and cannot pass a sign-in page.
@@ -90,6 +94,7 @@ fn namespace_routes() -> Router<AppState> {
         .route("/{ns}/{repo}/branches", get(branches_page))
         .route("/{ns}/{repo}/tags", get(tags_page))
         .route("/{ns}/{repo}/settings", get(settings_page))
+        .route("/{ns}/{repo}/settings/visibility", post(set_visibility))
         .route("/{ns}/{repo}/settings/delete", post(delete_repo))
 }
 
@@ -1086,6 +1091,7 @@ async fn new_repo(
         name: f.name.trim().to_string(),
         description: Some(f.description.trim().to_string()),
         default_branch: Some(f.default_branch.trim().to_string()),
+        public: false,
     };
     match api::new_repo(&s, &p, &ns, body).await {
         Ok(m) => Redirect::to(&format!("{}/{}", ns_url(&ns), m.name)).into_response(),
@@ -1302,7 +1308,8 @@ async fn revoke_token(
 /// A repo the caller may read, located and hydrated.
 struct RepoCtx {
     ctx: Ctx,
-    p: Arc<Principal>,
+    /// `None` for an anonymous reader of a public repo.
+    p: Option<Arc<Principal>>,
     meta: RepoMeta,
     r: RepoRef,
     view: ReadView,
@@ -1315,12 +1322,14 @@ impl RepoCtx {
     }
 
     fn admin(&self) -> bool {
-        self.p.allows(&self.r.ns, None, Tier::Admin)
+        self.p
+            .as_ref()
+            .is_some_and(|p| p.allows(&self.r.ns, None, Tier::Admin))
     }
 }
 
 /// Everything a repo page starts with. A repo the caller cannot read is a 404,
-/// whether or not it exists.
+/// whether or not it exists, and a sign-in for an anonymous caller.
 async fn open_repo(
     s: &AppState,
     headers: &HeaderMap,
@@ -1329,10 +1338,18 @@ async fn open_repo(
     here: &str,
 ) -> Result<RepoCtx, Response> {
     let ctx = Ctx::new(s, headers).await;
-    let p = ctx.signed_in(here)?;
-    if api::check_names(ns, Some(repo)).is_err() || !p.allows(ns, Some(repo), Tier::Read) {
+    let valid = api::check_names(ns, Some(repo)).is_ok();
+    let allowed = valid
+        && ctx
+            .p
+            .as_ref()
+            .is_some_and(|p| p.allows(ns, Some(repo), Tier::Read));
+    let readable = allowed || (valid && api::is_public(s, ns, repo).await);
+    if !readable {
+        ctx.signed_in(here)?;
         return Err(not_found(&ctx));
     }
+    let p = ctx.p.clone();
     let (b, meta) = match api::existing(s, ns, repo).await {
         Ok(x) => x,
         Err(e) if e.status() == StatusCode::NOT_FOUND => return Err(not_found(&ctx)),
@@ -1378,7 +1395,8 @@ fn repo_header(rc: &RepoCtx, tab: Tab) -> Markup {
                 a href=(ns_url(&rc.r.ns)) { (rc.r.ns) }
                 span.sep { " / " }
                 a href=(base) { strong { (rc.r.name) } }
-                " " span.pill.pill-muted { (rc.p.tier_in(&rc.r.ns).map_or("read", Tier::as_str)) }
+                " " span.pill.pill-muted { (rc.p.as_ref().and_then(|p| p.tier_in(&rc.r.ns)).map_or("read", Tier::as_str)) }
+                @if rc.meta.public { " " span.pill.pill-accent { "public" } }
             }
             @if let Some(d) = &rc.meta.description { p.desc { (d) } }
             nav.tabs {
@@ -2148,6 +2166,18 @@ fn settings_view(rc: &RepoCtx, error: Option<&str>) -> Markup {
                     tr { td { "State version" } td.mono { (rc.view.state.version) " · " (rc.view.state.packs.len()) " packs" } }
                 } }
             }
+            div.card {
+                div.card-head { h3 { "Visibility" } }
+                @if rc.meta.public {
+                    p { "Public: anyone with this repository's URL can browse and clone it without signing in. It is not listed anywhere they could find it." }
+                } @else {
+                    p { "Private: only credentials with access to " (rc.r.ns) " can read it." }
+                }
+                form method="post" action=(format!("{base}/settings/visibility")) {
+                    input type="hidden" name="public" value=(if rc.meta.public { "false" } else { "true" });
+                    button.btn type="submit" { (if rc.meta.public { "Make private" } else { "Make public" }) }
+                }
+            }
             div.card.danger-zone {
                 div.card-head { h3 { "Danger zone" } }
                 @if let Some(e) = error { div.banner.banner-error { (e) } }
@@ -2182,6 +2212,34 @@ async fn settings_page(
         "",
         settings_view(&rc, None),
     ))
+}
+
+#[derive(Deserialize)]
+struct VisibilityForm {
+    public: bool,
+}
+
+async fn set_visibility(
+    State(s): State<AppState>,
+    Path((ns, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(f): Form<VisibilityForm>,
+) -> Response {
+    let ctx = Ctx::new(&s, &headers).await;
+    let p = match ctx.signed_in(&format!("/{ns}/{repo}/settings")) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !same_origin(&s, &headers) {
+        return forbidden_origin(&ctx);
+    }
+    if !p.allows(&ns, None, Tier::Admin) {
+        return not_found(&ctx);
+    }
+    match api::set_public(&s, &p, &ns, &repo, f.public).await {
+        Ok(_) => Redirect::to(&format!("{}/{repo}/settings", ns_url(&ns))).into_response(),
+        Err(e) => failure(&ctx, e.status(), &e.message()),
+    }
 }
 
 #[derive(Deserialize)]
