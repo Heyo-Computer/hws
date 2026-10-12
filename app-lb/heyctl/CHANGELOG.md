@@ -4,7 +4,7 @@ All notable changes to the `hws` crate (the Heyo Web Services SDK and the
 `heyctl` CLI). The crate follows [semantic versioning](https://semver.org/);
 while it is `0.x`, a minor bump may break the API.
 
-## Unreleased
+## 0.4.0 — 2026-10-12
 
 ### Added
 

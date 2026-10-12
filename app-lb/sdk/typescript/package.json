@@ -1,6 +1,6 @@
 {
   "name": "@heyocomputer/hws",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "The app-lb SDK for TypeScript — deployments, autoscaling, exec and shells, rollouts, namespace plugins and telemetry for heyvm microVMs. Twin of the hws crate.",
   "type": "module",
   "main": "./dist/index.js",
