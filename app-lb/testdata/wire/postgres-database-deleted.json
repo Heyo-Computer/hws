@@ -1,0 +1,6 @@
+{
+  "database": "ns_team_a_app",
+  "deleted": "app",
+  "note": "The credential is revoked. The database's data stays on the pool until an operator purges it, and any pg-* secret is left in place: delete it from the Secrets page once nothing uses it.",
+  "secret_kept": "pg-app"
+}

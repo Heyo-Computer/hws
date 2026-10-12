@@ -16,7 +16,7 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use hws::types::{
-    AuthProviderView, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView,
+    AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView, PostgresDatabases,
     UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
@@ -670,4 +670,58 @@ fn mirrored_token_summary_understands_every_field() {
     );
     assert!(t.fleet);
     assert_eq!(t.mirrored_from.as_deref(), Some("us2"));
+}
+
+/// The postgres plugin's three answers, recorded from the plugin itself
+/// (`src/plugins/postgres.rs`) rather than from a response type.
+#[test]
+fn postgres_plugin_answers_are_understood() {
+    let list: PostgresDatabases =
+        serde_json::from_str(&fixture("postgres-databases")).expect("fixture parses");
+    assert!(
+        list.extra.is_empty(),
+        "unknown list fields: {:?}",
+        list.extra.keys().collect::<Vec<_>>()
+    );
+    let db = &list.databases[0];
+    assert!(
+        db.extra.is_empty(),
+        "unknown database fields: {:?}",
+        db.extra.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        (db.name.as_str(), db.database.as_str()),
+        ("app", "ns_team_a_app")
+    );
+    assert_eq!(
+        (db.live, db.secret.as_deref()),
+        (Some(true), Some("pg-app"))
+    );
+    assert_eq!((list.port, list.limit), (6432, 2));
+
+    let created: CreatedPostgresDatabase =
+        serde_json::from_str(&fixture("postgres-database-created")).expect("fixture parses");
+    assert!(
+        created.extra.is_empty(),
+        "unknown create fields: {:?}",
+        created.extra.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(created.password, "p@ss/w:rd");
+    assert!(
+        created
+            .url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("postgres://"))
+    );
+    assert_eq!(created.status, "provisioning");
+
+    let deleted: DeletedPostgresDatabase =
+        serde_json::from_str(&fixture("postgres-database-deleted")).expect("fixture parses");
+    assert!(
+        deleted.extra.is_empty(),
+        "unknown delete fields: {:?}",
+        deleted.extra.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(deleted.deleted, "app");
+    assert_eq!(deleted.secret_kept.as_deref(), Some("pg-app"));
 }

@@ -3,7 +3,7 @@
 // drift on the wire.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ConflictError, Hws, Heyctl, ObsClient, logQueryString } from "../dist/index.js";
+import { ConflictError, Hws, Heyctl, ObsClient, PostgresClient, logQueryString } from "../dist/index.js";
 
 function stub(...replies) {
   const seen = [];
@@ -134,6 +134,29 @@ test("obs reads go through the namespace's plugin route", async () => {
     ],
   );
   assert.deepEqual(s.seen[4].body, { deployment: "web", threshold: 5, webhook_url: "https://hooks.example/x" });
+});
+
+test("postgres databases go through the namespace's plugin route", async () => {
+  const s = stub(
+    { status: 201, body: { name: "app", database: "ns_team_a_app", password: "x", secret: "pg-app" } },
+    { status: 201, body: { name: "scratch", secret: null } },
+    { body: { namespace: "team a", databases: [{ name: "app", live: true }] } },
+    { body: { deleted: "app", secret_kept: "pg-app" } },
+  );
+  const pg = lb(s).postgres("team a");
+  assert.ok(pg instanceof PostgresClient);
+  assert.equal(pg.namespace, "team a");
+  assert.equal((await pg.createDatabase({ name: "app" })).secret, "pg-app");
+  await pg.createDatabase({ name: "scratch", secret: false });
+  assert.equal((await pg.databases()).databases[0].name, "app");
+  assert.equal((await pg.deleteDatabase("app")).secret_kept, "pg-app");
+  const base = "/namespaces/team%20a/plugins/postgres/api";
+  assert.deepEqual(
+    s.seen.map((r) => `${r.method} ${r.url}`),
+    [`POST ${base}/databases`, `POST ${base}/databases`, `GET ${base}/databases`, `DELETE ${base}/databases/app`],
+  );
+  assert.deepEqual(s.seen[0].body, { name: "app", secret: true });
+  assert.deepEqual(s.seen[1].body, { name: "scratch", secret: false });
 });
 
 test("the log query is written in the crate's order and skips what is unset", () => {

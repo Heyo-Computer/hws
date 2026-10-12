@@ -207,6 +207,23 @@ heyctl logs web --level error --since 1h
 This is [`examples/namespace_workload.rs`](examples/namespace_workload.rs):
 `HEYCTL_SERVER=… HEYCTL_TOKEN=… cargo run --example namespace_workload`.
 
+### Postgres databases
+
+Where the operator has enabled the `postgres` plugin, a namespace makes its own
+databases on the region's pg-fc pool. Each gets its own role and password, also
+written to the namespace secret `pg-<name>` for a deployment's `env_from`:
+
+```rust
+lb.install_plugin(&ns, "postgres", None).await?;
+let pg = lb.postgres(&ns);
+let db = pg.create_database(&NewDatabase::new("app")).await?;
+// `db.password` and `db.url` come back this once; they are also in `pg-app`.
+for d in pg.databases().await?.databases {
+    println!("{} → {}", d.name, d.database);
+}
+pg.delete_database("app").await?; // revokes the credential; data and secret stay
+```
+
 ### The rest of the surface
 
 ```rust

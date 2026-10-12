@@ -77,6 +77,7 @@ pub mod api;
 pub mod error;
 pub mod images;
 pub mod obs;
+pub mod postgres;
 pub mod shell;
 pub mod transport;
 pub mod types;
@@ -97,6 +98,7 @@ pub use api::{Client, ClientBuilder, ExecRequest, Gates, MetricsQuery, NewToken}
 pub const DEFAULT_NAMESPACE: &str = "default";
 pub use error::{Credential, Error, Result};
 pub use obs::{LogQuery, NewAlert, OBS_PLUGIN, ObsClient};
+pub use postgres::{NewDatabase, POSTGRES_PLUGIN, PostgresClient};
 pub use shell::{Shell, ShellEvent, ShellExit, ShellOptions};
 pub use transport::{Auth, Transport};
 pub use types::*;

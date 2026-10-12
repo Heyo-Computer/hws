@@ -1,0 +1,14 @@
+{
+  "database": "ns_team_a_app",
+  "host": "pg.example",
+  "name": "app",
+  "note": "This is the only time the password is shown.",
+  "password": "p@ss/w:rd",
+  "port": 6432,
+  "secret": "pg-app",
+  "secret_error": null,
+  "sslmode": "require",
+  "status": "provisioning",
+  "url": "postgres://ns_team_a_app:p%40ss%2Fw%3Ard@pg.example:6432/ns_team_a_app?sslmode=require",
+  "user": "ns_team_a_app"
+}

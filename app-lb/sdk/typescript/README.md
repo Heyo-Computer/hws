@@ -200,9 +200,22 @@ while (page.next_before_ms !== null) {
 }
 ```
 
-Before it is installed every `obs` call rejects with a `ConflictError` whose
-`code` is `plugin_not_installed` (or `plugin_disabled` while the operator has it
-off).
+Where the operator has enabled the `postgres` plugin, a namespace makes its own
+databases. Each gets its own role and password, also written to the namespace
+secret `pg-<name>` for a deployment's `env_from`:
+
+```ts
+await lb.installPlugin("team-a", "postgres");
+const pg = lb.postgres("team-a");
+const db = await pg.createDatabase({ name: "app" }); // { secret: false } skips pg-app
+// db.password and db.url come back this once.
+const { databases } = await pg.databases();
+await pg.deleteDatabase("app"); // revokes the credential; data and secret stay
+```
+
+Before a plugin is installed every `obs` or `postgres` call rejects with a
+`ConflictError` whose `code` is `plugin_not_installed` (or `plugin_disabled`
+while the operator has it off).
 
 `whoami()` says what the server makes of the credential: its tier, whether it is
 confined, and to which namespace.

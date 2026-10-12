@@ -1158,6 +1158,11 @@ export interface PluginView {
   per_namespace?: boolean;
   /** The namespaces that have, for a per-namespace plugin. */
   installed_in?: string[];
+  /**
+   * Where its dashboard sits on a namespace's surface (`ui`), for a plugin that
+   * has one; app-lb frames it at `/namespaces/<ns>/plugin-console/<id>`.
+   */
+  dashboard?: string | null;
 }
 
 // -- whoami ------------------------------------------------------------------
@@ -1273,6 +1278,8 @@ export interface NamespacePlugin {
   /** `token:<id>` or `user:<id>`; absent for the operator. */
   installed_by?: string;
   config?: unknown;
+  /** Where its dashboard sits on the namespace's surface, if it has one. */
+  dashboard?: string | null;
   [extra: string]: unknown;
 }
 
@@ -1416,5 +1423,75 @@ export interface ObsAlert {
   metric: string;
   threshold: number;
   webhook_url: string;
+  [extra: string]: unknown;
+}
+
+// -- databases (the postgres plugin) -----------------------------------------
+
+/** One database in {@link PostgresDatabases}. */
+export interface PostgresDatabase {
+  /** The name the namespace asked for, e.g. `app`. */
+  name: string;
+  /** The physical database (and role) on pg-fc, e.g. `ns_team_a_app`. */
+  database: string;
+  user: string;
+  created_by: string | null;
+  created_at: number;
+  /** The namespace secret holding its credentials (`pg-<name>`), while it exists. */
+  secret: string | null;
+  /** Whether pg-fc still has it; `null` when pg-fc could not be asked. */
+  live: boolean | null;
+  /** pg-fc's storage tier for it, e.g. `warm`. */
+  tier: string | null;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/postgres/api/databases` — a namespace's databases. Never carries a password. */
+export interface PostgresDatabases {
+  namespace: string;
+  /** Where every database is reached: the region's pg-fc pooler. */
+  host: string;
+  port: number;
+  sslmode: string;
+  /** The most databases this host lets one namespace have. */
+  limit: number;
+  databases: PostgresDatabase[];
+  /** Why pg-fc could not say which databases are live; the list is still complete. */
+  error: string | null;
+  [extra: string]: unknown;
+}
+
+/**
+ * The reply to creating a database. **`password` (and `url`, which embeds it)
+ * is the only time the credential is returned**; unless created without one, it
+ * is also in the namespace secret named by `secret`.
+ */
+export interface CreatedPostgresDatabase {
+  name: string;
+  database: string;
+  user: string;
+  password: string;
+  host: string;
+  port: number;
+  sslmode: string;
+  /** `postgres://user:password@host:port/database?sslmode=…`. */
+  url: string | null;
+  /** The namespace secret the credentials were written to (`pg-<name>`). */
+  secret: string | null;
+  /** Why the secret could not be written, when it was asked for and was not. */
+  secret_error: string | null;
+  /** `provisioning`: the credential works now; the VM comes up in the background. */
+  status: string;
+  note: string;
+  [extra: string]: unknown;
+}
+
+/** The reply to deleting a database: its credential is revoked; data and secret stay. */
+export interface DeletedPostgresDatabase {
+  deleted: string;
+  database: string;
+  /** The `pg-<name>` secret left behind, if any. */
+  secret_kept: string | null;
+  note: string;
   [extra: string]: unknown;
 }

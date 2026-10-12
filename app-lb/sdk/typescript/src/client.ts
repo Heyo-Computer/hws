@@ -6,6 +6,7 @@ import {
   fromResponse,
 } from "./errors.js";
 import { ObsClient } from "./obs.js";
+import { PostgresClient } from "./postgres.js";
 import type {
   AdminScope,
   AuthProviderView,
@@ -694,6 +695,11 @@ export class Heyctl {
   /** One namespace's telemetry through the `obs` plugin. Makes no request. */
   obs(namespace: string): ObsClient {
     return new ObsClient(this, namespace);
+  }
+
+  /** One namespace's Postgres databases through the `postgres` plugin. Makes no request. */
+  postgres(namespace: string): PostgresClient {
+    return new PostgresClient(this, namespace);
   }
 
   // -- secrets --------------------------------------------------------------

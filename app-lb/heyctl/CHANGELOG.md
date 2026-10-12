@@ -8,6 +8,13 @@ while it is `0.x`, a minor bump may break the API.
 
 ### Added
 
+- **Postgres databases.** `Client::postgres(namespace)` returns a
+  `PostgresClient` for the `postgres` plugin: `databases()`,
+  `create_database(&NewDatabase::new("app"))` (the password comes back once and
+  is also written to the namespace secret `pg-<name>` unless
+  `.without_secret()`) and `delete_database(name)`. Blocking twins on
+  `blocking::Client::postgres`, and `Raw::postgres_databases`.
+  `CreatedPostgresDatabase`'s `Debug` leaves the password and URL out.
 - **Tokens for every server.** `NewToken::on_all_servers()` (and
   `heyctl token mint … --all-servers`) mints at a control-plane app-lb a token
   that every server mirroring it accepts. `TokenSummary` gains `fleet` and
