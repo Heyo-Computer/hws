@@ -24,6 +24,7 @@ use crate::api::{ExecRequest, Gates, MetricsQuery, NewToken};
 use crate::error::{Error, Result};
 use crate::obs::{LogQuery, NewAlert};
 use crate::postgres::NewDatabase;
+use crate::gate::Gate;
 use crate::shell::{ShellEvent, ShellExit, ShellOptions};
 use crate::transport::Auth;
 use crate::types::*;
@@ -550,6 +551,16 @@ impl Client {
             client: self,
             inner: self.inner.obs(namespace),
         }
+    }
+
+    /// Put a deployment behind sign-in. See [`crate::Client::set_auth`].
+    pub fn set_auth(&self, id: &str, gate: &Gate) -> Result<DeploymentStatus> {
+        run!(self, self.inner.set_auth(id, gate))
+    }
+
+    /// Remove a deployment's sign-in gate. See [`crate::Client::clear_auth`].
+    pub fn clear_auth(&self, id: &str) -> Result<DeploymentStatus> {
+        run!(self, self.inner.clear_auth(id))
     }
 
     /// One namespace's corner of the artifact store. See

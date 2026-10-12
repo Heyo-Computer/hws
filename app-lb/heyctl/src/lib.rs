@@ -76,6 +76,7 @@
 pub mod api;
 pub mod artifacts;
 pub mod error;
+pub mod gate;
 pub mod images;
 pub mod obs;
 pub mod postgres;
@@ -98,6 +99,7 @@ pub use api::{Client, ClientBuilder, ExecRequest, Gates, MetricsQuery, NewToken}
 /// name one.
 pub const DEFAULT_NAMESPACE: &str = "default";
 pub use error::{Credential, Error, Result};
+pub use gate::{Gate, GatePath};
 pub use obs::{LogQuery, NewAlert, OBS_PLUGIN, ObsClient};
 pub use artifacts::{ARTIFACTS_PLUGIN, ArtifactsClient};
 pub use postgres::{NewDatabase, POSTGRES_PLUGIN, PostgresClient};

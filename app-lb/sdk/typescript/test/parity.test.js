@@ -202,6 +202,31 @@ test("artifacts go through the namespace's plugin route, a tag's digest as text"
   assert.deepEqual(JSON.parse(seen[7].body), { public: true, description: null });
 });
 
+test("setAuth checks the provider, then replaces the spec with an inheriting gate", async () => {
+  const spec = { id: "reports", namespace: "team-a", routes: [{ host: "r.example.com" }],
+    auth: { provider: "google", client_id: "x", allowed_domains: ["example.com"], session_ttl_secs: 600 } };
+  const s = stub(
+    { body: { spec } },
+    { body: { name: "heyo", namespace: "team-a" } },
+    { body: { spec } },
+  );
+  await lb(s).setAuth("reports", { provider: "heyo", publicPaths: [{ path: "/healthz" }] });
+  assert.deepEqual(s.seen.map((r) => `${r.method} ${r.url}`), [
+    "GET /deployments/reports", "GET /auth-providers/team-a/heyo", "PUT /deployments/reports",
+  ]);
+  assert.deepEqual(s.seen[2].body.auth, {
+    provider_ref: "heyo", session_ttl_secs: 600, public_paths: [{ path: "/healthz", scope: "public" }],
+  });
+
+  const missing = stub({ body: { spec } }, { status: 404, body: { error: "no such provider" } });
+  await assert.rejects(() => lb(missing).setAuth("reports", { provider: "google" }), /auth-google/);
+  assert.equal(missing.seen.length, 2, "nothing was written");
+
+  const clear = stub({ body: { spec } }, { body: { spec } });
+  await lb(clear).clearAuth("reports");
+  assert.equal(clear.seen[1].body.auth, undefined);
+});
+
 test("the log query is written in the crate's order and skips what is unset", () => {
   assert.equal(logQueryString(), "");
   assert.equal(logQueryString({ level: "" }), "");

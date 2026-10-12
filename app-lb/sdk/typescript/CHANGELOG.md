@@ -3,6 +3,15 @@
 Versioned with the [`hws`](https://crates.io/crates/hws) crate; the two
 releases share a wire contract and are checked against the same app-lb fixtures.
 
+## Unreleased
+
+### Added
+
+- `setAuth(id, { provider, publicPaths?, sessionTtlSecs?, basePath?,
+  cookieName?, forwardIdentity? })` and `clearAuth(id)`: put a deployment
+  behind a namespace auth provider (`heyo`, `google`, …) or take it out.
+  `applyGate(spec, gate)` does the same to a spec in hand.
+
 ## 0.3.0 — 2026-10-12
 
 ### Added
