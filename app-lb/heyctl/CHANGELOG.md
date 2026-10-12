@@ -8,6 +8,13 @@ while it is `0.x`, a minor bump may break the API.
 
 ### Added
 
+- **Artifacts.** `Client::artifacts(namespace)` returns an `ArtifactsClient`
+  for the `artifacts` plugin (the namespace's corner of the global artifact
+  store): `info()`, `tags()`, `tag()`, `set_tag()`, `delete_tag()`,
+  `manifest()`, `repo()` and `set_repo()` (visibility). Blocking twins on
+  `blocking::Client::artifacts`. `transport::Request` gains `text` (a
+  plain-text body) for `set_tag`; code that builds a `Request` with a struct
+  literal must add it.
 - **Postgres databases.** `Client::postgres(namespace)` returns a
   `PostgresClient` for the `postgres` plugin: `databases()`,
   `create_database(&NewDatabase::new("app"))` (the password comes back once and

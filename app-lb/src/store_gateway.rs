@@ -16,15 +16,19 @@
 //!   The gate has already measured the caller's reach and tier against the
 //!   namespace in the path, exactly as for a namespace's plugins.
 //!
-//! Configured with `APP_LB_ARTIFACT_STORE` (the store's URL) and
-//! `APP_LB_ARTIFACT_STORE_API_KEY` (delivered from HeyoSecret like
-//! `APP_LB_DAEMON_API_KEY`). Without a URL there is no global store: the API
-//! answers 503 and an `artifact` block must name its `store`, as before.
+//! Configured by the `artifacts` plugin ([`crate::plugins::artifacts`]) when
+//! the operator enables it, and otherwise by `APP_LB_ARTIFACT_STORE` (the
+//! store's URL) and `APP_LB_ARTIFACT_STORE_API_KEY` (delivered from HeyoSecret
+//! like `APP_LB_DAEMON_API_KEY`), which are also the plugin's defaults. The
+//! [`StoreSlot`] holds whichever is current. Without either there is no global
+//! store: the API answers 503 and an `artifact` block must name its `store`,
+//! as before.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::TryStreamExt;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::config::{ArtifactSpec, is_valid_artifact_ref};
@@ -94,6 +98,12 @@ impl GlobalStore {
 
     pub fn has_key(&self) -> bool {
         self.api_key.is_some()
+    }
+
+    /// The key itself, so the plugin can reuse the environment's for the same
+    /// store. Never leaves app-lb.
+    pub(crate) fn key(&self) -> Option<&str> {
+        self.api_key.as_deref()
     }
 
     /// Whether `store` names this store, however it is spelled at the end.
@@ -190,6 +200,99 @@ impl GlobalStore {
         match resp.json::<Vec<TagEntry>>().await {
             Ok(rows) => axum::Json(filter_tags(rows, namespace)).into_response(),
             Err(e) => gateway_error(StatusCode::BAD_GATEWAY, format!("the artifact store's tag listing did not parse: {e}")),
+        }
+    }
+}
+
+/// The global store as it stands right now: the `artifacts` plugin's while
+/// the operator has it enabled, else the one the environment names.
+///
+/// Pulls, the `/namespaces/:name/artifacts` gateway and the plugin's own
+/// namespace surface all read it per request, so enabling, reconfiguring or
+/// disabling the plugin takes effect without a restart.
+#[derive(Debug, Default)]
+pub struct StoreSlot {
+    env: Option<Arc<GlobalStore>>,
+    plugin: RwLock<Option<Arc<GlobalStore>>>,
+}
+
+impl StoreSlot {
+    pub fn new(env: Option<GlobalStore>) -> Self {
+        Self { env: env.map(Arc::new), plugin: RwLock::default() }
+    }
+
+    /// The store pulls and the gateway use now.
+    pub fn current(&self) -> Option<Arc<GlobalStore>> {
+        self.plugin.read().unwrap().clone().or_else(|| self.env.clone())
+    }
+
+    /// The store `APP_LB_ARTIFACT_STORE` names, which the plugin defaults to.
+    pub fn env(&self) -> Option<&GlobalStore> {
+        self.env.as_deref()
+    }
+
+    /// `plugin`, `env` or `none`: where [`Self::current`] comes from.
+    pub fn source(&self) -> &'static str {
+        if self.plugin.read().unwrap().is_some() {
+            "plugin"
+        } else if self.env.is_some() {
+            "env"
+        } else {
+            "none"
+        }
+    }
+
+    /// Set (or, with `None`, clear) the plugin's store. Clearing falls back to
+    /// the environment's.
+    pub fn set_plugin(&self, store: Option<Arc<GlobalStore>>) {
+        *self.plugin.write().unwrap() = store;
+    }
+}
+
+/// `GET …/artifacts` — whether there is a global store, whether this app-lb
+/// can write to it, and the prefix the namespace's tags must carry. Names no
+/// URL: the store is app-lb's business, not the caller's.
+pub fn describe(namespace: &str, store: Option<&GlobalStore>) -> Response {
+    axum::Json(serde_json::json!({
+        "namespace": namespace,
+        "available": store.is_some(),
+        "writable": store.is_some_and(GlobalStore::has_key),
+        "prefix": format!("{namespace}/"),
+    }))
+    .into_response()
+}
+
+/// Confine one request to `namespace`'s corner of `store` and forward it:
+/// the whole of a namespace's artifact API after the caller's reach and tier
+/// were checked. Shared by `/namespaces/:name/artifacts/…` and the plugin's
+/// `/namespaces/:name/plugins/artifacts/api/…`.
+pub async fn serve(
+    store: Option<Arc<GlobalStore>>,
+    namespace: &str,
+    rest: &str,
+    method: reqwest::Method,
+    headers: &HeaderMap,
+    body: Option<Body>,
+) -> Response {
+    let Some(store) = store else {
+        return gateway_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "this app-lb has no global artifact store: enable the artifacts plugin, or set {STORE_ENV}"
+            ),
+        );
+    };
+    match classify(namespace, &method, rest) {
+        Err(why) => gateway_error(StatusCode::FORBIDDEN, why),
+        Ok(Route::TagList) => store.namespace_tags(namespace).await,
+        Ok(Route::Forward(path)) => {
+            if method != reqwest::Method::GET && method != reqwest::Method::HEAD && !store.has_key() {
+                return gateway_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "this app-lb's global artifact store is read-only: it holds no store key",
+                );
+            }
+            store.forward(method, &path, headers, body).await
         }
     }
 }
@@ -408,6 +511,21 @@ mod tests {
         assert_eq!(effective(&spec, Some(&g)).unwrap().store, "https://art.example.com");
         let named = ArtifactSpec { store: "https://art.other.com".into(), ..spec };
         assert_eq!(effective(&named, Some(&g)).unwrap().store, "https://art.other.com");
+    }
+
+    #[test]
+    fn the_plugins_store_wins_and_clearing_it_falls_back_to_the_environments() {
+        let slot = StoreSlot::new(Some(GlobalStore::new("https://env.example.com", None).unwrap()));
+        assert_eq!(slot.source(), "env");
+        assert_eq!(slot.current().unwrap().base(), "https://env.example.com");
+        slot.set_plugin(Some(Arc::new(GlobalStore::new("https://plugin.example.com", Some("k".into())).unwrap())));
+        assert_eq!(slot.source(), "plugin");
+        assert_eq!(slot.current().unwrap().base(), "https://plugin.example.com");
+        slot.set_plugin(None);
+        assert_eq!(slot.current().unwrap().base(), "https://env.example.com");
+        let empty = StoreSlot::new(None);
+        assert_eq!(empty.source(), "none");
+        assert!(empty.current().is_none());
     }
 
     #[test]
