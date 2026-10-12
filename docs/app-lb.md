@@ -584,6 +584,19 @@ Reads need the view tier in the namespace; writes need an admin credential for t
 
 `heyctl artifact` and the MCP server's `art_*` tools use these routes.
 
+#### The `artifacts` plugin
+
+The same API is the `artifacts` plugin's namespace surface, at `/namespaces/:name/plugins/artifacts/api/…` (`…/api` is the description above). The SDKs use it: `Client::artifacts(ns)` in `hws`, `lb.artifacts(ns)` in `@heyocomputer/hws`. The plugin is also where the operator names the store:
+
+```sh
+echo '{}' | heyctl plugins set artifacts -f -      # adopt APP_LB_ARTIFACT_STORE (and its key)
+echo '{"url": "https://art.us2.heyo.work", "api_key": {"secret": "artifact-store", "key": "api-key"}}' \
+  | heyctl plugins set artifacts -f -
+heyctl plugins enable artifacts
+```
+
+`url` and `api_key` default to `APP_LB_ARTIFACT_STORE` and `APP_LB_ARTIFACT_STORE_API_KEY`; the environment's key goes only to the environment's store. While the plugin is enabled its store is the global store for pulls and for `/namespaces/:name/artifacts`; disabling it falls back to the environment. Its status reports `source` (`plugin`, `env` or `none`), `url` and `writable`. It installs itself in every namespace unless `"auto_install": false`. Pulls do not depend on a namespace's install.
+
 ### Always-authenticated routes
 
 | Route | Purpose |

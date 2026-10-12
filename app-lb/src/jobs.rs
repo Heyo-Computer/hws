@@ -608,7 +608,7 @@ pub struct Jobs {
     /// The store an `artifact` block with no `store` pulls from, and the key
     /// app-lb presents there for a namespace's own refs. Unset when
     /// `APP_LB_ARTIFACT_STORE` is.
-    global_store: std::sync::OnceLock<Arc<crate::store_gateway::GlobalStore>>,
+    global_store: std::sync::OnceLock<Arc<crate::store_gateway::StoreSlot>>,
 }
 
 impl Jobs {
@@ -660,8 +660,9 @@ impl Jobs {
         }
     }
 
-    /// See [`Jobs::global_store`]. Set once at startup.
-    pub fn set_global_store(&self, store: Arc<crate::store_gateway::GlobalStore>) {
+    /// See [`Jobs::global_store`]. Set once at startup; what it holds follows
+    /// the artifacts plugin.
+    pub fn set_global_store(&self, store: Arc<crate::store_gateway::StoreSlot>) {
         let _ = self.global_store.set(store);
     }
 
@@ -676,7 +677,8 @@ impl Jobs {
         spec: &ArtifactSpec,
         namespace: &str,
     ) -> Result<(ArtifactSpec, Option<String>), String> {
-        let global = self.global_store.get().map(Arc::as_ref);
+        let global = self.global_store.get().and_then(|s| s.current());
+        let global = global.as_deref();
         let spec = crate::store_gateway::effective(spec, global)?;
         let key = match spec.auth.as_ref() {
             Some(r) => self.store_key(Some(r))?,
@@ -692,7 +694,11 @@ impl Jobs {
     /// block that names none, so a job list never shows a blank source.
     fn display_store(&self, spec: &ArtifactSpec) -> String {
         if spec.store.trim().is_empty() {
-            self.global_store.get().map(|g| g.base().to_string()).unwrap_or_default()
+            self.global_store
+                .get()
+                .and_then(|s| s.current())
+                .map(|g| g.base().to_string())
+                .unwrap_or_default()
         } else {
             spec.store.clone()
         }
@@ -2921,9 +2927,9 @@ mod tests {
         let err = jobs.artifact_source(&spec("ci/web:v1"), "ci").unwrap_err();
         assert!(err.contains("APP_LB_ARTIFACT_STORE"), "{err}");
 
-        jobs.set_global_store(Arc::new(
+        jobs.set_global_store(Arc::new(crate::store_gateway::StoreSlot::new(Some(
             crate::store_gateway::GlobalStore::new("https://art.example.com/", Some("k".into())).unwrap(),
-        ));
+        ))));
         let (resolved, key) = jobs.artifact_source(&spec("ci/web:v1"), "ci").unwrap();
         assert_eq!(resolved.store, "https://art.example.com");
         assert_eq!(key.as_deref(), Some("k"));

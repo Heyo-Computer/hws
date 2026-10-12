@@ -211,7 +211,7 @@ fn safe_relative(path: &str) -> Option<PathBuf> {
 
 /// Decode `%XX` escapes. `None` if the encoding is malformed or decodes to
 /// invalid UTF-8, both of which are a bad request rather than a filename.
-fn percent_decode(s: &str) -> Option<String> {
+pub(crate) fn percent_decode(s: &str) -> Option<String> {
     if !s.contains('%') {
         return Some(s.to_string());
     }

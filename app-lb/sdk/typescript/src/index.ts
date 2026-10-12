@@ -55,6 +55,7 @@ export type {
 
 export { ObsClient, OBS_PLUGIN, logQueryString } from "./obs.js";
 export type { LogQuery, NewAlert } from "./obs.js";
+export { ArtifactsClient, ARTIFACTS_PLUGIN } from "./artifacts.js";
 export { PostgresClient, POSTGRES_PLUGIN } from "./postgres.js";
 export type { NewDatabase } from "./postgres.js";
 

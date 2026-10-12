@@ -4,10 +4,17 @@ All notable changes to the `hws` crate (the Heyo Web Services SDK and the
 `heyctl` CLI). The crate follows [semantic versioning](https://semver.org/);
 while it is `0.x`, a minor bump may break the API.
 
-## Unreleased
+## 0.3.0 — 2026-10-12
 
 ### Added
 
+- **Artifacts.** `Client::artifacts(namespace)` returns an `ArtifactsClient`
+  for the `artifacts` plugin (the namespace's corner of the global artifact
+  store): `info()`, `tags()`, `tag()`, `set_tag()`, `delete_tag()`,
+  `manifest()`, `repo()` and `set_repo()` (visibility). Blocking twins on
+  `blocking::Client::artifacts`. `transport::Request` gains `text` (a
+  plain-text body) for `set_tag`; code that builds a `Request` with a struct
+  literal must add it.
 - **Postgres databases.** `Client::postgres(namespace)` returns a
   `PostgresClient` for the `postgres` plugin: `databases()`,
   `create_database(&NewDatabase::new("app"))` (the password comes back once and
@@ -20,14 +27,27 @@ while it is `0.x`, a minor bump may break the API.
   that every server mirroring it accepts. `TokenSummary` gains `fleet` and
   `mirrored_from`; `heyctl token list` has a SERVERS column and `heyctl token
   describe` says where a token works and where to revoke it.
+- **Artifacts through app-lb from the CLI.** `heyctl artifact` publishes and
+  reads through app-lb's namespace gateway with the context's credential, and
+  `artifact::RegistryClient::gateway` (feature `artifact`) does the same for a
+  program.
+- **Redirect routes.** `RouteRule::redirect` (`RouteRedirect { to, status,
+  keep_path }`) and the matching `spec` helpers.
+- **Plugin dashboards.** `PluginView::dashboard` and
+  `NamespacePlugin::dashboard`; `heyctl plugins` shows them.
+- **Image cache and boot backoff.** The image inventory reports `cache_bytes`,
+  `cache_budget_bytes`, `cache_hits`, `cache_misses` and an image's
+  `artifact_ref`; `PoolStatus` reports `boot_failures` and
+  `boot_backoff_secs`.
 
 ### Changed
 
-- `NewToken` and `TokenSummary` have new public fields, which breaks code that
-  builds either one with a struct literal. Use `NewToken::new(…)` and its builder
-  methods instead.
+- `NewToken`, `TokenSummary`, `RouteRule` and `transport::Request` have new
+  public fields, which breaks code that builds any of them with a struct
+  literal. Use their constructors and builder methods (`NewToken::new(…)`,
+  `Request::new(…)`) instead.
 
-## 0.2.0 — unreleased
+## 0.2.0 — 2026-10-06
 
 The crate is now the SDK for creating and managing workloads on Heyo, including
 reading their telemetry, with a namespace-scoped token.

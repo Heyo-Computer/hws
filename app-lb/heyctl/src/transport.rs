@@ -49,6 +49,9 @@ pub struct Request {
     /// Overrides the client's default deadline. `exec` needs this: its wall
     /// clock is the command timeout *plus* a possible cold start.
     pub timeout: Option<Duration>,
+    /// A plain-text body, for the few routes that take one (moving an
+    /// artifact tag sends the digest as text). Ignored when `body` is set.
+    pub text: Option<String>,
 }
 
 impl Request {
@@ -58,11 +61,18 @@ impl Request {
             path: path.into(),
             body: None,
             timeout: None,
+            text: None,
         }
     }
 
     pub fn json(mut self, body: serde_json::Value) -> Self {
         self.body = Some(body);
+        self
+    }
+
+    /// Send `body` as `text/plain`.
+    pub fn text(mut self, body: impl Into<String>) -> Self {
+        self.text = Some(body.into());
         self
     }
 
@@ -189,6 +199,10 @@ impl Transport for HttpTransport {
             }
             if let Some(body) = &req.body {
                 b = b.json(body);
+            } else if let Some(text) = &req.text {
+                b = b
+                    .header(reqwest::header::CONTENT_TYPE, "text/plain")
+                    .body(text.clone());
             }
             if let Some(t) = req.timeout {
                 b = b.timeout(t);
@@ -232,6 +246,7 @@ pub mod stub {
         pub method: Method,
         pub path: String,
         pub body: Option<serde_json::Value>,
+        pub text: Option<String>,
     }
 
     /// Answers queued replies in order, recording what it was asked.
@@ -286,6 +301,7 @@ pub mod stub {
                 method: req.method,
                 path: req.path.clone(),
                 body: req.body.clone(),
+                text: req.text.clone(),
             });
             let next = self.queued.lock().unwrap().pop_front();
             Box::pin(async move {

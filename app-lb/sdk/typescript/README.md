@@ -213,7 +213,17 @@ const { databases } = await pg.databases();
 await pg.deleteDatabase("app"); // revokes the credential; data and secret stay
 ```
 
-Before a plugin is installed every `obs` or `postgres` call rejects with a
+The `artifacts` plugin is the namespace's corner of the global artifact store
+(where `artifact` images come from), walled to `<namespace>/`:
+
+```ts
+const store = lb.artifacts("team-a");
+const v2 = await store.tag("team-a/web:v2");
+await store.setTag("team-a/web:latest", v2.digest);   // promote
+await store.setRepo("team-a/web", { public: true });  // publish on the hub
+```
+
+Before a plugin is installed every `obs`, `postgres` or `artifacts` call rejects with a
 `ConflictError` whose `code` is `plugin_not_installed` (or `plugin_disabled`
 while the operator has it off).
 

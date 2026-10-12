@@ -176,7 +176,7 @@ struct AdminState {
     images: Option<Arc<crate::images::ImageCatalog>>,
     /// The global artifact store `/namespaces/:name/artifacts` fronts, with
     /// the key only app-lb holds. `None` when `APP_LB_ARTIFACT_STORE` is unset.
-    artifact_store: Option<Arc<crate::store_gateway::GlobalStore>>,
+    artifact_store: Arc<crate::store_gateway::StoreSlot>,
     rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
@@ -394,7 +394,7 @@ impl AdminApi {
                 views: None,
                 token_sync: Default::default(),
                 images: None,
-                artifact_store: None,
+                artifact_store: Arc::default(),
                 rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
@@ -451,10 +451,7 @@ impl AdminApi {
         self
     }
 
-    pub fn with_artifact_store(
-        mut self,
-        store: Option<Arc<crate::store_gateway::GlobalStore>>,
-    ) -> Self {
+    pub fn with_artifact_store(mut self, store: Arc<crate::store_gateway::StoreSlot>) -> Self {
         self.state.artifact_store = store;
         self
     }
@@ -2494,20 +2491,14 @@ fn namespace_artifact_target<'a>(matched: &str, path: &'a str) -> Option<&'a str
     path.split('/').nth(2).filter(|s| !s.is_empty())
 }
 
-/// `GET /namespaces/:name/artifacts` — whether this app-lb fronts a global
-/// store, and the prefix the namespace's tags must carry. Names no URL: the
-/// store is app-lb's business, not the caller's.
+/// `GET /namespaces/:name/artifacts` — see [`crate::store_gateway::describe`].
+/// The same API is the `artifacts` plugin's namespace surface; this path
+/// stays for the clients that predate it.
 async fn namespace_artifacts(State(state): State<AdminState>, Path(ns): Path<String>) -> Response {
     if let Some(r) = bad_namespace(&ns) {
         return r;
     }
-    Json(serde_json::json!({
-        "namespace": ns,
-        "available": state.artifact_store.is_some(),
-        "writable": state.artifact_store.as_ref().is_some_and(|s| s.has_key()),
-        "prefix": format!("{ns}/"),
-    }))
-    .into_response()
+    crate::store_gateway::describe(&ns, state.artifact_store.current().as_deref())
 }
 
 /// `GET|HEAD /namespaces/:name/artifacts/*rest` — a read of the namespace's
@@ -2553,34 +2544,13 @@ async fn forward_namespace_artifact(
     headers: HeaderMap,
     body: Option<axum::body::Body>,
 ) -> Response {
-    use crate::store_gateway::{Route, classify};
     if let Some(r) = bad_namespace(ns) {
         return r;
     }
-    let Some(store) = state.artifact_store.as_ref() else {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "this app-lb has no global artifact store configured (APP_LB_ARTIFACT_STORE)",
-        )
-        .into_response();
-    };
     let Ok(method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
         return err(StatusCode::METHOD_NOT_ALLOWED, "unsupported method").into_response();
     };
-    match classify(ns, &method, rest) {
-        Err(why) => err(StatusCode::FORBIDDEN, why).into_response(),
-        Ok(Route::TagList) => store.namespace_tags(ns).await,
-        Ok(Route::Forward(path)) => {
-            if method != reqwest::Method::GET && method != reqwest::Method::HEAD && !store.has_key() {
-                return err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "this app-lb's global artifact store is read-only: it holds no store key",
-                )
-                .into_response();
-            }
-            store.forward(method, &path, &headers, body).await
-        }
-    }
+    crate::store_gateway::serve(state.artifact_store.current(), ns, rest, method, &headers, body).await
 }
 
 fn bad_namespace(ns: &str) -> Option<Response> {
@@ -8119,7 +8089,7 @@ mod tests {
                 f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
                 f.state.gate_admin = true;
                 f.state.gate_view = true;
-                f.state.artifact_store = store.map(Arc::new);
+                f.state.artifact_store = Arc::new(crate::store_gateway::StoreSlot::new(store));
                 f
             }
 

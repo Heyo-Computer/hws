@@ -2540,6 +2540,66 @@ pub struct DeletedPostgresDatabase {
     pub extra: Extra,
 }
 
+// -- the artifacts plugin --------------------------------------------------
+
+/// The namespace's view of the global artifact store, from
+/// `GET /namespaces/:ns/plugins/artifacts/api`. Never names the store.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ArtifactStoreInfo {
+    pub namespace: String,
+    /// Whether this app-lb fronts a global store at all.
+    pub available: bool,
+    /// Whether it holds the store's key, so the namespace can publish.
+    pub writable: bool,
+    /// What every tag and repository of the namespace starts with: `<ns>/`.
+    pub prefix: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A tag and the digest it points at.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ArtifactTag {
+    /// `<ns>/<repo>:<tag>`.
+    pub tag: String,
+    /// A 64-hex sha256 of a manifest (or, for `art put --tag`, a blob).
+    pub digest: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A repository: the part of a tag before `:`, with what was said about it.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ArtifactRepo {
+    /// `<ns>/<repo>`.
+    pub repo: String,
+    /// Public repositories are on the hub and pull without a credential.
+    pub public: bool,
+    pub description: Option<String>,
+    /// Unix seconds of the last metadata change.
+    pub updated: u64,
+    /// Its tags. Empty in the answer to [`crate::ArtifactsClient::set_repo`].
+    pub tags: Vec<ArtifactRepoTag>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One tag in an [`ArtifactRepo`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ArtifactRepoTag {
+    /// `<ns>/<repo>:<tag>`.
+    pub tag: String,
+    /// The part after `:`.
+    pub name: String,
+    pub digest: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 // -- heyvm's image catalog ------------------------------------------------
 
 /// `GET /images`: heyvm's image catalog as app-lb manages it. Fleet scope.

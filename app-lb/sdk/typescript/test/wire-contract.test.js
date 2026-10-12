@@ -103,6 +103,7 @@ const KNOWN = {
     PostgresDatabase: ["name", "database", "user", "created_by", "created_at", "secret", "live", "tier"],
     CreatedPostgresDatabase: ["name", "database", "user", "password", "host", "port", "sslmode", "url", "secret", "secret_error", "status", "note"],
     DeletedPostgresDatabase: ["deleted", "database", "secret_kept", "note"],
+    ArtifactStoreInfo: ["namespace", "available", "writable", "prefix"],
   },
 };
 
@@ -147,6 +148,7 @@ const FIXTURES = {
   "postgres-databases": "PostgresDatabases",
   "postgres-database-created": "CreatedPostgresDatabase",
   "postgres-database-deleted": "DeletedPostgresDatabase",
+  "artifact-store-info": "ArtifactStoreInfo",
   "auth-provider-google": "AuthProviderView",
   "auth-provider-heyo": "AuthProviderView",
   "deployment-inherited-gate": "DeploymentSpec",
