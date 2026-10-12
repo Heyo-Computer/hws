@@ -387,6 +387,19 @@ impl Bus {
         }))
     }
 
+    /// Each CI instance gets availability notifications. These are wakeups,
+    /// not deployment commands; missed events are recovered from the catalog.
+    pub async fn candidate_events(&self) -> Result<PullConsumer, BusError> {
+        let stream = self.js.get_stream(&self.events_stream).await
+            .map_err(|e| BusError::Stream { stream: self.events_stream.clone(), reason: e.to_string() })?;
+        stream.create_consumer(PullConfig {
+            filter_subject: format!("{}.evt.release.candidate.ready", self.prefix),
+            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
+            inactive_threshold: Duration::from_secs(120),
+            ..Default::default()
+        }).await.map_err(|e| BusError::Consumer { durable: "candidate-events".into(), reason: e.to_string() })
+    }
+
     /// Publish one durable outbox row and wait for the JetStream PubAck.
     async fn publish_outbox(&self, event: &crate::store::OutboxEvent) -> Result<(), BusError> {
         let subject = format!("{}.evt.{}", self.prefix, event.subject);

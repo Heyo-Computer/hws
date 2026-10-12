@@ -91,6 +91,7 @@ pub fn router(
         .route("/release-environments", get(release_environments))
         .route("/release-promotions", post(promote_release))
         .route("/release-automation", post(release_automation))
+        .route("/release-mode", post(release_mode))
         .route("/maintenance", get(maintenance_status))
         .route("/maintenance/{id}/{action}", post(maintenance_action))
         .route("/maintenance/runners/{runner}", get(runner_maintenance_status))
@@ -164,6 +165,16 @@ pub fn router(
         .merge(ns::router(&state).unwrap_or_default())
         .layer(axum::middleware::from_fn_with_state(state.clone(), instance_http::route))
         .with_state(state)
+}
+
+async fn release_mode(State(state): State<AppState>, headers: HeaderMap,
+    Json(request): Json<crate::release_environment::ModeRequest>) -> axum::response::Response {
+    let who = match may_manage(&state, &headers).await { Ok(who) => who, Err(response) => return response };
+    let actor = who.as_ref().map(|who| who.subject.as_str()).unwrap_or("local-admin");
+    match crate::release_environment::set_mode(&state.dispatcher, request, actor).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+    }
 }
 
 async fn release_automation(State(state): State<AppState>, headers: HeaderMap,

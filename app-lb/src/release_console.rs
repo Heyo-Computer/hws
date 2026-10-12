@@ -24,7 +24,7 @@ fn endpoint(
         ),
         "POST" => matches!(
             resource,
-            "release-builds" | "release-promotions" | "release-automation"
+            "release-builds" | "release-promotions" | "release-automation" | "release-mode"
         ),
         _ => false,
     };

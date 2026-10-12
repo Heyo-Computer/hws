@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Selection {
     pub workflow: String,

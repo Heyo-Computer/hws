@@ -4,7 +4,7 @@
 # This example releases orchestrator only, not the complete Heyo platform.
 CI_RELEASE_POLICIES:
   https://github.com/Heyo-Computer/hws.git:
-    submission_mode: merge_only
+    submission_mode: publish_candidates
     workflow_path: .ci/workflows/regional-release.yml
     workflow: |
       on: release
@@ -37,7 +37,7 @@ CI_RELEASE_BUILDS:
         artifact: orchestrator-linux
 
 CI_RELEASE_ENVIRONMENTS:
-  hws-stage:
+  stage:
     repository: https://github.com/Heyo-Computer/hws.git
     workflow_id: public
     network: platform
@@ -90,12 +90,12 @@ CI_RELEASE_ENVIRONMENTS:
         revision_env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
         start_command: /opt/orchestrator-release/start.sh
         working_directory: /opt/orchestrator-release
-  hws-production:
+  production:
     repository: https://github.com/Heyo-Computer/hws.git
     workflow_id: public
     network: platform
     mode: manual
-    requires: [hws-stage]
+    requires: [stage]
     workflow: *promotion
     service_targets:
       first-orchestrator:

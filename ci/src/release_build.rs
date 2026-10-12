@@ -403,6 +403,65 @@ async fn persist(
     Ok(saved)
 }
 
+/// Publish only producers present in this submission's frozen validation set.
+/// Path-filtered services keep their previous candidate. No deployment history
+/// is created here, and retries reuse the same retained build identity.
+pub(crate) async fn publish_submission(
+    store: &Store,
+    sink: &dyn crate::artifacts::ArtifactSink,
+    run_id: &str,
+    selections: &BTreeMap<String, Selection>,
+) -> Result<()> {
+    if selections.is_empty() {
+        return Ok(());
+    }
+    let (revision, git_ref) = crate::release::deployment_source(store, run_id)
+        .await.map_err(anyhow::Error::msg)?;
+    let run = store.get_run(run_id).await?.ok_or_else(|| anyhow::anyhow!("missing submission"))?;
+    ensure!(revision == run.sha, "candidate must use the exact published revision");
+    for (service, selection) in selections {
+        let included: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_submission_validation m
+            JOIN ci_run r ON r.id=m.validation_run_id WHERE m.release_run_id=$1 AND r.workflow_path=$2)")
+            .bind(run_id).bind(&selection.workflow).fetch_one(store.pool()).await?;
+        if !included {
+            continue;
+        }
+        let producer = crate::submission::artifact_run(store, run_id, &selection.workflow)
+            .await.map_err(anyhow::Error::msg)?;
+        let source_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_run_source WHERE run_id=$1)")
+            .bind(&producer).fetch_one(store.pool()).await?;
+        ensure!(source_exists, "candidate producer has no retained source descriptor");
+        let id = format!("candidate-{}", hex::encode(Sha256::digest(serde_json::to_vec(
+            &json!([run_id, service, selection])
+        )?)));
+        let name = format!("{}-{}-{}", service.chars().take(90).collect::<String>(),
+            run.created_at.format("%Y%m%d"), &id[10..22]);
+        let policy = Policy {
+            workflow_id: run.workflow_id.clone(), git_ref: git_ref.clone(),
+            components: BTreeMap::from([(service.clone(), selection.clone())]),
+            network: None, daily_utc_minute: None, input_identity: None,
+        };
+        let mut tx = store.pool().begin().await?;
+        sqlx::query("INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,created_at)
+            VALUES($1,$2,$3,$4,$5,$6,'submission',$7) ON CONFLICT(id) DO NOTHING")
+            .bind(&id).bind(&run.repo_url).bind(&name).bind(&revision).bind(&git_ref)
+            .bind(serde_json::to_value(&policy)?).bind(run.created_at).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO ci_release_build_run(build_id,workflow_path,run_id)
+            VALUES($1,$2,$3) ON CONFLICT(build_id,workflow_path) DO NOTHING")
+            .bind(&id).bind(&selection.workflow).bind(&producer).execute(&mut *tx).await?;
+        tx.commit().await?;
+        let build: Value = sqlx::query_scalar("SELECT to_jsonb(b) FROM ci_release_build b WHERE id=$1")
+            .bind(&id).fetch_one(store.pool()).await?;
+        if build["status"] != "ready" {
+            ensure!(build["status"] == "building", "candidate preparation failed");
+            let manifest = collect(store, &build).await?
+                .ok_or_else(|| anyhow::anyhow!("candidate producer has not completed"))?;
+            finalize(store, sink, &build, manifest).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Adopt an ordinary submission's already validated producer before its first
 /// deployment effect. Use the same retention, manifest and promotion contracts
 /// as a separately requested build; never rebuild or invent a publication.
@@ -647,6 +706,14 @@ async fn finalize(
     if let Some(deployment) = build["source_deployment_id"].as_str() {
         link_submission_release(&mut tx, deployment, id).await?;
     }
+    let producer = manifest["components"].as_object().unwrap().values().next().unwrap()["run_id"]
+        .as_str().ok_or_else(|| anyhow::anyhow!("candidate has no producer"))?;
+    let event = Store::add_event(&mut tx, producer, None, None, None,
+        "ci.release.candidate.ready.v1", "ready", None).await?;
+    sqlx::query("UPDATE ci_event_outbox SET subject='release.candidate.ready',payload=payload || $2 WHERE id=$1")
+        .bind(event).bind(json!({"candidate_id":id,"repository":build["repository"],
+            "services":manifest["components"].as_object().unwrap().keys().collect::<Vec<_>>()}))
+        .execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }

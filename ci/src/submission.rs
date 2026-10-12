@@ -646,6 +646,28 @@ jobs:
         sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri)
             VALUES('artifact','build','build.check','cloud','artifacts',$1,37,'original-cloud')")
             .bind("a".repeat(64)).execute(store.pool()).await.unwrap();
+        // Candidate publication is independent of deployments, and a skipped
+        // workflow must not borrow an artifact from an unrelated submission.
+        let selections = std::collections::BTreeMap::from([
+            ("cloud".into(), crate::release_catalog::Selection {
+                workflow: "cloud.yml".into(), job: "check".into(), artifact: "cloud".into(),
+            }),
+            ("unchanged".into(), crate::release_catalog::Selection {
+                workflow: "unchanged.yml".into(), job: "check".into(), artifact: "cloud".into(),
+            }),
+        ]);
+        assert!(crate::release_build::publish_submission(&store, &Sink { fail: true }, "release", &selections).await.is_err());
+        assert!(crate::release_catalog::list(&store, None).await.unwrap().is_empty());
+        for _ in 0..2 {
+            crate::release_build::publish_submission(&store, &Sink { fail: false }, "release", &selections).await.unwrap();
+        }
+        let candidates = crate::release_catalog::list(&store, None).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["manifest"]["components"]["cloud"]["uri"], "retained-cloud");
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ci_release_service_deployment")
+            .fetch_one(store.pool()).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ci_event_outbox WHERE event_type='ci.release.candidate.ready.v1'")
+            .fetch_one(store.pool()).await.unwrap(), 1);
         for (service, step) in [("cloud",0),("worker",1)] {
             sqlx::query("INSERT INTO ci_release_service_environment(name,service,repository) VALUES('stage',$1,'repo')")
                 .bind(service).execute(store.pool()).await.unwrap();
@@ -660,14 +682,15 @@ jobs:
             &store, if fail { &unavailable } else { &available },
             "release", "release.check.0", "cloud.yml", "cloud");
         assert!(retain(true).await.is_err());
-        assert!(crate::release_catalog::list(&store, None).await.unwrap().is_empty());
+        assert_eq!(crate::release_catalog::list(&store, None).await.unwrap().len(), 1);
         retain(false).await.unwrap();
         retain(false).await.unwrap();
         crate::release_build::retain_submission(&store, &Sink { fail: false },
             "release", "release.check.1", "cloud.yml", "cloud").await.unwrap();
         let catalog = crate::release_catalog::list(&store, None).await.unwrap();
-        assert_eq!(catalog.len(), 2, "services may retain one producer without rebuilding");
-        let cloud = catalog.iter().find(|r| r["manifest"]["components"].get("cloud").is_some()).unwrap();
+        assert_eq!(catalog.len(), 3, "services may retain one producer without rebuilding");
+        let cloud = catalog.iter().find(|r| r["id"].as_str().unwrap().starts_with("submission-")
+            && r["manifest"]["components"].get("cloud").is_some()).unwrap();
         assert!(cloud["name"].as_str().unwrap().starts_with("cloud-"));
         assert_eq!(cloud["manifest"]["components"]["cloud"]["uri"], "retained-cloud");
         assert_eq!(store.get_run("release").await.unwrap().unwrap().status, "running");

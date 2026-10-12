@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     #[default]
@@ -428,11 +428,7 @@ pub async fn admit(
     let policy = configured
         .get(&request.environment)
         .ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
-    let (selected, policy) = select(policy, request.service.as_deref())?;
-    ensure!(
-        !automatic || policy.mode == Mode::Automatic,
-        "environment requires manual promotion"
-    );
+    let (selected, mut policy) = select(policy, request.service.as_deref())?;
     let selected = if configured[&request.environment].services.is_empty() {
         let names = service_names(d, &policy)?;
         ensure!(
@@ -443,6 +439,8 @@ pub async fn admit(
     } else {
         selected
     };
+    policy.mode = effective_mode(&d.store, &request.environment, &selected, policy.mode).await?;
+    ensure!(!automatic || policy.mode == Mode::Automatic, "environment requires manual promotion");
     let bundle = bundle(&d.store, &request.bundle_id).await?;
     request.service = Some(candidate_service(
         &bundle["manifest"],
@@ -596,6 +594,9 @@ async fn persist(
         !automatic || !env.get::<bool, _>("automation_held"),
         "environment automation is held"
     );
+    let mode = env.get::<Option<String>, _>("deployment_mode")
+        .map(|value| serde_json::from_value::<Mode>(json!(value))).transpose()?.unwrap_or(policy.mode);
+    ensure!(!automatic || mode == Mode::Automatic, "environment requires manual promotion");
     if request.recover {
         ensure!(!automatic, "recovery must be requested manually");
         ensure!(
@@ -751,6 +752,8 @@ async fn service_view(store: &Store, name: &str, service: &str) -> Result<Value>
 
 pub async fn list(d: &Dispatcher) -> Result<Value> {
     let configured = policies(d.config.release_environments.as_deref())?;
+    let submission_policies: BTreeMap<String, crate::release_policy::Policy> =
+        serde_yaml::from_str(d.config.release_policies.as_deref().unwrap_or("{}"))?;
     let mut environments = Vec::new();
     for (name, policy) in configured {
         let mut names: std::collections::BTreeSet<String> =
@@ -770,6 +773,7 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
         let services: Vec<Value> = futures::stream::iter(names.into_iter().map(|service| {
             let name = &name;
             let policy = &policy;
+            let submission_policies = &submission_policies;
             async move {
                 let mut view = service_view(&d.store, name, &service).await?;
                 let configured =
@@ -782,7 +786,12 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
                         select(policy, Some(&service))?.1
                     };
                     view["repository"] = json!(resolved.repository);
-                    view["mode"] = json!(resolved.mode);
+                    view["policy_editable"] = json!(d.config.release_service_environments_enabled
+                        && submission_policies.iter().any(|(repo, policy)|
+                            crate::repos::same_repo(repo, &resolved.repository)
+                            && policy.submission_mode == crate::release_policy::SubmissionMode::PublishCandidates));
+                    view["mode"] = view["state"]["deployment_mode"].as_str()
+                        .map(|mode| json!(mode)).unwrap_or(json!(resolved.mode));
                     view["requires"] = json!(resolved.requires);
                 }
                 Ok::<_, anyhow::Error>(view)
@@ -795,6 +804,51 @@ pub async fn list(d: &Dispatcher) -> Result<Value> {
             "services":services}));
     }
     Ok(json!({"environments":environments}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModeRequest {
+    pub environment: String,
+    pub service: String,
+    pub mode: Mode,
+}
+
+fn publication_only(d: &Dispatcher, repository: &str) -> Result<bool> {
+    Ok(crate::release_policy::select(d.config.release_policies.as_deref(), repository)?
+        .is_some_and(|policy| policy.submission_mode == crate::release_policy::SubmissionMode::PublishCandidates))
+}
+
+pub(crate) async fn effective_mode(store: &Store, environment: &str, service: &str, fallback: Mode) -> Result<Mode> {
+    let mode: Option<String> = sqlx::query_scalar(
+        "SELECT deployment_mode FROM ci_release_service_environment WHERE name=$1 AND service=$2")
+        .bind(environment).bind(service).fetch_optional(store.pool()).await?.flatten();
+    Ok(mode.map(|mode| serde_json::from_value(json!(mode))).transpose()?.unwrap_or(fallback))
+}
+
+pub async fn set_mode(d: &Dispatcher, request: ModeRequest, actor: &str) -> Result<Value> {
+    ensure!(d.config.release_service_environments_enabled, "service release policies are not enabled");
+    let configured = policies(d.config.release_environments.as_deref())?;
+    let policy = configured.get(&request.environment).ok_or_else(|| anyhow::anyhow!("unknown environment"))?;
+    ensure!(service_names(d, policy)?.contains(&request.service), "unknown environment service");
+    let (_, policy) = select(policy, Some(&request.service))?;
+    ensure!(publication_only(d, &policy.repository)?,
+        "configure publish_candidates submissions before editing environment deployment policy");
+    let mode = serde_json::to_value(request.mode)?;
+    let mut tx = d.store.pool().begin().await?;
+    sqlx::query("INSERT INTO ci_release_service_environment(name,service,repository) VALUES($1,$2,$3) ON CONFLICT(name,service) DO NOTHING")
+        .bind(&request.environment).bind(&request.service).bind(&policy.repository).execute(&mut *tx).await?;
+    let row = sqlx::query("SELECT repository,active_run FROM ci_release_service_environment WHERE name=$1 AND service=$2 FOR UPDATE")
+        .bind(&request.environment).bind(&request.service).fetch_one(&mut *tx).await?;
+    ensure!(crate::repos::same_repo(row.get("repository"), &policy.repository), "environment repository changed");
+    ensure!(request.mode == Mode::Manual || row.get::<Option<String>, _>("active_run").is_none(),
+        "wait for the active promotion before enabling automatic deployment");
+    sqlx::query("UPDATE ci_release_service_environment SET deployment_mode=$3,automation_held=$4,updated_at=now() WHERE name=$1 AND service=$2")
+        .bind(&request.environment).bind(&request.service).bind(mode.as_str().unwrap())
+        .bind(request.mode == Mode::Manual).execute(&mut *tx).await?;
+    tx.commit().await?;
+    tracing::info!(environment=%request.environment,service=%request.service,mode=?request.mode,actor,"deployment policy changed");
+    Ok(json!({"environment":request.environment,"service":request.service,"mode":request.mode}))
 }
 
 #[derive(Deserialize)]
@@ -839,7 +893,8 @@ async fn set_automation(
         request.service.is_some(),
         "service is required for automation mutation"
     );
-    let (service, policy) = select(policy, request.service.as_deref())?;
+    let (service, mut policy) = select(policy, request.service.as_deref())?;
+    policy.mode = effective_mode(store, &request.environment, &service, policy.mode).await?;
     ensure!(
         !service.is_empty(),
         "service is required for automation mutation"
@@ -931,9 +986,35 @@ async fn finish(store: &Store) -> Result<()> {
 }
 
 pub fn spawn(d: Arc<Dispatcher>) {
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let bus = d.bus.clone();
+    let notifications = wake.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            let result: Result<()> = async {
+                let consumer = bus.candidate_events().await?;
+                let mut messages = consumer.messages().await?;
+                while let Some(message) = messages.next().await {
+                    let message = message?;
+                    notifications.notify_one();
+                    // Receipt only: durable catalog reconciliation owns admission.
+                    message.ack().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                }
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "candidate notifications unavailable; catalog reconciliation continues");
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {},
+                _ = wake.notified() => {},
+            }
             let Ok(_effect) = d.executor.effect_permit().await else {
                 continue;
             };
@@ -967,15 +1048,13 @@ async fn reconcile(d: &Dispatcher) -> Result<()> {
         return Ok(());
     }
     for (environment, policy) in policies(d.config.release_environments.as_deref())? {
-        if policy.services.is_empty() && policy.mode != Mode::Automatic {
-            continue;
-        }
         for service in service_names(d, &policy)? {
-            let resolved = if policy.services.is_empty() {
+            let mut resolved = if policy.services.is_empty() {
                 policy.clone()
             } else {
                 select(&policy, Some(&service))?.1
             };
+            resolved.mode = effective_mode(&d.store, &environment, &service, resolved.mode).await?;
             if resolved.mode != Mode::Automatic {
                 continue;
             }
@@ -1174,14 +1253,14 @@ mod tests {
                 .unwrap();
         assert_eq!(
             submission.submission_mode,
-            crate::release_policy::SubmissionMode::MergeOnly
+            crate::release_policy::SubmissionMode::PublishCandidates
         );
         let builds = crate::release_build::policies(Some(&raw("CI_RELEASE_BUILDS"))).unwrap();
         assert_eq!(builds[repository].daily_utc_minute, Some(120));
         let environments = policies(Some(&raw("CI_RELEASE_ENVIRONMENTS"))).unwrap();
-        assert_eq!(environments["hws-stage"].mode, Mode::Automatic);
-        assert_eq!(environments["hws-production"].mode, Mode::Manual);
-        assert_eq!(environments["hws-production"].requires, ["hws-stage"]);
+        assert_eq!(environments["stage"].mode, Mode::Automatic);
+        assert_eq!(environments["production"].mode, Mode::Manual);
+        assert_eq!(environments["production"].requires, ["stage"]);
         for (name, policy) in environments {
             let selections: Vec<Option<&str>> = if policy.services.is_empty() {
                 vec![None]
@@ -1456,6 +1535,17 @@ mod tests {
             changes: crate::paths::Changes::unknown("retained release"),
         })
         .unwrap();
+        // A mode change after policy resolution must still prevent automatic
+        // admission. It must neither affect another environment nor block a
+        // later explicit deployment below.
+        sqlx::query("INSERT INTO ci_release_service_environment(name,service,repository,deployment_mode)
+            VALUES('stage','api','repo','manual')")
+            .execute(store.pool()).await.unwrap();
+        let automatic = Policy { mode: Mode::Automatic, ..policy.clone() };
+        assert!(persist(&store, &request, &automatic, &bundle, &plan, &source, "automatic", true)
+            .await.unwrap_err().to_string().contains("manual promotion"));
+        assert_eq!(effective_mode(&store, "stage", "api", Mode::Automatic).await.unwrap(), Mode::Manual);
+        assert_eq!(effective_mode(&store, "production", "api", Mode::Automatic).await.unwrap(), Mode::Automatic);
         request.recover = true;
         assert!(
             persist(
@@ -1477,6 +1567,8 @@ mod tests {
         );
         let run = a.unwrap()["run_id"].as_str().unwrap().to_owned();
         assert_eq!(b.unwrap()["run_id"], run);
+        sqlx::query("UPDATE ci_release_service_environment SET deployment_mode=NULL WHERE name='stage' AND service='api'")
+            .execute(store.pool()).await.unwrap();
         let conflicting = Request {
             environment: request.environment.clone(),
             service: request.service.clone(),

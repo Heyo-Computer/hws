@@ -3060,6 +3060,11 @@ impl Dispatcher {
                     .transpose()?.unwrap_or_default();
                 let release = crate::release::merge(&self.store, msg, plan,
                     &manifests, &tags, &required("token")?).await.map_err(DispatchError::StepFailed)?;
+                if let Some(policy) = &plan.release_policy {
+                    crate::release_build::publish_submission(&self.store, self.artifacts.as_ref(),
+                        &msg.run_id, &policy.candidates).await
+                        .map_err(|e| DispatchError::StepFailed(format!("publish release candidates: {e}")))?;
+                }
                 Ok((format!("[ci] merged and published release {} on {}\nVersions: {}\n",
                     release.release_sha, release.git_ref, release.versions), serde_json::json!({
                         "sha": release.release_sha, "ref": release.git_ref, "versions": release.versions.to_string(),

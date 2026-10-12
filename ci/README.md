@@ -1896,6 +1896,51 @@ This option does not defer validation builds or create a daily build scheduler.
 Do not enable it until operators are ready for automatic per-submit deployment
 to stop. Update all regional CI apps before changing shared policy.
 
+### Environment-owned deployment
+
+Set the operator repository policy to `submission_mode: publish_candidates`
+to separate submission from deployment. Only its merge job is admitted; put
+deployment workflows and target mappings under `CI_RELEASE_ENVIRONMENTS`, not
+in the submission. The submission must have no `service_deployments` entries.
+After Git publication, CI retains the validated artifacts selected by the
+repository's `CI_RELEASE_BUILDS.components` policy. That selection is frozen at
+admission. Services whose workflows were path-filtered out do not receive a new
+candidate. Retention failures fail publication completion and retry against the
+same build identity; they do not rebuild, deploy, or invent successful history.
+
+CI is also the deployment controller; no additional service is required.
+Candidate finalization and an outbox event commit together. The existing NATS
+outbox publisher delivers `ci.release.candidate.ready.v1` on
+`<prefix>.evt.release.candidate.ready`. Each CI instance listens for wakeups;
+the event itself is not a deployment command. Startup and 30-second catalog
+reconciliation recover missed notifications. Existing transactional admission
+coordinates one service/environment rollout, not a global CI execution lock.
+
+Environment identities are independent of repositories and servers: for example,
+`stage` contains the configured US3 and EU1 targets. Its `services` map can include
+services from different repositories. Region membership, rollout order, and
+target aliases stay in operator environment configuration; hosts do not decide
+independently to deploy upon receiving an event.
+
+In the control panel, select an environment and service, choose **Automatic** or
+**Manual**, and click **Save policy**. The authenticated `POST /release-mode`
+endpoint stores this override in `ci_release_service_environment`; a restart
+does not reset it and no PR is required. Automatic mode selects the latest ready
+eligible candidate, subject to prerequisites and held automation. Manual mode
+accumulates candidates. Explicit deploy and rollback remain available in either
+mode. Changing to manual does not interrupt an admitted rollout. Enabling
+automatic mode resumes held automation and can deploy immediately; the UI asks
+for confirmation. Overrides affect only the selected service/environment.
+
+Activation: update every CI executor and app-lb control panel first, enable
+`CI_RELEASE_SERVICE_ENVIRONMENTS_ENABLED`, provision the build selections and
+environment rollout policies, then switch each repository's submission policy to
+`publish_candidates`. Allow already admitted direct-deploy runs to finish before
+enabling automatic policies. Policy editing is disabled until the repository uses
+candidate publication, so the panel cannot promise manual-only deployment while
+new submissions still deploy directly. The example configuration is illustrative,
+not live infrastructure configuration.
+
 ### Immutable release catalog (foundation)
 
 The catalog is separate from `ci_release`, which records publication to Git.

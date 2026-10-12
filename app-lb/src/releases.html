@@ -69,7 +69,8 @@
     <div class="topbar-right"><span>{{WHO}}</span><button class="theme-toggle" data-theme-toggle>Theme</button></div>
   </header>
   <div class="page-head"><div><span class="eyebrow">Deployment workspace</span><h1>Releases</h1><p class="muted">Review recorded deployments. See exactly what a release will change.</p></div><button id="refresh" class="btn">Refresh status</button></div>
-  <div class="toolbar"><label>Deployment environment<select id="environment" aria-label="Deployment environment"></select></label><label>Service<select id="service" aria-label="Service"></select></label><div id="policy"></div><span id="updated" class="sub">Not refreshed</span></div>
+  <div class="toolbar"><label>Deployment environment<select id="environment" aria-label="Deployment environment"></select></label><label>Service<select id="service" aria-label="Service"></select></label><label>Deployment policy<select id="deployment-mode"><option value="automatic">Automatic</option><option value="manual">Manual</option></select></label><button id="save-mode" class="btn" disabled>Save policy</button><div id="policy"></div><span id="updated" class="sub">Not refreshed</span></div>
+  <p id="policy-help" class="sub"></p>
   <p id="message" role="status" aria-live="polite">Loading release catalog…</p>
   <div class="workspace">
     <div>
@@ -198,6 +199,14 @@
     $('candidate').disabled = !choices.length;
     if (service && !configured(service)) $('catalog').innerHTML = '<p class="empty">This service is not configured for this environment. Historical rollout records remain available; builds and deployments are disabled.</p>';
     $('policy').innerHTML = e ? !configured(service) ? '<span class="tag">Service not configured</span>' : `<span class="tag">${esc(policy(service).mode)} policy</span><span class="tag">Service automation ${service?.state?.automation_held ? 'held' : policy(service).mode === 'automatic' ? 'enabled' : 'off'}</span>` : 'No environments configured';
+    $('deployment-mode').value = policy(service).mode || 'manual';
+    $('deployment-mode').disabled = !service?.policy_editable;
+    $('save-mode').disabled = true;
+    $('policy-help').textContent = !service?.policy_editable
+      ? 'Policy editing is unavailable until candidate-only submission is activated for this service’s repository. Existing submission workflows may still deploy directly.'
+      : policy(service).mode === 'automatic'
+      ? 'Automatic: validated candidates deploy automatically unless automation is held. You can still choose a version manually.'
+      : 'Manual: submissions build and retain release candidates without deploying. Choose a version below when ready. An active rollout is allowed to finish.';
     $('build').elements.repository.value = policy(service).repository || '';
     $('build').querySelector('button').disabled = !configured(service);
     $('build').closest('details').open = configured(service) && !choices.length;
@@ -253,6 +262,13 @@
     finally { busy = false; $('refresh').disabled = false; }
   }
   $('refresh').onclick = () => perform(async () => {});
+  $('deployment-mode').onchange = () => { $('save-mode').disabled = !selectedService()?.policy_editable || $('deployment-mode').value === policy(selectedService()).mode; };
+  $('save-mode').onclick = () => {
+    if (busy || !selectedService()?.policy_editable) return;
+    const environment = selectedEnv().name, service = selectedService().service, mode = $('deployment-mode').value;
+    const consequence = mode === 'automatic' ? 'The latest eligible candidate may deploy immediately. This also resumes held automation.' : 'Future submissions will retain candidates without deploying. Already admitted rollouts will finish with their existing policy.';
+    if (confirm(`Set ${environment} / ${service} to ${mode}?\n\n${consequence}`)) perform(() => api('release-mode',{environment,service,mode}));
+  };
   $('inventory').closest('details').ontoggle = event => { if (event.target.open) void refreshInventory(); };
   $('environment').onchange = renderEnvironment; $('service').onchange = renderService; $('candidate').onchange = renderSelection; $('search').oninput = renderInventory;
   $('service-releases').onclick = event => { const button = event.target.closest('[data-service]'); if (button) { $('service').value = button.dataset.service; renderService(); } };

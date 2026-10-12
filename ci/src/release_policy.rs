@@ -28,6 +28,8 @@ pub enum SubmissionMode {
     #[default]
     MergeAndDeploy,
     MergeOnly,
+    /// Publish validated candidates; environment policy owns every deployment.
+    PublishCandidates,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -56,6 +58,8 @@ pub struct Policy {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Snapshot {
     pub digest: String,
+    #[serde(default)]
+    pub candidates: BTreeMap<String, crate::release_catalog::Selection>,
     #[serde(default)]
     pub service_deployments: Vec<ServiceDeploymentScope>,
     pub maintenance: BTreeMap<String, host_maintenance::Target>,
@@ -170,10 +174,16 @@ pub(crate) async fn prepare_plan(d: &Dispatcher, repository: &str, policy: &Poli
     let mut effective = policy.clone();
     effective.placements.retain(|id, _| plan.jobs.iter().any(|job| &job.base_id == id));
     validate_service_deployments(&plan, &effective.service_deployments)?;
-    if effective.service_deployments.is_empty() {
+    if effective.service_deployments.is_empty() && policy.submission_mode == SubmissionMode::MergeAndDeploy {
         tracing::warn!(repository, "release policy has no service_deployments: declare environment/service obligations with stable job keys and zero-based step indices; this run cannot establish scoped ordinary deployment history");
     }
-    let mut snapshot = Snapshot { digest: String::new(), service_deployments: effective.service_deployments.clone(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, token_expressions: Vec::new() };
+    let mut snapshot = Snapshot { digest: String::new(), candidates: BTreeMap::new(), service_deployments: effective.service_deployments.clone(), maintenance: BTreeMap::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, token_expressions: Vec::new() };
+    if policy.submission_mode == SubmissionMode::PublishCandidates {
+        ensure!(d.config.release_service_environments_enabled, "enable service environments before candidate publication");
+        let builds = crate::release_build::policies(d.config.release_builds.as_deref())?;
+        snapshot.candidates = builds.iter().find(|(repo, _)| crate::repos::same_repo(repo, repository))
+            .ok_or_else(|| anyhow::anyhow!("candidate publication requires a release build policy"))?.1.components.clone();
+    }
     let mut aliases: Vec<String> = effective.placements.values().cloned().collect();
     for job in &plan.jobs {
         for step in &job.steps {
@@ -225,9 +235,9 @@ fn submission_plan(policy: &Policy) -> Result<Plan> {
     ensure!(policy.placements.keys().all(|id| plan.jobs.iter().any(|j| &j.base_id == id)),
         "release placement names an unknown job");
     validate_service_deployments(&plan, &policy.service_deployments)?;
-    if policy.submission_mode == SubmissionMode::MergeOnly {
+    if matches!(policy.submission_mode, SubmissionMode::MergeOnly | SubmissionMode::PublishCandidates) {
         ensure!(policy.service_deployments.is_empty(),
-            "merge_only policy cannot declare deployment obligations; declare scopes on deployment workflows instead");
+            "publication-only policy cannot declare deployment obligations; use environment rollout policies instead");
         // validate_release_plan proves this is one unconditional, single-step
         // job. Existing submission membership still gates its publication.
         plan.jobs.retain(|job| job.steps.iter().any(|s| s.uses.as_deref() == Some("ci/merge-release")));
@@ -437,11 +447,13 @@ mod tests {
     fn merge_only_excludes_deployment_but_preserves_publication_validation() {
         let mut policy = policy();
         assert_eq!(submission_plan(&policy).unwrap().jobs.len(), 3);
-        policy.submission_mode = SubmissionMode::MergeOnly;
-        let plan = submission_plan(&policy).unwrap();
-        assert_eq!(plan.jobs.len(), 1);
-        assert_eq!(plan.jobs[0].steps[0].uses.as_deref(), Some("ci/merge-release"));
-        assert!(crate::submission::validate_release_plan(&plan).is_ok());
+        for mode in [SubmissionMode::MergeOnly, SubmissionMode::PublishCandidates] {
+            policy.submission_mode = mode;
+            let plan = submission_plan(&policy).unwrap();
+            assert_eq!(plan.jobs.len(), 1);
+            assert_eq!(plan.jobs[0].steps[0].uses.as_deref(), Some("ci/merge-release"));
+            assert!(crate::submission::validate_release_plan(&plan).is_ok());
+        }
         policy.workflow = policy.workflow.replace("manifests: '[]'", "manifests: '[\"Cargo.toml\"]'");
         assert!(submission_plan(&policy).is_err());
     }
@@ -457,7 +469,7 @@ mod tests {
     }
 
     fn snapshot() -> Snapshot {
-        Snapshot { digest: "frozen-policy".into(), service_deployments: Vec::new(), token_expressions: Vec::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, maintenance: BTreeMap::from([
+        Snapshot { digest: "frozen-policy".into(), candidates: BTreeMap::new(), service_deployments: Vec::new(), token_expressions: Vec::new(), hosts: BTreeMap::new(), app_lbs: BTreeMap::new(), ci_application: None, maintenance: BTreeMap::from([
             ("us3".into(), host_maintenance::Target { repository: REPO.into(), runner_hd_id: "us-runner".into(),
                 backend_server_id: "us-backend".into(), cloud_url: "https://cloud.eu.example".into(),
                 orchestrator_url: "https://archive.eu.example".into(), artifact_user_id: "archive-owner".into(),
