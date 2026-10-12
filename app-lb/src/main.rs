@@ -612,6 +612,35 @@ fn main() {
             std::path::Path::new(&cfg.secrets_path).display()
         ),
     }
+    // One store every namespace shares, with a key only app-lb holds: the
+    // artifacts plugin's once the operator enables it, else this one. A bad
+    // URL is logged and the gateway left off rather than taking the LB down:
+    // every deployment that names its own store keeps working regardless.
+    let env_store = match store_gateway::GlobalStore::from_env() {
+        Ok(Some(store)) => {
+            tracing::info!(
+                store = store.base(),
+                key = store.has_key(),
+                "global artifact store from the environment: storeless `artifact` blocks pull \
+                 from it and /namespaces/:name/artifacts fronts it until the artifacts plugin \
+                 names another"
+            );
+            if !store.has_key() {
+                tracing::warn!(
+                    "{} is unset: the global store is used anonymously, so only public \
+                     repositories pull and the artifacts API cannot write",
+                    store_gateway::KEY_ENV
+                );
+            }
+            Some(store)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(error = %e, "ignoring the global artifact store");
+            None
+        }
+    };
+    let store_slot = Arc::new(store_gateway::StoreSlot::new(env_store));
     let plugin_host = Arc::new(plugins::PluginHost::new(
         vec![
             plugins::pgfc::PgFcPlugin::new(secrets.clone()),
@@ -620,6 +649,7 @@ fn main() {
             plugins::ci::CiPlugin::new(secrets.clone()),
             plugins::remote::RemotePlugin::new(secrets.clone()),
             plugins::secrets::SecretsPlugin::new(secrets.clone()),
+            plugins::artifacts::ArtifactsPlugin::new(secrets.clone(), store_slot.clone()),
             // Its ownership file sits beside the plugin records, in a
             // directory of its own so the record loader never reads it.
             plugins::postgres::PostgresPlugin::new(
@@ -994,34 +1024,7 @@ fn main() {
     );
     image_catalog.set_jobs(&jobs);
     jobs.set_images(image_catalog.clone());
-    // One store every namespace shares, with a key only app-lb holds. A bad
-    // URL is logged and the gateway left off rather than taking the LB down:
-    // every deployment that names its own store keeps working regardless.
-    let global_store = match store_gateway::GlobalStore::from_env() {
-        Ok(Some(store)) => {
-            tracing::info!(
-                store = store.base(),
-                key = store.has_key(),
-                "global artifact store: storeless `artifact` blocks pull from it and \
-                 /namespaces/:name/artifacts fronts it"
-            );
-            if !store.has_key() {
-                tracing::warn!(
-                    "{} is unset: the global store is used anonymously, so only public \
-                     repositories pull and the artifacts API cannot write",
-                    store_gateway::KEY_ENV
-                );
-            }
-            let store = Arc::new(store);
-            jobs.set_global_store(store.clone());
-            Some(store)
-        }
-        Ok(None) => None,
-        Err(e) => {
-            tracing::error!(error = %e, "ignoring the global artifact store");
-            None
-        }
-    };
+    jobs.set_global_store(store_slot.clone());
     autoscaler.set_images(image_catalog.clone());
 
     // ACME runs only when a contact address is configured. Its `Notify` goes to
@@ -1108,7 +1111,7 @@ fn main() {
             ["APP_LB_FLEET_FILE", "APP_LB_CONTROL_PLANE_FILE"].map(|key| std::env::var_os(key).map(Into::into)),
         ).unwrap_or_else(|error| panic!("invalid view configuration: {error}"))))
         .with_images(image_catalog.clone())
-        .with_artifact_store(global_store),
+        .with_artifact_store(store_slot.clone()),
     );
 
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {

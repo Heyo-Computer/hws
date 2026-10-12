@@ -224,6 +224,18 @@ for d in pg.databases().await?.databases {
 pg.delete_database("app").await?; // revokes the credential; data and secret stay
 ```
 
+### Artifacts
+
+The `artifacts` plugin is the namespace's corner of the global artifact store,
+where a deployment's `artifact` image comes from, walled to `<namespace>/`:
+
+```rust
+let store = lb.artifacts(&ns);
+let v2 = store.tag(&format!("{ns}/web:v2")).await?;
+store.set_tag(&format!("{ns}/web:latest"), &v2.digest).await?; // promote
+store.set_repo(&format!("{ns}/web"), true, None).await?;       // publish on the hub
+```
+
 ### The rest of the surface
 
 ```rust

@@ -16,7 +16,7 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use hws::types::{
-    AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView, PostgresDatabases,
+    ArtifactStoreInfo, AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView, PostgresDatabases,
     UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
@@ -724,4 +724,15 @@ fn postgres_plugin_answers_are_understood() {
     );
     assert_eq!(deleted.deleted, "app");
     assert_eq!(deleted.secret_kept.as_deref(), Some("pg-app"));
+}
+
+/// The artifacts plugin's description of the store, recorded from the plugin
+/// (`src/plugins/artifacts.rs`).
+#[test]
+fn artifact_store_info_is_understood() {
+    let info: ArtifactStoreInfo =
+        serde_json::from_str(&fixture("artifact-store-info")).expect("fixture parses");
+    assert!(info.extra.is_empty(), "unknown fields: {:?}", info.extra.keys().collect::<Vec<_>>());
+    assert!(info.available && info.writable);
+    assert_eq!((info.namespace.as_str(), info.prefix.as_str()), ("team-a", "team-a/"));
 }

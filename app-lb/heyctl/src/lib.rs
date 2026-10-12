@@ -74,6 +74,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod api;
+pub mod artifacts;
 pub mod error;
 pub mod images;
 pub mod obs;
@@ -98,6 +99,7 @@ pub use api::{Client, ClientBuilder, ExecRequest, Gates, MetricsQuery, NewToken}
 pub const DEFAULT_NAMESPACE: &str = "default";
 pub use error::{Credential, Error, Result};
 pub use obs::{LogQuery, NewAlert, OBS_PLUGIN, ObsClient};
+pub use artifacts::{ARTIFACTS_PLUGIN, ArtifactsClient};
 pub use postgres::{NewDatabase, POSTGRES_PLUGIN, PostgresClient};
 pub use shell::{Shell, ShellEvent, ShellExit, ShellOptions};
 pub use transport::{Auth, Transport};

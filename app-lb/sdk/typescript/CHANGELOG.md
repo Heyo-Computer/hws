@@ -7,6 +7,9 @@ releases share a wire contract and are checked against the same app-lb fixtures.
 
 ### Added
 
+- Artifacts through the `artifacts` plugin: `artifacts(ns)` returns an
+  `ArtifactsClient` with `info`, `tags`, `tag`, `setTag`, `deleteTag`,
+  `manifest`, `repo` and `setRepo` (visibility).
 - Postgres databases through the `postgres` plugin: `postgres(ns)` returns a
   `PostgresClient` with `databases()`, `createDatabase({ name, secret? })` and
   `deleteDatabase(name)`. Mirrors the `hws` crate's `PostgresClient`.

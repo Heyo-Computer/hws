@@ -7,6 +7,7 @@ import {
 } from "./errors.js";
 import { ObsClient } from "./obs.js";
 import { PostgresClient } from "./postgres.js";
+import { ArtifactsClient } from "./artifacts.js";
 import type {
   AdminScope,
   AuthProviderView,
@@ -189,6 +190,8 @@ export class Heyctl {
     path: string,
     opts: {
       body?: unknown;
+      /** A plain-text body, for the few routes that take one. `body` wins. */
+      text?: string;
       kind?: string;
       name?: string;
       timeoutMs?: number;
@@ -199,6 +202,7 @@ export class Heyctl {
     const auth = this.authHeader();
     if (auth) headers.authorization = auth;
     if (opts.body !== undefined) headers["content-type"] = "application/json";
+    else if (opts.text !== undefined) headers["content-type"] = "text/plain";
 
     // A caller's own signal *and* our deadline: whichever fires first wins.
     const timer = new AbortController();
@@ -211,7 +215,7 @@ export class Heyctl {
       const res = await this.doFetch(`${this.server}${path}`, {
         method,
         headers,
-        body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+        body: opts.body !== undefined ? JSON.stringify(opts.body) : opts.text,
         signal: timer.signal,
       });
       return { status: res.status, text: await res.text() };
@@ -230,6 +234,8 @@ export class Heyctl {
     path: string,
     opts: {
       body?: unknown;
+      /** A plain-text body (moving an artifact tag sends the digest as text). */
+      text?: string;
       kind?: string;
       name?: string;
       timeoutMs?: number;
@@ -695,6 +701,11 @@ export class Heyctl {
   /** One namespace's telemetry through the `obs` plugin. Makes no request. */
   obs(namespace: string): ObsClient {
     return new ObsClient(this, namespace);
+  }
+
+  /** One namespace's corner of the artifact store through the `artifacts` plugin. Makes no request. */
+  artifacts(namespace: string): ArtifactsClient {
+    return new ArtifactsClient(this, namespace);
   }
 
   /** One namespace's Postgres databases through the `postgres` plugin. Makes no request. */

@@ -57,6 +57,7 @@
 //! at `/api/plugins/<id>/machine/…` outside the admin gate, answer 404 while
 //! the plugin is disabled, and authenticate every request themselves.
 
+pub mod artifacts;
 pub mod ci;
 pub mod ns_proxy;
 pub mod obs;

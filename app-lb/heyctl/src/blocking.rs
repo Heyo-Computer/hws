@@ -552,6 +552,15 @@ impl Client {
         }
     }
 
+    /// One namespace's corner of the artifact store. See
+    /// [`crate::Client::artifacts`].
+    pub fn artifacts(&self, namespace: impl Into<String>) -> ArtifactsClient<'_> {
+        ArtifactsClient {
+            client: self,
+            inner: self.inner.artifacts(namespace),
+        }
+    }
+
     /// One namespace's Postgres databases. See [`crate::Client::postgres`].
     pub fn postgres(&self, namespace: impl Into<String>) -> PostgresClient<'_> {
         PostgresClient {
@@ -618,6 +627,50 @@ impl ObsClient<'_> {
 
     pub fn delete_alert(&self, id: &str) -> Result<()> {
         block_on(&self.client.rt, self.inner.delete_alert(id))?
+    }
+}
+
+/// One namespace's artifacts, blocking. See [`crate::ArtifactsClient`].
+pub struct ArtifactsClient<'a> {
+    client: &'a Client,
+    inner: crate::ArtifactsClient,
+}
+
+impl ArtifactsClient<'_> {
+    pub fn namespace(&self) -> &str {
+        self.inner.namespace()
+    }
+
+    pub fn info(&self) -> Result<ArtifactStoreInfo> {
+        block_on(&self.client.rt, self.inner.info())?
+    }
+
+    pub fn tags(&self) -> Result<Vec<ArtifactTag>> {
+        block_on(&self.client.rt, self.inner.tags())?
+    }
+
+    pub fn tag(&self, tag: &str) -> Result<ArtifactTag> {
+        block_on(&self.client.rt, self.inner.tag(tag))?
+    }
+
+    pub fn set_tag(&self, tag: &str, digest: &str) -> Result<()> {
+        block_on(&self.client.rt, self.inner.set_tag(tag, digest))?
+    }
+
+    pub fn delete_tag(&self, tag: &str) -> Result<()> {
+        block_on(&self.client.rt, self.inner.delete_tag(tag))?
+    }
+
+    pub fn manifest(&self, tag_or_digest: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.inner.manifest(tag_or_digest))?
+    }
+
+    pub fn repo(&self, repo: &str) -> Result<ArtifactRepo> {
+        block_on(&self.client.rt, self.inner.repo(repo))?
+    }
+
+    pub fn set_repo(&self, repo: &str, public: bool, description: Option<&str>) -> Result<ArtifactRepo> {
+        block_on(&self.client.rt, self.inner.set_repo(repo, public, description))?
     }
 }
 
