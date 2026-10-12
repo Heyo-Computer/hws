@@ -1,6 +1,6 @@
 # heyctl
 
-`heyctl` is a kubectl-style command-line client, and a Rust client library, for the app-lb admin API: deployments, VM pools, secrets, tokens, auth providers, builds, pulls, artifact stores, and the telemetry the `obs` plugin collects. The crate is published on crates.io as [`hws`](https://crates.io/crates/hws), the Heyo Web Services SDK; the binary it installs is `heyctl`.
+`heyctl` is a kubectl-style command-line client, and a Rust client library, for the app-lb admin API: deployments, VM pools, secrets, tokens, auth providers, builds, pulls, artifact stores, and the telemetry the `obs` plugin collects. The crate is published on crates.io as [`hws`](https://crates.io/crates/hws), the Heyo Web Services SDK; the binary it installs is `heyctl`. Its TypeScript twin is [`@heyocomputer/hws`](https://www.npmjs.com/package/@heyocomputer/hws); see [SDKs](sdk.md).
 
 ## What it is
 

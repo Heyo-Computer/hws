@@ -17,6 +17,8 @@ Heyo Web Services documentation. These pages are also published at
 - [heyctl](heyctl.md) — the command-line client
 - [HTTP API](http-api.md) — the raw admin API for curl and other languages
 - [API reference](api/overview.md) — every endpoint the `hws` crate calls, one resource per page
+- [Plugins](plugins.md) — telemetry, git, CI, Postgres, artifacts, secrets and sign-in, enabled per host and installed per namespace
+- [SDKs](sdk.md) — [`@heyocomputer/hws`](https://www.npmjs.com/package/@heyocomputer/hws) for TypeScript and [`hws`](https://crates.io/crates/hws) for Rust
 - [Orchestrator](orchestrator.md) — service deployments, discovery and regional rollouts
 
 ## Platform services

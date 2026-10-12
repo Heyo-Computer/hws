@@ -1,6 +1,6 @@
 # app-lb HTTP API reference
 
-This page describes app-lb's admin API at the HTTP level, for callers using curl or a language without an SDK. The [`hws`](../app-lb/heyctl) Rust crate (which `heyctl` is built on) and the [`@heyocomputer/hws`](../app-lb/sdk/typescript) TypeScript SDK wrap this API. Both are checked against the response fixtures in [`app-lb/testdata/wire/`](../app-lb/testdata/wire), which also supply the example bodies on this page.
+This page describes app-lb's admin API at the HTTP level, for callers using curl or a language without an SDK. The [`hws`](https://crates.io/crates/hws) Rust crate (which `heyctl` is built on) and the [`@heyocomputer/hws`](https://www.npmjs.com/package/@heyocomputer/hws) TypeScript SDK wrap this API; see [SDKs](sdk.md). Both are checked against the response fixtures in [`app-lb/testdata/wire/`](../app-lb/testdata/wire), which also supply the example bodies on this page.
 
 For an endpoint-by-endpoint reference of what the `hws` crate calls, with request and response fields and the crate method for each, see the [API reference](api/overview.md). This page sticks to the wire format. For what a deployment field does, see the [deployment spec](app-lb.md#deployment-spec). For how credentials are issued and gates are configured, see [app-lb-auth](app-lb-auth.md).
 
