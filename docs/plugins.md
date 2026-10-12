@@ -46,9 +46,9 @@ Installing needs `admin` over the whole namespace: the operator, a fleet admin t
 | `remote` | Git | automatically | Git repositories on the region's git remote, repo tokens, and a repository browser | install only |
 | `secrets` | Secrets | automatically | A page for the namespace's own secrets: key names, never values | `lb.secrets(ns)` and friends |
 | `artifacts` | Artifacts | automatically | Its `<ns>/` corner of the global [artifact store](artifacts.md): tags, manifests, repository visibility | `lb.artifacts(ns)` |
-| `auth-heyo` | Heyo sign-in | automatically, **enabled by default** | The auth provider `heyo`, so a deployment requires Heyo sign-in with one call | `lb.setAuth(id, { provider: "heyo" })` (after 0.3.0) |
+| `auth-heyo` | Heyo sign-in | automatically, **enabled by default** | The auth provider `heyo`, so a deployment requires Heyo sign-in with one call | `lb.setAuth(id, { provider: "heyo" })` (since 0.4.0) |
 | `postgres` | Postgres | opt-in | Dedicated databases on [pg-fc](pg-fc.md), each with its own role, credentials written to the secret `pg-<name>` | `lb.postgres(ns)` |
-| `auth-google` | Google sign-in | opt-in | The auth provider `google`, with the namespace's own OAuth client | `lb.setAuth(id, { provider: "google" })` (after 0.3.0) |
+| `auth-google` | Google sign-in | opt-in | The auth provider `google`, with the namespace's own OAuth client | `lb.setAuth(id, { provider: "google" })` (since 0.4.0) |
 | `ci` | CI | opt-in | Repositories, runs and submit tokens on the region's [ci](ci.md) | install only |
 | `pgfc` | pg-fc databases | fleet only | An operator console for pg-fc pools | — |
 | `vapi` | vapi inference | fleet only | An operator console for vapi inference gateways | — |

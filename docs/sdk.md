@@ -7,7 +7,7 @@ Two SDKs drive app-lb from code — deployments, scaling, exec and shells, build
 | TypeScript / JavaScript | [`@heyocomputer/hws`](https://www.npmjs.com/package/@heyocomputer/hws) on npm | `npm install @heyocomputer/hws` |
 | Rust | [`hws`](https://crates.io/crates/hws) on crates.io ([docs.rs](https://docs.rs/hws)) | `cargo add hws --no-default-features` |
 
-The Rust crate is also the `heyctl` CLI (`cargo install hws` installs the binary); `--no-default-features` leaves out the CLI and gives you only the library. Both are versioned together (currently 0.3.0) and tested against the response fixtures app-lb's own tests write, so a field app-lb sends that an SDK does not model fails a test rather than going missing. Their changelogs: [TypeScript](../app-lb/sdk/typescript/CHANGELOG.md), [Rust](../app-lb/heyctl/CHANGELOG.md).
+The Rust crate is also the `heyctl` CLI (`cargo install hws` installs the binary); `--no-default-features` leaves out the CLI and gives you only the library. Both are versioned together (currently 0.4.0) and tested against the response fixtures app-lb's own tests write, so a field app-lb sends that an SDK does not model fails a test rather than going missing. Their changelogs: [TypeScript](../app-lb/sdk/typescript/CHANGELOG.md), [Rust](../app-lb/heyctl/CHANGELOG.md).
 
 For the routes underneath, see the [HTTP API](http-api.md) and the [API reference](api/overview.md).
 
@@ -57,7 +57,7 @@ Each namespace [plugin](plugins.md) with an API has a client, and every call car
 | `obs` | `lb.obs(ns)` | `lb.obs(ns)` | `fleet`, `deployment`, `logs` (paged), `alerts`, `createAlert`, `deleteAlert` |
 | `postgres` | `lb.postgres(ns)` | `lb.postgres(ns)` | `databases`, `createDatabase`, `deleteDatabase` |
 | `artifacts` | `lb.artifacts(ns)` | `lb.artifacts(ns)` | `info`, `tags`, `tag`, `setTag`, `deleteTag`, `manifest`, `repo`, `setRepo` |
-| `auth-heyo`, `auth-google` | `lb.setAuth(id, gate)`, `lb.clearAuth(id)` | `lb.set_auth(id, &Gate)`, `lb.clear_auth(id)` | Put a deployment behind the provider the plugin declared, or take it out (next release, after 0.3.0) |
+| `auth-heyo`, `auth-google` | `lb.setAuth(id, gate)`, `lb.clearAuth(id)` | `lb.set_auth(id, &Gate)`, `lb.clear_auth(id)` | Put a deployment behind the provider the plugin declared, or take it out (since 0.4.0) |
 
 ```ts
 // A database for the app, its URL handed to the deployment as a secret.
@@ -92,4 +92,4 @@ A namespace on Heyo Cloud is reached through cloud's door, `https://<cloud>/name
 | TypeScript | [`@heyocomputer/sdk`](https://www.npmjs.com/package/@heyocomputer/sdk) | `Namespace.connect("team-a").workloads()` returns an `Hws` |
 | Rust | [`heyo-sdk`](https://crates.io/crates/heyo-sdk) | `Namespace::connect("team-a", opts)?.workloads()?` returns an `hws::Client` |
 
-`workloads()` ships in `@heyocomputer/sdk` 0.2.0 and `heyo-sdk` 0.1.16 (next release; the versions on the registries today predate it). The door exposes deployments, secrets, auth providers, and the `obs`, `postgres`, `artifacts`, `auth-heyo` and `auth-google` plugins; see [Through Heyo Cloud](plugins.md#through-heyo-cloud).
+`workloads()` arrives in `@heyocomputer/sdk` 0.2.0 and `heyo-sdk` 0.2.0, both built on hws 0.4.0. The door exposes deployments, secrets, auth providers, and the `obs`, `postgres`, `artifacts`, `auth-heyo` and `auth-google` plugins; see [Through Heyo Cloud](plugins.md#through-heyo-cloud).
