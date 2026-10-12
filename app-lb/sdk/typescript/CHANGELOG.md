@@ -3,7 +3,7 @@
 Versioned with the [`hws`](https://crates.io/crates/hws) crate; the two
 releases share a wire contract and are checked against the same app-lb fixtures.
 
-## Unreleased
+## 0.3.0 — 2026-10-12
 
 ### Added
 
@@ -15,6 +15,9 @@ releases share a wire contract and are checked against the same app-lb fixtures.
   `deleteDatabase(name)`. Mirrors the `hws` crate's `PostgresClient`.
 - `PluginView` and `NamespacePlugin` declare `dashboard`, which app-lb already
   sent.
+- Redirect routes: `RouteRule.redirect` (`{ to, status, keep_path }`).
+- `PoolStatus` declares `boot_failures` and `boot_backoff_secs`.
+- `request()` takes a plain-text `text` body.
 
 ## 0.2.0
 
