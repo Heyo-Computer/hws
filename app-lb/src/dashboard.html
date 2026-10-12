@@ -315,6 +315,27 @@
 body[data-tier="view"] #local-view button:not(#dep-prev):not(#dep-next),
 body[data-tier="view"] [data-admin-only] { display: none; }
 #ns-banner a { margin-left: .5em; }
+/* The topbar tray: the session's controls, folded behind one button. */
+.topbar-tray { position: relative; }
+.topbar-tray > summary { list-style: none; display: inline-flex; }
+.topbar-tray > summary::-webkit-details-marker { display: none; }
+.topbar-tray[open] > summary { border-color: var(--border-accent); color: var(--text-primary); }
+.tray-panel {
+  position: absolute; top: calc(100% + 8px); right: 0; z-index: 30;
+  display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+  min-width: 180px; padding: 10px;
+  background: var(--bg-panel); border: 1px solid var(--border-color);
+  box-shadow: 0 8px 24px var(--shadow);
+}
+.tray-panel .topbar-user { display: block; max-width: 30ch; }
+.tray-panel .topbar-user:empty { display: none; }
+.tray-panel form, .tray-panel .btn, .tray-panel .theme-toggle { width: 100%; }
+.tray-panel .theme-toggle { justify-content: center; }
+.tray-nav { display: flex; flex-direction: column; }
+.tray-nav:empty { display: none; }
+.tray-nav a { padding: 6px 4px; color: var(--text-secondary); white-space: nowrap; }
+.tray-nav a:hover { color: var(--text-primary); background: var(--bg-elevated); }
+.tray-nav:not(:empty) { padding-bottom: 8px; border-bottom: 1px solid var(--border-color); }
 /* The "Get started" card a namespace user sees first: three numbered steps. */
 #get-started ol { margin: 0; padding-left: 1.4em; display: grid; gap: 18px; }
 #get-started .gs-step { display: block; margin-bottom: 4px; }
@@ -375,6 +396,7 @@ table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
       <a href="/plugins" data-local-nav data-fleet-only>Plugins</a>
       <a href="/network" id="network-nav">Network</a>
       <a href="/metrics" data-local-nav>Metrics</a>
+      <a href="#" id="plugins-nav" hidden>Plugins</a>
       <a href="#get-started" id="gs-open" hidden>Get started</a>
     </nav>
     <div class="topbar-right">
@@ -383,10 +405,18 @@ table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
            be the wrong trade. -->
       <span class="sub" id="uptime">—</span>
       <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
-      <span class="topbar-user">{{WHO}}</span>
-      {{SESSION_ACTION}}
-      <button class="btn btn-sm" id="pausebtn">Pause</button>
-      <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+      <!-- The tray: everything that is not navigation or the live status,
+           so the bar fits however many pages the nav carries. -->
+      <details class="topbar-tray" id="topbar-tray">
+        <summary class="topbar-toggle tray-toggle" aria-label="More" title="More"><span aria-hidden="true">⋯</span></summary>
+        <div class="tray-panel">
+          <nav class="tray-nav" id="tray-nav" aria-label="More pages"></nav>
+          <span class="topbar-user">{{WHO}}</span>
+          <button class="btn btn-sm" id="pausebtn">Pause</button>
+          <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+          {{SESSION_ACTION}}
+        </div>
+      </details>
     </div>
   </header>
 
@@ -592,7 +622,10 @@ if (pinnedNamespace) {
 // One server's page never shows the cross-server sections, and never polls them.
 document.querySelectorAll("[data-control-plane]").forEach(el => el.hidden = localView);
 document.getElementById("local-view").hidden = !localView;
-document.querySelectorAll("[data-local-nav]").forEach(el => el.hidden = !localView);
+// A fleet-only link stays hidden in a namespace's view even though that view
+// is a local one.
+document.querySelectorAll("[data-local-nav]").forEach(el =>
+  el.hidden = !localView || (namespaceView && el.hasAttribute("data-fleet-only")));
 document.querySelector(".topbar-brand").href = pinnedNamespace
   ? "/dashboard?namespace=" + encodeURIComponent(pinnedNamespace) : "/dashboard";
 document.querySelector(".topbar-app").textContent = pinnedNamespace
@@ -622,6 +655,36 @@ document.getElementById("network-nav").href = localView ? "/network?view=local" 
   });
   nav.addEventListener("click", (e) => { if (e.target.closest("a")) close(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+})();
+// The tray: on a wide screen, nav links that do not fit in the bar move into
+// it, last first, rather than being clipped. A narrow screen has the
+// hamburger instead, so there every link stays in the nav.
+const fitNav = (function setupTray() {
+  const tray = document.getElementById("topbar-tray");
+  const nav = document.getElementById("topbar-nav");
+  const more = document.getElementById("tray-nav");
+  const narrow = window.matchMedia("(max-width: 860px)");
+  const order = [...nav.children];
+  document.addEventListener("click", (e) => {
+    if (!tray.contains(e.target) || e.target.closest("a")) tray.open = false;
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") tray.open = false; });
+  function fit() {
+    // Back in order first, then out again from the end until the bar fits.
+    order.forEach(a => nav.appendChild(a));
+    if (narrow.matches) return;
+    const movable = () => [...nav.children].filter(a => !a.hidden && a.getAttribute("aria-current") !== "page");
+    while (nav.scrollWidth > nav.clientWidth + 1) {
+      const last = movable().pop();
+      if (!last) break;
+      more.prepend(last);
+    }
+  }
+  window.addEventListener("resize", fit);
+  narrow.addEventListener("change", fit);
+  if (document.fonts) document.fonts.ready.then(fit);
+  fit();
+  return fit;
 })();
 const REFRESH_MS = 2000;
 // Certs, secrets and jobs move on human timescales; see `pollSlow`.
@@ -3061,6 +3124,7 @@ function renderGetStarted() {
   const info = onboardingInfo;
   if (!pinnedNamespace || !info) { card.hidden = true; return; }
   $("gs-open").hidden = false;
+  fitNav();
   const show = gsWanted || (!gsHidden && (info.deployments === 0 || pageParams.get("onboarding") === "1"));
   card.hidden = !show;
   if (!show || interacting) return;
@@ -3180,52 +3244,22 @@ async function applyNamespaceTier() {
   if (!who.ok) { if (who.status === 401) sessionExpired(); return; }
   const tier = who.data.fleet ? "admin" : (who.data.namespaces || {})[pinnedNamespace];
   document.body.dataset.tier = tier || "none";
+  if (tier) { showPluginsNav(); return; }
   const banner = $("ns-banner");
-  banner.textContent = tier
-    ? "Namespace " + pinnedNamespace + " · " + (tier === "admin" ? "admin" : "read-only") + " access"
-    : "This session cannot reach namespace " + pinnedNamespace + ".";
+  banner.textContent = "This session cannot reach namespace " + pinnedNamespace + ".";
   banner.hidden = false;
-  if (tier) renderPluginLinks(tier);
 }
 
-// The namespace's plugins, for whichever the operator has switched on: a
-// link to each installed one's dashboard, an Install button for an admin
-// before that, and the namespace's plugin page. Nothing at all when this
-// host offers namespaces no plugins.
-async function renderPluginLinks(tier) {
+// A Plugins button in the nav, to the namespace's plugin console (install,
+// open a dashboard), when this host offers namespaces any plugin at all.
+async function showPluginsNav() {
   const ns = encodeURIComponent(pinnedNamespace);
   const res = await api("GET", "namespaces/" + ns + "/plugins").catch(() => ({ ok: false }));
   if (!res.ok || !Array.isArray(res.data) || !res.data.some(p => p.enabled)) return;
-  const banner = $("ns-banner");
-  banner.querySelectorAll("[data-plugin]").forEach(el => el.remove());
-  for (const p of res.data.filter(p => p.enabled && p.dashboard)) {
-    if (p.installed) {
-      const a = document.createElement("a");
-      a.dataset.plugin = p.id;
-      a.href = "namespaces/" + ns + "/plugin-console/" + encodeURIComponent(p.id);
-      a.textContent = p.name + " →";
-      banner.appendChild(a);
-    } else if (tier === "admin") {
-      const b = document.createElement("button");
-      b.dataset.plugin = p.id;
-      b.className = "btn mini";
-      b.style.marginLeft = ".5em";
-      b.textContent = "Install " + p.name.toLowerCase();
-      b.title = p.description;
-      b.addEventListener("click", async () => {
-        const put = await api("PUT", "namespaces/" + ns + "/plugins/" + encodeURIComponent(p.id), {});
-        if (!put.ok) return toast(errMsg(put), true);
-        toast(p.name.toLowerCase() + " installed in " + pinnedNamespace);
-        renderPluginLinks(tier);
-      });
-      banner.appendChild(b);
-    }
-  }
-  const all = document.createElement("a");
-  all.dataset.plugin = "";
-  all.href = "namespaces/" + ns + "/plugin-console";
-  all.textContent = "Plugins";
-  banner.appendChild(all);
+  const a = $("plugins-nav");
+  a.href = "namespaces/" + ns + "/plugin-console";
+  a.hidden = false;
+  fitNav();
 }
 
 applyNamespaceTier();
