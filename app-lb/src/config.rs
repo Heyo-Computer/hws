@@ -3151,6 +3151,11 @@ impl Providers {
         Self(vec![p])
     }
 
+    /// Several providers, any of which admits a request.
+    pub fn many(ps: Vec<AuthProvider>) -> Self {
+        Self(ps)
+    }
+
     pub fn contains(&self, p: AuthProvider) -> bool {
         self.0.contains(&p)
     }

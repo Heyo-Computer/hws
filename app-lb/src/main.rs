@@ -650,6 +650,18 @@ fn main() {
             plugins::remote::RemotePlugin::new(secrets.clone()),
             plugins::secrets::SecretsPlugin::new(secrets.clone()),
             plugins::artifacts::ArtifactsPlugin::new(secrets.clone(), store_slot.clone()),
+            plugins::auth::AuthPlugin::new(
+                plugins::auth::Kind::Heyo,
+                auth_providers.clone(),
+                registry.clone(),
+                cfg.auth_url.clone(),
+            ),
+            plugins::auth::AuthPlugin::new(
+                plugins::auth::Kind::Google,
+                auth_providers.clone(),
+                registry.clone(),
+                cfg.auth_url.clone(),
+            ),
             // Its ownership file sits beside the plugin records, in a
             // directory of its own so the record loader never reads it.
             plugins::postgres::PostgresPlugin::new(
@@ -659,6 +671,18 @@ fn main() {
         ],
         plugin_store,
     ));
+    // What a default-enabled plugin installs into on the boot that enables
+    // it: declared namespaces and any a deployment names.
+    let known_namespaces: plugins::KnownNamespaces = {
+        let namespaces = namespaces.clone();
+        let registry = registry.clone();
+        Arc::new(move || {
+            let mut all: std::collections::BTreeSet<String> =
+                namespaces.list().iter().map(|n| n.name.clone()).collect();
+            all.extend(registry.deployments().values().map(|d| d.spec.namespace.clone()));
+            all.into_iter().collect()
+        })
+    };
     let tokens = Arc::new(tokens::TokenStore::new(&cfg.tokens_path));
     match tokens.load() {
         Ok(0) => tracing::info!(path = %tokens.path().display(), "no app-tokens"),
@@ -1179,7 +1203,7 @@ fn main() {
     ));
     // Plugins own their tasks; this only starts the enabled ones and stops
     // them on shutdown. Not a dependency of the proxy, like the others.
-    server.add_service(background_service("plugins", plugins::PluginService::new(plugin_host)));
+    server.add_service(background_service("plugins", plugins::PluginService::new(plugin_host, known_namespaces)));
     // Offloads idle images one at a time, standing down while pools boot.
     server.add_service(background_service("images", images::ImagePacer::new(image_catalog.clone())));
     // Pulls and holds APP_LB_IMAGE_WARM, so its first VM is never a cold fetch.

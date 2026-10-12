@@ -473,6 +473,41 @@ Rotation: a key-set provider rotates with no change in app-lb (the issuer publis
 
 Through Cloud's namespace door (`https://<cloud>/namespaces/<ns>/lb`), a namespace-scoped key can list, create, get and delete providers in that namespace only.
 
+### Auth provider plugins
+
+Two plugins declare a provider for a namespace when it installs them, and remove it when it uninstalls:
+
+| Plugin | Declares | Default | Install configuration |
+| --- | --- | --- | --- |
+| `auth-heyo` | `heyo`: the `heyo-jwks` preset (Heyo gate tokens, nothing secret held) | **Enabled** wherever `APP_LB_AUTH_URL` is set, and installed in every namespace | Optional: `name`, and `require` merged over the preset's `role` check, e.g. `{"require": {"accountId": ["acct_7f3c"]}}` |
+| `auth-google` | `google`: Google sign-in with the namespace's own OAuth client | Opt-in: the operator enables it, each namespace installs it | `client_id`, `client_secret` (a reference to a secret in the namespace), `allowed_domains` and/or `allowed_emails`; optional `name`, `cookie_domain`, `app_token: true` to also admit app-tokens |
+
+So on a host with `APP_LB_AUTH_URL`, a deployment can use Heyo sign-in with nothing declared first:
+
+```sh
+heyctl set auth reports --provider-ref heyo
+```
+
+`auth-heyo`'s fleet configuration is optional: `jwks_url` (default `{APP_LB_AUTH_URL}/.well-known/jwks.json`), `login_url` and `cookie` for the hosted sign-in page, and `auto_install`. It is enabled once, on the first boot that finds no record for it; an operator who disables it keeps it disabled.
+
+Google for one namespace:
+
+```sh
+heyctl plugins enable auth-google                          # operator, once
+heyctl create secret google -n team-a --from-stdin client_secret < ~/.google-oauth
+cat > google.json <<'JSON'
+{"client_id": "1234.apps.googleusercontent.com",
+ "client_secret": {"secret": "google", "key": "client_secret"},
+ "allowed_domains": ["example.com"], "cookie_domain": "example.com"}
+JSON
+heyctl plugins install auth-google -n team-a -f google.json
+heyctl set auth intranet --provider-ref google
+```
+
+From the SDK, the same install is `lb.installPlugin("team-a", "auth-google", config)` (TypeScript) or `lb.install_plugin("team-a", "auth-google", Some(&config))` (Rust).
+
+A provider a plugin declares says so in its `description`. The plugins never replace or remove a provider declared by hand: installing over one of the same name answers `409` (install with `{"name": "…"}` to use another name), and the automatic install skips that namespace. Uninstalling while a deployment still inherits the provider answers `409` and names the deployments, as deleting the provider would. Reinstalling with a new configuration re-declares the provider in place.
+
 ## Putting the admin dashboard behind Google
 
 You can front the admin listener with a gated static deployment (upstream `127.0.0.1:9090`, see [`examples/app-lb-admin.json`](../app-lb/examples/app-lb-admin.json)). The gate lets people sign in; then something must authenticate them to the admin API.
