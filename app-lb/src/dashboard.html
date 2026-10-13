@@ -350,7 +350,6 @@ body[data-tier="view"] [data-admin-only] { display: none; }
 #get-started .gs-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 8px; }
 #get-started .gs-tile { border: 1px solid var(--grid); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 #get-started .gs-tile h3 { margin: 0; font-size: 13px; font-weight: 650; }
-#get-started .gs-tile p { margin: 0; font-size: 12px; color: var(--text-2); flex: 1 1 auto; }
 #get-started .gs-tile .gs-row { margin-top: 2px; }
 #get-started a.btn { display: inline-block; text-decoration: none; }
 /* Workloads: namespace × deployment with a cell per server. Wide fleets
@@ -3117,12 +3116,9 @@ function mcpClientConfig(url, token) {
 // plain-text twin (.txt) written to be handed to a coding agent.
 const GUIDES_BASE = "https://heyo.computer/guides/";
 const GUIDES = [
-  { slug: "create-your-own-daytona", title: "Sandboxes for agents",
-    blurb: "Firecracker sandboxes from the hub that boot in seconds: run code with exec or a shell, keep state in /workspace, push it to git." },
-  { slug: "create-your-own-neon", title: "A database per agent",
-    blurb: "Postgres databases created from code, each its own microVM that scales to zero. Installs the postgres plugin." },
-  { slug: "create-your-own-lovable", title: "An AI app builder",
-    blurb: "A VM per project with a live preview behind Heyo sign-in, your agent connected over MCP, and apps published from git." },
+  { slug: "create-your-own-lovable", title: "Build your own Lovable" },
+  { slug: "create-your-own-daytona", title: "Build your own Daytona" },
+  { slug: "create-your-own-neon", title: "Build your own Neon" },
 ];
 
 function guidePrompt(g, ns) {
@@ -3159,7 +3155,6 @@ function renderGetStarted() {
   const tiles = GUIDES.map((g, i) => `
           <div class="gs-tile">
             <h3>${esc(g.title)}</h3>
-            <p>${esc(g.blurb)}</p>
             <div class="gs-row">
               <a class="btn mini primary" href="${esc(GUIDES_BASE + g.slug + ".html")}" target="_blank" rel="noopener">Read the guide</a>
               <button class="btn mini" data-guide="${i}" title="${esc(guidePrompt(g, info.namespace))}">Copy prompt</button>
@@ -3208,13 +3203,8 @@ function renderGetStarted() {
              (<code>APP_LB_ONBOARDING_MCP_URL</code>). Use the token with <code>heyctl</code> instead.</div>`}
       </li>
       <li><strong class="gs-step">Pick something to build</strong>
-        Each guide walks you (or your agent) through one pattern on Heyo, end to end.
-        <strong>Copy prompt</strong> gives your agent the guide's plain-text version and asks it to
-        build it in <code>${esc(info.namespace)}</code> through the <code>${esc(mcpName())}</code> MCP server.
         <div class="gs-tiles">${tiles}</div>
-        ${hubUrl ? `<div class="note">The guides start from public images on the hub:
-          <a href="${esc(hubUrl)}" target="_blank" rel="noopener">browse public images</a>.
-          Publish your own under <code>${esc(info.namespace)}/…</code> with the <code>art_*</code> tools.</div>` : ""}
+        ${hubUrl ? `<div class="note"><a href="${esc(hubUrl)}" target="_blank" rel="noopener">Browse public images</a></div>` : ""}
       </li>
     </ol>`;
 }
