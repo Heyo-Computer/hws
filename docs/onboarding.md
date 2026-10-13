@@ -13,7 +13,7 @@ A new Heyo user goes from sign-up to a running app in three places:
      ```
 
      It then says to restart Claude Code and check `/mcp`, or to ask Claude to run `heyo_status` on the server. For other clients that take a URL and headers, it gives the same server as an `mcpServers` JSON entry. The token is the server's only authority. It reaches the app-lb tools, git repos, and artifact-store tags under `<namespace>/` (see `mcp/deploy/vm.md`). Logs and CI tools need a fleet token.
-   - **Pick something to build.** Three tiles, one per Create-Your-Own guide on heyo.computer: sandboxes for agents (Daytona), a database per agent (Neon) and an AI app builder (Lovable). Each links to its guide, and **Copy prompt** copies a request for the user's agent: read the guide's plain-text version (`.txt`) and build it in this namespace through the MCP server from step 2.
+   - **Pick something to build.** Three tiles: Build your own Lovable, Build your own Daytona and Build your own Neon, one per guide on heyo.computer. Each links to its guide, and **Copy prompt** copies a request for the user's agent: read the guide's plain-text version (`.txt`) and build it in this namespace through the MCP server from step 2.
 3. **The user's agent.** It follows the guide through the MCP server's tools, in the namespace the token is confined to.
 
 ## Configuring the MCP step
