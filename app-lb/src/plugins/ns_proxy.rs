@@ -79,6 +79,25 @@ pub struct Health {
     pub polled_at: u64,
 }
 
+/// Why a health poll failed, and whether waiting can fix it: an upstream that
+/// does not answer yet (connection refused, a timeout, a gateway's 502–504)
+/// may next time; a token that cannot be resolved, or any other answer, will
+/// not until the configuration changes.
+#[derive(Debug)]
+struct PollError {
+    message: String,
+    transient: bool,
+}
+
+impl PollError {
+    fn config(message: String) -> Self {
+        PollError {
+            message,
+            transient: false,
+        }
+    }
+}
+
 /// One plugin's proxy onto its fleet service, plus the health poll that
 /// tells the operator whether that service is answering.
 pub struct NsProxy {
@@ -168,7 +187,7 @@ impl NsProxy {
         };
         let upstream = Arc::new(upstream);
         *self.upstream.write().unwrap() = Some(upstream.clone());
-        self.poll(&upstream).await;
+        let first = self.poll(&upstream).await;
         let me = self.me.clone();
         let poll_up = upstream.clone();
         *self.poller.lock().unwrap() = Some(tokio::spawn(async move {
@@ -180,9 +199,30 @@ impl NsProxy {
                 me.poll(&poll_up).await;
             }
         }));
-        match self.health.read().unwrap().error.clone() {
-            None => Ok(()),
-            Some(e) => Err(format!("{} at {}: {e}", self.label, upstream.url)),
+        match first {
+            Ok(()) => Ok(()),
+            // Not answering yet is not a failed apply: the proxy is configured
+            // and the poller keeps trying, and `status` reports what it finds.
+            // On boot this is the common case, not the odd one: a service
+            // whose public name routes through this app-lb cannot answer
+            // before this app-lb is serving. Failing here left the plugin
+            // marked broken until somebody re-applied it.
+            Err(PollError {
+                message,
+                transient: true,
+            }) => {
+                tracing::warn!(
+                    service = self.label,
+                    url = %upstream.url,
+                    error = %message,
+                    "plugin upstream not answering yet; polling until it does"
+                );
+                Ok(())
+            }
+            Err(PollError {
+                message,
+                transient: false,
+            }) => Err(format!("{} at {}: {message}", self.label, upstream.url)),
         }
     }
 
@@ -206,27 +246,40 @@ impl NsProxy {
         Ok(req)
     }
 
-    async fn poll(&self, up: &Upstream) {
+    /// Probe the upstream's `/healthz`, record the answer for `status`, and
+    /// say whether a failure is one that waiting can fix.
+    async fn poll(&self, up: &Upstream) -> Result<(), PollError> {
         let polled_at = crate::deployment::now_secs();
         let result = async {
             let resp = self
-                .request(up, reqwest::Method::GET, "/healthz")?
+                .request(up, reqwest::Method::GET, "/healthz")
+                .map_err(PollError::config)?
                 .timeout(POLL_TIMEOUT)
                 .send()
                 .await
-                .map_err(|e| format!("/healthz: {e}"))?;
-            if resp.status().is_success() {
+                .map_err(|e| PollError {
+                    message: format!("/healthz: {e}"),
+                    transient: e.is_connect() || e.is_timeout() || e.is_request(),
+                })?;
+            let status = resp.status();
+            if status.is_success() {
                 Ok(())
             } else {
-                Err(format!("/healthz: HTTP {}", resp.status()))
+                Err(PollError {
+                    message: format!("/healthz: HTTP {status}"),
+                    // A gateway in front of the service answering for it while
+                    // the service is down or starting.
+                    transient: matches!(status.as_u16(), 502..=504),
+                })
             }
         }
         .await;
         *self.health.write().unwrap() = Health {
             up: result.is_ok(),
-            error: result.err(),
+            error: result.as_ref().err().map(|e| e.message.clone()),
             polled_at,
         };
+        result
     }
 
     /// Serve one request on the plugin's namespace surface.
@@ -703,6 +756,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&first[..], b"data: one\n\n");
+        p.configure(None, Duration::ZERO).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_upstream_not_answering_yet_is_not_a_failed_apply() {
+        // Nothing listens on port 1: the service is "not up yet", as on boot,
+        // when its public name routes through this app-lb before it serves.
+        let p = NsProxy::new("svc", "svc", secrets_with("x"), false, false);
+        p.configure(
+            Some(Upstream {
+                url: "http://127.0.0.1:1".into(),
+                api_token: None,
+            }),
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("an unreachable upstream is reported by status, not by apply");
+        let health = p.health();
+        assert!(!health.up);
+        assert!(
+            health
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("/healthz:")),
+            "{health:?}"
+        );
+        assert!(p.upstream().is_some(), "configured, and polling");
+        p.configure(None, Duration::ZERO).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_token_still_fails_the_apply() {
+        let dir = std::env::temp_dir().join(format!("app-lb-nsproxy-{}-empty", std::process::id()));
+        let empty = Arc::new(SecretStore::new(dir.join("secrets.json"), None));
+        let p = NsProxy::new("svc", "svc", empty, false, false);
+        let url = fake("right").await;
+        let e = p
+            .configure(
+                Some(Upstream {
+                    url,
+                    api_token: Some(svc_ref()),
+                }),
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.contains("cannot resolve"), "{e}");
         p.configure(None, Duration::ZERO).await.unwrap();
     }
 
