@@ -21,6 +21,7 @@
 //! somebody meets on their worst day.
 
 use crate::config::NamespaceSpec;
+use crate::fleet_store::{Collection, Expect, FileCollection, FileOptions};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,15 +31,24 @@ use std::sync::Arc;
 pub struct NamespaceStore {
     namespaces: ArcSwap<HashMap<String, Arc<NamespaceSpec>>>,
     dir: PathBuf,
+    records: Arc<dyn Collection>,
 }
 
 impl NamespaceStore {
     /// `dir` is where one JSON file per namespace lives, derived from the state
     /// path the way the registry and the workflow store derive theirs.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let records = Arc::new(FileCollection::new(&dir, ".json", FileOptions::PLAIN));
+        Self::with_collection(dir, records)
+    }
+
+    /// The same store over another backend. `dir` is only reported in logs.
+    pub fn with_collection(dir: impl Into<PathBuf>, records: Arc<dyn Collection>) -> Self {
         Self {
             namespaces: ArcSwap::from_pointee(HashMap::new()),
             dir: dir.into(),
+            records,
         }
     }
 
@@ -82,13 +92,8 @@ impl NamespaceStore {
         let existed = next.remove(name).is_some();
         self.namespaces.store(Arc::new(next));
         if existed {
-            let path = self.dir.join(file_name(name));
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                // Already gone is the desired end state.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            // Already gone is the desired end state.
+            self.records.delete(&key(name), Expect::Any)?;
         }
         Ok(existed)
     }
@@ -96,13 +101,10 @@ impl NamespaceStore {
     /// Write-then-rename, so a reader never sees a half-written object and a
     /// crash mid-write leaves the previous version intact.
     fn persist_one(&self, spec: &NamespaceSpec) -> Result<(), std::io::Error> {
-        std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(spec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let path = self.dir.join(file_name(&spec.name));
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        self.records.put(&key(&spec.name), &json, Expect::Any)?;
+        Ok(())
     }
 
     /// Load every object from disk, skipping any that will not parse.
@@ -114,16 +116,16 @@ impl NamespaceStore {
         let mut loaded = HashMap::new();
         let mut skipped = 0usize;
 
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            // No directory yet is the empty case, not an error.
-            return (0, 0);
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
+        let entries = match self.records.list() {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "could not list namespace objects");
+                return (0, 0);
             }
-            match std::fs::read(&path)
+        };
+        for entry in entries {
+            match entry
+                .body
                 .ok()
                 .and_then(|b| serde_json::from_slice::<NamespaceSpec>(&b).ok())
             {
@@ -133,7 +135,7 @@ impl NamespaceStore {
                 _ => {
                     tracing::warn!(
                         "skipping unreadable namespace object {}; it is still on disk",
-                        path.display()
+                        entry.location
                     );
                     skipped += 1;
                 }
@@ -158,21 +160,16 @@ fn file_name(name: &str) -> String {
     format!("{safe}.json")
 }
 
+/// The store key: [`file_name`] without its `.json`.
+fn key(name: &str) -> String {
+    let mut name = file_name(name);
+    name.truncate(name.len() - ".json".len());
+    name
+}
+
 /// `app-lb-state.json` -> `app-lb-namespaces.d`, beside it.
 pub fn namespace_dir(state_path: &str) -> PathBuf {
-    let path = Path::new(state_path);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("app-lb-state");
-    let name = match stem.strip_suffix("-state") {
-        Some(prefix) => format!("{prefix}-namespaces.d"),
-        None => format!("{stem}-namespaces.d"),
-    };
-    match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(name),
-        _ => PathBuf::from(name),
-    }
+    crate::fleet_store::sibling_dir(state_path, "namespaces")
 }
 
 #[cfg(test)]

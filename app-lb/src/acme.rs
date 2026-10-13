@@ -30,6 +30,7 @@
 //! wildcard covers is warned about once and served the static fallback.
 
 use crate::deployment::now_secs;
+use crate::fleet_store::{Document, Expect, FileDocument, FileOptions};
 use crate::registry::Registry;
 use crate::tls::CertStore;
 use arc_swap::ArcSwap;
@@ -321,6 +322,10 @@ pub struct AcmeManager {
     /// the CA. `tokio` mutex because construction is async.
     account: tokio::sync::Mutex<Option<Arc<Account>>>,
     backoff: Mutex<HashMap<String, Backoff>>,
+    /// `account.json`, `0600` in the `0700` ACME directory.
+    account_file: Arc<dyn Document>,
+    /// `backoff.json`, in the same directory.
+    backoff_file: Arc<dyn Document>,
     /// Hostnames already warned about as unsupported, so the wildcard warning
     /// doesn't repeat on every sweep.
     warned: Mutex<HashSet<String>>,
@@ -333,13 +338,37 @@ impl AcmeManager {
         challenges: Arc<ChallengeTable>,
         config: AcmeConfig,
     ) -> Self {
+        let account_file = Arc::new(FileDocument::new(
+            config.dir.join("account.json"),
+            FileOptions::PRIVATE.private_dir(0o700),
+        ));
+        let backoff_file = Arc::new(FileDocument::new(
+            config.dir.join("backoff.json"),
+            FileOptions::PLAIN.private_dir(0o700),
+        ));
+        Self::with_documents(registry, certs, challenges, config, account_file, backoff_file)
+    }
+
+    /// The same manager over other backends for the account and the backoff
+    /// state. The directory stamp stays a file in `config.dir`: which CA this
+    /// host last talked to is the host's own business.
+    pub fn with_documents(
+        registry: Arc<Registry>,
+        certs: Arc<CertStore>,
+        challenges: Arc<ChallengeTable>,
+        config: AcmeConfig,
+        account_file: Arc<dyn Document>,
+        backoff_file: Arc<dyn Document>,
+    ) -> Self {
         Self {
             registry,
             certs,
             challenges,
             signal: Arc::new(Notify::new()),
             account: tokio::sync::Mutex::new(None),
-            backoff: Mutex::new(Self::load_backoff(&config.dir)),
+            backoff: Mutex::new(Self::load_backoff(backoff_file.as_ref())),
+            account_file,
+            backoff_file,
             warned: Mutex::new(HashSet::new()),
             config,
         }
@@ -366,14 +395,14 @@ impl AcmeManager {
         }
 
         let path = self.account_path();
-        let account = match std::fs::read(&path) {
-            Ok(bytes) => {
+        let account = match self.account_file.read() {
+            Ok(Some((bytes, _))) => {
                 let credentials: AccountCredentials = serde_json::from_slice(&bytes)
                     .map_err(|e| AcmeError::Io(std::io::Error::other(e)))?;
                 tracing::info!(path = %path.display(), "restored ACME account");
                 Account::builder()?.from_credentials(credentials).await?
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None) => {
                 let contact = format!("mailto:{}", self.config.email);
                 let (account, credentials) = Account::builder()?
                     .create(
@@ -389,7 +418,9 @@ impl AcmeManager {
 
                 let json = serde_json::to_vec_pretty(&credentials)
                     .map_err(|e| AcmeError::Io(std::io::Error::other(e)))?;
-                save_secret(&path, &json)?;
+                self.account_file
+                    .write(&json, Expect::Any)
+                    .map_err(|e| AcmeError::Io(e.into()))?;
                 tracing::info!(path = %path.display(), "registered new ACME account");
                 account
             }
@@ -508,20 +539,14 @@ impl AcmeManager {
         self.persist_backoff(&snapshot);
     }
 
-    fn backoff_path(&self) -> PathBuf {
-        self.config.dir.join("backoff.json")
-    }
 
     /// Best-effort: losing the backoff file degrades to the old in-memory
     /// behaviour, which is worth a log line but not a failed issuance.
     fn persist_backoff(&self, backoff: &HashMap<String, Backoff>) {
         let write = || -> std::io::Result<()> {
-            crate::tls::create_dir_private(&self.config.dir)?;
             let json = serde_json::to_vec_pretty(backoff)?;
-            let path = self.backoff_path();
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, json)?;
-            std::fs::rename(&tmp, &path)
+            self.backoff_file.write(&json, Expect::Any)?;
+            Ok(())
         };
         if let Err(e) = write() {
             tracing::warn!(error = %e, "could not persist ACME backoff state");
@@ -530,9 +555,8 @@ impl AcmeManager {
 
     /// Restore the cooldowns a previous run recorded. A missing or unreadable
     /// file is a normal first run.
-    fn load_backoff(dir: &Path) -> HashMap<String, Backoff> {
-        let path = dir.join("backoff.json");
-        let Ok(bytes) = std::fs::read(&path) else {
+    fn load_backoff(file: &dyn Document) -> HashMap<String, Backoff> {
+        let Ok(Some((bytes, _))) = file.read() else {
             return HashMap::new();
         };
         match serde_json::from_slice(&bytes) {
@@ -768,17 +792,6 @@ impl AcmeManager {
     }
 }
 
-/// Write a secret with a restrictive mode, via a temp file so a crash can't
-/// leave a half-written key behind.
-fn save_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        crate::tls::create_dir_private(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)?;
-    crate::tls::restrict(&tmp)?;
-    std::fs::rename(&tmp, path)
-}
 
 #[async_trait]
 impl BackgroundService for AcmeManager {

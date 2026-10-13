@@ -64,6 +64,7 @@
 //! across a restart. Mirrored tokens are read-only where they are mirrored;
 //! they are changed and revoked at the control plane that minted them.
 
+use crate::fleet_store::{Document, Expect, FileDocument, FileOptions};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -403,6 +404,7 @@ struct Mirror {
 pub struct TokenStore {
     tokens: ArcSwap<HashMap<String, Arc<AppToken>>>,
     path: PathBuf,
+    file: Arc<dyn Document>,
     mirror: ArcSwap<Mirror>,
 }
 
@@ -418,9 +420,18 @@ impl std::fmt::Debug for TokenStore {
 
 impl TokenStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let file = Arc::new(FileDocument::new(&path, FileOptions::PRIVATE));
+        Self::with_document(path, file)
+    }
+
+    /// The same store over another backend. `path` still anchors the fleet
+    /// mirror (`tokens.fleet.json`), which is per host by nature.
+    pub fn with_document(path: impl Into<PathBuf>, file: Arc<dyn Document>) -> Self {
         Self {
             tokens: ArcSwap::from_pointee(HashMap::new()),
             path: path.into(),
+            file,
             mirror: ArcSwap::from_pointee(Mirror::default()),
         }
     }
@@ -651,7 +662,10 @@ impl TokenStore {
 
         let json = serde_json::to_vec_pretty(&TokenFile { version: 1, tokens })
             .map_err(TokenError::Json)?;
-        write_restricted(&self.path, &json)
+        self.file
+            .write(&json, Expect::Any)
+            .map_err(|e| TokenError::Io(e.into()))?;
+        Ok(())
     }
 
     /// Load the file. A missing one is a normal first run.
@@ -660,10 +674,9 @@ impl TokenStore {
     /// starting with no tokens would revoke every client at once, and would look
     /// exactly like a working server until the calls started failing.
     pub fn load(&self) -> Result<usize, TokenError> {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(TokenError::Io(e)),
+        let bytes = match self.file.read().map_err(TokenError::Io)? {
+            Some((b, _)) => b,
+            None => return Ok(0),
         };
         let file: TokenFile = serde_json::from_slice(&bytes).map_err(TokenError::Json)?;
         if file.version != 1 {

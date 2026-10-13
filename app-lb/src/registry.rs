@@ -9,6 +9,7 @@
 
 use crate::config::DeploymentSpec;
 use crate::deployment::{Deployment, DeploymentState};
+use crate::fleet_store::{Collection, Expect, FileCollection, FileOptions};
 use arc_swap::ArcSwap;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -238,6 +239,10 @@ pub struct Registry {
     deployments: ArcSwap<HashMap<Arc<str>, Arc<Deployment>>>,
     routes: ArcSwap<RouteTable>,
     persist_path: PathBuf,
+    /// One record per deployment (`app-lb-state.d/<key>.json` on disk).
+    records: Arc<dyn Collection>,
+    /// Content-addressed copies of retired records (`app-lb-state.d/retired/`).
+    retired: Arc<dyn Collection>,
     /// Serializes compound admin mutations by deployment identity. Deployment
     /// objects are replaceable, so a mutex stored on one object cannot protect
     /// a drain from racing a spec replacement.
@@ -254,7 +259,7 @@ pub struct Registry {
     retired_discovery: std::sync::Mutex<HashMap<String, Vec<Arc<crate::deployment::VmBackend>>>>,
     staged: std::sync::Mutex<HashMap<String, Arc<Deployment>>>,
     #[cfg(test)]
-    pub(crate) fail_after_rename: std::sync::atomic::AtomicBool,
+    pub(crate) fail_after_rename: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the last [`load`](Registry::load) left a file on disk that it
     /// could not turn into a deployment. Gates
     /// [`sweep_orphan_state`](Registry::sweep_orphan_state), which must not
@@ -264,17 +269,41 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(persist_path: impl Into<PathBuf>) -> Self {
+        let persist_path = persist_path.into();
+        let dir = crate::fleet_store::registry_dir(&persist_path);
+        let records = FileCollection::new(&dir, ".json", FileOptions::SYNCED);
+        let retired = FileCollection::new(dir.join("retired"), ".json", FileOptions::SYNCED);
+        #[cfg(test)]
+        let hook = records.fail_after_rename.clone();
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut registry = Self::with_collections(persist_path, Arc::new(records), Arc::new(retired));
+        #[cfg(test)]
+        {
+            registry.fail_after_rename = hook;
+        }
+        registry
+    }
+
+    /// The same registry over other backends. `persist_path` still locates the
+    /// legacy single file and the controller lock, which are per host.
+    pub fn with_collections(
+        persist_path: impl Into<PathBuf>,
+        records: Arc<dyn Collection>,
+        retired: Arc<dyn Collection>,
+    ) -> Self {
         Self {
             deployments: ArcSwap::from_pointee(HashMap::new()),
             routes: ArcSwap::from_pointee(RouteTable::default()),
             persist_path: persist_path.into(),
+            records,
+            retired,
             change_lock: tokio::sync::Mutex::new(()),
             retirement_gate: Arc::new(tokio::sync::RwLock::new(())),
             persist_lock: std::sync::Mutex::new(()),
             retired_discovery: std::sync::Mutex::new(HashMap::new()),
             staged: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
-            fail_after_rename: std::sync::atomic::AtomicBool::new(false),
+            fail_after_rename: Default::default(),
             load_skipped: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -708,16 +737,7 @@ impl Registry {
     /// `app-lb-state.d/`. Derived rather than separately configured so there is
     /// still one knob to point at a data directory.
     pub fn state_dir(&self) -> PathBuf {
-        let stem = self
-            .persist_path
-            .file_stem()
-            .unwrap_or_else(|| std::ffi::OsStr::new("app-lb-state"));
-        let mut name = stem.to_os_string();
-        name.push(".d");
-        match self.persist_path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.join(name),
-            _ => PathBuf::from(name),
-        }
+        crate::fleet_store::registry_dir(&self.persist_path)
     }
 
     /// Write one deployment's file. O(1) in fleet size, which is the point: a
@@ -747,48 +767,17 @@ impl Registry {
         deployment: &Deployment,
         state: &DeploymentState,
     ) -> std::io::Result<()> {
-        let dir = self.state_dir();
-        let mut missing_dirs = Vec::new();
-        let mut ancestor = dir.as_path();
-        while !ancestor.as_os_str().is_empty() && !ancestor.exists() {
-            missing_dirs.push(ancestor.to_path_buf());
-            let Some(parent) = ancestor.parent() else {
-                break;
-            };
-            ancestor = parent;
-        }
-        std::fs::create_dir_all(&dir)?;
-        // create_dir_all makes each directory visible, but those entries are
-        // not crash-durable until their parents are synced. Work from the
-        // highest newly-created directory down toward the state directory.
-        for created in missing_dirs.iter().rev() {
-            let parent = created
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| std::path::Path::new("."));
-            std::fs::File::open(parent)?.sync_all()?;
-        }
         let record = StoredDeployment {
             spec: deployment.spec.clone(),
             state: state.clone(),
         };
         let json = serde_json::to_vec_pretty(&record)?;
-        // Write-then-rename so a crash mid-write can't truncate existing state.
-        let path = dir.join(state_file_name(&deployment.spec.id));
-        let tmp = path.with_extension("json.tmp");
-        let mut file = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, &json)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &path)?;
-        #[cfg(test)]
-        if self.fail_after_rename.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Err(std::io::Error::other("injected failure after rename"));
-        }
-        // The rename is not durable until the directory entry is synced. A
-        // successful drain must not disappear after a host crash and silently
-        // reopen traffic on restart.
-        std::fs::File::open(dir)?.sync_all()
+        // Durable: fsynced, renamed into place, and the directory synced after,
+        // so a successful drain cannot disappear after a host crash and
+        // silently reopen traffic on restart.
+        self.records
+            .put(&state_key(&deployment.spec.id), &json, Expect::Any)?;
+        Ok(())
     }
 
     /// Save the exact spec and completed history outside the startup registry.
@@ -797,23 +786,20 @@ impl Registry {
     pub fn archive_record(&self, deployment: &Deployment) -> std::io::Result<()> {
         let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.persist_snapshot_inner(deployment, &deployment.state())?;
-        let dir = self.state_dir();
-        let source = dir.join(state_file_name(&deployment.spec.id));
-        let bytes = std::fs::read(&source)?;
-        let archive = dir.join("retired");
-        std::fs::create_dir_all(&archive)?;
-        std::fs::File::open(&dir)?.sync_all()?;
-        let target = archive.join(format!("{:x}.json", Sha256::digest(&bytes)));
-        match std::fs::hard_link(&source, &target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if std::fs::read(&target)? != bytes {
-                    return Err(std::io::Error::other("retired record archive content mismatch"));
+        let Some((bytes, _)) = self.records.get(&state_key(&deployment.spec.id))? else {
+            return Err(std::io::Error::other("deployment record vanished before it could be archived"));
+        };
+        let key = format!("{:x}", Sha256::digest(&bytes));
+        match self.retired.put(&key, &bytes, Expect::Absent) {
+            Ok(_) => Ok(()),
+            Err(crate::fleet_store::StoreError::Conflict { .. }) => {
+                match self.retired.get(&key)? {
+                    Some((existing, _)) if existing == bytes => Ok(()),
+                    _ => Err(std::io::Error::other("retired record archive content mismatch")),
                 }
             }
-            Err(error) => return Err(error),
+            Err(e) => Err(e.into()),
         }
-        std::fs::File::open(archive)?.sync_all()
     }
 
     /// Drop one deployment's file. A missing file is success — deregistering
@@ -822,11 +808,8 @@ impl Registry {
         if self.retirement_frozen(id) {
             return Err(std::io::Error::other("retirement preserves the deployment record"));
         }
-        match std::fs::remove_file(self.state_dir().join(state_file_name(id))) {
-            Ok(()) => std::fs::File::open(self.state_dir())?.sync_all(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        self.records.delete(&state_key(id), Expect::Any)?;
+        Ok(())
     }
 
     /// Delete state files that no live deployment claims, and report how many.
@@ -851,25 +834,16 @@ impl Registry {
             );
             return Ok(0);
         }
-        let dir = self.state_dir();
         let wanted: std::collections::HashSet<String> = self
             .deployments()
             .keys()
-            .map(|id| state_file_name(id))
+            .map(|id| state_key(id))
             .collect();
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e),
-        };
         let mut removed = 0;
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.ends_with(".json") && !wanted.contains(name) {
-                tracing::info!(file = %name, "removing orphaned deployment state file");
-                std::fs::remove_file(entry.path())?;
+        for entry in self.records.list()? {
+            if !wanted.contains(&entry.key) {
+                tracing::info!(file = %entry.location, "removing orphaned deployment state file");
+                self.records.delete(&entry.key, Expect::Any)?;
                 removed += 1;
             }
         }
@@ -885,24 +859,14 @@ impl Registry {
     pub fn load(&self) -> std::io::Result<usize> {
         self.migrate_legacy_file()?;
 
-        let dir = self.state_dir();
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e),
-        };
-
         let mut loaded = 0;
         let mut skipped = false;
-        for entry in entries {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue; // a stray `.json.tmp` from an interrupted write
-            }
-            let bytes = match std::fs::read(&path) {
+        // A stray `.json.tmp` from an interrupted write is never listed.
+        for entry in self.records.list()? {
+            let bytes = match entry.body {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "unreadable state file");
+                    tracing::warn!(path = %entry.location, error = %e, "unreadable state file");
                     skipped = true;
                     continue;
                 }
@@ -910,7 +874,7 @@ impl Registry {
             let mut record: StoredDeployment = match serde_json::from_slice(&bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "unparseable state file");
+                    tracing::warn!(path = %entry.location, error = %e, "unparseable state file");
                     skipped = true;
                     continue;
                 }
@@ -946,6 +910,9 @@ impl Registry {
     }
 
     /// Import a pre-directory `app-lb-state.json`, then move it aside.
+    ///
+    /// Works on the host's files directly, whatever backs [`Self::records`]:
+    /// the legacy file only ever existed on a single server's disk.
     ///
     /// Renamed rather than deleted so a downgrade still has the data, and so a
     /// second start cannot re-import specs that have since been edited or
@@ -1034,14 +1001,20 @@ struct StoredDeployment {
 /// collide on one file. It is deliberately not reversible — the id is read back
 /// from the spec inside the file, so the name is a key and nothing more.
 fn state_file_name(id: &str) -> String {
-    let mut out = String::with_capacity(id.len() + 5);
+    let mut out = state_key(id);
+    out.push_str(".json");
+    out
+}
+
+/// The store key for a deployment id: [`state_file_name`] without `.json`.
+fn state_key(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
     for b in id.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
-    out.push_str(".json");
     out
 }
 

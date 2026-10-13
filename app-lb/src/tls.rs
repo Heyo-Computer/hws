@@ -13,6 +13,7 @@
 //!
 //! [`TlsSettings::with_callbacks`]: pingora_core::listeners::TlsSettings::with_callbacks
 
+use crate::fleet_store::{Collection, Expect, FileCollection, FileOptions};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use openssl::asn1::Asn1Time;
@@ -166,7 +167,12 @@ struct CertView {
 }
 
 enum StoreBacking {
-    Disk(PathBuf),
+    /// `<host>.crt.pem` and `<host>.key.pem`, both `0600` in a `0700`
+    /// directory, on disk.
+    Disk {
+        chains: Arc<dyn Collection>,
+        keys: Arc<dyn Collection>,
+    },
     MemoryOnly,
 }
 
@@ -183,12 +189,28 @@ pub struct CertStore {
 
 impl CertStore {
     pub fn new(dir: impl Into<PathBuf>, fallback: Option<Arc<CertifiedKey>>) -> Self {
+        let dir = dir.into();
+        let opts = FileOptions::PRIVATE.private_dir(0o700);
+        Self::with_collections(
+            Arc::new(FileCollection::new(&dir, ".crt.pem", opts)),
+            Arc::new(FileCollection::new(&dir, ".key.pem", opts)),
+            fallback,
+        )
+    }
+
+    /// The same store over other backends: certificate chains and private keys
+    /// under the hostname.
+    pub fn with_collections(
+        chains: Arc<dyn Collection>,
+        keys: Arc<dyn Collection>,
+        fallback: Option<Arc<CertifiedKey>>,
+    ) -> Self {
         Self {
             view: ArcSwap::from_pointee(CertView {
                 certs: HashMap::new(),
                 fallback,
             }),
-            backing: StoreBacking::Disk(dir.into()),
+            backing: StoreBacking::Disk { chains, keys },
         }
     }
 
@@ -296,7 +318,7 @@ impl CertStore {
     /// a write failure is logged rather than fatal: serving the cert until the
     /// next restart beats not serving it at all.
     pub fn insert(&self, host: &str, chain_pem: &[u8], key_pem: &[u8]) -> Result<(), CertError> {
-        if !matches!(&self.backing, StoreBacking::Disk(_)) {
+        if !matches!(&self.backing, StoreBacking::Disk { .. }) {
             return Err(CertError::ReadOnly);
         }
         let host = normalize_host(host)?;
@@ -321,20 +343,14 @@ impl CertStore {
     /// would fail to parse on the next boot. Same approach as
     /// [`Registry::persist`](crate::registry::Registry::persist).
     fn persist(&self, host: &str, chain_pem: &[u8], key_pem: &[u8]) -> std::io::Result<()> {
-        let StoreBacking::Disk(dir) = &self.backing else {
+        let StoreBacking::Disk { chains, keys } = &self.backing else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "certificate store is memory-only",
             ));
         };
-        create_dir_private(dir)?;
-        for (suffix, bytes) in [("crt", chain_pem), ("key", key_pem)] {
-            let final_path = dir.join(format!("{host}.{suffix}.pem"));
-            let tmp = final_path.with_extension("pem.tmp");
-            std::fs::write(&tmp, bytes)?;
-            restrict(&tmp)?;
-            std::fs::rename(&tmp, &final_path)?;
-        }
+        chains.put(host, chain_pem, Expect::Any)?;
+        keys.put(host, key_pem, Expect::Any)?;
         Ok(())
     }
 
@@ -343,31 +359,35 @@ impl CertStore {
     /// disk. Returns how many loaded; a bad pair is skipped, not fatal, so one
     /// corrupt file can't keep the proxy from starting.
     pub fn load_from_disk(&self) -> usize {
-        let StoreBacking::Disk(dir) = &self.backing else {
+        let StoreBacking::Disk { chains, keys } = &self.backing else {
             return 0;
         };
-        let entries = match std::fs::read_dir(dir) {
+        // A directory that does not exist yet lists empty: a normal first run.
+        let entries = match chains.list() {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0, // normal first run
             Err(e) => {
-                tracing::error!(dir = %dir.display(), error = %e, "could not read cert directory");
+                tracing::error!(dir = %chains.location(""), error = %e, "could not read cert directory");
                 return 0;
             }
         };
 
         let mut loaded = HashMap::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(host) = name.to_str().and_then(|n| n.strip_suffix(".crt.pem")) else {
-                continue;
-            };
-            let Ok(host) = normalize_host(host) else {
-                tracing::warn!(file = ?name, "skipping cert with unusable hostname");
+        for entry in entries {
+            let Ok(host) = normalize_host(&entry.key) else {
+                tracing::warn!(file = %entry.location, "skipping cert with unusable hostname");
                 continue;
             };
 
-            let key_path = dir.join(format!("{host}.key.pem"));
-            match Self::load_pair(&entry.path().to_string_lossy(), &key_path.to_string_lossy()) {
+            let pair = entry.body.map_err(CertError::Io).and_then(|chain| {
+                let key = keys.get(&host).map_err(CertError::Io)?.ok_or_else(|| {
+                    CertError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no private key at {}", keys.location(&host)),
+                    ))
+                })?;
+                CertifiedKey::from_pem(&chain, &key.0)
+            });
+            match pair {
                 Ok(cert) => {
                     loaded.insert(host, Arc::new(cert));
                 }
@@ -522,11 +542,11 @@ impl TlsAccept for SniResolver {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A self-signed cert/key pair valid for `days`, as PEM.
-    fn self_signed(host: &str, days: u32) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn self_signed(host: &str, days: u32) -> (Vec<u8>, Vec<u8>) {
         use openssl::asn1::Asn1Time;
         use openssl::hash::MessageDigest;
         use openssl::pkey::PKey;

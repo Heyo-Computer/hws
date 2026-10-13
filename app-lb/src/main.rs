@@ -26,6 +26,9 @@ mod disks;
 mod dns;
 mod federated;
 mod fleet;
+mod fleet_store;
+#[cfg(test)]
+mod fleet_store_layout_tests;
 mod feed;
 mod gateway;
 mod regional;

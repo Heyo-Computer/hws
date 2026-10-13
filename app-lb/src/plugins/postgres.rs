@@ -50,6 +50,7 @@ use serde_json::{Value, json};
 
 use super::ns_proxy::{NamespaceActor, check_url, fail};
 use super::{NamespaceScope, Plugin, PluginMeta};
+use crate::fleet_store::{Document, Expect, FileDocument, FileOptions};
 use crate::secrets::{SecretRef, SecretSpec, SecretStore};
 
 pub(crate) const PAGE_HTML: &str = include_str!("../postgres_plugin.html");
@@ -232,7 +233,7 @@ struct OwnershipFile {
 
 /// The ownership file, held in memory and rewritten whole on every change.
 struct Ownership {
-    path: PathBuf,
+    file: Arc<dyn Document>,
     records: Mutex<BTreeMap<String, Owned>>,
     /// Why the file could not be read at start-up. While set, nothing is
     /// created or deleted: starting empty would let a namespace claim a name
@@ -242,8 +243,9 @@ struct Ownership {
 
 impl Ownership {
     fn open(path: PathBuf) -> Self {
-        let (records, broken) = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<OwnershipFile>(&bytes) {
+        let file: Arc<dyn Document> = Arc::new(FileDocument::new(&path, FileOptions::PLAIN));
+        let (records, broken) = match file.read() {
+            Ok(Some((bytes, _))) => match serde_json::from_slice::<OwnershipFile>(&bytes) {
                 Ok(f) if f.version == 1 => (f.databases, None),
                 Ok(f) => (
                     BTreeMap::new(),
@@ -254,15 +256,15 @@ impl Ownership {
                 ),
                 Err(e) => (BTreeMap::new(), Some(format!("unreadable: {e}"))),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), None),
+            Ok(None) => (BTreeMap::new(), None),
             Err(e) => (BTreeMap::new(), Some(e.to_string())),
         };
         if let Some(e) = &broken {
-            tracing::error!(path = %path.display(), error = %e,
+            tracing::error!(path = %file.location(), error = %e,
                 "the postgres plugin's ownership file cannot be read; namespaces cannot create or delete databases until it is fixed");
         }
         Self {
-            path,
+            file,
             records: Mutex::new(records),
             broken,
         }
@@ -284,18 +286,13 @@ impl Ownership {
 
     /// Write `next` and, once it is on disk, make it current.
     fn commit(&self, next: BTreeMap<String, Owned>) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let file = OwnershipFile {
             version: 1,
             databases: next,
         };
         let json = serde_json::to_vec_pretty(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &self.path)?;
+        self.file.write(&json, Expect::Any)?;
         *self.records.lock().unwrap() = file.databases;
         Ok(())
     }

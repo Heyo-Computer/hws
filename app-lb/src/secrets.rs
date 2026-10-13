@@ -15,7 +15,7 @@
 
 use crate::config::{DEFAULT_NAMESPACE, is_valid_namespace};
 use crate::deployment::now_secs;
-use crate::tls::restrict;
+use crate::fleet_store::{Document, Expect, FileDocument, FileOptions};
 use arc_swap::ArcSwap;
 use base64::Engine;
 use openssl::symm::{Cipher, decrypt_aead, encrypt_aead};
@@ -320,6 +320,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
 pub struct SecretStore {
     secrets: ArcSwap<HashMap<String, Arc<SecretSpec>>>,
     path: PathBuf,
+    file: Arc<dyn Document>,
     /// 32 bytes, or `None` for plaintext-at-rest.
     key: Option<Vec<u8>>,
 }
@@ -337,9 +338,17 @@ impl std::fmt::Debug for SecretStore {
 
 impl SecretStore {
     pub fn new(path: impl Into<PathBuf>, key: Option<Vec<u8>>) -> Self {
+        let path = path.into();
+        let file = Arc::new(FileDocument::new(&path, FileOptions::PRIVATE));
+        Self::with_document(path, file, key)
+    }
+
+    /// The same store over another backend. `path` is only reported.
+    pub fn with_document(path: impl Into<PathBuf>, file: Arc<dyn Document>, key: Option<Vec<u8>>) -> Self {
         Self {
             secrets: ArcSwap::from_pointee(HashMap::new()),
             path: path.into(),
+            file,
             key,
         }
     }
@@ -505,14 +514,10 @@ impl SecretStore {
         };
 
         let json = serde_json::to_vec_pretty(&file).map_err(StoreError::Json)?;
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, b"").map_err(StoreError::Io)?;
-        restrict(&tmp).map_err(StoreError::Io)?;
-        std::fs::write(&tmp, json).map_err(StoreError::Io)?;
-        std::fs::rename(&tmp, &self.path).map_err(StoreError::Io)
+        self.file
+            .write(&json, Expect::Any)
+            .map_err(|e| StoreError::Io(e.into()))?;
+        Ok(())
     }
 
     /// Load the file. A missing one is a normal first run.
@@ -522,10 +527,9 @@ impl SecretStore {
     /// credential the operator thinks was rotated. Anything unreadable is an
     /// error the caller is expected to treat as fatal.
     pub fn load(&self) -> Result<usize, StoreError> {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(StoreError::Io(e)),
+        let bytes = match self.file.read().map_err(StoreError::Io)? {
+            Some((b, _)) => b,
+            None => return Ok(0),
         };
         let file: SecretFile = serde_json::from_slice(&bytes).map_err(StoreError::Json)?;
         if file.version != 1 {

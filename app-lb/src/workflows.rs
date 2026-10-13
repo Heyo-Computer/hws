@@ -18,6 +18,7 @@
 //! bad object takes the whole load balancer down with it.
 
 use crate::config::WorkflowSpec;
+use crate::fleet_store::{Collection, Expect, FileCollection, FileOptions};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,15 +28,24 @@ use std::sync::Arc;
 pub struct WorkflowStore {
     workflows: ArcSwap<HashMap<String, Arc<WorkflowSpec>>>,
     dir: PathBuf,
+    records: Arc<dyn Collection>,
 }
 
 impl WorkflowStore {
     /// `dir` is where one JSON file per workflow lives, derived from the state
     /// path the same way the registry derives its own.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let records = Arc::new(FileCollection::new(&dir, ".json", FileOptions::PLAIN));
+        Self::with_collection(dir, records)
+    }
+
+    /// The same store over another backend. `dir` is only reported in logs.
+    pub fn with_collection(dir: impl Into<PathBuf>, records: Arc<dyn Collection>) -> Self {
         Self {
             workflows: ArcSwap::from_pointee(HashMap::new()),
             dir: dir.into(),
+            records,
         }
     }
 
@@ -70,13 +80,8 @@ impl WorkflowStore {
         let existed = next.remove(id).is_some();
         self.workflows.store(Arc::new(next));
         if existed {
-            let path = self.dir.join(file_name(id));
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                // Already gone is the desired end state.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            // Already gone is the desired end state.
+            self.records.delete(&key(id), Expect::Any)?;
         }
         Ok(existed)
     }
@@ -84,13 +89,10 @@ impl WorkflowStore {
     /// Write-then-rename, so a reader never sees a half-written object and a
     /// crash mid-write leaves the previous version intact.
     fn persist_one(&self, spec: &WorkflowSpec) -> Result<(), std::io::Error> {
-        std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(spec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let path = self.dir.join(file_name(&spec.id));
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        self.records.put(&key(&spec.id), &json, Expect::Any)?;
+        Ok(())
     }
 
     /// Load every object from disk, skipping any that will not parse.
@@ -102,16 +104,16 @@ impl WorkflowStore {
         let mut loaded = HashMap::new();
         let mut skipped = 0usize;
 
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            // No directory yet is the empty case, not an error.
-            return (0, 0);
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
+        let entries = match self.records.list() {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "could not list workflow objects");
+                return (0, 0);
             }
-            match std::fs::read(&path)
+        };
+        for entry in entries {
+            match entry
+                .body
                 .ok()
                 .and_then(|b| serde_json::from_slice::<WorkflowSpec>(&b).ok())
             {
@@ -121,7 +123,7 @@ impl WorkflowStore {
                 _ => {
                     tracing::warn!(
                         "skipping unreadable workflow object {}; it is still on disk",
-                        path.display()
+                        entry.location
                     );
                     skipped += 1;
                 }
@@ -137,6 +139,13 @@ impl WorkflowStore {
 ///
 /// Ids are already restricted by `WorkflowSpec::validate`, but a file on disk
 /// may predate a validation change, so the encoding is applied unconditionally.
+/// The store key: [`file_name`] without its `.json`.
+fn key(id: &str) -> String {
+    let mut name = file_name(id);
+    name.truncate(name.len() - ".json".len());
+    name
+}
+
 fn file_name(id: &str) -> String {
     let mut out = String::with_capacity(id.len() + 5);
     for b in id.bytes() {
@@ -308,20 +317,7 @@ mod tests {
 /// Derived rather than separately configured so an operator who moves the state
 /// path takes the workflows with it.
 pub fn workflow_dir(state_path: &str) -> PathBuf {
-    let path = Path::new(state_path);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("app-lb-state");
-    // `app-lb-state` -> `app-lb-workflows`; anything else just gets a suffix.
-    let name = match stem.strip_suffix("-state") {
-        Some(prefix) => format!("{prefix}-workflows.d"),
-        None => format!("{stem}-workflows.d"),
-    };
-    match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(name),
-        _ => PathBuf::from(name),
-    }
+    crate::fleet_store::sibling_dir(state_path, "workflows")
 }
 
 #[cfg(test)]
