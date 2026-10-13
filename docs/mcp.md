@@ -29,14 +29,16 @@ npm test             # optional: node --test over dist/*.test.js
 
 ### Claude Code, hosted server
 
-Heyo runs the server at `https://mcp.us2.heyo.work/mcp` (streamable HTTP). Point Claude Code at it with an app-lb token:
+Heyo runs the server at `https://mcp.heyo.work/mcp` (streamable HTTP), next to the production app-lb in us5 (`admin.us5.heyo.work`). Point Claude Code at it with an app-lb token:
 
 ```sh
-claude mcp add --transport http heyo https://mcp.us2.heyo.work/mcp \
+claude mcp add --transport http heyo https://mcp.heyo.work/mcp \
   --header "Authorization: Bearer applb_…"
 ```
 
 A namespace user mints that token from the app-lb dashboard's "Get started" card (or **App-tokens → New token**). It is an `admin`-tier token confined to their namespace and expires within 90 days; see [app-lb auth](app-lb-auth.md#namespace-admins-mint-their-own-tokens). The `applb_*` tools work with it. The app-obs and ci tools do not yet, because those gates live in the `default` namespace (see [Limits and known gaps](#limits-and-known-gaps)).
+
+A namespace on us2 (`admin.us2.heyo.work`) uses that region's server, `https://mcp.us2.heyo.work/mcp`, the same way. [Onboarding](onboarding.md) lists each region's endpoint.
 
 ### Claude Code, local server
 
