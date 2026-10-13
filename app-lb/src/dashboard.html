@@ -346,6 +346,13 @@ body[data-tier="view"] [data-admin-only] { display: none; }
 #get-started .gs-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
 #get-started .gs-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 #get-started .gs-head h2 { margin: 0; font-size: 15px; }
+/* Step 3: one tile per Create-Your-Own guide. */
+#get-started .gs-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 8px; }
+#get-started .gs-tile { border: 1px solid var(--grid); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+#get-started .gs-tile h3 { margin: 0; font-size: 13px; font-weight: 650; }
+#get-started .gs-tile p { margin: 0; font-size: 12px; color: var(--text-2); flex: 1 1 auto; }
+#get-started .gs-tile .gs-row { margin-top: 2px; }
+#get-started a.btn { display: inline-block; text-decoration: none; }
 /* Workloads: namespace × deployment with a cell per server. Wide fleets
    scroll sideways inside the card rather than widening the page. */
 .wl-scroll { overflow-x: auto; }
@@ -3075,7 +3082,8 @@ function sessionExpired() {
 // ---- Get started ---------------------------------------------------------
 // A namespace user's first three steps, from GET /onboarding (onboarding.rs):
 // mint a token, install the hosted MCP server in Claude Code with it, and
-// deploy fastcar. Shown while the namespace is empty, or when asked for.
+// pick a guide to build from. Shown while the namespace is empty, or when
+// asked for.
 let onboardingInfo = null;
 let mintedSecret = "";      // the token just minted here, for the install command
 let gsWanted = false;       // opened from the nav, so shown even when not empty
@@ -3105,10 +3113,26 @@ function mcpClientConfig(url, token) {
     type: "http", url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2);
 }
 
-function claudeDeployPrompt(info) {
-  return `Using the ${esc(mcpName())} MCP server, deploy this app-lb spec with applb_deploy, `
-    + `then poll applb_job (if it starts one) and applb_get_deployment until the deployment `
-    + `${esc(info.fastcar.id)} is registered, and tell me its URL.`;
+// Step 3's tiles: the Create-Your-Own guides on heyo.computer. Each has a
+// plain-text twin (.txt) written to be handed to a coding agent.
+const GUIDES_BASE = "https://heyo.computer/guides/";
+const GUIDES = [
+  { slug: "create-your-own-daytona", title: "Sandboxes for agents",
+    blurb: "Firecracker sandboxes from the hub that boot in seconds: run code with exec or a shell, keep state in /workspace, push it to git." },
+  { slug: "create-your-own-neon", title: "A database per agent",
+    blurb: "Postgres databases created from code, each its own microVM that scales to zero. Installs the postgres plugin." },
+  { slug: "create-your-own-lovable", title: "An AI app builder",
+    blurb: "A VM per project with a live preview behind Heyo sign-in, your agent connected over MCP, and apps published from git." },
+];
+
+function guidePrompt(g, ns) {
+  return `Read ${GUIDES_BASE}${g.slug}.txt and build it in my Heyo namespace ${ns}, `
+    + `using the ${mcpName()} MCP server for every Heyo step.`;
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast("Copied"); }
+  catch { toast("Could not copy — select the text instead"); }
 }
 
 async function copyFrom(id) {
@@ -3129,18 +3153,18 @@ function renderGetStarted() {
   card.hidden = !show;
   if (!show || interacting) return;
 
-  const fc = info.fastcar;
-  const fromHub = fc.source === "hub" && !!fc.ref;
   const hubUrl = info.hub && info.hub.url;
   const mcpUrl = info.mcp && info.mcp.url;
   const token = mintedSecret || "applb_…";
-  const spec = JSON.stringify(fc.spec, null, 2);
-  const imageNote = fc.image === "ok" ? ""
-    : `<div class="note">${esc(fc.note || "The fastcar image could not be resolved.")}</div>`;
-  const gateNote = fc.gated
-    ? `It sits behind Heyo sign-in (the namespace's <code>heyo</code> provider); only <code>/api/health</code> is open.`
-    : `<strong>This namespace has no <code>heyo</code> sign-in provider</strong>, so this spec has no gate:
-       fastcar is an agent with a shell, so add one before you share the URL.`;
+  const tiles = GUIDES.map((g, i) => `
+          <div class="gs-tile">
+            <h3>${esc(g.title)}</h3>
+            <p>${esc(g.blurb)}</p>
+            <div class="gs-row">
+              <a class="btn mini primary" href="${esc(GUIDES_BASE + g.slug + ".html")}" target="_blank" rel="noopener">Read the guide</a>
+              <button class="btn mini" data-guide="${i}" title="${esc(guidePrompt(g, info.namespace))}">Copy prompt</button>
+            </div>
+          </div>`).join("");
 
   card.innerHTML = `
     <div class="gs-head">
@@ -3183,30 +3207,14 @@ function renderGetStarted() {
           : `<div class="note">This load balancer has no hosted MCP endpoint configured
              (<code>APP_LB_ONBOARDING_MCP_URL</code>). Use the token with <code>heyctl</code> instead.</div>`}
       </li>
-      <li><strong class="gs-step">Deploy fastcar</strong>
-        fastcar is an agent workspace, prebuilt as a public Firecracker image${fromHub
-          ? ` on the hub (<code>${esc(fc.ref)}</code>), pulled with no key`
-          : ""}. This spec runs it in mock mode, so it boots without any model keys. ${gateNote}
-        ${imageNote}
-        <textarea id="gs-spec" class="mono" readonly spellcheck="false">${esc(spec)}</textarea>
-        <div class="gs-row">
-          <button class="btn mini" data-copy="gs-spec">Copy spec</button>
-          <span class="note">Paste the spec into Claude Code with this request:</span>
-        </div>
-        <input id="gs-prompt" class="mono" readonly value="${claudeDeployPrompt(info)}">
-        <div class="gs-row"><button class="btn mini" data-copy="gs-prompt">Copy request</button>
-          <span class="note">Or save it as <code>fastcar.json</code> and run
-          <code>heyctl apply -f fastcar.json</code>${fromHub
-            ? ` then <code>heyctl pull ${esc(fc.id)} --wait</code> (Claude's <code>applb_deploy</code> starts the pull itself)`
-            : ""}.</span></div>
-        ${fc.url ? `<div class="note">It will answer at <a href="${esc(fc.url)}" target="_blank" rel="noopener">${esc(fc.url)}</a>
-          — the first request boots the VM, which takes a minute or two.</div>` : ""}
-        ${hubUrl ? `<div class="note">Other public images, and what you publish yourself, are on the hub:
+      <li><strong class="gs-step">Pick something to build</strong>
+        Each guide walks you (or your agent) through one pattern on Heyo, end to end.
+        <strong>Copy prompt</strong> gives your agent the guide's plain-text version and asks it to
+        build it in <code>${esc(info.namespace)}</code> through the <code>${esc(mcpName())}</code> MCP server.
+        <div class="gs-tiles">${tiles}</div>
+        ${hubUrl ? `<div class="note">The guides start from public images on the hub:
           <a href="${esc(hubUrl)}" target="_blank" rel="noopener">browse public images</a>.
           Publish your own under <code>${esc(info.namespace)}/…</code> with the <code>art_*</code> tools.</div>` : ""}
-        <div class="note">To run it for real, store your keys as namespace secrets and reference them
-          with <code>vm.env_from</code>: <code>INCEPTION_API_KEY</code>, <code>OPENROUTER_API_KEY</code>
-          and optionally <code>TAVILY_API_KEY</code>. Then set <code>FASTCAR_MOCK</code> to <code>0</code>.</div>
       </li>
     </ol>`;
 }
@@ -3214,6 +3222,8 @@ function renderGetStarted() {
 $("get-started").addEventListener("click", (e) => {
   const copy = e.target.closest("[data-copy]");
   if (copy) { copyFrom(copy.dataset.copy); return; }
+  const guide = e.target.closest("[data-guide]");
+  if (guide && onboardingInfo) { copyText(guidePrompt(GUIDES[+guide.dataset.guide], onboardingInfo.namespace)); return; }
   if (e.target.closest("#gs-dismiss")) { gsDismiss(); return; }
   if (e.target.closest("#gs-mint")) {
     openNewToken({ name: "claude-code-" + pinnedNamespace, admin: "admin" });
