@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 /// Bound into the AEAD as additional data, so a payload can't be replayed into a
 /// different file format or a future version that means something else by it.
-const AAD: &[u8] = b"app-lb-secrets-v1";
+const AAD: &[u8] = crate::secrets_seal::AAD;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
@@ -289,32 +289,7 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// Turn whatever `APP_LB_SECRET_KEY` holds into 32 bytes.
-///
-/// 64 hex characters are taken literally, so a key generated with `openssl rand
-/// -hex 32` is used as-is; anything else is hashed, so a passphrase works too
-/// without a silently-truncated key.
-pub fn derive_key(material: &str) -> Vec<u8> {
-    let material = material.trim();
-    if material.len() == 64
-        && let Ok(bytes) = hex_decode(material)
-    {
-        return bytes;
-    }
-    openssl::hash::hash(openssl::hash::MessageDigest::sha256(), material.as_bytes())
-        .expect("sha256 of a byte string cannot fail")
-        .to_vec()
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
-    if !s.len().is_multiple_of(2) {
-        return Err(());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
-        .collect()
-}
+pub use crate::secrets_seal::derive_key;
 
 /// Secret id -> secret, behind the same copy-on-write swap the registry uses.
 pub struct SecretStore {
@@ -877,5 +852,32 @@ mod tests {
             self.put(spec);
             self
         }
+    }
+
+    #[test]
+    fn a_plaintext_file_sealed_elsewhere_opens_with_the_same_key() {
+        let dir = std::env::temp_dir().join(format!("app-lb-secrets-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = SecretStore::new(dir.join("plain.json"), None);
+        plain.put(SecretSpec {
+            namespace: crate::config::DEFAULT_NAMESPACE.to_string(),
+            id: "github".into(),
+            description: None,
+            data: BTreeMap::from([("token".to_string(), "t0ken".to_string())]),
+            updated_at: 3,
+        });
+        plain.persist().unwrap();
+        let key = derive_key("fleet key");
+        let sealed = crate::secrets_seal::seal_file(&key, &std::fs::read(dir.join("plain.json")).unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&sealed).contains("t0ken"));
+        std::fs::write(dir.join("sealed.json"), &sealed).unwrap();
+        let store = SecretStore::new(dir.join("sealed.json"), Some(key.clone()));
+        assert_eq!(store.load().unwrap(), 1);
+        assert!(store.is_encrypted());
+        // Already sealed: passed through untouched.
+        assert_eq!(crate::secrets_seal::seal_file(&key, &sealed).unwrap(), sealed);
+        assert!(SecretStore::new(dir.join("sealed.json"), Some(derive_key("other"))).load().is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

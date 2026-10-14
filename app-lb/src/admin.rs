@@ -4192,6 +4192,9 @@ async fn register(
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    if let Err(refused) = check_placement(&state, &spec) {
+        return refused;
+    }
     if let Err(refused) = check_provider_ref(&state, &spec) {
         return refused;
     }
@@ -4336,6 +4339,9 @@ async fn update(
     spec.normalize();
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(refused) = check_placement(&state, &spec) {
+        return refused;
     }
     if let Err(refused) = check_provider_ref(&state, &spec) {
         return refused;
@@ -7093,6 +7099,31 @@ fn router(state: AdminState) -> Router {
         .layer(middleware::from_fn_with_state(fleet_layer_state, fleet_admission))
 }
 
+/// A deployment is registered, and changed, on the host that runs it — or
+/// that will: until fleet hosts forward to each other (phase 6), registering
+/// one here for another host would have this host write a record it has no
+/// way to act on, and the same id is refused while another host holds it.
+#[allow(clippy::result_large_err)]
+fn check_placement(state: &AdminState, spec: &DeploymentSpec) -> Result<(), Response> {
+    if !state.registry.placed_here(spec) {
+        let home = spec.placement.as_ref().and_then(|p| p.home.clone()).unwrap_or_default();
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("{} is placed on {home}; register and change it there", spec.id),
+        )
+        .into_response());
+    }
+    if let Some(theirs) = state.registry.foreign().get(&spec.id) {
+        let home = theirs.placement.as_ref().and_then(|p| p.home.clone()).unwrap_or_default();
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("{} is a fleet deployment placed on {home}; change it there", spec.id),
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
 /// Whether a request changes fleet state: a mutation of anything the fleet
 /// store holds. Sign-in, a sandbox's shell, regional probes and the
 /// host-local surfaces (disks, images) are not, and keep working while the
@@ -8792,6 +8823,42 @@ mod tests {
             let (status, _, v) = send(&f, "GET", "/whoami", "").await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(v["fleet_store"]["available"], false, "{v}");
+        }
+
+        /// A deployment is registered on the host that runs it. Until hosts
+        /// forward to each other, one placed elsewhere is refused here, and so
+        /// is reusing the id of another host's deployment.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_deployment_placed_on_another_host_is_registered_there() {
+            let mut f = fixture(true).await;
+            let fleet_dir = f.root.join("fleet");
+            let fleet: Arc<dyn crate::fleet_store::Collection> = Arc::new(crate::fleet_store::FileCollection::new(
+                &fleet_dir,
+                ".json",
+                crate::fleet_store::FileOptions::SYNCED,
+            ));
+            std::fs::create_dir_all(&fleet_dir).unwrap();
+            std::fs::write(
+                fleet_dir.join("theirs.json"),
+                br#"{"spec":{"id":"theirs","routes":[{"host":"t.example"}],"upstreams":["127.0.0.1:1"],"placement":{"mode":"pinned","home":"us5"}}}"#,
+            )
+            .unwrap();
+            let registry = Arc::new(Registry::new(f.root.join("fleet-state.json")).with_fleet(fleet, "us4"));
+            registry.load().unwrap();
+            f.state.registry = registry;
+
+            let elsewhere = r#"{"id":"new","routes":[{"host":"n.example"}],"upstreams":["127.0.0.1:1"],"placement":{"mode":"pinned","home":"us5"}}"#;
+            let (status, _, v) = send(&f, "POST", "/deployments", elsewhere).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{v}");
+            assert!(v["error"].as_str().unwrap().contains("placed on us5"));
+
+            let same_id = r#"{"id":"theirs","routes":[{"host":"t.example"}],"upstreams":["127.0.0.1:1"]}"#;
+            let (status, _, _) = send(&f, "POST", "/deployments", same_id).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+
+            let here = r#"{"id":"mine","routes":[{"host":"m.example"}],"upstreams":["127.0.0.1:1"],"placement":{"mode":"pinned","home":"us4"}}"#;
+            let (status, _, v) = send(&f, "POST", "/deployments", here).await;
+            assert!(status.is_success(), "{status} {v}");
         }
 
         #[test]

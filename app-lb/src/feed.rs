@@ -311,6 +311,7 @@ mod tests {
 
     fn spec(id: &str, namespace: &str, feed: Option<FeedSpec>) -> DeploymentSpec {
         DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,

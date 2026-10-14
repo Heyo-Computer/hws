@@ -9,6 +9,7 @@
 
 use crate::config::DeploymentSpec;
 use crate::deployment::{Deployment, DeploymentState};
+use crate::fleet_split::{fleet_half, merge_halves};
 use crate::fleet_store::{Collection, Expect, FileCollection, FileOptions};
 use arc_swap::ArcSwap;
 use std::borrow::Cow;
@@ -248,6 +249,14 @@ pub struct Registry {
     /// whole record goes to `records`, which stays this host's own copy and
     /// the only home of its host state. `None` on a single server.
     fleet: Option<Arc<dyn Collection>>,
+    /// This host's fleet name, in fleet mode: what `placement.home` is
+    /// compared against.
+    fleet_host: Option<String>,
+    /// Fleet deployments placed on another host. Kept apart from
+    /// `deployments` on purpose: everything that runs, routes, adopts or
+    /// certifies reads that map, so a deployment that is not this host's
+    /// cannot reach any of it. Listed, never acted on.
+    foreign: ArcSwap<HashMap<String, Arc<DeploymentSpec>>>,
     /// Serializes compound admin mutations by deployment identity. Deployment
     /// objects are replaceable, so a mutex stored on one object cannot protect
     /// a drain from racing a spec replacement.
@@ -303,6 +312,8 @@ impl Registry {
             records,
             retired,
             fleet: None,
+            fleet_host: None,
+            foreign: ArcSwap::from_pointee(HashMap::new()),
             change_lock: tokio::sync::Mutex::new(()),
             retirement_gate: Arc::new(tokio::sync::RwLock::new(())),
             persist_lock: std::sync::Mutex::new(()),
@@ -317,9 +328,86 @@ impl Registry {
     /// Keep the fleet half of every record in `fleet` as well
     /// (`docs/design/fleet-shared-state.md` § 1). The local records keep their
     /// exact single-server format, so leaving fleet mode is a restart.
-    pub fn with_fleet(mut self, fleet: Arc<dyn Collection>) -> Self {
+    pub fn with_fleet(mut self, fleet: Arc<dyn Collection>, host: &str) -> Self {
         self.fleet = Some(fleet);
+        self.fleet_host = Some(host.to_string());
         self
+    }
+
+    /// Whether this host runs `spec`. Always, on a single server; in a fleet,
+    /// unless its placement names another host.
+    pub fn placed_here(&self, spec: &DeploymentSpec) -> bool {
+        match (&self.fleet_host, &spec.placement) {
+            (Some(host), Some(placement)) => placement.includes(host),
+            _ => true,
+        }
+    }
+
+    /// Fleet deployments this host keeps but does not run.
+    pub fn foreign(&self) -> Arc<HashMap<String, Arc<DeploymentSpec>>> {
+        self.foreign.load_full()
+    }
+
+    /// Re-read the fleet's deployments after another writer changed them.
+    ///
+    /// Deployments placed on other hosts are replaced wholesale: this host
+    /// runs nothing for them, so there is no runtime state to reconcile. A
+    /// change to one of this host's own deployments made elsewhere is not
+    /// applied live — its pools, rollouts and drains need the admin path's
+    /// care — and takes effect at the next start, which is said loudly.
+    pub fn apply_fleet_changes(&self) {
+        if self.fleet.is_none() {
+            return;
+        }
+        let entries = match self.entries() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not re-read the fleet's deployments");
+                return;
+            }
+        };
+        let local = self.deployments();
+        let mut foreign = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut deferred = Vec::new();
+        for entry in entries {
+            let Some(mut record) = entry
+                .body
+                .ok()
+                .and_then(|b| serde_json::from_slice::<StoredDeployment>(&b).ok())
+            else {
+                tracing::warn!(path = %entry.location, "skipping an unreadable fleet deployment");
+                continue;
+            };
+            record.spec.normalize();
+            if let Err(e) = record.spec.validate() {
+                tracing::warn!(id = %record.spec.id, error = %e, "skipping an invalid fleet deployment");
+                continue;
+            }
+            let id = record.spec.id.clone();
+            seen.insert(id.clone());
+            if self.placed_here(&record.spec) {
+                if local.get(id.as_str()).is_none_or(|d| d.spec != record.spec) {
+                    deferred.push(id);
+                }
+            } else {
+                foreign.insert(id, Arc::new(record.spec));
+            }
+        }
+        deferred.extend(local.keys().filter(|id| !seen.contains(id.as_ref())).map(|id| id.to_string()));
+        let before = self.foreign.load().len();
+        let after = foreign.len();
+        self.foreign.store(Arc::new(foreign));
+        if before != after {
+            tracing::info!(before, after, "deployments placed on other hosts updated");
+        }
+        if !deferred.is_empty() {
+            tracing::warn!(
+                deployments = ?deferred,
+                "this host's own deployments were changed by another fleet writer; \
+                 the change takes effect at this host's next start"
+            );
+        }
     }
 
     /// Hold across fetch → mutation/replacement → persistence. Administrative
@@ -760,6 +848,10 @@ impl Registry {
     pub fn persist_one(&self, id: &str) -> std::io::Result<()> {
         let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let Some(d) = self.get(id) else {
+            // Another host's deployment is never this host's to delete.
+            if self.foreign.load().contains_key(id) {
+                return Ok(());
+            }
             return self.forget(id);
         };
         self.persist_snapshot_inner(&d, &d.state())
@@ -831,6 +923,11 @@ impl Registry {
     /// Drop one deployment's file. A missing file is success — deregistering
     /// something that was never persisted is not an error.
     pub fn forget(&self, id: &str) -> std::io::Result<()> {
+        if self.foreign.load().contains_key(id) {
+            return Err(std::io::Error::other(
+                "this deployment is placed on another fleet host; deregister it there",
+            ));
+        }
         if self.retirement_frozen(id) {
             return Err(std::io::Error::other("retirement preserves the deployment record"));
         }
@@ -890,6 +987,7 @@ impl Registry {
 
         let mut loaded = 0;
         let mut skipped = false;
+        let mut foreign = HashMap::new();
         // A stray `.json.tmp` from an interrupted write is never listed.
         for entry in self.entries()? {
             let bytes = match entry.body {
@@ -919,6 +1017,11 @@ impl Registry {
                 skipped = true;
                 continue;
             }
+            // Another host's: kept for listing, never run here.
+            if !self.placed_here(&record.spec) {
+                foreign.insert(record.spec.id.clone(), Arc::new(record.spec));
+                continue;
+            }
             // Reload cannot replace a local freeze with an older disk image.
             if self.retirement_frozen(&record.spec.id) {loaded += 1; continue;}
             let d = self.upsert(record.spec);
@@ -935,6 +1038,13 @@ impl Registry {
         }
         self.load_skipped
             .store(skipped, std::sync::atomic::Ordering::Relaxed);
+        if !foreign.is_empty() {
+            tracing::info!(
+                count = foreign.len(),
+                "fleet deployments placed on other hosts: kept and listed, never run here"
+            );
+        }
+        self.foreign.store(Arc::new(foreign));
         Ok(loaded)
     }
 
@@ -1035,45 +1145,6 @@ fn validate_handoff(flat: &DeploymentSpec, regional: &DeploymentSpec) -> Result<
     Ok(())
 }
 
-/// The state fields every fleet host must agree on (`docs/design/fleet-shared-state.md`
-/// § 1). Everything else in [`DeploymentState`] — suspended sandboxes, create
-/// attempts, rollouts, the active prefix, a retirement freeze — describes this
-/// host's own daemon and stays in its own file. A field added later is host
-/// state until it is listed here.
-pub const FLEET_STATE_FIELDS: &[&str] = &["upstream_drains", "discovery_version", "route_handoff"];
-
-/// A whole record's fleet half: the spec and the [`FLEET_STATE_FIELDS`].
-pub fn fleet_half(record: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut value: serde_json::Value = serde_json::from_slice(record)?;
-    if let Some(state) = value.get_mut("state").and_then(|s| s.as_object_mut()) {
-        state.retain(|k, _| FLEET_STATE_FIELDS.contains(&k.as_str()));
-    }
-    Ok(serde_json::to_vec_pretty(&value)?)
-}
-
-/// A whole record from the fleet's half and this host's own record, if any:
-/// the fleet's spec and fleet fields, this host's everything else.
-pub fn merge_halves(fleet: &[u8], host: Option<&[u8]>) -> std::io::Result<Vec<u8>> {
-    let mut merged: serde_json::Value = serde_json::from_slice(fleet)?;
-    let mut state = match host {
-        Some(bytes) => {
-            let host: serde_json::Value = serde_json::from_slice(bytes)?;
-            host.get("state").and_then(|s| s.as_object()).cloned().unwrap_or_default()
-        }
-        None => serde_json::Map::new(),
-    };
-    state.retain(|k, _| !FLEET_STATE_FIELDS.contains(&k.as_str()));
-    if let Some(fleet_state) = merged.get("state").and_then(|s| s.as_object()) {
-        for (k, v) in fleet_state {
-            if FLEET_STATE_FIELDS.contains(&k.as_str()) {
-                state.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    merged["state"] = serde_json::Value::Object(state);
-    Ok(serde_json::to_vec_pretty(&merged)?)
-}
-
 /// Every local record's fleet half, to seed an empty fleet store from this
 /// host. A record that will not parse is left out (and stays on disk): the
 /// load that follows reports it, as it would on a single server.
@@ -1137,6 +1208,7 @@ mod tests {
 
     fn spec(id: &str, routes: Vec<RouteRule>) -> DeploymentSpec {
         DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,
@@ -1182,6 +1254,7 @@ mod tests {
 
     fn static_spec(id: &str, routes: Vec<RouteRule>, upstreams: &[&str]) -> DeploymentSpec {
         DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,
@@ -1788,7 +1861,7 @@ mod tests {
             Arc::new(FileCollection::new(&fleet_dir, ".json", FileOptions::SYNCED))
         };
 
-        let r = Registry::new(&state_file).with_fleet(fleet());
+        let r = Registry::new(&state_file).with_fleet(fleet(), "us4");
         let d = r.upsert(spec("a", vec![host("a.local")]));
         let mut state = (*d.state()).clone();
         state.discovery_version = Some(7); // fleet
@@ -1812,7 +1885,7 @@ mod tests {
         let mut changed = fleet_half.clone();
         changed["state"]["discovery_version"] = 9.into();
         std::fs::write(fleet_dir.join("a.json"), serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
-        let r2 = Registry::new(&state_file).with_fleet(fleet());
+        let r2 = Registry::new(&state_file).with_fleet(fleet(), "us4");
         assert_eq!(r2.load().unwrap(), 1);
         let state = r2.get("a").unwrap().state();
         assert_eq!(state.discovery_version, Some(9));
@@ -1831,7 +1904,7 @@ mod tests {
             std::fs::read(dir.join("app-lb-state.d/a.json")).unwrap(),
         )
         .unwrap();
-        let r3 = Registry::new(&state_file).with_fleet(fleet());
+        let r3 = Registry::new(&state_file).with_fleet(fleet(), "us4");
         assert_eq!(r3.load().unwrap(), 2);
         assert!(r3.get("b").unwrap().state().suspended.is_empty());
         assert!(r3.get("c").is_none());
@@ -1865,7 +1938,7 @@ mod tests {
         d.set_state(state);
         r3.persist_one("a").unwrap();
         assert_eq!(std::fs::read(fleet_dir.join("a.json")).unwrap(), before, "fleet half untouched");
-        let away = Registry::new(&state_file).with_fleet(Arc::new(Refusing));
+        let away = Registry::new(&state_file).with_fleet(Arc::new(Refusing), "us4");
         away.upsert(d.spec.clone());
         assert!(away.persist_one("a").is_err(), "a fleet half the fleet lacks must be written");
 
@@ -1877,6 +1950,56 @@ mod tests {
         // And the seed is every local record's fleet half.
         let seed = fleet_seed(&state_file).unwrap();
         assert!(seed.is_empty(), "nothing local is left");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_deployment_placed_on_another_host_is_kept_but_never_run_here() {
+        let dir = std::env::temp_dir().join(format!("app-lb-fleet-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_file = dir.join("app-lb-state.json");
+        let fleet_dir = dir.join("fleet");
+        let fleet: Arc<dyn Collection> =
+            Arc::new(FileCollection::new(&fleet_dir, ".json", FileOptions::SYNCED));
+        let write = |id: &str, home: Option<&str>| {
+            let mut s = spec(id, vec![host(&format!("{id}.example"))]);
+            s.placement = home.map(crate::config::Placement::pinned);
+            std::fs::create_dir_all(&fleet_dir).unwrap();
+            std::fs::write(
+                fleet_dir.join(format!("{id}.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({"spec": s})).unwrap(),
+            )
+            .unwrap();
+        };
+        write("theirs", Some("us5"));
+        write("ours", Some("us4"));
+        write("anywhere", None);
+
+        let r = Registry::new(&state_file).with_fleet(fleet.clone(), "us4");
+        assert_eq!(r.load().unwrap(), 2);
+        assert!(r.get("theirs").is_none(), "not in the map that runs, routes and certifies");
+        assert!(r.route(Some("theirs.example"), "/").is_none());
+        assert!(r.get("ours").is_some() && r.get("anywhere").is_some());
+        assert_eq!(r.foreign().keys().collect::<Vec<_>>(), ["theirs"]);
+
+        // Never this host's to delete, by persisting or by forgetting.
+        r.persist_one("theirs").unwrap();
+        assert!(fleet_dir.join("theirs.json").exists());
+        assert!(r.forget("theirs").is_err());
+        assert!(fleet_dir.join("theirs.json").exists());
+
+        // The feed: another host's deployment arrives, one leaves.
+        write("arrived", Some("us5"));
+        std::fs::remove_file(fleet_dir.join("theirs.json")).unwrap();
+        r.apply_fleet_changes();
+        assert_eq!(r.foreign().keys().collect::<Vec<_>>(), ["arrived"]);
+        assert!(r.get("arrived").is_none());
+
+        // A single server runs everything, placement or not.
+        let single = Registry::new(dir.join("single.json"));
+        let mut s = spec("x", vec![]);
+        s.placement = Some(crate::config::Placement::pinned("us5"));
+        assert!(single.placed_here(&s));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -107,6 +107,17 @@
       "description": "The namespace this deployment belongs to. Namespaces segregate use: a\ntoken minted for a namespace reaches only the deployments in it, and the\nevent feed is kept per namespace. Absent means `\"default\"`, so a fleet\nthat never says the word keeps behaving as one namespace.",
       "type": "string"
     },
+    "placement": {
+      "description": "Which host of an app-lb fleet runs this deployment's VMs. See\n[`Placement`]. Absent means wherever the spec is loaded, which on a\nsingle server is the only host there is.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Placement"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "routes": {
       "description": "Which requests reach this deployment, most specific rule winning.\n\nMay be empty only for a `vm` deployment, which is then reachable by exec\nand shell but takes no HTTP traffic. A static deployment and a site are\nreachable only through the proxy, so both need at least one.",
       "type": "array",
@@ -874,6 +885,39 @@
           "type": "string",
           "const": "admin"
         }
+      ]
+    },
+    "Placement": {
+      "description": "Where a deployment runs when several app-lb hosts share one fleet store\n(`docs/design/fleet-shared-state.md` § 4).\n\nOnly `pinned` is accepted today: every replica runs on `home`, and every\nother host keeps the spec but runs, routes and certifies nothing for it.\n`spread`, which lets replicas run on any listed host, arrives with the\nplacement controller that decides how many go where.\n\nA single-server app-lb accepts the field and ignores it: there is no other\nhost for a deployment to be placed on.",
+      "type": "object",
+      "properties": {
+        "home": {
+          "description": "The host a `pinned` deployment runs on, by its fleet name\n(`APP_LB_FLEET_HOST`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hosts": {
+          "description": "The hosts a `spread` deployment may run on; empty means all of them.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/PlacementMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "PlacementMode": {
+      "type": "string",
+      "enum": [
+        "pinned",
+        "spread"
       ]
     },
     "Providers": {

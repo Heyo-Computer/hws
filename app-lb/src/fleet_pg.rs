@@ -148,6 +148,9 @@ pub struct Snapshot {
     pub seeded: Option<String>,
 }
 
+/// A live record with its last writer: `(key, body, revision, updated_by)`.
+pub type Written = (String, Vec<u8>, Revision, String);
+
 /// Why a call failed.
 #[derive(Debug)]
 pub enum PgFailure {
@@ -494,6 +497,27 @@ impl PgStore {
             let c = pool.get().await.map_err(pool_failure)?;
             let row = c.query_opt(&sql, &[&kind, &key]).await.map_err(classify)?;
             Ok(row.map(|r| (r.get::<_, Vec<u8>>(0), r.get::<_, i64>(1) as Revision)))
+        })
+    }
+
+    /// Every live record of `kind` with its last writer, for a writer that
+    /// must tell its own records from everyone else's (the importer).
+    #[allow(dead_code)]
+    pub fn list_records(
+        &self,
+        kind: &str,
+    ) -> Result<Vec<Written>, PgFailure> {
+        let sql = self.sql(
+            "SELECT key, body, revision, updated_by FROM {s}.records WHERE kind = $1 AND body IS NOT NULL",
+        );
+        let kind = kind.to_string();
+        self.call_blocking(move |pool| async move {
+            let c = pool.get().await.map_err(pool_failure)?;
+            let rows = c.query(&sql, &[&kind]).await.map_err(classify)?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get::<_, i64>(2) as Revision, r.get(3)))
+                .collect())
         })
     }
 

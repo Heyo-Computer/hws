@@ -28,6 +28,9 @@ mod federated;
 mod fleet;
 mod fleet_store;
 mod fleet_pg;
+mod fleet_seal;
+mod fleet_split;
+mod secrets_seal;
 mod fleet_sync;
 #[cfg(test)]
 mod fleet_store_layout_tests;
@@ -294,6 +297,13 @@ fn config_from_env() -> LbConfig {
 /// The `EnvFilter` sits in front of both, so `RUST_LOG` still decides what app-lb
 /// logs *at all* and shipping only ever sees a subset of that. The layer applies
 /// its own INFO floor on top — see `obs::EventLayer`.
+/// Where the data-plane session signing key lives (`APP_LB_AUTH_KEY`).
+fn auth_key_path() -> std::path::PathBuf {
+    std::env::var("APP_LB_AUTH_KEY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| auth::default_key_path())
+}
+
 /// `APP_LB_SECRET_KEY`, derived, when set.
 fn secret_key_from_env() -> Option<Vec<u8>> {
     std::env::var("APP_LB_SECRET_KEY")
@@ -323,6 +333,10 @@ fn fleet_mode(cfg: &LbConfig) -> Option<fleet_sync::FleetStores> {
         .filter(|h| !h.trim().is_empty())
         .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|h| h.trim().to_string()))
         .unwrap_or_else(|| "app-lb".into());
+    if !config::is_valid_fleet_host(&host) {
+        tracing::error!(host = %host, "APP_LB_FLEET_HOST must be letters, digits, `-`, `_` and `.`; refusing to start");
+        std::process::exit(1);
+    }
     let holder = format!("{host}/{}", std::process::id());
     let pg = match fleet_pg::PgStore::open(&url, &holder, fleet_pg::timeout_from_env()) {
         Ok(pg) => pg,
@@ -339,7 +353,7 @@ fn fleet_mode(cfg: &LbConfig) -> Option<fleet_sync::FleetStores> {
         guard_path: cfg.guard_path.clone().into(),
         acme_dir: cfg.acme_dir.clone().into(),
     };
-    let stores = fleet_sync::FleetStores::register(&fleet, &layout);
+    let stores = fleet_sync::FleetStores::register(&fleet, &layout, &host, &auth_key_path());
     match fleet.start() {
         Ok(fleet_sync::Started::Seeded { records }) => {
             tracing::info!(holder = %holder, records, "fleet mode: seeded the fleet store from this host")
@@ -578,7 +592,7 @@ fn main() {
     // anything loads. See `fleet_sync`.
     let fleet_stores = fleet_mode(&cfg);
     let registry = Arc::new(match &fleet_stores {
-        Some(fs) => Registry::new(&cfg.state_path).with_fleet(fs.deployments.clone()),
+        Some(fs) => Registry::new(&cfg.state_path).with_fleet(fs.deployments.clone(), &fs.host),
         None => Registry::new(&cfg.state_path),
     });
     let _controller_lock = registry.controller_lock().unwrap_or_else(|e| {
@@ -864,6 +878,8 @@ fn main() {
                 tracing::error!(error = %e, "could not apply the fleet's tokens; keeping the ones in memory");
             }
         });
+        let s = registry.clone();
+        fleet.on_reload("deployments", move || s.apply_fleet_changes());
         let s = guard.clone();
         fleet.on_reload("guard", move || {
             if let Err(e) = s.load(deployment::now_secs()) {
@@ -951,9 +967,7 @@ fn main() {
     // a restart doesn't sign every user of a gated deployment out. Loaded even
     // when no deployment is gated — one file read, and it means enabling a gate
     // later needs no restart.
-    let auth_key_path = std::env::var("APP_LB_AUTH_KEY")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| auth::default_key_path());
+    let auth_key_path = auth_key_path();
     // Attack detection over the same requests the access log describes. Built
     // here because everything downstream takes a clone of its sink, and — like
     // `obs::from_env` — it allocates a channel and nothing else, so it survives
@@ -970,9 +984,21 @@ fn main() {
             .unwrap_or_else(|| Arc::from(obs::LB_DEPLOYMENT)),
     );
 
+    let auth_key = Authenticator::load_key(&auth_key_path)
+        .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display()));
+    // A host that generated its signing key just now (none in its files, none
+    // in the fleet) offers it to the fleet. Any other host's key that got
+    // there first wins, and arrives here at the next start.
+    if let Some(fs) = &fleet_stores
+        && matches!(fleet_store::Document::read(&*fs.auth_key), Ok(Some((_, 0))))
+    {
+        match fleet_store::Document::write(&*fs.auth_key, &auth_key, fleet_store::Expect::Absent) {
+            Ok(_) => tracing::info!("offered this host's session signing key to the fleet"),
+            Err(e) => tracing::warn!(error = %e, "this host's session signing key is not the fleet's yet"),
+        }
+    }
     let auth = Arc::new(Authenticator::with_admin_addr(
-        Authenticator::load_key(&auth_key_path)
-            .unwrap_or_else(|e| panic!("cannot read or create {}: {e}", auth_key_path.display())),
+        auth_key,
         secrets.clone(),
         Some(tokens.clone()),
         siem.as_ref().map(|s| s.sink.clone()),

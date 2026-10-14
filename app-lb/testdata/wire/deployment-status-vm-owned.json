@@ -110,6 +110,10 @@
       "cookie_domain": ".example.com",
       "redirect_url": "https://sandbox.example.com/__applb/auth/callback",
       "forward_identity": true
+    },
+    "placement": {
+      "mode": "pinned",
+      "home": "us5"
     }
   },
   "kind": "vm",

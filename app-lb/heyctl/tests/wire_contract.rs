@@ -312,6 +312,24 @@ fn guest_mounts_survive_the_wire() {
     assert!(m.summary().contains("/data/corpus"));
 }
 
+/// Which fleet host runs a deployment, which a client shows beside its name:
+/// read as an absent field, it would describe another host's deployment as
+/// one this host runs.
+#[test]
+fn placement_survives_the_wire() {
+    let d: DeploymentStatus =
+        serde_json::from_str(&fixture("deployment-status-vm-owned")).expect("fixture parses");
+    let placement = d.spec.placement.expect("the owned fixture is pinned");
+    assert_eq!(placement.mode, "pinned");
+    assert_eq!(placement.home.as_deref(), Some("us5"));
+    assert!(placement.extra.is_empty(), "every placement field is modelled: {:?}", placement.extra);
+    assert_eq!(placement.summary(), "pinned to us5");
+
+    let single: DeploymentStatus =
+        serde_json::from_str(&fixture("deployment-status-vm")).expect("fixture parses");
+    assert!(single.spec.placement.is_none(), "absent on a single server");
+}
+
 /// The third kind of pull, whose result lives in `mounts` rather than in
 /// `image` — so a client that only understood the other two would render a mount
 /// pull as a job that did nothing.

@@ -163,6 +163,33 @@ pub struct DeploymentSpec {
     pub update: Option<UpdateSpec>,
     pub auth: Option<AuthGate>,
     pub site: Option<SiteSpec>,
+    /// Which host of an app-lb fleet runs it. Absent on a single server, and
+    /// on a fleet deployment that runs wherever it is loaded.
+    pub placement: Option<Placement>,
+}
+
+/// Where a fleet deployment runs: `pinned` to its `home` host, or (later)
+/// `spread` across `hosts`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct Placement {
+    pub mode: String,
+    pub home: Option<String>,
+    pub hosts: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl Placement {
+    /// `pinned to us5`, `spread across us4, us5`, `spread across every host`.
+    pub fn summary(&self) -> String {
+        match (self.mode.as_str(), &self.home) {
+            ("pinned", Some(home)) => format!("pinned to {home}"),
+            ("spread", _) if self.hosts.is_empty() => "spread across every host".into(),
+            ("spread", _) => format!("spread across {}", self.hosts.join(", ")),
+            (mode, _) => mode.to_string(),
+        }
+    }
 }
 
 impl DeploymentSpec {

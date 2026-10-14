@@ -123,6 +123,17 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "description": "The namespace this deployment belongs to.",
       "type": "string"
     },
+    "placement": {
+      "description": "Which host of an app-lb fleet runs this deployment's VMs.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Placement"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "routes": {
       "description": "Which requests reach this deployment, most specific rule winning.",
       "type": "array",
@@ -424,6 +435,16 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "additionalProperties": true,
       "description": "How a managed deployment is reached from the Heyo cloud. (Call applb_spec_schema with block \"IngressSpec\" for the full shape; everything it accepted is still accepted.)"
     },
+    "Placement": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Where a deployment runs when several app-lb hosts share one fleet store (`docs/design/fleet-shared-state.md` § 4). (Call applb_spec_schema with block \"Placement\" for the full shape; everything it accepted is still accepted.)"
+    },
+    "RouteRedirect": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Where a redirecting route sends its requests. (Call applb_spec_schema with block \"RouteRedirect\" for the full shape; everything it accepted is still accepted.)"
+    },
     "RouteRule": {
       "description": "How a request is matched to a deployment.",
       "type": "object",
@@ -447,6 +468,17 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
           "type": [
             "string",
             "null"
+          ]
+        },
+        "redirect": {
+          "description": "Answer every request this rule matches with a redirect instead of serving it, so one deployment can capture a host (an old subdomain, a vanity name) and send it elsewhere while its…",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RouteRedirect"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "strip_prefix": {
@@ -783,6 +815,17 @@ export const DEPLOYMENT_SPEC_FULL = {
     "namespace": {
       "description": "The namespace this deployment belongs to. Namespaces segregate use: a\ntoken minted for a namespace reaches only the deployments in it, and the\nevent feed is kept per namespace. Absent means `\"default\"`, so a fleet\nthat never says the word keeps behaving as one namespace.",
       "type": "string"
+    },
+    "placement": {
+      "description": "Which host of an app-lb fleet runs this deployment's VMs. See\n[`Placement`]. Absent means wherever the spec is loaded, which on a\nsingle server is the only host there is.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Placement"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "routes": {
       "description": "Which requests reach this deployment, most specific rule winning.\n\nMay be empty only for a `vm` deployment, which is then reachable by exec\nand shell but takes no HTTP traffic. A static deployment and a site are\nreachable only through the proxy, so both need at least one.",
@@ -1553,6 +1596,39 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       ]
     },
+    "Placement": {
+      "description": "Where a deployment runs when several app-lb hosts share one fleet store\n(`docs/design/fleet-shared-state.md` § 4).\n\nOnly `pinned` is accepted today: every replica runs on `home`, and every\nother host keeps the spec but runs, routes and certifies nothing for it.\n`spread`, which lets replicas run on any listed host, arrives with the\nplacement controller that decides how many go where.\n\nA single-server app-lb accepts the field and ignores it: there is no other\nhost for a deployment to be placed on.",
+      "type": "object",
+      "properties": {
+        "home": {
+          "description": "The host a `pinned` deployment runs on, by its fleet name\n(`APP_LB_FLEET_HOST`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hosts": {
+          "description": "The hosts a `spread` deployment may run on; empty means all of them.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/PlacementMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "PlacementMode": {
+      "type": "string",
+      "enum": [
+        "pinned",
+        "spread"
+      ]
+    },
     "Providers": {
       "description": "One provider, or several. A single provider is written as a bare string so a gate authored before app-tokens existed round-trips unchanged.",
       "anyOf": [
@@ -1627,6 +1703,32 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       ]
     },
+    "RouteRedirect": {
+      "description": "Where a redirecting route sends its requests.",
+      "type": "object",
+      "properties": {
+        "keep_path": {
+          "description": "Append the request path and query to `to`. Off sends every request to\n`to` exactly.",
+          "type": "boolean",
+          "default": true
+        },
+        "status": {
+          "description": "`301` (default), `302`, `303`, `307` or `308`.",
+          "type": "integer",
+          "format": "uint16",
+          "default": 301,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "to": {
+          "description": "Absolute `http`/`https` URL. With `keep_path` the request path (after\n`strip_prefix`, if the rule strips) and query are appended to it, so\n`https://example.com/docs` sends `/a/b?q` to `https://example.com/docs/a/b?q`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "to"
+      ]
+    },
     "RouteRule": {
       "description": "How a request is matched to a deployment.\n\nA rule matches when *every* populated field matches. An empty rule matches\nnothing (rejected at registration) rather than everything, so a typo can't\nsilently swallow all traffic.",
       "type": "object",
@@ -1650,6 +1752,17 @@ export const DEPLOYMENT_SPEC_FULL = {
           "type": [
             "string",
             "null"
+          ]
+        },
+        "redirect": {
+          "description": "Answer every request this rule matches with a redirect instead of\nserving it, so one deployment can capture a host (an old subdomain, a\nvanity name) and send it elsewhere while its other routes serve as usual.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RouteRedirect"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "strip_prefix": {

@@ -185,6 +185,11 @@ pub trait Transactional: Send + Sync {
     fn changes_since(&self, cursor: Revision, limit: usize) -> io::Result<Vec<Change>>;
 }
 
+/// The key a [`Document`] is filed under in a store of collections: a
+/// document is a kind with one record.
+#[allow(dead_code)]
+pub const DOC_KEY: &str = "document";
+
 /// A single record.
 pub trait Document: Send + Sync + fmt::Debug {
     /// `None` when it has never been written.

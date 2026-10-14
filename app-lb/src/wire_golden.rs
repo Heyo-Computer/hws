@@ -72,6 +72,7 @@ pub(crate) fn golden(name: &str, value: &impl Serialize) {
 /// deployment that cannot exist.
 fn vm_spec() -> DeploymentSpec {
     DeploymentSpec {
+        placement: None,
         ingress: None,
         account_id: None,
         user_id: None,
@@ -226,11 +227,14 @@ fn owned_vm_spec() -> DeploymentSpec {
     s.namespace = "team-a".into();
     s.account_id = Some("3f7c2a1e-9b4d-4c8e-a5f6-1d2e3f4a5b6c".into());
     s.user_id = Some("7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d".into());
+    // A fleet deployment: which host runs it is part of what a client shows.
+    s.placement = Some(crate::config::Placement::pinned("us5"));
     s
 }
 
 fn site_spec() -> DeploymentSpec {
     DeploymentSpec {
+        placement: None,
         ingress: None,
         account_id: None,
         user_id: None,
@@ -289,6 +293,7 @@ fn site_spec() -> DeploymentSpec {
 
 fn static_spec() -> DeploymentSpec {
     DeploymentSpec {
+        placement: None,
         ingress: None,
         account_id: None,
         user_id: None,
