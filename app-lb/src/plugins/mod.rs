@@ -240,6 +240,25 @@ pub struct PluginRecord {
     /// an explicit install clears it.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub declined: BTreeSet<String>,
+    /// In a fleet, the one host that runs this plugin (`APP_LB_FLEET_HOST`).
+    /// Every host keeps the record, its configuration and its installs; only
+    /// this one starts the plugin and acts for its namespaces, so nothing a
+    /// plugin does — run CI, provision a database, poll — happens twice.
+    /// Absent means wherever the record is, which on a single server is the
+    /// only host there is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+}
+
+impl PluginRecord {
+    /// Whether `host` (this host's fleet name, `None` on a single server)
+    /// runs the plugin.
+    pub fn runs_on(&self, host: Option<&str>) -> bool {
+        match (host, self.home.as_deref()) {
+            (Some(host), Some(home)) => host == home,
+            _ => true,
+        }
+    }
 }
 
 // ---- the store ------------------------------------------------------------
@@ -407,6 +426,8 @@ pub enum SetError {
     Disabled(&'static str),
     /// The install or uninstall would clash with what is already there.
     Conflict(String),
+    /// Another fleet host runs this plugin; act on it there.
+    Elsewhere { id: &'static str, home: String },
 }
 
 impl std::fmt::Display for SetError {
@@ -421,6 +442,10 @@ impl std::fmt::Display for SetError {
                  `heyctl plugins enable {id}` before a namespace can install it"
             ),
             SetError::Conflict(m) => f.write_str(m),
+            SetError::Elsewhere { id, home } => write!(
+                f,
+                "the {id} plugin runs on fleet host {home}, not this one; install and change it there"
+            ),
         }
     }
 }
@@ -438,6 +463,9 @@ struct Slot {
 pub struct PluginHost {
     slots: Vec<Arc<Slot>>,
     store: PluginStore,
+    /// This host's fleet name, in fleet mode: plugins whose record names
+    /// another home are kept, not run. `None` on a single server.
+    host: Option<String>,
 }
 
 impl PluginHost {
@@ -463,7 +491,7 @@ impl PluginHost {
                 })
             })
             .collect();
-        Self { slots, store }
+        Self { slots, store, host: None }
     }
 
     #[cfg(test)]
@@ -471,12 +499,31 @@ impl PluginHost {
         &self.store
     }
 
+    /// Run only the plugins whose home is `host` (fleet mode).
+    pub fn with_host(mut self, host: Option<String>) -> Self {
+        self.host = host;
+        self
+    }
+
+    fn runs_here(&self, record: &PluginRecord) -> bool {
+        record.runs_on(self.host.as_deref())
+    }
+
+    /// Why a namespace action must go to another host, if it must.
+    fn elsewhere(&self, id: &'static str, record: &PluginRecord) -> Option<SetError> {
+        (!self.runs_here(record)).then(|| SetError::Elsewhere {
+            id,
+            home: record.home.clone().unwrap_or_default(),
+        })
+    }
+
     fn slot(&self, id: &str) -> Option<&Arc<Slot>> {
         self.slots.iter().find(|s| s.plugin.meta().id == id)
     }
 
+    /// Enabled, and run by this host.
     pub fn is_enabled(&self, id: &str) -> bool {
-        self.store.get(id).is_some_and(|r| r.enabled)
+        self.store.get(id).is_some_and(|r| r.enabled && self.runs_here(&r))
     }
 
     pub async fn list(&self) -> Vec<PluginView> {
@@ -533,9 +580,14 @@ impl PluginHost {
             updated_at: crate::deployment::now_secs(),
             installs: current.installs,
             declined: current.declined,
+            // Configured here and homed nowhere yet: this host runs it.
+            home: current.home.or_else(|| self.host.clone()),
         };
+        let here = self.runs_here(&record);
         self.store.put(id, record).map_err(SetError::Io)?;
-        self.apply_slot(&slot, enabled.then_some(config)).await;
+        if here {
+            self.apply_slot(&slot, enabled.then_some(config)).await;
+        }
         drop(_held);
         Ok(self.view(&slot).await)
     }
@@ -608,6 +660,9 @@ impl PluginHost {
         if !record.enabled {
             return Err(SetError::Disabled(slot.plugin.meta().id));
         }
+        if let Some(e) = self.elsewhere(slot.plugin.meta().id, &record) {
+            return Err(e);
+        }
         slot.plugin
             .validate_install(ns, &config)
             .map_err(SetError::Invalid)?;
@@ -637,6 +692,9 @@ impl PluginHost {
         let slot = self.installable(id).ok_or(SetError::NotFound)?.clone();
         let _held = slot.lock.lock().await;
         let mut record = self.store.get(id).unwrap_or_default();
+        if let Some(e) = self.elsewhere(slot.plugin.meta().id, &record) {
+            return Err(e);
+        }
         if let Some(install) = record.installs.get(ns) {
             slot.plugin.on_uninstall(ns, &install.config).await?;
         }
@@ -665,6 +723,7 @@ impl PluginHost {
                 continue;
             };
             if !record.enabled
+                || !self.runs_here(&record)
                 || !slot.plugin.auto_install(&record.config)
                 || record.installs.contains_key(ns)
                 || record.declined.contains(ns)
@@ -750,6 +809,7 @@ impl PluginHost {
                     enabled: true,
                     config,
                     updated_at: crate::deployment::now_secs(),
+                    home: self.host.clone(),
                     ..Default::default()
                 };
                 match self.store.put(id, record) {
@@ -763,6 +823,10 @@ impl PluginHost {
             let Some(record) = self.store.get(id).filter(|r| r.enabled) else {
                 continue;
             };
+            if !self.runs_here(&record) {
+                tracing::info!(plugin = id, home = ?record.home, "plugin runs on another fleet host; keeping its record, not starting it");
+                continue;
+            }
             let _held = slot.lock.lock().await;
             if let Err(e) = slot.plugin.validate(&record.config) {
                 tracing::warn!(plugin = id, error = %e, "stored plugin configuration is invalid; not starting it");
@@ -1038,6 +1102,36 @@ mod tests {
         let reloaded = PluginStore::new(&dir.0);
         assert_eq!(reloaded.load(), (1, 0));
         assert_eq!(reloaded.get("probe").unwrap().config, cfg);
+    }
+
+    /// In a fleet, a plugin runs only on its home host; every other host keeps
+    /// the record without starting it.
+    #[tokio::test]
+    async fn a_plugin_runs_only_on_its_home_host() {
+        let dir = TempDir::new();
+        let probe = Arc::new(Probe::default());
+        let us5 = PluginHost::new(vec![probe.clone()], PluginStore::new(&dir.0)).with_host(Some("us5".into()));
+        us5.set("probe", true, Some(serde_json::json!({"x": 1}))).await.unwrap();
+        assert_eq!(us5.store.get("probe").unwrap().home.as_deref(), Some("us5"), "configured here, homed here");
+        assert!(us5.is_enabled("probe"));
+        assert_eq!(probe.applied.lock().unwrap().len(), 1);
+
+        // us4 shares the record (here: the same files) but does not run it.
+        let elsewhere = Arc::new(Probe::default());
+        let us4 = PluginHost::new(vec![elsewhere.clone()], PluginStore::new(&dir.0)).with_host(Some("us4".into()));
+        us4.store.load();
+        assert!(us4.start_enabled().await.is_empty());
+        assert!(elsewhere.applied.lock().unwrap().is_empty(), "never started on us4");
+        assert!(!us4.is_enabled("probe"), "its routes answer as if disabled");
+        us4.set("probe", true, Some(serde_json::json!({"x": 2}))).await.unwrap();
+        assert!(elsewhere.applied.lock().unwrap().is_empty(), "changed from us4, still run by us5");
+        assert_eq!(us4.store.get("probe").unwrap().home.as_deref(), Some("us5"));
+
+        // A single server, and a record with no home, run everywhere.
+        let single = PluginHost::new(vec![Arc::new(Probe::default())], PluginStore::new(&dir.0));
+        single.store.load();
+        assert!(single.is_enabled("probe"));
+        assert!(PluginRecord { enabled: true, ..Default::default() }.runs_on(Some("us4")));
     }
 
     #[tokio::test]

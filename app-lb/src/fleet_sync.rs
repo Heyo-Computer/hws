@@ -54,6 +54,15 @@ pub use crate::fleet_store::DOC_KEY;
 /// Leases: who renews certificates, sweeps expired tokens and collects
 /// tombstones, fleet-wide.
 pub const LEASE_ACME: &str = "acme";
+
+/// This host's ACME lease. Per host, not fleet-wide: a host issues only for
+/// the deployments it runs (the only names DNS sends it, and so the only ones
+/// whose HTTP-01 challenge it can answer from memory), so issuance never
+/// needs one host for the whole fleet. The lease keeps a host's certificate
+/// writes fenced against an earlier process of its own.
+pub fn acme_lease(host: &str) -> &'static str {
+    Box::leak(format!("{LEASE_ACME}:{host}").into_boxed_str())
+}
 pub const LEASE_TOKEN_SWEEP: &str = "token-sweep";
 pub const LEASE_TOMBSTONES: &str = "tombstone-gc";
 pub const LEASE_TTL: Duration = Duration::from_secs(15);
@@ -1015,19 +1024,20 @@ impl FleetStores {
         auth_key_path: &Path,
     ) -> Self {
         let plain = KindOptions::default();
+        let acme_lease = acme_lease(host);
         let acme = KindOptions {
             sealed: false,
-            fence: Some(LEASE_ACME),
+            fence: Some(acme_lease),
         };
         let acme_sealed = KindOptions {
             sealed: true,
-            fence: Some(LEASE_ACME),
+            fence: Some(acme_lease),
         };
         let private_dir = FileOptions::PRIVATE.private_dir(0o700);
         let state = layout.state_path.to_string_lossy().into_owned();
         let state_path = layout.state_path.clone();
         let certs = layout.acme_certs_dir();
-        fleet.lease(LEASE_ACME);
+        fleet.lease(acme_lease);
         fleet.lease(LEASE_TOMBSTONES);
         Self {
             deployments: fleet.collection_seeded(

@@ -55,15 +55,20 @@ app-lb-fleet-import — carry an app-lb host's tenant state into a fleet
 
 Usage:
   app-lb-fleet-import --dry-run [paths]
-  app-lb-fleet-import --export --from-host NAME --to-key PUB.pem --out BUNDLE [paths]
-  app-lb-fleet-import --apply BUNDLE --key PRIVATE.pem [--dry-run]
+  app-lb-fleet-import --export --from-host NAME --to-key PUB.pem --out BUNDLE
+                      [--join] [--host-scoped ID]... [paths]
+  app-lb-fleet-import --apply BUNDLE --key PRIVATE.pem [--dry-run] [--seed]
 
 --dry-run (alone) reads the APP_LB_* paths app-lb does and reports counts.
 --export reads them too, and writes one bundle encrypted to PUB.pem. It never
-writes the state, and needs no fleet credential.
+writes the state, and needs no fleet credential. By default it carries tenant
+identity (a shadow); --join also carries the host's plugins (homed on it), the
+postgres ownership map, its ACME account and certificates. --host-scoped ID
+carries per-host deployment ID as ID-NAME.
 --apply decrypts BUNDLE with PRIVATE.pem and writes it into the fleet store at
 APP_LB_FLEET_DATABASE_URL in one transaction, sealing with APP_LB_SECRET_KEY.
-With --dry-run it only reports what it would write.
+With --dry-run it only reports what it would write. --seed makes the bundle
+the first records of a fleet store nobody has seeded.
 
 Paths (default to app-lb's variables and defaults):
       --state-path <path>    APP_LB_STATE_PATH
@@ -80,6 +85,10 @@ a usage error.
 
 #[derive(Debug, Default)]
 struct Args {
+    join: bool,
+    /// `--apply` into a fleet store nobody has seeded yet.
+    seed: bool,
+    host_scoped: Vec<String>,
     layout: Option<Layout>,
     auth_key: Option<PathBuf>,
     dry_run: bool,
@@ -104,6 +113,22 @@ fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--dry-run" => a.dry_run = true,
             "--export" => a.export = true,
             "--from-host" => a.from_host = Some(value(&arg)?),
+            "--join" => a.join = true,
+            "--seed" => a.seed = true,
+            "--host-scoped" => {
+                let id = value(&arg)?;
+                if id.is_empty()
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                {
+                    return Err(
+                        "--host-scoped takes a deployment id of letters, digits, `-` and `_`"
+                            .into(),
+                    );
+                }
+                a.host_scoped.push(id);
+            }
             "--to-key" => a.to_key = Some(value(&arg)?.into()),
             "--out" => a.out = Some(value(&arg)?.into()),
             "--apply" => a.apply = Some(value(&arg)?.into()),
@@ -121,6 +146,12 @@ fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
     let modes = [a.export, a.apply.is_some()].iter().filter(|m| **m).count();
     if modes > 1 {
         return Err("--export and --apply are separate runs, on separate hosts".into());
+    }
+    if a.seed && a.apply.is_none() {
+        return Err("--seed belongs to --apply".into());
+    }
+    if !a.export && (a.join || !a.host_scoped.is_empty()) {
+        return Err("--join and --host-scoped shape an export".into());
     }
     if a.export {
         if a.dry_run {
@@ -174,9 +205,18 @@ fn main() -> ExitCode {
             args.from_host.as_deref().expect("checked"),
             args.to_key.as_deref().expect("checked"),
             args.out.as_deref().expect("checked"),
+            &Scope {
+                join: args.join,
+                host_scoped: args.host_scoped.clone(),
+            },
         )
     } else if let Some(bundle) = &args.apply {
-        apply(bundle, args.key.as_deref().expect("checked"), args.dry_run)
+        apply(
+            bundle,
+            args.key.as_deref().expect("checked"),
+            args.dry_run,
+            args.seed,
+        )
     } else {
         let report = survey(&layout);
         print!("{}", report.render());
@@ -197,7 +237,7 @@ fn main() -> ExitCode {
 
 // ---- export ------------------------------------------------------------------
 
-/// The kinds a bundle carries, in the order they are written.
+/// The kinds a shadow bundle carries: tenant identity.
 const KINDS: &[&str] = &[
     "namespaces",
     "auth-providers",
@@ -207,6 +247,33 @@ const KINDS: &[&str] = &[
     "auth-key",
     "deployments",
 ];
+
+/// What a host joining the fleet also brings (`--join`): the state that has
+/// a host act — its plugins (homed on it), the postgres plugin's ownership
+/// map, its ACME account and its certificates. Left out of a shadow on
+/// purpose; a member needs them, or joining would replace them with the
+/// fleet's.
+const JOIN_KINDS: &[&str] = &[
+    "plugins",
+    "pg-ownership",
+    "acme-account",
+    "cert-chains",
+    "cert-keys",
+];
+
+fn shadow_kinds() -> Vec<String> {
+    KINDS.iter().map(|k| k.to_string()).collect()
+}
+
+/// What an export reads.
+#[derive(Debug, Default, Clone)]
+struct Scope {
+    /// Everything a member needs, not only tenant identity.
+    join: bool,
+    /// Deployment ids that name a per-host thing (each host's admin route):
+    /// carried as `<id>-<host>` so every host's can live in one fleet.
+    host_scoped: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Record {
@@ -223,6 +290,10 @@ struct Bundle {
     /// to and every record is written as (`import:<from>`).
     from: String,
     created_at: u64,
+    /// The kinds this bundle speaks for. Apply deletes only within them, so a
+    /// shadow bundle never removes what a join bundle brought.
+    #[serde(default = "shadow_kinds")]
+    kinds: Vec<String>,
     records: Vec<Record>,
 }
 
@@ -242,13 +313,19 @@ mod b64 {
 /// Every record the bundle should carry, read from the host's files. An
 /// unreadable record is an error: a bundle that silently lacks a deployment
 /// would have `--apply` delete it from the fleet.
-fn read_records(layout: &Layout, auth_key: &Path, from: &str) -> Result<Vec<Record>, String> {
+fn read_records(
+    layout: &Layout,
+    auth_key: &Path,
+    from: &str,
+    scope: &Scope,
+) -> Result<Vec<Record>, String> {
     let mut out = Vec::new();
     let mut collection = |kind: &str,
                           dir: PathBuf,
+                          suffix: &'static str,
                           f: &dyn Fn(Vec<u8>) -> Result<Vec<u8>, String>|
      -> Result<(), String> {
-        let store = FileCollection::new(&dir, ".json", FileOptions::PLAIN);
+        let store = FileCollection::new(&dir, suffix, FileOptions::PLAIN);
         for entry in store
             .list()
             .map_err(|e| format!("{}: {e}", dir.display()))?
@@ -267,21 +344,34 @@ fn read_records(layout: &Layout, auth_key: &Path, from: &str) -> Result<Vec<Reco
         serde_json::from_slice::<serde_json::Value>(&b).map_err(|e| format!("not JSON: {e}"))?;
         Ok(b)
     };
-    collection("namespaces", layout.namespace_dir(), &json)?;
-    collection("auth-providers", layout.auth_provider_dir(), &json)?;
-    collection("deployments", layout.registry_dir(), &|b| {
+    let raw = |b: Vec<u8>| -> Result<Vec<u8>, String> { Ok(b) };
+    collection("namespaces", layout.namespace_dir(), ".json", &json)?;
+    collection("auth-providers", layout.auth_provider_dir(), ".json", &json)?;
+    collection("deployments", layout.registry_dir(), ".json", &|b| {
         let half = fleet_split::fleet_half(&b).map_err(|e| e.to_string())?;
         fleet_split::pin_to(&half, from).map_err(|e| e.to_string())
     })?;
-    for (kind, path) in [
+    let mut documents = vec![
         ("secrets", layout.secrets_path.clone()),
         ("tokens", layout.tokens_path.clone()),
         ("guard", layout.guard_path.clone()),
         ("auth-key", auth_key.to_path_buf()),
-    ] {
+    ];
+    if scope.join {
+        collection("plugins", layout.plugin_dir(), ".json", &|b| {
+            home_plugin(&b, from)
+        })?;
+        collection("cert-chains", layout.acme_certs_dir(), ".crt.pem", &raw)?;
+        collection("cert-keys", layout.acme_certs_dir(), ".key.pem", &raw)?;
+        documents.push(("pg-ownership", layout.postgres_ownership_path()));
+        documents.push(("acme-account", layout.acme_dir.join("account.json")));
+    }
+    for (kind, path) in documents {
         let doc = FileDocument::new(&path, FileOptions::PLAIN);
         if let Some((body, _)) = doc.read().map_err(|e| format!("{}: {e}", path.display()))? {
-            if kind != "auth-key" && !body.iter().all(u8::is_ascii_whitespace) {
+            if !matches!(kind, "auth-key" | "acme-account")
+                && !body.iter().all(u8::is_ascii_whitespace)
+            {
                 serde_json::from_slice::<serde_json::Value>(&body)
                     .map_err(|e| format!("{}: not JSON: {e}", path.display()))?;
             }
@@ -298,7 +388,40 @@ fn read_records(layout: &Layout, auth_key: &Path, from: &str) -> Result<Vec<Reco
             });
         }
     }
+    for id in &scope.host_scoped {
+        rename_host_scoped(&mut out, id, from)?;
+    }
     Ok(out)
+}
+
+/// A plugin record homed on `from`, unless it already names a home.
+fn home_plugin(record: &[u8], from: &str) -> Result<Vec<u8>, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(record).map_err(|e| format!("not JSON: {e}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or("a plugin record that is not an object")?;
+    object
+        .entry("home")
+        .or_insert_with(|| serde_json::Value::String(from.to_string()));
+    serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())
+}
+
+/// Carry deployment `id` as `<id>-<from>`: a per-host deployment every host
+/// has under the same id.
+fn rename_host_scoped(records: &mut [Record], id: &str, from: &str) -> Result<(), String> {
+    let renamed = format!("{id}-{from}");
+    for r in records
+        .iter_mut()
+        .filter(|r| r.kind == "deployments" && r.key == id)
+    {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&r.body).map_err(|e| e.to_string())?;
+        value["spec"]["id"] = serde_json::Value::String(renamed.clone());
+        r.body = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
+        r.key = renamed.clone();
+    }
+    Ok(())
 }
 
 fn export(
@@ -307,8 +430,13 @@ fn export(
     from: &str,
     to_key: &Path,
     out: &Path,
+    scope: &Scope,
 ) -> Result<(), String> {
-    let records = read_records(layout, auth_key, from)?;
+    let records = read_records(layout, auth_key, from, scope)?;
+    let mut kinds = shadow_kinds();
+    if scope.join {
+        kinds.extend(JOIN_KINDS.iter().map(|k| k.to_string()));
+    }
     let bundle = Bundle {
         version: 1,
         from: from.to_string(),
@@ -316,6 +444,7 @@ fn export(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        kinds,
         records,
     };
     let plaintext = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
@@ -323,19 +452,24 @@ fn export(
     let sealed = envelope::seal(&public, &plaintext).map_err(|e| e.to_string())?;
     write_private(out, &sealed).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("exported from {from}, encrypted to {}:", to_key.display());
-    print!("{}", counts(&bundle.records));
+    print!("{}", counts(&bundle.kinds, &bundle.records));
     println!("bundle: {} ({} bytes)", out.display(), sealed.len());
     Ok(())
 }
 
-fn counts(records: &[Record]) -> String {
+fn counts(kinds: &[String], records: &[Record]) -> String {
     let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
     for r in records {
         *by_kind.entry(r.kind.as_str()).or_default() += 1;
     }
-    KINDS
+    kinds
         .iter()
-        .map(|k| format!("  {k:<15} {}\n", by_kind.get(k).copied().unwrap_or(0)))
+        .map(|k| {
+            format!(
+                "  {k:<15} {}\n",
+                by_kind.get(k.as_str()).copied().unwrap_or(0)
+            )
+        })
         .collect()
 }
 
@@ -499,8 +633,8 @@ fn plan(
         }
     }
     // What this source wrote before and no longer has: gone at the source.
-    for kind in KINDS {
-        for (key, c) in current.get(*kind).unwrap_or(&empty) {
+    for kind in &bundle.kinds {
+        for (key, c) in current.get(kind).unwrap_or(&empty) {
             if c.writer == writer && !seen.contains(&(kind.to_string(), key.clone())) {
                 p.writes.push(Write::Delete {
                     kind: kind.to_string(),
@@ -514,7 +648,7 @@ fn plan(
     Ok(p)
 }
 
-fn apply(bundle_path: &Path, private_key: &Path, dry_run: bool) -> Result<(), String> {
+fn apply(bundle_path: &Path, private_key: &Path, dry_run: bool, seed: bool) -> Result<(), String> {
     let sealed =
         std::fs::read(bundle_path).map_err(|e| format!("{}: {e}", bundle_path.display()))?;
     let pem = std::fs::read(private_key).map_err(|e| format!("{}: {e}", private_key.display()))?;
@@ -540,7 +674,7 @@ fn apply(bundle_path: &Path, private_key: &Path, dry_run: bool) -> Result<(), St
     let writer = format!("import:{}", bundle.from);
     let pg = fleet_pg::PgStore::open(&url, &writer, fleet_pg::timeout_from_env())
         .map_err(|e| e.to_string())?;
-    let report = apply_to(&pg, &bundle, &secret_key, dry_run)?;
+    let report = apply_to(&pg, &bundle, &secret_key, dry_run, seed)?;
     print!("{report}");
     Ok(())
 }
@@ -552,6 +686,7 @@ fn apply_to(
     bundle: &Bundle,
     secret_key: &[u8],
     dry_run: bool,
+    seed: bool,
 ) -> Result<String, String> {
     use std::fmt::Write as _;
     let writer = format!("import:{}", bundle.from);
@@ -563,14 +698,19 @@ fn apply_to(
         ));
     }
     pg.migrate().map_err(|e| e.to_string())?;
-    if pg.snapshot().map_err(|e| e.to_string())?.seeded.is_none() {
+    let unseeded = pg.snapshot().map_err(|e| e.to_string())?.seeded.is_none();
+    if unseeded && !seed {
         return Err(
-            "the fleet store has never been seeded: start an app-lb in fleet mode against it first"
+            "the fleet store has never been seeded: start an app-lb in fleet mode against it \
+             first, or pass --seed to make this bundle its first records"
                 .into(),
         );
     }
+    if !unseeded && seed {
+        return Err("--seed is for an empty fleet store, and this one is seeded".into());
+    }
     let mut current: BTreeMap<String, BTreeMap<String, Current>> = BTreeMap::new();
-    for kind in KINDS {
+    for kind in &bundle.kinds {
         for (key, body, revision, writer) in pg.list_records(kind).map_err(|e| e.to_string())? {
             current.entry(kind.to_string()).or_default().insert(
                 key,
@@ -585,8 +725,8 @@ fn apply_to(
     let stored = |r: &Record| -> Result<Vec<u8>, String> {
         match r.kind.as_str() {
             "secrets" => secrets_seal::seal_file(secret_key, &r.body).map_err(|e| e.to_string()),
-            "auth-key" => {
-                fleet_seal::seal(secret_key, "auth-key", &r.key, &r.body).map_err(|e| e.to_string())
+            "auth-key" | "acme-account" | "cert-keys" => {
+                fleet_seal::seal(secret_key, &r.kind, &r.key, &r.body).map_err(|e| e.to_string())
             }
             _ => Ok(r.body.clone()),
         }
@@ -597,8 +737,8 @@ fn apply_to(
                 (secrets_seal::open_file(secret_key, held), secrets_seal::open_file(secret_key, &r.body)),
                 (Ok(a), Ok(b)) if a == b
             ),
-            "auth-key" => {
-                fleet_seal::unseal(secret_key, "auth-key", &r.key, held).is_ok_and(|k| k == r.body)
+            "auth-key" | "acme-account" | "cert-keys" => {
+                fleet_seal::unseal(secret_key, &r.kind, &r.key, held).is_ok_and(|k| k == r.body)
             }
             _ => held == r.body.as_slice(),
         }
@@ -622,8 +762,8 @@ fn apply_to(
         "  {:<15} {:>7} {:>9} {:>7}",
         "kind", "written", "unchanged", "deleted"
     );
-    for kind in KINDS {
-        let (w, u, d) = p.tally.get(*kind).copied().unwrap_or_default();
+    for kind in &bundle.kinds {
+        let (w, u, d) = p.tally.get(kind).copied().unwrap_or_default();
         let _ = writeln!(out, "  {kind:<15} {w:>7} {u:>9} {d:>7}");
     }
     for (kind, key, other) in &p.collisions {
@@ -633,6 +773,22 @@ fn apply_to(
         );
     }
     if dry_run || p.writes.is_empty() {
+        return Ok(out);
+    }
+    if unseeded {
+        // The first records: claim the store and write them in one go, so no
+        // host can seed it with something else in between.
+        if !pg
+            .seed(p.writes.clone(), bundle.kinds.clone())
+            .map_err(|e| e.to_string())?
+        {
+            return Err("another writer seeded the fleet store first; apply without --seed".into());
+        }
+        let _ = writeln!(
+            out,
+            "seeded the fleet store with {} writes in one transaction",
+            p.writes.len()
+        );
         return Ok(out);
     }
     let revisions = pg.transaction(&p.writes, None).map_err(|e| e.to_string())?;
@@ -965,7 +1121,13 @@ mod import_tests {
     #[test]
     fn export_carries_tenant_identity_pinned_to_its_source_and_nothing_else() {
         let src = source();
-        let records = read_records(&src.layout(), &src.0.join("app-lb-auth-key"), "us5").unwrap();
+        let records = read_records(
+            &src.layout(),
+            &src.0.join("app-lb-auth-key"),
+            "us5",
+            &Scope::default(),
+        )
+        .unwrap();
         let kinds: BTreeSet<&str> = records.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(
             kinds,
@@ -985,7 +1147,15 @@ mod import_tests {
 
         // An unreadable record stops the export rather than vanish from it.
         src.put("app-lb-namespaces.d/broken.json", b"not json");
-        assert!(read_records(&src.layout(), &src.0.join("app-lb-auth-key"), "us5").is_err());
+        assert!(
+            read_records(
+                &src.layout(),
+                &src.0.join("app-lb-auth-key"),
+                "us5",
+                &Scope::default()
+            )
+            .is_err()
+        );
     }
 
     fn bundle_of(records: Vec<Record>) -> Bundle {
@@ -993,6 +1163,7 @@ mod import_tests {
             version: 1,
             from: "us5".into(),
             created_at: 0,
+            kinds: shadow_kinds(),
             records,
         }
     }
@@ -1072,8 +1243,15 @@ mod import_tests {
                 .unwrap();
         host.migrate().unwrap();
         let src = source();
-        let bundle =
-            bundle_of(read_records(&src.layout(), &src.0.join("app-lb-auth-key"), "us5").unwrap());
+        let bundle = bundle_of(
+            read_records(
+                &src.layout(),
+                &src.0.join("app-lb-auth-key"),
+                "us5",
+                &Scope::default(),
+            )
+            .unwrap(),
+        );
         let pg = fleet_pg::PgStore::open_in(
             &url,
             "import:us5",
@@ -1083,7 +1261,7 @@ mod import_tests {
         .unwrap();
         let key = secrets_seal::derive_key("fleet");
         assert!(
-            apply_to(&pg, &bundle, &key, false).is_err(),
+            apply_to(&pg, &bundle, &key, false, false).is_err(),
             "an unseeded store is refused"
         );
 
@@ -1098,7 +1276,7 @@ mod import_tests {
             vec!["deployments".into()],
         )
         .unwrap();
-        let report = apply_to(&pg, &bundle, &key, false).unwrap();
+        let report = apply_to(&pg, &bundle, &key, false, false).unwrap();
         assert!(report.contains("kept deployments/app-lb-admin"), "{report}");
         assert!(!report.contains("t0ken"));
         let (secrets, _) = pg.get("secrets", DOC_KEY).unwrap().unwrap();
@@ -1123,20 +1301,180 @@ mod import_tests {
         assert!(pg.get("deployments", "web").unwrap().is_some());
 
         // Again, unchanged: nothing written.
-        let again = apply_to(&pg, &bundle, &key, false).unwrap();
+        let again = apply_to(&pg, &bundle, &key, false, false).unwrap();
         assert!(!again.contains("applied"), "{again}");
 
         // The source deregisters `web`: the next bundle deletes it.
         std::fs::remove_file(src.0.join("app-lb-state.d/web.json")).unwrap();
-        let bundle =
-            bundle_of(read_records(&src.layout(), &src.0.join("app-lb-auth-key"), "us5").unwrap());
-        let dry = apply_to(&pg, &bundle, &key, true).unwrap();
+        let bundle = bundle_of(
+            read_records(
+                &src.layout(),
+                &src.0.join("app-lb-auth-key"),
+                "us5",
+                &Scope::default(),
+            )
+            .unwrap(),
+        );
+        let dry = apply_to(&pg, &bundle, &key, true, false).unwrap();
         assert!(dry.contains("dry run"));
         assert!(
             pg.get("deployments", "web").unwrap().is_some(),
             "a dry run writes nothing"
         );
-        apply_to(&pg, &bundle, &key, false).unwrap();
+        apply_to(&pg, &bundle, &key, false, false).unwrap();
         assert!(pg.get("deployments", "web").unwrap().is_none());
+    }
+
+    /// A member brings what has it act, homed on it; per-host deployments
+    /// arrive renamed.
+    #[test]
+    fn a_join_export_carries_plugins_certificates_and_the_account() {
+        let src = source();
+        src.put("acme/certs/web.us5.crt.pem", b"CHAIN");
+        src.put("acme/certs/web.us5.key.pem", b"-----BEGIN PRIVATE KEY-----");
+        src.put(
+            "acme/account.json",
+            br#"{"id":"acct","key_pkcs8":"secret"}"#,
+        );
+        src.put(
+            "app-lb-plugins.d/state/postgres.json",
+            br#"{"version":1,"databases":{}}"#,
+        );
+        let scope = Scope {
+            join: true,
+            host_scoped: vec!["app-lb-admin".into()],
+        };
+        let records =
+            read_records(&src.layout(), &src.0.join("app-lb-auth-key"), "us5", &scope).unwrap();
+        let get = |kind: &str, key: &str| records.iter().find(|r| r.kind == kind && r.key == key);
+        let ci: serde_json::Value =
+            serde_json::from_slice(&get("plugins", "ci").unwrap().body).unwrap();
+        assert_eq!(ci["home"], "us5");
+        assert_eq!(get("cert-chains", "web.us5").unwrap().body, b"CHAIN");
+        assert!(get("cert-keys", "web.us5").is_some());
+        assert!(get("acme-account", DOC_KEY).is_some());
+        assert!(get("pg-ownership", DOC_KEY).is_some());
+        assert!(get("deployments", "app-lb-admin").is_none());
+        let admin: serde_json::Value =
+            serde_json::from_slice(&get("deployments", "app-lb-admin-us5").unwrap().body).unwrap();
+        assert_eq!(admin["spec"]["id"], "app-lb-admin-us5");
+        assert_eq!(admin["spec"]["placement"]["home"], "us5");
+        assert!(
+            get("deployments", "web").is_some(),
+            "only the named id is renamed"
+        );
+
+        // Without --join, a shadow: none of that.
+        let shadow = read_records(
+            &src.layout(),
+            &src.0.join("app-lb-auth-key"),
+            "us5",
+            &Scope::default(),
+        )
+        .unwrap();
+        assert!(!shadow.iter().any(|r| JOIN_KINDS.contains(&r.kind.as_str())));
+    }
+
+    #[test]
+    fn a_bundle_from_before_join_speaks_only_for_the_shadow_kinds() {
+        let old = br#"{"version":1,"from":"us5","created_at":0,"records":[]}"#;
+        let bundle: Bundle = serde_json::from_slice(old).unwrap();
+        assert_eq!(bundle.kinds, shadow_kinds());
+        // So applying it never deletes a joined host's plugins.
+        let current = BTreeMap::from([(
+            "plugins".to_string(),
+            BTreeMap::from([(
+                "ci".to_string(),
+                Current {
+                    body: b"{}".to_vec(),
+                    revision: 1,
+                    writer: "import:us5".into(),
+                },
+            )]),
+        )]);
+        let p = plan(&bundle, &current, &|r| Ok(r.body.clone()), &|r, held| {
+            held == r.body.as_slice()
+        })
+        .unwrap();
+        assert!(p.writes.is_empty());
+    }
+
+    #[test]
+    fn join_flags_belong_to_an_export() {
+        let p = |a: &[&str]| parse(a.iter().map(|s| s.to_string()));
+        assert!(
+            p(&[
+                "--export",
+                "--from-host",
+                "us5",
+                "--to-key",
+                "k",
+                "--out",
+                "o",
+                "--join",
+                "--host-scoped",
+                "app-lb-admin"
+            ])
+            .is_ok()
+        );
+        assert!(p(&["--dry-run", "--join"]).is_err());
+        assert!(
+            p(&[
+                "--export",
+                "--from-host",
+                "us5",
+                "--to-key",
+                "k",
+                "--out",
+                "o",
+                "--host-scoped",
+                "a/b"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn seed_makes_a_bundle_the_first_records_of_an_empty_store() {
+        let Ok(url) = std::env::var("APP_LB_FLEET_TEST_DATABASE_URL") else {
+            eprintln!("skipped: APP_LB_FLEET_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let schema = format!("t_seed_{}", std::process::id());
+        let pg = fleet_pg::PgStore::open_in(
+            &url,
+            "import:us5",
+            std::time::Duration::from_secs(5),
+            &schema,
+        )
+        .unwrap();
+        let src = source();
+        let bundle = bundle_of(
+            read_records(
+                &src.layout(),
+                &src.0.join("app-lb-auth-key"),
+                "us5",
+                &Scope::default(),
+            )
+            .unwrap(),
+        );
+        let key = secrets_seal::derive_key("fleet");
+        let dry = apply_to(&pg, &bundle, &key, true, true).unwrap();
+        assert!(dry.contains("dry run"));
+        assert!(
+            pg.snapshot().unwrap().seeded.is_none(),
+            "a dry run seeds nothing"
+        );
+        let report = apply_to(&pg, &bundle, &key, false, true).unwrap();
+        assert!(report.contains("seeded the fleet store"), "{report}");
+        let snap = pg.snapshot().unwrap();
+        assert_eq!(snap.seeded.as_deref(), Some("import:us5"));
+        assert!(snap.kinds.contains("auth-key") && snap.kinds.contains("deployments"));
+        assert!(pg.get("deployments", "web").unwrap().is_some());
+        assert!(
+            apply_to(&pg, &bundle, &key, false, true).is_err(),
+            "--seed refuses a seeded store"
+        );
+        assert!(apply_to(&pg, &bundle, &key, false, false).is_ok());
     }
 }

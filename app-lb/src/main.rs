@@ -790,7 +790,7 @@ fn main() {
             },
         ],
         plugin_store,
-    ));
+    ).with_host(fleet_stores.as_ref().map(|fs| fs.host.clone())));
     // What a default-enabled plugin installs into on the boot that enables
     // it: declared namespaces and any a deployment names.
     let known_namespaces: plugins::KnownNamespaces = {
@@ -1294,7 +1294,7 @@ fn main() {
                         fs.acme_account.clone(),
                         fs.acme_backoff.clone(),
                     )
-                    .with_lease(fs.fleet.lease(fleet_sync::LEASE_ACME)),
+                    .with_lease(fs.fleet.lease(fleet_sync::acme_lease(&fs.host))),
                     None => AcmeManager::new(registry.clone(), certs.clone(), challenges.clone(), config),
                 }
             },
