@@ -527,10 +527,27 @@ pub fn whoami(globals: &GlobalOpts) -> Result<()> {
     };
     output::field("Deployment API", access("/deployments"));
     output::field("Metrics", access("/metrics"));
+    if let Some(store) = client.whoami().ok().and_then(|me| me.fleet_store) {
+        output::field("Fleet store", fleet_store_summary(&store));
+    }
     if artifacts_via_lb {
         artifacts_section(&client);
     }
     Ok(())
+}
+
+/// One line for a fleet-mode server's view of the shared store.
+fn fleet_store_summary(store: &crate::types::FleetStoreStatus) -> String {
+    let age = match store.snapshot_age_secs {
+        Some(secs) => format!("snapshot {secs}s old"),
+        None => "never synced".to_string(),
+    };
+    match (store.available, &store.blocked, &store.last_error) {
+        (true, _, _) => format!("writable ({age}, revision {})", store.cursor),
+        (false, Some(why), _) => format!("read-only, held back — {why}"),
+        (false, None, Some(e)) => format!("unreachable; serving the last {age} — {e}"),
+        (false, None, None) => format!("unreachable; serving the last {age}"),
+    }
 }
 
 /// Where `heyctl artifact` goes when no registry is saved: app-lb's gateway,
@@ -716,6 +733,28 @@ pub fn config(globals: &GlobalOpts, cmd: &ConfigCmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::context_name_for;
+
+    #[test]
+    fn a_fleet_store_reads_as_writable_held_back_or_unreachable() {
+        use super::fleet_store_summary;
+        let parse = |v: serde_json::Value| -> crate::types::WhoAmI { serde_json::from_value(v).unwrap() };
+        let me = parse(serde_json::json!({"caller": "operator"}));
+        assert!(me.fleet_store.is_none(), "a single server reports none");
+        let me = parse(serde_json::json!({
+            "caller": "operator",
+            "fleet_store": {"available": true, "snapshot_age_secs": 1, "cursor": 42}
+        }));
+        assert_eq!(fleet_store_summary(me.fleet_store.as_ref().unwrap()), "writable (snapshot 1s old, revision 42)");
+        let me = parse(serde_json::json!({
+            "fleet_store": {"available": false, "snapshot_age_secs": 600, "cursor": 42, "last_error": "connection refused"}
+        }));
+        assert_eq!(
+            fleet_store_summary(me.fleet_store.as_ref().unwrap()),
+            "unreachable; serving the last snapshot 600s old — connection refused"
+        );
+        let me = parse(serde_json::json!({"fleet_store": {"available": false, "blocked": "never seeded"}}));
+        assert!(fleet_store_summary(me.fleet_store.as_ref().unwrap()).starts_with("read-only, held back"));
+    }
 
     #[test]
     fn platform_password_never_goes_to_an_unsafe_origin() {

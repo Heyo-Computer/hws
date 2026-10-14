@@ -1,6 +1,6 @@
 # Fleet shared state: one app-lb across hosts
 
-Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Nothing here is implemented.
+Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built and live on us4 in fleet mode, with its gate passed (2026-10-14, § Phase 2).
 - Scope: a *fleet* of app-lb hosts that act as one tenant surface, starting with us4 and us5.
 - Supersedes, for the fleet scope only, the rule in `MULTI_REGION_DESIGN.md` § Proposed architecture: "do not turn app-lb into a scheduler and do not build a second service registry beside Orchestrator discovery". The reasons are in § Relation to the multi-region design.
 - The us3/eu1 regional platform and its gates are unchanged.
@@ -102,7 +102,7 @@ The schema is `fleet`:
 - app-lb gains its first database client: `tokio-postgres` plus `deadpool`, with no ORM.
 
 **Where Postgres runs: pg-fc, one writer, read replicas on some hosts.**
-- The fleet database is a pg-fc dedicated database with physical streaming replicas on other hosts. pg-fc already has peers and an operator-driven physical handoff.
+- The fleet database is a pg-fc dedicated database with replicas on other hosts. pg-fc already has peers, continuous **logical** replication, and an operator-driven physical handoff. Logical replication does not carry sequences, so promoting a replica must first set `fleet.revision` past `max(revision)` (open question below).
 - Replicas are not required on every host. The fleet is expected to grow, and an app-lb needs neither a local replica nor exact replication on its node.
 - Which connection is used for what:
   - **Writes, CAS reads and leases** go to the writer (`APP_LB_FLEET_DATABASE_URL`).
@@ -406,14 +406,50 @@ A pure refactor: no database, no on-disk change, no behaviour change. Single-ser
 
 ### Phase 2: fleet store on us4
 
-- `PgStore`, the `fleet` schema and migrations, the revision feed with `LISTEN`, the local snapshot, and leases with fencing epochs. Enabled by `APP_LB_FLEET_DATABASE_URL`.
-- `transaction` and `changes_since` on the traits.
-- The `StoredDeployment` split. Fleet fields go to `PgStore`; host fields (`suspended`, `create_attempts`, rollouts, `active_prefix`) go to `<state>-host.d/`. The file store keeps writing the combined record.
-- pg-fc on us4, holding the fleet database as its writer.
-- Live tests on us4:
-  - stop the database for 10 minutes under load, with zero failed requests and mutations returning 503;
-  - kill a lease holder;
-  - force a CAS conflict.
+Built as specified, with the differences called out. Single-server app-lb is unchanged: with `APP_LB_FLEET_DATABASE_URL` unset it opens no connection, writes no new file and builds every store exactly as phase 1 does.
+
+**`fleet_pg` (`PgStore`)**
+- tokio-postgres with a four-connection deadpool, TLS through postgres-openssl (openssl is already app-lb's TLS stack). No ORM.
+- **One table, not one per kind.** `fleet.records(kind, key, body bytea, revision, updated_at, updated_by)`. The feed is one ordered index scan, and a transaction spans kinds without a union. Bodies are `bytea`, the exact bytes the stores write, so the snapshot is byte-for-byte a single server's files.
+- Revisions come from one sequence. **Every write transaction first takes one advisory lock and holds it to commit**, so revisions become visible in allocation order and the feed can never skip a slow commit. Writes are admin mutations; serializing them costs nothing that matters.
+- Compare-and-swap on every write (`Expect::Revision` or `Expect::Absent`; a tombstone counts as absent). Deletes are tombstones with a revision of their own, collected after seven days by the `tombstone-gc` lease holder.
+- `LISTEN fleet_changes` from a trigger, plus a one-second poll.
+- Leases `(name, holder, epoch, expires_at)`: TTL 15 s, renewed every 5 s, and the holder stops acting 3 s before the TTL would lapse. A write made under a lease carries its epoch, and the transaction refuses it unless that lease is still held at that epoch.
+- `fleet.migrations`, applied under an advisory lock so two hosts starting together do not race.
+- Calls from synchronous store code go through one worker thread that owns the pool, bounded by `APP_LB_FLEET_TIMEOUT_MS` (default 5000); on a multi-thread runtime the wait uses `block_in_place`.
+
+**`transaction` and `changes_since`** are on a `Transactional` trait in `fleet_store`, implemented by `PgStore` only. A single server's files have no other writer and no caller relies on a multi-file write being atomic, so the file store does not pretend to.
+
+**`fleet_sync` (fleet mode)**
+- Every fleet-state store is built over a `FleetCollection` or `FleetDocument`. A write goes to the database first, as a compare-and-swap against the revision this host last saw; only when it commits is the local file written, with the phase 1 file code. Reads never touch the database.
+- The files are the local snapshot. `app-lb-fleet-snapshot.json` beside the state file records the feed cursor and each record's revision.
+- **Seeding.** The first host to reach an empty database writes its records in one transaction and marks it seeded. A later host takes the database's records, after copying its own state aside to `app-lb-pre-fleet-<time>/`. A host that already has a fleet snapshot but finds an unseeded database does not reseed it: it serves its snapshot read-only and says how to reseed on purpose.
+- **Without the database:** a host with a snapshot serves it and refuses mutations; a host with neither refuses to start.
+- **The feed** applies other hosts' changes to the files and reloads the owning store: namespaces, workflows, auth providers, secrets, tokens, guard rules and certificates. Deployments, plugin records, postgres ownership and the ACME account land in the files and take effect at the next start; with one writer per kind until phase 3 that is never exercised, and live apply of deployments arrives with phase 3, where the importer becomes their second writer.
+- **Sealing.** Certificate private keys and the ACME account key are sealed with `APP_LB_SECRET_KEY` (AES-256-GCM, bound to kind and key) before they reach the database. Secrets are already sealed by their own store. **Fleet mode requires `APP_LB_SECRET_KEY`.**
+- Host identity: `APP_LB_FLEET_HOST` (default: the hostname), suffixed with the process id, so a restarted app-lb is a new lease holder.
+
+**The `StoredDeployment` split.** The fleet half is the spec plus `upstream_drains`, `discovery_version` and `route_handoff`; it goes to the database, with its snapshot in `app-lb-fleet.d/deployments/`. **Host fields stay in `app-lb-state.d/`, in the whole record a single server writes**, rather than a new `<state>-host.d/`: that file was already this host's, the format stays exact, and leaving fleet mode is a restart. Load merges the fleet half with this host's own state; a field added later is host state until it is listed in `FLEET_STATE_FIELDS`.
+
+**Leases in use:** `acme` (issuance and renewal; certificate, key, account and backoff writes are fenced by it), `token-sweep` (the expiry sweep, hourly, replacing the sweep at each start), `tombstone-gc`. The placement controller's lease arrives with the controller.
+
+**Admin API.** In fleet mode a mutation of fleet state answers **503** while the store cannot be written, before any handler runs. A write refused mid-request answers **409** (another writer changed the record; the record is re-read so a retry succeeds) or **503** (outage, or another host holds the lease), whatever the handler made of it. Sign-in, exec/shell, regional probes, disks and images are host-local and carry on. `/whoami` reports `fleet_store {available, snapshot_age_secs, cursor}`, and `heyctl whoami` prints it.
+
+**pg-fc on us4** holds the fleet database (`fleet`) as its writer, listening on `127.0.0.1:6432` only, with the database in `PG_VM_POOL_KEEPALIVE_SCHEMAS`.
+
+**Tests.** Against a real PostgreSQL when `APP_LB_FLEET_TEST_DATABASE_URL` is set, each in its own schema: CAS and conflicts, transactions, the feed's order and limit, seeding once, a lease's single holder and the fencing of a lapsed one, LISTEN, two hosts converging (including a forced conflict that succeeds after re-reading), offline start from a snapshot and the refusal without one, the reseed refusal, the fenced kind. Without a database: the registry split and merge, sealing, the admission rules, and the 503 with the store unreachable.
+
+**Live gate on us4: passed 2026-10-14.** Scripts and raw evidence are in `us4:/root/phase2/`.
+- **Backward compatibility.** The phase 2 binary in file mode (no fleet variables) left the state, ACME files, modes, deployments and certificates byte-identical, and wrote no fleet file.
+- **Seeding.** Switching to fleet mode seeded the empty database with us4's 10 records. The files were unchanged apart from the new snapshot (`app-lb-fleet.d/`, `app-lb-fleet-snapshot.json`), and smoke-us4 kept serving over HTTP and HTTPS with no certificate reissued.
+- **Store outage.** pg-fc's pooler was stopped for 10 minutes (18:18:28–18:28:35) under continuous load. 257,023 requests got **0 failures**: HTTPS and HTTP to a static deployment back to back, plus a VM deployment over HTTPS at 2/s. All 30 mutations during the outage answered **503**. `/whoami` reported the snapshot age rising from 20 s to 601 s. The store was writable again within 20 s of the restart, and every mutation afterwards answered 201.
+- **Lease holder killed.** After `kill -9`, the next process took all three leases 15 s later (the TTL) at epoch 2. The dead process's `(holder, epoch)` no longer satisfies the fence.
+- **CAS conflict.** A change was committed behind app-lb's back while app-lb's write of the same record waited on the write lock. App-lb's write answered **409**, and the retry answered 200 on top of the re-read record.
+- **Fenced issuance.** A throwaway deployment on a `*.us4` name was issued a Let's Encrypt certificate in 5 s by the `acme` lease holder. Its key is sealed in the database, a `0600` PEM on disk, and served verified.
+
+Caveat: the VM deployment's backend is a one-connection `busybox nc` loop. At full speed its health checks fail and app-lb rightly answers "no healthy backend", which voided a first outage run. That is why the VM path is paced.
+
+Found along the way, and outside the fleet store: `pg-fc/Dockerfile.pg18` lacked `pg-fc-physical` (fixed in this phase). Deleting a namespace leaves the `heyo` auth provider the auth plugin auto-installed into it.
 
 ### Phase 3: shadow us5
 
@@ -468,6 +504,10 @@ Each row needs a discriminating live test and recorded evidence. Unit tests do n
 | [ ] Never cross-daemon | Audit both heyvm logs across all gates: no host created, adopted or killed a VM on the other host's daemon. |
 
 ## Open questions
+
+- **Promoting a logical replica of the fleet database.** pg-fc replicates logically, which does not carry sequences: before a replica takes writes, `fleet.revision` must be set past `max(revision)`, or new revisions would repeat old ones and every feed would skip them. Phase 5 needs either that step in the promotion runbook or a physical replica.
+- **ACME across hosts.** Only the `acme` lease holder issues, but the admin API's "issue now" nudge is local, so a deployment registered on another host waits for the holder's next sweep (12 h). Phase 6 needs the nudge to travel (the feed can carry it).
+- **One token document.** Tokens are one fleet record, so two hosts minting at once conflict, and the loser's sign-in token is dropped from memory when its store reloads. Before two hosts serve sign-ins (phase 6), tokens should become one record each.
 
 - **Customer database snapshots:**
   - the snapshot interval, which is the recovery point;

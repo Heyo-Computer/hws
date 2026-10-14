@@ -132,6 +132,16 @@ sha2.workspace = true
 # stream in `src/artifact.rs`. Already in the tree via pingora and reqwest.
 tokio-util = { version = "0.7", features = ["io"] }
 
+# The shared fleet store (`src/fleet_pg.rs`), used only when
+# `APP_LB_FLEET_DATABASE_URL` is set: a single-server app-lb never opens a
+# connection. tokio-postgres with a small deadpool and no ORM, the same pair
+# pg-fc uses. TLS through postgres-openssl because openssl is already this
+# binary's TLS stack (see pingora-core above), so a remote fleet database adds
+# no second one.
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+postgres-openssl = "0.5"
+
 # Unpacking a site's artifact bundle (`src/unpack.rs`). In-process rather than
 # shelling out to `tar`, for two reasons: a bundle is untrusted input, and this
 # way the containment rules are ours and testable rather than whichever `tar` is

@@ -2116,6 +2116,27 @@ pub struct WhoAmI {
     pub namespaces: Option<BTreeMap<String, String>>,
     pub detail: Option<String>,
     pub note: Option<String>,
+    /// How current this server's copy of the shared fleet store is. Only a
+    /// server in fleet mode reports it.
+    pub fleet_store: Option<FleetStoreStatus>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A fleet-mode server's view of the shared store, from `GET /whoami`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct FleetStoreStatus {
+    /// Whether it can write: reachable, and not holding back on purpose.
+    pub available: bool,
+    /// Seconds since it last heard from the store. A credential revoked on
+    /// another host can be honoured here for this long.
+    pub snapshot_age_secs: Option<u64>,
+    /// The last fleet revision applied.
+    pub cursor: u64,
+    /// Why it refuses writes even though the store answers.
+    pub blocked: Option<String>,
+    pub last_error: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }

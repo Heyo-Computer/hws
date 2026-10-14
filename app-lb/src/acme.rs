@@ -329,6 +329,9 @@ pub struct AcmeManager {
     /// Hostnames already warned about as unsupported, so the wildcard warning
     /// doesn't repeat on every sweep.
     warned: Mutex<HashSet<String>>,
+    /// In a fleet, only the holder of this lease issues and renews; every
+    /// other host serves what the holder wrote. `None` on a single server.
+    lease: Option<Arc<crate::fleet_sync::Lease>>,
 }
 
 impl AcmeManager {
@@ -370,7 +373,21 @@ impl AcmeManager {
             account_file,
             backoff_file,
             warned: Mutex::new(HashSet::new()),
+            lease: None,
             config,
+        }
+    }
+
+    /// Issue and renew only while holding `lease`.
+    pub fn with_lease(mut self, lease: Arc<crate::fleet_sync::Lease>) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    fn may_issue(&self) -> bool {
+        match &self.lease {
+            None => true,
+            Some(lease) => lease.held().is_some(),
         }
     }
 
@@ -573,6 +590,10 @@ impl AcmeManager {
     /// Sequential on purpose: orders against one account share rate limits, and
     /// a burst of parallel orders is the fastest way to get throttled.
     async fn reconcile(&self) {
+        if !self.may_issue() {
+            tracing::debug!("another fleet host holds the ACME lease; not issuing");
+            return;
+        }
         // Wildcards first and unconditionally: they are configured, not derived
         // from what is registered, so one has to be issued before the first
         // sandbox that needs it exists — otherwise the first request to a new
@@ -809,6 +830,15 @@ impl BackgroundService for AcmeManager {
         // without waiting out the first tick — but only once the proxy is
         // actually accepting, since it answers the http-01 challenge and this
         // service starts before it binds.
+        // A fleet host learns whether it holds the lease from the feed's first
+        // renewal, which may not have happened yet. A restarted holder waits
+        // out its predecessor's TTL before it can take the lease, so allow two.
+        if let Some(lease) = &self.lease {
+            let deadline = tokio::time::Instant::now() + 2 * crate::fleet_sync::LEASE_TTL;
+            while lease.held().is_none() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
         if wait_for_proxy(&self.config.proxy_addr, PROXY_WAIT).await {
             self.reconcile().await;
         } else {

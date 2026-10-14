@@ -170,6 +170,9 @@ fn html_escape(s: &str) -> String {
 #[derive(Clone)]
 struct AdminState {
     views: Option<Arc<crate::fleet::ViewStore>>,
+    /// The shared fleet store, in fleet mode. Mutations are refused while it
+    /// cannot be written, and a write it refuses answers 409 or 503.
+    fleet_store: Option<Arc<crate::fleet_sync::Fleet>>,
     /// The last pull of the token authority's fleet tokens, if one is bound.
     token_sync: Arc<std::sync::Mutex<TokenSyncStatus>>,
     /// heyvm's image catalog as app-lb manages it; `None` in tests.
@@ -392,6 +395,7 @@ impl AdminApi {
             addr,
             state: AdminState {
                 views: None,
+                fleet_store: None,
                 token_sync: Default::default(),
                 images: None,
                 artifact_store: Arc::default(),
@@ -443,6 +447,11 @@ impl AdminApi {
 
     pub fn with_views(mut self, views: Arc<crate::fleet::ViewStore>) -> Self {
         self.state.views = Some(views);
+        self
+    }
+
+    pub fn with_fleet_store(mut self, fleet: Option<Arc<crate::fleet_sync::Fleet>>) -> Self {
+        self.state.fleet_store = fleet;
         self
     }
 
@@ -7057,6 +7066,7 @@ fn router(state: AdminState) -> Router {
     // each route checks it itself. See `Plugin::machine_routes`.
     let plugin_machine = state.plugins.machine_router();
 
+    let fleet_layer_state = state.clone();
     Router::new()
         .route("/healthz", get(healthz))
         // Embedded static assets contain no fleet state. Sign-in needs them
@@ -7080,6 +7090,80 @@ fn router(state: AdminState) -> Router {
         .merge(plugin_view)
         .merge(plugin_crud)
         .merge(plugin_machine)
+        .layer(middleware::from_fn_with_state(fleet_layer_state, fleet_admission))
+}
+
+/// Whether a request changes fleet state: a mutation of anything the fleet
+/// store holds. Sign-in, a sandbox's shell, regional probes and the
+/// host-local surfaces (disks, images) are not, and keep working while the
+/// store is away.
+fn mutates_fleet_state(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+    const FLEET: &[&str] = &[
+        "/deployments",
+        "/namespaces",
+        "/auth-providers",
+        "/workflows",
+        "/secrets",
+        "/tokens",
+        "/security",
+        "/api/plugins",
+    ];
+    const HOST: &[&str] = &["/exec", "/shell", "/regional-probe", "/regional-active-probe"];
+    FLEET.iter().any(|p| {
+        let base = p.trim_end_matches('/');
+        path == base || path.strip_prefix(base).is_some_and(|rest| rest.starts_with('/'))
+    }) && !HOST.iter().any(|h| path.ends_with(h))
+        && !path.contains("/machine/")
+}
+
+/// Fleet mode only. Refuses a fleet-state mutation up front while the store
+/// cannot be written (503), and answers for a write the store refused
+/// mid-request whatever the handler made of it: 409 for a conflict with
+/// another writer, 503 for an outage or a lease this host does not hold.
+/// Handlers report their own write failures as 500, or only log them, and
+/// none of that is right once the failure is the fleet's.
+async fn fleet_admission(
+    State(state): State<AdminState>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let Some(fleet) = state.fleet_store.clone() else {
+        return next.run(req).await;
+    };
+    if !mutates_fleet_state(req.method(), req.uri().path()) {
+        return next.run(req).await;
+    }
+    if !fleet.writable() {
+        let status = fleet.status();
+        let reason = status
+            .blocked
+            .or(status.last_error)
+            .unwrap_or_else(|| "not reachable".into());
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("fleet store unavailable: {reason}; this host is serving its last snapshot and accepts no changes until the store is back"),
+        )
+        .into_response();
+    }
+    let (response, failure) = crate::fleet_sync::capture(next.run(req)).await;
+    match failure {
+        None => response,
+        Some(crate::fleet_sync::WriteFailure::Conflict(message)) => {
+            err(StatusCode::CONFLICT, message).into_response()
+        }
+        Some(crate::fleet_sync::WriteFailure::Unavailable(message)) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+        }
+        Some(crate::fleet_sync::WriteFailure::Fenced(lease)) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("another fleet host holds the {lease:?} lease; this change is that host's to make"),
+        )
+        .into_response(),
+    }
 }
 
 #[async_trait]
@@ -7167,7 +7251,10 @@ impl BackgroundService for AdminApi {
 ///
 /// The secret is never echoed, for the reason [`MintedToken`] gives: only its
 /// hash is kept, and a route that could read one back would undo that.
-async fn whoami(caller: Option<axum::Extension<Caller>>) -> impl IntoResponse {
+async fn whoami(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
     let now = now_secs();
     // The layer always inserts one; `None` would mean the route was reached
     // without the middleware, which is a wiring bug rather than a caller error.
@@ -7201,6 +7288,11 @@ async fn whoami(caller: Option<axum::Extension<Caller>>) -> impl IntoResponse {
         "fleet": caller.covers_fleet(),
         "confined": caller.confined(),
     });
+    // How fresh this host's view of the fleet is, in fleet mode: what a
+    // revoked credential still being honoured would come down to.
+    if let Some(fleet) = &state.fleet_store {
+        body["fleet_store"] = serde_json::to_value(fleet.status()).unwrap_or_default();
+    }
 
     match &caller {
         Caller::Ungated => {
@@ -8674,6 +8766,60 @@ mod tests {
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             (status, (), serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        }
+
+        /// Fleet mode with the store out of reach: reads are served from the
+        /// snapshot, fleet mutations are refused before any handler runs, and
+        /// host-local operations carry on.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn in_fleet_mode_mutations_wait_for_the_fleet_store() {
+            let mut f = fixture(true).await;
+            let pg = crate::fleet_pg::PgStore::open_in(
+                "postgres://u:p@127.0.0.1:9/x?connect_timeout=1",
+                "host-a",
+                std::time::Duration::from_secs(1),
+                "fleet",
+            )
+            .unwrap();
+            f.state.fleet_store = Some(crate::fleet_sync::Fleet::new(pg, f.root.join("meta.json"), vec![0; 32]));
+
+            let (status, _, v) = send(&f, "POST", "/namespaces", r#"{"name":"team-new"}"#).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+            assert!(v["error"].as_str().unwrap().contains("fleet store unavailable"));
+            assert!(!f.state.namespaces.contains("team-new"), "the handler never ran");
+            let (status, _, _) = send(&f, "GET", "/namespaces", "").await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _, v) = send(&f, "GET", "/whoami", "").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v["fleet_store"]["available"], false, "{v}");
+        }
+
+        #[test]
+        fn only_fleet_state_mutations_wait_for_the_fleet_store() {
+            use axum::http::Method;
+            for (method, path) in [
+                (Method::POST, "/deployments"),
+                (Method::PUT, "/deployments/web"),
+                (Method::DELETE, "/namespaces/team"),
+                (Method::POST, "/secrets"),
+                (Method::POST, "/tokens"),
+                (Method::PATCH, "/security/rules/r1"),
+                (Method::PUT, "/api/plugins/obs"),
+            ] {
+                assert!(mutates_fleet_state(&method, path), "{method} {path}");
+            }
+            for (method, path) in [
+                (Method::GET, "/deployments"),
+                (Method::POST, "/deployments/web/exec"),
+                (Method::POST, "/deployments/web/regional-probe"),
+                (Method::POST, "/login"),
+                (Method::POST, "/disks/sweep"),
+                (Method::POST, "/images/sweep"),
+                (Method::POST, "/api/plugins/ci/machine/runs"),
+                (Method::POST, "/deploymentsx"),
+            ] {
+                assert!(!mutates_fleet_state(&method, path), "{method} {path}");
+            }
         }
 
         /// Observability is set up with the namespace: declaring one, a first

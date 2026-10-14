@@ -7,12 +7,13 @@
 //! [`Collection`] is a set of records under string keys (one file each today);
 //! a [`Document`] is one record (one file).
 //!
-//! The only implementation is the file one, and it is exact: the same paths,
-//! the same bytes, the same temp-file-then-rename, the same fsyncs where they
-//! were, the same `0600`/`0700` modes. A single-server app-lb behaves as it
-//! always has and its state directory stays readable by an older binary. The
-//! seam exists so a shared store can sit behind the same calls later (see
-//! `docs/design/fleet-shared-state.md`); nothing here assumes one.
+//! The file implementation here is exact: the same paths, the same bytes, the
+//! same temp-file-then-rename, the same fsyncs where they were, the same
+//! `0600`/`0700` modes. A single-server app-lb behaves as it always has and its
+//! state directory stays readable by an older binary. The shared store
+//! (`fleet_pg`, behind `APP_LB_FLEET_DATABASE_URL`) sits behind the same calls
+//! and keeps these files as its local snapshot; see
+//! `docs/design/fleet-shared-state.md`.
 //!
 //! Each store keeps its own serialization, validation and in-memory view.
 //! This module moves bytes.
@@ -41,9 +42,7 @@ pub enum Expect {
     Any,
     /// Only create: fail if the record exists.
     Absent,
-    /// Only replace this exact version. No file-backed caller needs it; the
-    /// shared store's callers will.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Only replace this exact version.
     Revision(Revision),
 }
 
@@ -54,6 +53,11 @@ pub enum StoreError {
     Conflict {
         key: String,
         current: Option<Revision>,
+    },
+    /// A write made under a lease this process no longer holds, or holds under
+    /// an older epoch than the store's. Nothing was written.
+    Fenced {
+        lease: String,
     },
 }
 
@@ -73,6 +77,9 @@ impl fmt::Display for StoreError {
             Self::Conflict { key, current: None } => {
                 write!(f, "{key:?} does not exist, or no longer does")
             }
+            Self::Fenced { lease } => {
+                write!(f, "this host no longer holds the {lease:?} lease")
+            }
         }
     }
 }
@@ -90,6 +97,9 @@ impl From<StoreError> for io::Error {
     fn from(e: StoreError) -> Self {
         match e {
             StoreError::Io(e) => e,
+            fenced @ StoreError::Fenced { .. } => {
+                io::Error::new(io::ErrorKind::PermissionDenied, fenced.to_string())
+            }
             conflict => io::Error::new(io::ErrorKind::AlreadyExists, conflict.to_string()),
         }
     }
@@ -122,6 +132,57 @@ pub trait Collection: Send + Sync + fmt::Debug {
     /// `false` under [`Expect::Any`].
     fn delete(&self, key: &str, expect: Expect) -> Result<bool, StoreError>;
     fn location(&self, key: &str) -> String;
+}
+
+/// One record's latest change, as a store with a change feed reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // the importer compiles this module without a shared store
+pub struct Change {
+    pub revision: Revision,
+    pub kind: String,
+    pub key: String,
+    /// `None` when the change was a delete.
+    pub body: Option<Vec<u8>>,
+}
+
+/// One write in a [`Transactional::transaction`]. `kind` names the
+/// collection, as the shared store files records under it.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum Write {
+    Put {
+        kind: String,
+        key: String,
+        body: Vec<u8>,
+        expect: Expect,
+    },
+    Delete {
+        kind: String,
+        key: String,
+        expect: Expect,
+    },
+}
+
+/// What a store shared between hosts adds to [`Collection`]: writes to several
+/// records that land together or not at all, and the feed of what changed.
+///
+/// Only the shared store implements it. A single server's files have no
+/// other writer to hear from, and no caller relies on a multi-file write being
+/// atomic.
+#[allow(dead_code)]
+pub trait Transactional: Send + Sync {
+    /// Apply every write or none. With `fence`, the writes also require that
+    /// the named lease is still held at that epoch ([`StoreError::Fenced`]
+    /// otherwise). Returns each write's revision; a delete of nothing is `0`.
+    fn transaction(
+        &self,
+        writes: &[Write],
+        fence: Option<(&str, u64)>,
+    ) -> Result<Vec<Revision>, StoreError>;
+
+    /// Changes with a revision above `cursor`, oldest first, at most `limit`.
+    /// A record changed twice appears once, at its latest revision.
+    fn changes_since(&self, cursor: Revision, limit: usize) -> io::Result<Vec<Change>>;
 }
 
 /// A single record.
@@ -231,6 +292,12 @@ impl FileCollection {
             #[cfg(test)]
             fail_after_rename: Default::default(),
         }
+    }
+
+    /// The directory the records live in.
+    #[allow(dead_code)]
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     fn path(&self, key: &str) -> io::Result<PathBuf> {
@@ -367,6 +434,26 @@ impl FileDocument {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Revision>> {
         self.revision.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[allow(dead_code)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Remove the file. Gone already is success. Only the shared store's
+    /// snapshot needs this: no single-server store ever deletes its document.
+    #[allow(dead_code)]
+    pub fn remove(&self) -> io::Result<bool> {
+        let mut rev = self.lock();
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {
+                *rev = None;
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 

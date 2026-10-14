@@ -243,7 +243,10 @@ struct Ownership {
 
 impl Ownership {
     fn open(path: PathBuf) -> Self {
-        let file: Arc<dyn Document> = Arc::new(FileDocument::new(&path, FileOptions::PLAIN));
+        Self::from_document(Arc::new(FileDocument::new(&path, FileOptions::PLAIN)))
+    }
+
+    fn from_document(file: Arc<dyn Document>) -> Self {
         let (records, broken) = match file.read() {
             Ok(Some((bytes, _))) => match serde_json::from_slice::<OwnershipFile>(&bytes) {
                 Ok(f) if f.version == 1 => (f.databases, None),
@@ -326,7 +329,15 @@ pub struct PostgresPlugin {
 impl PostgresPlugin {
     /// `state_dir` holds the ownership file, `postgres.json`.
     pub fn new(secrets: Arc<SecretStore>, state_dir: impl Into<PathBuf>) -> Arc<Self> {
-        let ownership = Ownership::open(state_dir.into().join("postgres.json"));
+        Self::with_ownership(secrets, Ownership::open(state_dir.into().join("postgres.json")))
+    }
+
+    /// The same plugin with its ownership map in another backend.
+    pub fn with_ownership_document(secrets: Arc<SecretStore>, file: Arc<dyn Document>) -> Arc<Self> {
+        Self::with_ownership(secrets, Ownership::from_document(file))
+    }
+
+    fn with_ownership(secrets: Arc<SecretStore>, ownership: Ownership) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             secrets,
