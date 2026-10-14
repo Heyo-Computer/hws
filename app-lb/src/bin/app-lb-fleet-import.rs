@@ -1088,12 +1088,15 @@ mod import_tests {
         );
 
         // us4 seeded the fleet with its own admin route.
-        host.seed(vec![Write::Put {
-            kind: "deployments".into(),
-            key: "app-lb-admin".into(),
-            body: b"{}".to_vec(),
-            expect: Expect::Absent,
-        }])
+        host.seed(
+            vec![Write::Put {
+                kind: "deployments".into(),
+                key: "app-lb-admin".into(),
+                body: b"{}".to_vec(),
+                expect: Expect::Absent,
+            }],
+            vec!["deployments".into()],
+        )
         .unwrap();
         let report = apply_to(&pg, &bundle, &key, false).unwrap();
         assert!(report.contains("kept deployments/app-lb-admin"), "{report}");

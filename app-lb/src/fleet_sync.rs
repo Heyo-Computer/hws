@@ -671,7 +671,8 @@ impl Fleet {
             (None, None) => {
                 let writes = self.seed_writes()?;
                 seeded = writes.len();
-                if self.pg.seed(writes).map_err(|e| e.to_string())? {
+                let kinds = lock(&self.kinds).keys().cloned().collect();
+                if self.pg.seed(writes, kinds).map_err(|e| e.to_string())? {
                     tracing::info!(
                         records = seeded,
                         "seeded the empty fleet store with this host's records"
@@ -683,6 +684,35 @@ impl Fleet {
                 self.pg.snapshot().map_err(|e| e.to_string())?
             }
             _ => snapshot,
+        };
+
+        // Kinds this binary keeps that the fleet has never been seeded with
+        // (added by a newer app-lb than the one that seeded it) are seeded
+        // from this host's own records, not replaced by an empty set.
+        let unseeded: Vec<String> = lock(&self.kinds)
+            .keys()
+            .filter(|k| !snapshot.kinds.contains(*k))
+            .cloned()
+            .collect();
+        let snapshot = if unseeded.is_empty() {
+            snapshot
+        } else {
+            for kind in &unseeded {
+                let records = self.seed_records(kind)?;
+                match self
+                    .pg
+                    .seed_kind(kind, records)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(n) => tracing::info!(
+                        kind,
+                        records = n,
+                        "seeded a kind new to the fleet store from this host"
+                    ),
+                    None => tracing::info!(kind, "another host seeded this kind first"),
+                }
+            }
+            self.pg.snapshot().map_err(|e| e.to_string())?
         };
 
         if previous.is_none() && seeded == 0 {
@@ -703,6 +733,28 @@ impl Fleet {
         } else {
             Started::Synced { records, cursor }
         })
+    }
+
+    /// One kind's records as this host would seed them: read from its
+    /// files (or its seed source) and sealed where the kind is.
+    fn seed_records(&self, kind: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let k = self
+            .kind(kind)
+            .ok_or_else(|| format!("unknown kind {kind}"))?;
+        let records = match &k.seed {
+            Some(seed) => seed(),
+            None => k.cache.records(),
+        }
+        .map_err(|e| format!("could not read this host's {kind} to seed the fleet store: {e}"))?;
+        records
+            .into_iter()
+            .map(|(key, body)| {
+                let body = self
+                    .sealed_for_store(&k, kind, &key, &body)
+                    .map_err(|e| e.to_string())?;
+                Ok((key, body))
+            })
+            .collect()
     }
 
     fn seed_writes(&self) -> Result<Vec<Write>, String> {
@@ -1530,6 +1582,32 @@ mod tests {
         let empty = Dir::new("cold");
         let (cold, _, _) = host(dead(), &empty);
         assert!(cold.start().is_err(), "no snapshot and no database: refuse");
+    }
+
+    #[test]
+    fn a_kind_added_after_seeding_is_seeded_from_the_host_not_wiped() {
+        let pg = pg_or_skip!("newkind", "host-a");
+        let dir = Dir::new("nk");
+        let (a, _, _) = host(pg.clone(), &dir);
+        a.start().unwrap();
+        // The next binary keeps a new kind, and this host has a record of it.
+        std::fs::write(dir.0.join("app-lb-auth-key"), [5u8; 32]).unwrap();
+        let (again, _, _) = host(pg.clone(), &dir);
+        let key = again.document(
+            "auth-key",
+            FileDocument::new(dir.0.join("app-lb-auth-key"), FileOptions::PRIVATE),
+            KindOptions {
+                sealed: true,
+                fence: None,
+            },
+        );
+        again.start().unwrap();
+        assert_eq!(key.read().unwrap().unwrap().0, [5u8; 32], "kept, not wiped");
+        let (stored, _) = pg.get("auth-key", DOC_KEY).unwrap().unwrap();
+        assert!(
+            stored.starts_with(crate::fleet_seal::MAGIC),
+            "and sealed into the fleet"
+        );
     }
 
     #[test]
