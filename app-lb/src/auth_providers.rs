@@ -19,6 +19,7 @@
 //! [`AuthProviderSpec`]: crate::config::AuthProviderSpec
 
 use crate::config::AuthProviderSpec;
+use crate::fleet_store::{Collection, Expect, FileCollection, FileOptions};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,15 +32,24 @@ type Key = (String, String);
 pub struct AuthProviderStore {
     providers: ArcSwap<HashMap<Key, Arc<AuthProviderSpec>>>,
     dir: PathBuf,
+    records: Arc<dyn Collection>,
 }
 
 impl AuthProviderStore {
     /// `dir` is where one JSON file per object lives, derived from the state
     /// path the way the namespace store derives its directory.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let records = Arc::new(FileCollection::new(&dir, ".json", FileOptions::PLAIN));
+        Self::with_collection(dir, records)
+    }
+
+    /// The same store over another backend. `dir` is only reported in logs.
+    pub fn with_collection(dir: impl Into<PathBuf>, records: Arc<dyn Collection>) -> Self {
         Self {
             providers: ArcSwap::from_pointee(HashMap::new()),
             dir: dir.into(),
+            records,
         }
     }
 
@@ -96,12 +106,8 @@ impl AuthProviderStore {
             .is_some();
         self.providers.store(Arc::new(next));
         if existed {
-            let path = self.dir.join(file_name(namespace, name));
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            // Already gone is the desired end state.
+            self.records.delete(&key(namespace, name), Expect::Any)?;
         }
         Ok(existed)
     }
@@ -109,13 +115,10 @@ impl AuthProviderStore {
     /// Write-then-rename, so a reader never sees a half-written object and a
     /// crash mid-write leaves the previous version intact.
     fn persist_one(&self, spec: &AuthProviderSpec) -> Result<(), std::io::Error> {
-        std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(spec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let path = self.dir.join(file_name(&spec.namespace, &spec.name));
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        self.records.put(&key(&spec.namespace, &spec.name), &json, Expect::Any)?;
+        Ok(())
     }
 
     /// Load every object from disk, skipping any that will not parse or validate.
@@ -127,15 +130,16 @@ impl AuthProviderStore {
         let mut loaded = HashMap::new();
         let mut skipped = 0usize;
 
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return (0, 0);
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
+        let entries = match self.records.list() {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "could not list auth provider objects");
+                return (0, 0);
             }
-            match std::fs::read(&path)
+        };
+        for entry in entries {
+            match entry
+                .body
                 .ok()
                 .and_then(|b| serde_json::from_slice::<AuthProviderSpec>(&b).ok())
                 .map(|mut spec| {
@@ -152,7 +156,7 @@ impl AuthProviderStore {
                 _ => {
                     tracing::warn!(
                         "skipping unreadable auth provider object {}; it is still on disk",
-                        path.display()
+                        entry.location
                     );
                     skipped += 1;
                 }
@@ -168,6 +172,13 @@ impl AuthProviderStore {
 /// contains. `namespace__name.json`; both are restricted to a safe alphabet by
 /// validation, but a file may predate a validation change, so anything outside
 /// it is encoded rather than trusted.
+/// The store key: [`file_name`] without its `.json`.
+fn key(namespace: &str, name: &str) -> String {
+    let mut name = file_name(namespace, name);
+    name.truncate(name.len() - ".json".len());
+    name
+}
+
 fn file_name(namespace: &str, name: &str) -> String {
     let safe = |s: &str| -> String {
         s.chars()
@@ -180,19 +191,7 @@ fn file_name(namespace: &str, name: &str) -> String {
 /// `app-lb-state.json` -> `app-lb-auth-providers.d`, beside it — the same
 /// derivation `namespace_dir` uses.
 pub fn auth_provider_dir(state_path: &str) -> PathBuf {
-    let path = Path::new(state_path);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("app-lb-state");
-    let name = match stem.strip_suffix("-state") {
-        Some(prefix) => format!("{prefix}-auth-providers.d"),
-        None => format!("{stem}-auth-providers.d"),
-    };
-    match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(name),
-        _ => PathBuf::from(name),
-    }
+    crate::fleet_store::sibling_dir(state_path, "auth-providers")
 }
 
 #[cfg(test)]

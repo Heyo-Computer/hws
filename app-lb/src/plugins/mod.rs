@@ -68,6 +68,7 @@ pub mod remote;
 pub mod secrets;
 pub mod vapi;
 
+use crate::fleet_store::{Collection, Expect, FileCollection, FileOptions};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::Router;
@@ -250,13 +251,23 @@ pub struct PluginRecord {
 pub struct PluginStore {
     records: ArcSwap<HashMap<String, PluginRecord>>,
     dir: PathBuf,
+    backing: Arc<dyn Collection>,
 }
 
 impl PluginStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let backing = Arc::new(FileCollection::new(&dir, ".json", FileOptions::PLAIN));
+        Self::with_collection(dir, backing)
+    }
+
+    /// The same store over another backend. `dir` is still where plugins keep
+    /// their own state files (`state/`), and what logs report.
+    pub fn with_collection(dir: impl Into<PathBuf>, backing: Arc<dyn Collection>) -> Self {
         Self {
             records: ArcSwap::from_pointee(HashMap::new()),
             dir: dir.into(),
+            backing,
         }
     }
 
@@ -271,13 +282,9 @@ impl PluginStore {
     /// Replace, then persist. Write-then-rename, so a crash mid-write leaves
     /// the previous version.
     pub fn put(&self, id: &str, record: PluginRecord) -> Result<(), std::io::Error> {
-        std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let path = self.dir.join(format!("{id}.json"));
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)?;
+        self.backing.put(id, &json, Expect::Any)?;
         let mut next = (**self.records.load()).clone();
         next.insert(id.to_string(), record);
         self.records.store(Arc::new(next));
@@ -287,35 +294,32 @@ impl PluginStore {
     /// Load every record, skipping any that will not parse. Returns
     /// `(loaded, skipped)`, like the other object stores.
     pub fn load(&self) -> (usize, usize) {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return (0, 0);
+        let entries = match self.backing.list() {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "could not list plugin records");
+                return (0, 0);
+            }
         };
         let mut loaded = HashMap::new();
         let mut skipped = 0usize;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(id) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .filter(|s| is_valid_id(s))
-            else {
+        for entry in entries {
+            if !is_valid_id(&entry.key) {
                 skipped += 1;
                 continue;
-            };
-            match std::fs::read(&path)
+            }
+            match entry
+                .body
                 .ok()
                 .and_then(|b| serde_json::from_slice::<PluginRecord>(&b).ok())
             {
                 Some(record) => {
-                    loaded.insert(id.to_string(), record);
+                    loaded.insert(entry.key, record);
                 }
                 None => {
                     tracing::warn!(
                         "skipping unreadable plugin record {}; it is still on disk",
-                        path.display()
+                        entry.location
                     );
                     skipped += 1;
                 }
@@ -337,19 +341,7 @@ fn is_valid_id(id: &str) -> bool {
 
 /// `app-lb-state.json` -> `app-lb-plugins.d`, beside it.
 pub fn plugin_dir(state_path: &str) -> PathBuf {
-    let path = Path::new(state_path);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("app-lb-state");
-    let name = match stem.strip_suffix("-state") {
-        Some(prefix) => format!("{prefix}-plugins.d"),
-        None => format!("{stem}-plugins.d"),
-    };
-    match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(name),
-        _ => PathBuf::from(name),
-    }
+    crate::fleet_store::sibling_dir(state_path, "plugins")
 }
 
 // ---- the host -------------------------------------------------------------

@@ -9226,4 +9226,36 @@ mod tests {
             }
         }
     }
+
+    /// `app-lb-fleet-import` finds state through `fleet_store::Layout`, which
+    /// cannot see `Config`. Pin its defaults and derived directories to the
+    /// ones the server uses, so the two can never disagree about where a
+    /// host's records are.
+    #[test]
+    fn fleet_import_layout_matches_the_servers_paths() {
+        use crate::fleet_store::Layout;
+        assert_eq!(Layout::DEFAULT_STATE_PATH, default_state_path());
+        assert_eq!(Layout::DEFAULT_SECRETS_PATH, default_secrets_path());
+        assert_eq!(Layout::DEFAULT_TOKENS_PATH, default_tokens_path());
+        assert_eq!(Layout::DEFAULT_GUARD_PATH, default_guard_path());
+        assert_eq!(Layout::DEFAULT_ACME_DIR, default_acme_dir());
+
+        let state = "/var/lib/app-lb/app-lb-state.json";
+        let layout = Layout {
+            state_path: state.into(),
+            secrets_path: default_secrets_path().into(),
+            tokens_path: default_tokens_path().into(),
+            guard_path: default_guard_path().into(),
+            acme_dir: default_acme_dir().into(),
+        };
+        assert_eq!(layout.registry_dir(), crate::registry::Registry::new(state).state_dir());
+        assert_eq!(layout.namespace_dir(), crate::namespaces::namespace_dir(state));
+        assert_eq!(layout.workflow_dir(), crate::workflows::workflow_dir(state));
+        assert_eq!(layout.auth_provider_dir(), crate::auth_providers::auth_provider_dir(state));
+        assert_eq!(layout.plugin_dir(), crate::plugins::plugin_dir(state));
+        assert_eq!(
+            layout.postgres_ownership_path(),
+            crate::plugins::plugin_dir(state).join("state").join("postgres.json")
+        );
+    }
 }

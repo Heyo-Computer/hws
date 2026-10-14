@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::fleet_store::{Document, Expect, FileDocument, FileOptions};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
@@ -749,6 +750,7 @@ pub struct Guard {
     /// rule would vanish.
     write: Mutex<()>,
     path: PathBuf,
+    file: Arc<dyn Document>,
     enforce: bool,
     blocked: AtomicU64,
     exempted: AtomicU64,
@@ -761,10 +763,18 @@ pub struct Guard {
 
 impl Guard {
     pub fn new(path: impl Into<PathBuf>, enforce: bool) -> Self {
+        let path = path.into();
+        let file = Arc::new(FileDocument::new(&path, FileOptions::PLAIN));
+        Self::with_document(path, file, enforce)
+    }
+
+    /// The same guard over another backend. `path` is only reported.
+    pub fn with_document(path: impl Into<PathBuf>, file: Arc<dyn Document>, enforce: bool) -> Self {
         Self {
             rules: ArcSwap::from_pointee(Vec::new()),
             write: Mutex::new(()),
             path: path.into(),
+            file,
             enforce,
             blocked: AtomicU64::new(0),
             exempted: AtomicU64::new(0),
@@ -974,21 +984,18 @@ impl Guard {
             .collect();
         let json = serde_json::to_vec_pretty(&StoredRules { version: 1, rules })
             .map_err(GuardError::Json)?;
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(GuardError::Io)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(GuardError::Io)?;
-        std::fs::rename(&tmp, &self.path).map_err(GuardError::Io)
+        self.file
+            .write(&json, Expect::Any)
+            .map_err(|e| GuardError::Io(e.into()))?;
+        Ok(())
     }
 
     /// Load the rule set, dropping anything that expired while the process was
     /// down. Returns how many were loaded. A missing file is not an error.
     pub fn load(&self, now: u64) -> Result<usize, GuardError> {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(GuardError::Io(e)),
+        let bytes = match self.file.read().map_err(GuardError::Io)? {
+            Some((b, _)) => b,
+            None => return Ok(0),
         };
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok(0);
