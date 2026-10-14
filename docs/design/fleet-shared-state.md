@@ -1,6 +1,6 @@
 # Fleet shared state: one app-lb across hosts
 
-Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built and live on us4 in fleet mode, with its gate passed (2026-10-14, § Phase 2). Phase 3 is built and us4 shadows us5, gate passed (2026-10-14, § Phase 3). Phase 4 is built and restarts drop nothing on us4, gate passed (2026-10-14, § Phase 4).
+Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built and live on us4 in fleet mode, with its gate passed (2026-10-14, § Phase 2). Phase 3 is built and us4 shadows us5, gate passed (2026-10-14, § Phase 3). Phase 4 is built and restarts drop nothing on us4, gate passed (2026-10-14, § Phase 4). Phase 5: us5 and us4 are one fleet, writer on us5 (2026-10-14, § Phase 5).
 - Scope: a *fleet* of app-lb hosts that act as one tenant surface, starting with us4 and us5.
 - Supersedes, for the fleet scope only, the rule in `MULTI_REGION_DESIGN.md` § Proposed architecture: "do not turn app-lb into a scheduler and do not build a second service registry beside Orchestrator discovery". The reasons are in § Relation to the multi-region design.
 - The us3/eu1 regional platform and its gates are unchanged.
@@ -548,12 +548,49 @@ The first run's streams also showed that the drain, not the runtime shutdown tim
 
 ### Phase 5: us5 joins
 
-1. Deploy the fleet build to us5 in file mode. It does nothing until enabled.
-2. Run the final import, then switch us5 to the fleet store. Add a read replica on us5.
-3. us5 keeps its certificates, keeps the renewal lease and keeps its files for rollback.
+Done 2026-10-14. us5 and us4 are members of one fleet, and the fleet database's writer is on us5's pg-fc. Decisions, made with the user:
+- **The writer lives on production (us5)**, so production writes never depend on the shadow host. us4 reaches it over TLS at `pg.us5.heyo.work:6432`.
+- **The first deploy onto the phase 4 build was a fast kill:** `SIGKILL` the old manager, and supervisor restarts the new binary.
+- **Plugins run only on a home host.**
+- **Per-host deployments are renamed:** `app-lb-admin` became `app-lb-admin-us4` and `app-lb-admin-us5`.
 
-Gate: zero failed requests on us5 production names across each restart.
+**What joining needed** (a joining host's files are replaced by the fleet's):
+- **Plugin home host.** Plugin records carry `home`. In fleet mode only that host starts the plugin and acts for its namespaces; the others keep the record. A plugin first configured or default-enabled on a host is homed there, and acting on it elsewhere answers 409 `plugin_elsewhere`. Without this, us5's CI, postgres and remote plugins would have run on us4 too.
+- **Default placement.** In fleet mode a deployment registered or updated without a placement is pinned to the host that took it. us4's unpinned smoke VM would otherwise have started on us5.
+- **Per-host ACME lease (`acme:<host>`).** A host issues only for the deployments it runs: the names DNS sends it, and the only HTTP-01 challenges it can answer from memory. A fleet-wide lease would have had us4 order certificates for us5's names and fail.
+- **The join import.**
+  - `--export --join` also carries plugins (homed on the source), the postgres ownership map, the ACME account and every certificate, with keys sealed on apply.
+  - `--host-scoped ID` carries a per-host deployment as `ID-<host>`.
+  - Bundles name the kinds they speak for, and apply deletes only within them.
+  - `--apply --seed` makes a bundle the first records of an empty store.
+- **TLS to the database.** This binary's openssl is built from source (`openssl-src`), so its default trust store is the empty `/usr/local/ssl`. The client now loads the system CA bundle, or `APP_LB_FLEET_CA_FILE`.
+- **Adoption wakes held requests.** A request that reached a starting manager before adoption held for a cold start that adoption never ended. At us5's switch one request hung for 70 s. Adoption now notifies waiters, and the manager decides requests only once adoption is done (60 s at most), so requests held across a restart go straight to the adopted VMs. pingora starts a dependent service when its dependency *starts*, not when it is ready, so the old "proxy waits for adoption" ordering never really held.
 
+**Rollout, in order**
+1. **us4:** the new build, by handoff.
+2. **us5:** the new build in file mode, by fast kill.
+   - The drop was **about 2 s** (10 of 176 probes at 0.2 s).
+   - Afterwards state, certificates, deployments, plugins and every production name were identical. The only change was `dassie-app`'s host state, a deployment whose VM has been failing to boot since 2026-10-10.
+3. **Credentials moved as ciphertext only** (RSA-OAEP to the receiving host's key):
+   - the fleet database's password to us4;
+   - the fleet `APP_LB_SECRET_KEY` (us4's; us5 had none) to us5.
+4. **The `fleet` database was created on us5's pg-fc.** pg-fc's config was not changed (that needs a restart that drops customer databases). The database is never idle, because every member holds a `LISTEN` connection.
+5. **us4 seeded it with its own join bundle** (`--seed`, 47 records). Then us5's fresh join bundle was applied over it (93 writes): us5's values overwrote the stale shadow copies, and us4's `app-lb-admin-us4` and `smoke-us4` were kept.
+6. **us4 moved onto it.** With its snapshot record removed it rejoined as a fresh member: it runs `app-lb-admin-us4` and `smoke-us4`, keeps us5's 14 deployments as foreign, and starts none of us5's 7 plugins.
+7. **us5 switched.**
+   - A final export and apply came first. The fleet key went into `/etc/app-lb/env`, and the supervisor command now sources `/etc/app-lb/fleet.env`.
+   - The restart was a handoff. us5 copied its state aside (`app-lb-pre-fleet-*`, plaintext secrets included) and took the fleet's 139 records. It runs its 14 deployments, sees us4's 2 as foreign, and holds `acme:us5`.
+
+**Gate**
+- **Restart on production names.** After the adoption fix, a handoff restart under paced load (admin, hub and farm-rsvp, each every 0.2 s): **1,159 requests, 0 failures, max latency 0.06 s**. The switch restart itself, before that fix, lost the one request described above.
+- **Nothing lost.** Against us5's pre-fleet baseline: the same 14 deployments, with the admin route renamed and still serving `admin.us5.heyo.work`. The same plugins, enabled and applied; the same answers on every production name; 22 secrets across the namespaces, now sealed at rest; 7 tokens; us5's 35 certificates, plus us4's 4.
+- **One authority.** A namespace created on us5 was visible through us4's admin API about a second later, and its delete propagated.
+
+**Rollback (us5).** Move `/etc/app-lb/fleet.env` aside and restart. The files are a complete snapshot, and the fleet key stays in `/etc/app-lb/env`, which the sealed secrets file needs. The pre-fleet state is in `/var/lib/app-lb/app-lb-pre-fleet-1792016345/`, and the previous binary is `app-lb.bak-pre-fleet-join`.
+
+**Not done here**
+- **A read replica.** pg-fc replicates logically and needs `PG_VM_POOL_REPLICATION` on both nodes, which means restarting us5's pg-fc and dropping customer database connections. It also needs the sequence step from the open questions before a replica could be promoted. Each host keeps serving from its own snapshot while the writer is down; writes answer 503.
+- **us4's old fleet database** (on us4's pg-fc) is unused and can be removed.
 ### Phase 6: serve together
 
 1. Enable the fleet hop (`APP_LB_FLEET_FORWARD=1`), us4 first.
