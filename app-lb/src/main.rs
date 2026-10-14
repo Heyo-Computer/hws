@@ -790,7 +790,7 @@ fn main() {
             },
         ],
         plugin_store,
-    ));
+    ).with_host(fleet_stores.as_ref().map(|fs| fs.host.clone())));
     // What a default-enabled plugin installs into on the boot that enables
     // it: declared namespaces and any a deployment names.
     let known_namespaces: plugins::KnownNamespaces = {
@@ -1172,6 +1172,7 @@ fn main() {
         ),
     );
     let autoscaler = autoscaler_svc.task();
+    let adopted = autoscaler.adopted();
 
     let disks = {
         let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()).with_workspaces(workspaces.clone()));
@@ -1294,7 +1295,7 @@ fn main() {
                         fs.acme_account.clone(),
                         fs.acme_backoff.clone(),
                     )
-                    .with_lease(fs.fleet.lease(fleet_sync::LEASE_ACME)),
+                    .with_lease(fs.fleet.lease(fleet_sync::acme_lease(&fs.host))),
                     None => AcmeManager::new(registry.clone(), certs.clone(), challenges.clone(), config),
                 }
             },
@@ -1376,6 +1377,7 @@ fn main() {
         proxy_addr: cfg.proxy_addr.clone(),
         tls_addr: cfg.tls_enabled().then(|| cfg.tls_addr.clone()),
         dir: worker_dir,
+        adopted: Some(adopted),
     });
 
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");

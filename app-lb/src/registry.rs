@@ -334,6 +334,11 @@ impl Registry {
         self
     }
 
+    /// This host's fleet name, in fleet mode.
+    pub fn fleet_host(&self) -> Option<&str> {
+        self.fleet_host.as_deref()
+    }
+
     /// Whether this host runs `spec`. Always, on a single server; in a fleet,
     /// unless its placement names another host.
     pub fn placed_here(&self, spec: &DeploymentSpec) -> bool {

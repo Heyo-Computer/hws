@@ -2464,6 +2464,11 @@ fn plugin_set_error(e: crate::plugins::SetError) -> Response {
         )
             .into_response(),
         e @ SetError::Conflict(_) => err(StatusCode::CONFLICT, e.to_string()).into_response(),
+        e @ SetError::Elsewhere { .. } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string(), "code": "plugin_elsewhere" })),
+        )
+            .into_response(),
     }
 }
 
@@ -4192,6 +4197,13 @@ async fn register(
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    // In a fleet, a deployment that says nothing about where it runs runs
+    // here: unplaced, it would run on every host that loads it.
+    if spec.placement.is_none()
+        && let Some(host) = state.registry.fleet_host()
+    {
+        spec.placement = Some(crate::config::Placement::pinned(host));
+    }
     if let Err(refused) = check_placement(&state, &spec) {
         return refused;
     }
@@ -4339,6 +4351,13 @@ async fn update(
     spec.normalize();
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    // In a fleet, a deployment that says nothing about where it runs runs
+    // here: unplaced, it would run on every host that loads it.
+    if spec.placement.is_none()
+        && let Some(host) = state.registry.fleet_host()
+    {
+        spec.placement = Some(crate::config::Placement::pinned(host));
     }
     if let Err(refused) = check_placement(&state, &spec) {
         return refused;

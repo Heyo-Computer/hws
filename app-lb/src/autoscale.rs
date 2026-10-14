@@ -106,6 +106,11 @@ const SUSPENDED_SWEEP: Duration = Duration::from_secs(300);
 
 pub struct Autoscaler {
     rollout_gate: tokio::sync::RwLock<()>,
+    /// Set once [`Autoscaler::adopt_existing`] has put the VMs already on the
+    /// daemon into their pools. The forwarding worker's manager waits for it
+    /// before deciding requests, so a request held across a restart is routed
+    /// to an adopted VM rather than to a cold start.
+    adopted: tokio::sync::watch::Sender<bool>,
     registry: Arc<Registry>,
     /// Both runtimes: heyvmd for microVMs, Incus for containers. See
     /// [`crate::runtime`] for why this is an enum-shaped struct rather than a
@@ -137,6 +142,11 @@ pub struct Autoscaler {
 }
 
 impl Autoscaler {
+    /// Becomes `true` once the VMs already on the daemon are adopted.
+    pub fn adopted(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.adopted.subscribe()
+    }
+
     pub fn new(
         registry: Arc<Registry>,
         runtime: crate::runtime::Runtime,
@@ -147,6 +157,7 @@ impl Autoscaler {
     ) -> Self {
         Self {
             rollout_gate: tokio::sync::RwLock::new(()),
+            adopted: tokio::sync::watch::channel(false).0,
             registry,
             runtime,
             metrics,
@@ -2149,6 +2160,9 @@ impl Autoscaler {
         for (id, backends) in adopted {
             if let Some(d) = deployments.get(id.as_str()) {
                 d.set_backends(backends);
+                // A request that arrived before adoption is holding for a
+                // cold start; this is the capacity it was waiting for.
+                d.ready_signal.notify_waiters();
             }
         }
 
@@ -2364,6 +2378,7 @@ impl BackgroundService for Autoscaler {
         }
 
         self.adopt_existing().await;
+        self.adopted.send_replace(true);
 
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3985,6 +4000,51 @@ mod tests {
             let url = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             (url, d, server)
+        }
+
+        /// A request that reaches a starting manager before it has adopted the
+        /// VMs already running holds for a cold start. Adoption is the capacity
+        /// it waits for, so adoption must wake it — before, it slept out its
+        /// whole cold-start timeout (seen on us5 at a restart).
+        #[tokio::test]
+        async fn adoption_wakes_a_request_held_for_a_cold_start() {
+            let vm = Router::new().fallback(|| async { "ok" });
+            let vm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = vm_listener.local_addr().unwrap().port();
+            let vm_server = tokio::spawn(async move { axum::serve(vm_listener, vm).await.unwrap() });
+            let app = Router::new()
+                .route("/deployed-sandboxes", get(|| async {
+                    Json(vec![row("sb-demo", "applb-demo-000000000001", "running")])
+                }))
+                .route("/sandboxes/inactive", get(|| async {
+                    Json(serde_json::json!({"sandboxes": [], "next_cursor": null}))
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let mut s = spec();
+            s.vm.as_mut().unwrap().port = port;
+            s.scaling.max_replicas = 2;
+            let (scaler, registry) = autoscaler_against(&url, s);
+            let d = registry.get("demo").unwrap();
+            let held = tokio::spawn({
+                let d = d.clone();
+                async move {
+                    crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!held.is_finished(), "held: nothing adopted yet");
+            let mut adopted = scaler.adopted();
+            assert!(!*adopted.borrow());
+            scaler.adopt_existing().await;
+            let got = tokio::time::timeout(Duration::from_secs(2), held).await
+                .expect("adoption wakes the held request").unwrap();
+            assert!(got.is_some(), "and hands it the adopted VM");
+            server.abort();
+            vm_server.abort();
+            let _ = adopted.borrow_and_update();
         }
 
         #[tokio::test]

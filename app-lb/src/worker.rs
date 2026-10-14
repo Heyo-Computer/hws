@@ -230,7 +230,15 @@ pub struct Supervisor {
     pub tls_addr: Option<String>,
     /// The fixed control directory ([`worker_dir`]).
     pub dir: PathBuf,
+    /// Becomes `true` when the VMs already running are adopted. Requests are
+    /// not decided before then, so ones a worker held across a restart reach
+    /// those VMs instead of waiting for a cold start.
+    pub adopted: Option<watch::Receiver<bool>>,
 }
+
+/// How long a starting manager waits for adoption before deciding requests
+/// anyway.
+const ADOPTION_WAIT: Duration = Duration::from_secs(60);
 
 /// The worker this manager is responsible for.
 enum Current {
@@ -454,6 +462,15 @@ impl Supervisor {
 #[async_trait]
 impl BackgroundService for Supervisor {
     async fn start(&self, mut shutdown: ShutdownWatch) {
+        if let Some(mut adopted) = self.adopted.clone() {
+            let wait = adopted.wait_for(|done| *done);
+            if tokio::time::timeout(ADOPTION_WAIT, wait).await.is_err() {
+                tracing::warn!(
+                    secs = ADOPTION_WAIT.as_secs(),
+                    "VM adoption is taking long; deciding requests anyway"
+                );
+            }
+        }
         let (requests, snapshots) = self.prepare().unwrap_or_else(|error| {
             tracing::error!(%error, "cannot open the worker control directory; stopping manager");
             std::process::exit(1);

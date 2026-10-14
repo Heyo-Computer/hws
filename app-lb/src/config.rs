@@ -3665,7 +3665,6 @@ pub enum PlacementMode {
 }
 
 impl Placement {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pinned(home: &str) -> Self {
         Self {
             mode: PlacementMode::Pinned,

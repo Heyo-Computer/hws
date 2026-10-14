@@ -38,6 +38,40 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const URL_ENV: &str = "APP_LB_FLEET_DATABASE_URL";
+/// A CA bundle to verify the fleet database's certificate with, when the
+/// system's is not where [`CA_BUNDLES`] looks.
+pub const CA_ENV: &str = "APP_LB_FLEET_CA_FILE";
+/// Where distributions keep the system CA bundle.
+const CA_BUNDLES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+];
+
+/// The TLS client for the fleet database. This binary's openssl is built from
+/// source (`openssl-src`), so its default trust store is `/usr/local/ssl`,
+/// which no distribution fills: every certificate would fail to verify. Trust
+/// the system bundle instead, or `APP_LB_FLEET_CA_FILE`.
+fn tls_connector() -> io::Result<openssl::ssl::SslConnector> {
+    let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
+        .map_err(io::Error::other)?;
+    let explicit = std::env::var(CA_ENV).ok().filter(|p| !p.trim().is_empty());
+    let bundle = explicit.or_else(|| {
+        CA_BUNDLES
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .map(|p| p.to_string())
+    });
+    match bundle {
+        Some(path) => builder
+            .set_ca_file(&path)
+            .map_err(|e| io::Error::other(format!("{CA_ENV} {path}: {e}")))?,
+        None => tracing::warn!(
+            "no system CA bundle found; a fleet database reached over TLS will not verify (set {CA_ENV})"
+        ),
+    }
+    Ok(builder.build())
+}
 pub const TIMEOUT_ENV: &str = "APP_LB_FLEET_TIMEOUT_MS";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The schema every host shares. Tests use their own.
@@ -281,10 +315,7 @@ impl PgStore {
             config.connect_timeout(timeout);
         }
         config.application_name(format!("app-lb {host}"));
-        let connector = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
-            .map_err(io::Error::other)?
-            .build();
-        let tls = postgres_openssl::MakeTlsConnector::new(connector);
+        let tls = postgres_openssl::MakeTlsConnector::new(tls_connector()?);
         let manager = Manager::from_config(
             config.clone(),
             tls.clone(),
@@ -1293,6 +1324,20 @@ pub(crate) mod tests {
             .await
             .expect("a notification")
             .expect("the channel is open");
+    }
+
+    #[test]
+    fn the_tls_client_trusts_the_system_bundle() {
+        // Building it loads a bundle; on a host without one it still builds.
+        assert!(tls_connector().is_ok());
+        if CA_BUNDLES.iter().any(|p| std::path::Path::new(p).exists()) {
+            let store = tls_connector().unwrap();
+            let ssl = store.configure().unwrap().into_ssl("example.com").unwrap();
+            assert!(
+                ssl.ssl_context().cert_store().all_certificates().len() > 10,
+                "the system's roots are loaded"
+            );
+        }
     }
 
     #[test]
