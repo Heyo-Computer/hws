@@ -1172,6 +1172,7 @@ fn main() {
         ),
     );
     let autoscaler = autoscaler_svc.task();
+    let adopted = autoscaler.adopted();
 
     let disks = {
         let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()).with_workspaces(workspaces.clone()));
@@ -1376,6 +1377,7 @@ fn main() {
         proxy_addr: cfg.proxy_addr.clone(),
         tls_addr: cfg.tls_enabled().then(|| cfg.tls_addr.clone()),
         dir: worker_dir,
+        adopted: Some(adopted),
     });
 
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");
