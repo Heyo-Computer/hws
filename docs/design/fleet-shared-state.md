@@ -1,6 +1,6 @@
 # Fleet shared state: one app-lb across hosts
 
-Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built and live on us4 in fleet mode, with its gate passed (2026-10-14, § Phase 2). Phase 3 is built and us4 shadows us5, gate passed (2026-10-14, § Phase 3).
+Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built and live on us4 in fleet mode, with its gate passed (2026-10-14, § Phase 2). Phase 3 is built and us4 shadows us5, gate passed (2026-10-14, § Phase 3). Phase 4 is built and restarts drop nothing on us4, gate passed (2026-10-14, § Phase 4).
 - Scope: a *fleet* of app-lb hosts that act as one tenant surface, starting with us4 and us5.
 - Supersedes, for the fleet scope only, the rule in `MULTI_REGION_DESIGN.md` § Proposed architecture: "do not turn app-lb into a scheduler and do not build a second service registry beside Orchestrator discovery". The reasons are in § Relation to the multi-region design.
 - The us3/eu1 regional platform and its gates are unchanged.
@@ -530,6 +530,21 @@ Both, in order: the proxy worker stays alive across a management restart, and th
 - **The worker logs to `app-lb-worker.d/worker.log`**, rotated at 50 MB. The manager's stdout is a supervisor pipe that closes when the manager exits.
 
 The first restart onto this build still drops: the old binary takes its worker down with it. Every restart after that hands over.
+
+A request whose manager is replaced between being begun and being forwarded is begun again with the next manager. That happens only when the link dropped and a different manager now answers; an answer from a live manager is unchanged.
+
+**Gate on us4: passed 2026-10-14.** Five `supervisorctl restart app-lb`, 40 s apart, under continuous load. Scripts are in `us4:/root/phase4/`.
+- **Requests:** 98,901 with **0 failures**. That is HTTPS and HTTP back to back to a static deployment with a Let's Encrypt certificate, plus a VM deployment over HTTPS at 2/s.
+- **Latency:** a separate probe every 0.2 s over HTTPS made 1,406 requests, all 200, and its **slowest was 0.01 s**. The time with no manager is shorter than the probe interval.
+- **Held streams:** two streams of 150 s, each one line a second, received **all 150 lines** across four of the restarts.
+- **Restart time:** each restart took 5.1 s, which is supervisor's `startsecs`. Before this phase every restart took 35–40 s and ended in `SIGKILL`.
+- **A real stop:** a request made after `supervisorctl stop` waited the 60 s budget and got a 503. A start inside the orphan window took the waiting worker over, and requests answered 200 again.
+
+Getting there found two drops, both now fixed:
+- **pingora's shutdown cleanup** cut a request the old worker had accepted at its last moment (1 failure in 82k). Fixed by deferring the cleanup 3 s.
+- **A dead manager mid-request:** a request begun by a manager that exited before the request asked for its upstream failed with 500 (1 in 82k). Fixed by beginning it again with the next manager.
+
+The first run's streams also showed that the drain, not the runtime shutdown timeout, bounds a held stream's life. The default drain is now 300 s.
 
 ### Phase 5: us5 joins
 

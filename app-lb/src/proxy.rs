@@ -434,7 +434,7 @@ impl ProxyHttp for LbProxy {
             Ok(selected) => selected,
             // The link dropped, not an answer: if a restart took the manager,
             // begin again with the next one and ask it.
-            Err(error) if !request.connected() && self.begin_again(ctx).await.is_ok() => {
+            Err(_) if !request.connected() && self.begin_again(ctx).await.is_ok() => {
                 let request = ctx.request.as_mut().expect("begun again");
                 request.next_peer().await.map_err(|e| control_error(request, e))?
             }
