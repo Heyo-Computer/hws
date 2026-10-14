@@ -154,6 +154,20 @@ pub struct RequestControl {
     guard: Arc<Guard>, feed: Arc<Feed>, auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
     secrets: Arc<crate::secrets::SecretStore>,
     strip_cookies: Arc<[String]>,
+    /// In fleet mode: admitting hops from peers, and forwarding requests for
+    /// deployments placed on another host (`fleet_hop`).
+    hop: Option<Arc<crate::fleet_hop::FleetHop>>,
+}
+
+/// Where a request is forwarded when its deployment runs on another host.
+struct HopOut {
+    home: String,
+    /// The request's host: the SNI and `Host` the home host sees.
+    sni: String,
+    origin: String,
+    token: Arc<str>,
+    client: Option<std::net::IpAddr>,
+    proto: &'static str,
 }
 
 const MAX_ATTEMPTS: usize = 3;
@@ -208,6 +222,12 @@ pub struct RequestState {
     cookie_rewrite: Option<Option<http::HeaderValue>>,
     forward_identity: bool,
     pending_login: Option<PendingLogin>,
+    /// This request arrived as a fleet hop: it is served here or nowhere.
+    hop_in: bool,
+    /// This host is in a fleet: the fleet's headers are never passed on.
+    fleet: bool,
+    /// This request goes to its deployment's home host, once.
+    hop_out: Option<HopOut>,
 }
 
 impl RequestState {
@@ -231,6 +251,30 @@ impl RequestState {
         }
 
         let mut out = Vec::new();
+        // In a fleet, whatever arrived under the fleet's names goes no further.
+        if self.fleet {
+            for name in [crate::fleet_hop::HOP, crate::fleet_hop::TOKEN] {
+                out.push(HeaderModification::Remove(http::HeaderName::from_static(name)));
+            }
+        }
+        if let Some(hop) = &self.hop_out {
+            // To the home host, which runs every check again: only what it
+            // needs to know who sent this and who the client is.
+            out.extend(crate::auth::IDENTITY_HEADERS.iter().map(|name| HeaderModification::Remove(http::HeaderName::from_static(name))));
+            out.push(HeaderModification::Set(http::HeaderName::from_static(crate::fleet_hop::HOP), value(&hop.origin, "fleet hop")?));
+            out.push(HeaderModification::Set(http::HeaderName::from_static(crate::fleet_hop::TOKEN), value(&hop.token, "fleet token")?));
+            match hop.client {
+                Some(ip) => out.push(HeaderModification::Set(http::HeaderName::from_static("x-forwarded-for"), value(&ip.to_string(), "forwarded-for")?)),
+                None => out.push(HeaderModification::Remove(http::HeaderName::from_static("x-forwarded-for"))),
+            }
+            out.push(HeaderModification::Set(http::HeaderName::from_static("x-forwarded-proto"), http::HeaderValue::from_static(hop.proto)));
+            return Ok(out);
+        }
+        if self.hop_in {
+            // A peer's identity headers are never trusted: the auth gate below
+            // sets them again from this host's own decision.
+            out.extend(crate::auth::IDENTITY_HEADERS.iter().map(|name| HeaderModification::Remove(http::HeaderName::from_static(name))));
+        }
         if let Some(assignment) = &self.regional_assignment {
             if let Some((spec, token, environment)) = &assignment.forward {
                 let mut headers = http::HeaderMap::new();
@@ -336,7 +380,7 @@ impl RequestState {
     }
 
     pub fn retry_allowed(&self) -> bool {
-        self.regional_assignment.is_none() && self.attempts < MAX_ATTEMPTS
+        self.regional_assignment.is_none() && self.hop_out.is_none() && self.attempts < MAX_ATTEMPTS
     }
 
     /// Select and reserve the next peer. Reservation happens before DNS awaits,
@@ -426,7 +470,13 @@ impl RequestState {
 impl RequestControl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(registry: Arc<Registry>, metrics: Arc<Metrics>, challenges: Arc<ChallengeTable>, auth: Arc<Authenticator>, guard: Arc<Guard>, feed: Arc<Feed>, auth_providers: Arc<crate::auth_providers::AuthProviderStore>, secrets: Arc<crate::secrets::SecretStore>) -> Self {
-        Self { registry, metrics, challenges, auth, guard, feed, auth_providers, secrets, strip_cookies: Arc::from([]) }
+        Self { registry, metrics, challenges, auth, guard, feed, auth_providers, secrets, strip_cookies: Arc::from([]), hop: None }
+    }
+
+    /// Fleet mode: admit peers' hops, and forward when the hop allows it.
+    pub fn with_fleet_hop(mut self, hop: Option<Arc<crate::fleet_hop::FleetHop>>) -> Self {
+        self.hop = hop;
+        self
     }
 
     /// Remove these cookies from every forwarded request (`APP_LB_STRIP_COOKIES`).
@@ -436,6 +486,16 @@ impl RequestControl {
     }
 
     pub async fn next_peer(&self, state: &mut RequestState) -> Result<Peer, RequestError> {
+        if let Some(hop) = &state.hop_out {
+            // Once: a hop is never replayed.
+            state.attempts += 1;
+            if state.attempts > 1 {
+                return Err(RequestError::connect("a fleet hop is never replayed"));
+            }
+            let fleet = self.hop.as_ref().ok_or_else(|| RequestError::internal("fleet hop without fleet mode"))?;
+            let address = fleet.address_of(&hop.home).await.map_err(RequestError::connect)?;
+            return Ok(Peer { address, tls: true, sni: hop.sni.clone() });
+        }
         state.next_peer(&self.registry, &self.metrics, &self.feed).await
     }
 
@@ -446,7 +506,46 @@ impl RequestControl {
             tracing::debug!(%path, "answering ACME http-01 challenge");
             return RequestDecision::Respond(ResponseData::plain(200, answer));
         }
-        let routed = self.registry.route(host.as_deref(), &path);
+        // A peer's hop: admitted with the fleet's token only, and then judged
+        // as the client it carries.
+        let hopped;
+        state.fleet = self.hop.is_some();
+        let head = match self.hop.as_ref().map(|h| h.inbound(&head.headers)) {
+            Some(crate::fleet_hop::Inbound::Refused) => {
+                tracing::warn!(peer = ?head.peer, "refused a fleet hop without the fleet's token");
+                return RequestDecision::Respond(ResponseData::plain(403, "fleet hop refused\n"));
+            }
+            Some(crate::fleet_hop::Inbound::Valid { client, .. }) => {
+                state.hop_in = true;
+                let mut copy = head.clone();
+                if let Some(ip) = client { copy.peer = Some(SocketAddr::new(ip, 0)); }
+                hopped = copy;
+                &hopped
+            }
+            _ => head,
+        };
+        let mut routed = self.registry.route(host.as_deref(), &path);
+        if routed.is_none() && let Some(foreign) = self.registry.route_foreign(host.as_deref(), &path) {
+            let home = foreign.spec.placement.as_ref().and_then(|p| p.home.clone()).unwrap_or_default();
+            if state.hop_in {
+                // Exactly one hop: never forward a forwarded request.
+                return RequestDecision::Respond(ResponseData::plain(503, format!("{} runs on {home}, not here; a fleet hop is never forwarded again\n", foreign.spec.id)));
+            }
+            match self.hop.as_ref().filter(|h| h.forwards()).and_then(|h| h.token().map(|t| (h, t))) {
+                Some((hop, token)) => {
+                    state.hop_out = Some(HopOut {
+                        home,
+                        sni: host.clone().unwrap_or_default(),
+                        origin: hop.host().to_string(),
+                        token,
+                        client: head.peer.map(|p| p.ip()),
+                        proto: if head.secure() { "https" } else { "http" },
+                    });
+                    routed = Some(foreign);
+                }
+                None => return RequestDecision::Respond(ResponseData::plain(404, "no deployment matches this request\n")),
+            }
+        }
         let facts = request_facts(head, host.as_deref(), &path, routed.as_deref());
         match self.guard.decide(&facts, crate::deployment::now_secs()) {
             GuardVerdict::Block(rule) => {
@@ -511,6 +610,12 @@ impl RequestControl {
         if let Some((status, location)) = matched_redirect(&deployment, host.as_deref(), &head.uri) {
             state.set_deployment(deployment);
             return RequestDecision::Respond(ResponseData { status, body: String::new(), content_type: "text/plain; charset=utf-8", headers: vec![(http::header::LOCATION, location)], cache_control: None });
+        }
+        // Everything past here is the home host's to serve: its feed, its
+        // site files, its backends.
+        if state.hop_out.is_some() {
+            state.set_deployment(deployment);
+            return RequestDecision::Proxy;
         }
         if let Some(expose) = deployment.spec.feed.as_ref().and_then(|f| f.expose.as_deref()) && path == expose {
             let link = match &host { Some(h) if head.secure() => format!("https://{h}{path}"), Some(h) => format!("http://{h}{path}"), None => path.clone() };
@@ -657,6 +762,137 @@ pub async fn wait_for_capacity(
 mod tests {
     use super::*;
     use crate::config::DeploymentSpec;
+
+    /// The fleet hop's decisions, on us4: `local` runs here, `theirs` is
+    /// pinned to us5.
+    mod fleet_hop {
+        use super::*;
+        use crate::fleet_hop::{FleetHop, HOP, TOKEN};
+
+        struct Fixture {
+            control: RequestControl,
+            _dir: tempfile::TempDir,
+        }
+
+        fn fixture(forward: bool) -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let fleet_dir = dir.path().join("fleet");
+            std::fs::create_dir_all(&fleet_dir).unwrap();
+            let write = |id: &str, home: &str| {
+                let spec = serde_json::json!({
+                    "spec": {"id": id, "routes": [{"host": format!("{id}.example")}], "upstreams": ["127.0.0.1:9"],
+                             "placement": {"mode": "pinned", "home": home}}
+                });
+                std::fs::write(fleet_dir.join(format!("{id}.json")), serde_json::to_vec(&spec).unwrap()).unwrap();
+            };
+            write("local", "us4");
+            write("theirs", "us5");
+            let fleet_records: Arc<dyn crate::fleet_store::Collection> = Arc::new(
+                crate::fleet_store::FileCollection::new(&fleet_dir, ".json", crate::fleet_store::FileOptions::PLAIN),
+            );
+            let registry = Arc::new(Registry::new(dir.path().join("state.json")).with_fleet(fleet_records, "us4"));
+            registry.load().unwrap();
+            let secrets = Arc::new(crate::secrets::SecretStore::new(dir.path().join("secrets"), None));
+            let pg = crate::fleet_pg::PgStore::open_in("postgres://u@127.0.0.1:9/x", "us4", Duration::from_secs(1), "fleet").unwrap();
+            let fleet = crate::fleet_sync::Fleet::new(pg, dir.path().join("meta.json"), vec![0; 32]);
+            let hop = Arc::new(FleetHop::new("us4", fleet, forward));
+            hop.set_token(Some("s3cret".into()));
+            let control = RequestControl::new(
+                registry,
+                Arc::new(Metrics::new()),
+                Arc::new(crate::acme::ChallengeTable::new()),
+                Arc::new(crate::auth::Authenticator::new(vec![7; 32], secrets.clone(), None, None)),
+                Arc::new(crate::guard::Guard::new(dir.path().join("guard"), true)),
+                Arc::new(Feed::new()),
+                Arc::new(crate::auth_providers::AuthProviderStore::new(dir.path().join("providers"))),
+                secrets,
+            )
+            .with_fleet_hop(Some(hop));
+            Fixture { control, _dir: dir }
+        }
+
+        fn head(host: &str, headers: &[(&'static str, &str)]) -> RequestHead {
+            let mut h = http::HeaderMap::new();
+            for (k, v) in headers {
+                h.insert(*k, v.parse().unwrap());
+            }
+            RequestHead {
+                method: http::Method::GET,
+                uri: format!("http://{host}/x").parse().unwrap(),
+                headers: h,
+                peer: Some("198.51.100.7:5000".parse().unwrap()),
+                tls_terminated: true,
+            }
+        }
+
+        fn names(mods: &[HeaderModification]) -> Vec<String> {
+            mods.iter()
+                .map(|m| match m {
+                    HeaderModification::Set(n, v) => format!("set {n}={}", v.to_str().unwrap()),
+                    HeaderModification::Remove(n) => format!("remove {n}"),
+                    HeaderModification::RewriteUri(u) => format!("rewrite {u}"),
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_request_for_another_hosts_deployment_hops_there_once() {
+            let f = fixture(true);
+            let mut state = RequestState::default();
+            let decision = f.control.decide(&head("theirs.example", &[(TOKEN, "client-sent")]), &mut state).await;
+            assert!(matches!(decision, RequestDecision::Proxy));
+            let mods = names(&state.forwarding_modifications(&"/x".parse().unwrap()).unwrap());
+            assert!(mods.contains(&"remove x-heyo-fleet-token".to_string()), "{mods:?}");
+            assert!(mods.contains(&"set x-heyo-fleet-hop=us4".to_string()));
+            assert!(mods.contains(&"set x-heyo-fleet-token=s3cret".to_string()));
+            assert!(mods.contains(&"set x-forwarded-for=198.51.100.7".to_string()), "the client, not what it claimed");
+            assert!(mods.contains(&"set x-forwarded-proto=https".to_string()));
+            assert!(!state.retry_allowed(), "never replayed");
+            // us5 is not a live member here, so there is no address: a connect
+            // error, not a guess.
+            assert!(f.control.next_peer(&mut state).await.is_err());
+            assert!(f.control.next_peer(&mut state).await.is_err(), "and no second attempt");
+        }
+
+        #[tokio::test]
+        async fn a_hop_without_the_token_is_refused() {
+            let f = fixture(true);
+            let mut state = RequestState::default();
+            let decision = f.control.decide(&head("local.example", &[(HOP, "us5")]), &mut state).await;
+            assert!(matches!(decision, RequestDecision::Respond(ResponseData { status: 403, .. })));
+            let decision = f.control.decide(&head("local.example", &[(HOP, "us5"), (TOKEN, "wrong!")]), &mut RequestState::default()).await;
+            assert!(matches!(decision, RequestDecision::Respond(ResponseData { status: 403, .. })));
+        }
+
+        #[tokio::test]
+        async fn a_hop_is_never_forwarded_again() {
+            let f = fixture(true);
+            let hop = [(HOP, "us5"), (TOKEN, "s3cret")];
+            let decision = f.control.decide(&head("theirs.example", &hop), &mut RequestState::default()).await;
+            assert!(matches!(decision, RequestDecision::Respond(ResponseData { status: 503, .. })), "not a bounce");
+        }
+
+        #[tokio::test]
+        async fn a_hop_for_a_local_deployment_is_served_here_as_its_client() {
+            let f = fixture(true);
+            let mut state = RequestState::default();
+            let hop = [(HOP, "us5"), (TOKEN, "s3cret"), ("x-forwarded-for", "203.0.113.9"), ("x-auth-request-email", "forged@x")];
+            let decision = f.control.decide(&head("local.example", &hop), &mut state).await;
+            assert!(matches!(decision, RequestDecision::Proxy));
+            assert!(state.hop_in && state.hop_out.is_none());
+            let mods = names(&state.forwarding_modifications(&"/x".parse().unwrap()).unwrap());
+            assert!(mods.contains(&"remove x-auth-request-email".to_string()), "{mods:?}");
+            assert!(mods.contains(&"remove x-heyo-fleet-token".to_string()));
+            assert!(!mods.iter().any(|m| m.starts_with("set x-heyo-fleet")));
+        }
+
+        #[tokio::test]
+        async fn without_forwarding_another_hosts_deployment_is_not_found() {
+            let f = fixture(false);
+            let decision = f.control.decide(&head("theirs.example", &[]), &mut RequestState::default()).await;
+            assert!(matches!(decision, RequestDecision::Respond(ResponseData { status: 404, .. })));
+        }
+    }
 
     #[test]
     fn owned_request_head_prefers_authority_and_preserves_socket_and_tls_facts() {
