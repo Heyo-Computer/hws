@@ -54,6 +54,7 @@ on:
       # as `.ci/**`, so adding a workflow for another crate does not rebuild
       # this one.
       - '.ci/workflows/ci.yml'
+      - '.ci/rust-cache.sh'
       - '.ci/image/ci/**'
       - '.ci/workflows/regional-release.yml'
 
@@ -69,7 +70,7 @@ jobs:
     # runs the same glob matcher as `paths:`, so the guard and the filter cannot
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
-    if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', 'pg-fc/deploy/replace_pooler.py', '.ci/workflows/ci.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+    if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', 'pg-fc/deploy/replace_pooler.py', '.ci/workflows/ci.yml', '.ci/rust-cache.sh', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
     # Unpinned: the controller chooses an eligible host in the runner network.
     vm: &ci_vm
       driver: firecracker
@@ -166,6 +167,15 @@ jobs:
         - rust-toolchain.toml
     env:
       CARGO_TERM_COLOR: never
+      # Empty mode means off. Provision dedicated cache storage/credentials
+      # before enabling; never reuse release-artifact or deployment credentials.
+      CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
+      SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
+      SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
+      SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
+      SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
+      CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
+      CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
     # Headroom over the sum of the steps below. A cold build of 510 packages —
     # iroh, quinn and hickory under heyo-sdk, async-nats, sqlx, axum — is most
     # of an hour; a warm VM reuses /var/cache/ci and relinks in minutes.
@@ -236,10 +246,13 @@ jobs:
         # the exec channel, not the serial console that carries the marker
         # protocol.
         run: |
+          set -eu
+          started=$(date +%s)
           cargo fetch --locked
+          echo "ci-cache dependency_fetch_seconds=$(($(date +%s) - started))"
           df -P / "$CARGO_TARGET_DIR"
           free -m || true
-          if ! cargo build --release --locked --bins; then
+          if ! sh /workspace/.ci/rust-cache.sh cargo build --release --locked --bins; then
             echo "=== build failed; guest kernel log tail ==="
             echo "(look for 'Out of memory: Killed process' — that means this"
             echo " needs CARGO_BUILD_JOBS in the job's env, or a larger class)"
@@ -251,7 +264,7 @@ jobs:
 
       - name: Test CI
         working-directory: /workspace/ci
-        run: cargo test --release --locked -- --test-threads=1
+        run: sh /workspace/.ci/rust-cache.sh cargo test --release --locked -- --test-threads=1
         timeout-minutes: 10
 
       - name: Verify CI claims and instance drain with disposable PostgreSQL and NATS

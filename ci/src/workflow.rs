@@ -1651,7 +1651,7 @@ mod repo_workflow {
         assert!(validate.condition.as_deref().unwrap().contains("'app-lb/src/host_bundle.rs'"),
             "the job filter must not skip a shared archive validator change");
         assert!(validate.steps.iter().any(|s| s.run.as_deref().is_some_and(|s|
-            s == "cargo test --release --locked -- --test-threads=1")));
+            s == "sh /workspace/.ci/rust-cache.sh cargo test --release --locked -- --test-threads=1")));
 
         // Every `uses:` step in it must name an action that exists, or the
         // build fails at the step rather than at parse time.

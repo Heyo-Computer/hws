@@ -37,6 +37,66 @@ artifact is deployed by hand or by `ci/deploy/ci.json`'s `update` block, never b
 the run itself — and a restart mid-run is redelivered off the JetStream work
 queue, so the self-reference costs less than it looks like it should.
 
+## Shared Rust compiler cache pilot
+
+`ci.yml` measures dependency-fetch and Cargo phase time and can use
+[`rust-cache.sh`](rust-cache.sh) with pinned sccache 0.18.0. The first pilot is
+the CI crate, not all Rust workflows. Job VMs and disks remain disposable.
+The script downloads a checksum-verified Linux binary into the job's data disk;
+it does not rebuild the base image or change the Rust toolchain.
+
+Caching defaults to **off**. Configure these operator variables in the existing
+`ci/heyo-public/default/` HeyoSecret scope (tag variables `public`):
+
+| Variable | Meaning |
+| --- | --- |
+| `CI_RUST_CACHE_MODE` | `off`, `read-only`, or `read-write` |
+| `CI_RUST_CACHE_BUCKET` | Dedicated compiler-cache bucket |
+| `CI_RUST_CACHE_ENDPOINT` | HTTPS S3-compatible endpoint, not the artifact HTTP API |
+| `CI_RUST_CACHE_REGION` | Storage provider's signing region |
+| `CI_RUST_CACHE_PREFIX` | Shared project/trust namespace, identical across regions |
+
+Inject `CI_RUST_CACHE_ACCESS_KEY_ID` and `CI_RUST_CACHE_SECRET_ACCESS_KEY` as
+secrets. Provision credentials restricted to that cache namespace, not the
+release-artifact bucket or deployment credentials. A prefix is not an access
+control: enforce permissions at the storage service. Only trusted submissions
+may write a cache consumed by trusted releases. Use separate credentials and
+namespaces for untrusted workloads. Configure bounded storage/expiration before
+enabling writes. Do not modify or expire release artifacts to reclaim cache.
+
+The cache daemon receives dedicated credentials; Cargo does not need them.
+Download/startup outages fall back to compilation, while invalid configuration
+and checksum mismatches fail explicitly. Logs report whether caching was active,
+setup time, command time, compiler hits/misses and non-cacheable reasons. The
+command's failure status is preserved. Linking, test execution, dependency
+downloads and build-script work are not all cacheable; a compiler cache is not
+a promise to eliminate the entire build.
+
+### Measure before enabling
+
+Use the same source revision, lockfile, base image/toolchain, Cargo flags,
+CPU/RAM class and host for paired comparisons. Each run must use a fresh VM and
+empty `target` directory; rebuilding in the same VM measures Cargo freshness,
+not shared-cache reuse. Record queue wait, image preparation, VM startup,
+checkout, dependency fetch, compilation, tests, packaging and upload separately.
+Cargo's `Finished ... in ...` and `test result ... finished in ...` lines
+separate compilation from actual test execution inside the test phase.
+
+1. Run with mode `off` to establish the unchanged baseline.
+2. Run `read-write` with a new dedicated prefix: cold-cache population.
+3. Run the same revision in another fresh VM with that prefix: warm-cache read.
+4. Repeat paired measurements at least three times and report medians and range.
+5. Repeat the warm read in the other region; report it separately because CPU
+   capacity and network latency differ.
+6. Change a source input and verify affected work misses; change compiler/flags
+   to verify invalidation. Check an unavailable cache still compiles and a
+   failing command stays failed.
+
+Keep source identity and sccache statistics with the run links. A fallback run
+with `active=false` is not a successful cache measurement. No speedup is claimed
+until the real cold/warm comparisons complete. Stage deployment policy remains
+independent: these validation jobs do not deploy a service by themselves.
+
 ## One file or two?
 
 One buildable thing per file, and one job per file. `app-lb.yml` and
