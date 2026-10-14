@@ -70,6 +70,19 @@ fn http_peer(selected: crate::request_control::Peer) -> HttpPeer {
     peer
 }
 
+/// 503 with `Retry-After`: no manager answered while app-lb restarted.
+async fn write_unavailable(session: &mut Session) -> Result<()> {
+    let message = "app-lb is restarting; retry shortly\n";
+    let mut header = ResponseHeader::build(503, Some(3))?;
+    header.insert_header(http::header::CONTENT_LENGTH, message.len().to_string())?;
+    header.insert_header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")?;
+    header.insert_header(http::header::RETRY_AFTER, "1")?;
+    session.write_response_header(Box::new(header), false).await?;
+    session
+        .write_response_body(Some(bytes::Bytes::copy_from_slice(message.as_bytes())), true)
+        .await
+}
+
 async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<()> {
     let mut header = ResponseHeader::build(code, Some(2))?;
     header.insert_header(http::header::CONTENT_LENGTH, message.len().to_string())?;
@@ -297,6 +310,13 @@ impl ProxyHttp for LbProxy {
                 return Ok(true);
             }
             Err(crate::worker_rpc::BeginError::Control(error)) => crate::worker::control_lost(&error),
+            // No manager within the wait: app-lb is restarting, or stopped.
+            // Say so and let the client retry, rather than drop it.
+            Err(crate::worker_rpc::BeginError::Unavailable(error)) => {
+                tracing::warn!(%error, "no manager answered within the wait; answering 503");
+                write_unavailable(session).await?;
+                return Ok(true);
+            }
         };
         ctx.request = Some(request);
         if matches!(decision, RemoteDecision::ReadLoginBody) {
@@ -435,14 +455,14 @@ impl ProxyHttp for LbProxy {
                 error: e.map(ToString::to_string),
             };
             if let Err(error) = request.complete(completion).await {
-                crate::worker::control_lost(&error);
+                crate::worker::control_interrupted(request.manager(), &error);
             }
         }
     }
 }
 
 fn control_error(request: &RemoteRequest, error: String) -> Box<Error> {
-    if !request.connected() { crate::worker::control_lost(&error); }
+    if !request.connected() { crate::worker::control_interrupted(request.manager(), &error); }
     Error::explain(ErrorType::ConnectProxyFailure, error)
 }
 

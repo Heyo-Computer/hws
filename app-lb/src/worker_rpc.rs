@@ -2,7 +2,16 @@
 //!
 //! A connection is a request.  In particular it is not a reconnectable session:
 //! losing it leaves the manager's admission state pinned until the manager has
-//! observed that incarnation exit.
+//! observed that worker exit.
+//!
+//! The manager may be replaced under a running worker (see `worker.rs`). A
+//! request waits for a manager to begin it, and its handshake names the manager
+//! that answered, so a broken link can be told apart: the same manager still
+//! answering means a fault, a different one (or none) means a restart.
+//!
+//! **Compatibility.** A worker and a manager from adjacent releases talk to
+//! each other across a takeover, so a change to these messages must be one an
+//! older peer can read: add fields with defaults, never repurpose one.
 
 use crate::config::SiteSpec;
 use crate::metrics::Metrics;
@@ -30,34 +39,86 @@ fn check_version(version: u16) -> Result<(), String> {
 #[derive(Clone)]
 pub struct Client {
     path: PathBuf,
+    /// How long a request waits for a manager to answer.
+    wait: Duration,
 }
 
-pub enum BeginError { HeadersTooLarge, Control(String) }
+pub enum BeginError {
+    HeadersTooLarge,
+    Control(String),
+    /// No manager answered within the wait: app-lb is restarting, or stopped.
+    Unavailable(String),
+}
 impl From<String> for BeginError {
     fn from(error: String) -> Self { Self::Control(error) }
 }
 
 impl Client {
-    pub fn new(path: PathBuf) -> Self { Self { path } }
+    pub fn new(path: PathBuf) -> Self {
+        Self::with_wait(path, crate::worker::wait_budget())
+    }
 
+    pub fn with_wait(path: PathBuf, wait: Duration) -> Self { Self { path, wait } }
+
+    /// Begin a request with whichever manager answers, waiting up to the
+    /// budget for one. A manager that goes away mid-begin took whatever it
+    /// started with it, so the next one is simply asked again.
     pub async fn begin(&self, head: RequestHead) -> Result<(RemoteRequest, RemoteDecision), BeginError> {
         let begin = ClientMessage::Begin(WireHead::from_head(&head)?);
         if serde_json::to_vec(&begin).map_err(|e| e.to_string())?.len() > MAX_FRAME {
             return Err(BeginError::HeadersTooLarge);
         }
-        let mut stream = UnixStream::connect(&self.path).await.map_err(|e| format!("request control connect failed: {e}"))?;
-        write_frame(&mut stream, &ClientMessage::Hello { version: VERSION }).await?;
-        match read_frame::<ServerMessage>(&mut stream).await? {
-            ServerMessage::Hello { version: VERSION } => {}
-            ServerMessage::Hello { version } => return Err(format!("request control protocol version mismatch: manager={version}, worker={VERSION}").into()),
-            ServerMessage::Error { message } => return Err(message.into()),
-            _ => return Err(BeginError::Control("request control protocol error: expected handshake".into())),
+        let deadline = tokio::time::Instant::now() + self.wait;
+        loop {
+            let error = match handshake(&self.path).await {
+                Ok((stream, manager)) => {
+                    let mut request = RemoteRequest { stream: Some(stream), backend_id: None, retry_allowed: false, failure_pending: false, completed: false, manager };
+                    match request.call(begin.clone()).await {
+                        Ok(reply) => {
+                            let (decision, backend_id, retry_allowed) = response(reply)?;
+                            request.backend_id = backend_id;
+                            request.retry_allowed = retry_allowed;
+                            return Ok((request, decision));
+                        }
+                        Err(error) => error,
+                    }
+                }
+                Err(Handshake::Refused(message)) => return Err(BeginError::Control(message)),
+                Err(Handshake::Absent(error)) => error,
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BeginError::Unavailable(error));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let mut request = RemoteRequest { stream: Some(stream), backend_id: None, retry_allowed: false, failure_pending: false, completed: false };
-        let (decision, backend_id, retry_allowed) = response(request.call(begin).await?)?;
-        request.backend_id = backend_id;
-        request.retry_allowed = retry_allowed;
-        Ok((request, decision))
+    }
+}
+
+enum Handshake {
+    /// Nothing answered, or the answer broke off: worth waiting for.
+    Absent(String),
+    /// A manager answered and refused: waiting will not change it.
+    Refused(String),
+}
+
+async fn handshake(path: &std::path::Path) -> Result<(UnixStream, Option<u64>), Handshake> {
+    let absent = |e: String| Handshake::Absent(e);
+    let mut stream = UnixStream::connect(path).await.map_err(|e| absent(format!("request control connect failed: {e}")))?;
+    write_frame(&mut stream, &ClientMessage::Hello { version: VERSION }).await.map_err(absent)?;
+    match read_frame::<ServerMessage>(&mut stream).await.map_err(absent)? {
+        ServerMessage::Hello { version: VERSION, manager } => Ok((stream, manager)),
+        ServerMessage::Hello { version, .. } => Err(Handshake::Refused(format!("request control protocol version mismatch: manager={version}, worker={VERSION}"))),
+        ServerMessage::Error { message } => Err(Handshake::Refused(message)),
+        _ => Err(Handshake::Refused("request control protocol error: expected handshake".into())),
+    }
+}
+
+/// The id of the manager answering at `path`. `Ok(None)` from a manager too
+/// old to say.
+pub async fn hello(path: &std::path::Path) -> Result<Option<u64>, String> {
+    match handshake(path).await {
+        Ok((_, manager)) => Ok(manager),
+        Err(Handshake::Absent(e) | Handshake::Refused(e)) => Err(e),
     }
 }
 
@@ -67,10 +128,13 @@ pub struct RemoteRequest {
     retry_allowed: bool,
     failure_pending: bool,
     completed: bool,
+    /// The manager that began this request.
+    manager: Option<u64>,
 }
 
 impl RemoteRequest {
     pub fn backend_id(&self) -> Option<&str> { self.backend_id.as_deref() }
+    pub fn manager(&self) -> Option<u64> { self.manager }
     pub fn connected(&self) -> bool { self.stream.is_some() }
 
     pub fn connection_failed(&mut self) -> bool {
@@ -122,6 +186,7 @@ impl RemoteRequest {
         let mut stream = self.stream.take().ok_or_else(|| "request control request is closed".to_string())?;
         let failed = std::mem::take(&mut self.failure_pending);
         let terminal = matches!(&message, ClientMessage::Complete(_) | ClientMessage::Cancel);
+        let manager = self.manager;
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Frame I/O must survive cancellation of the HTTP future. Otherwise
         // Drop could append Cancel inside a partially written frame or mistake
@@ -138,7 +203,7 @@ impl RemoteRequest {
                 write_frame(&mut stream, &message).await?;
                 read_frame(&mut stream).await
             }.await;
-            let _ = tx.send(Exchange { stream: Some(stream), result: Some(result), terminal });
+            let _ = tx.send(Exchange { stream: Some(stream), result: Some(result), terminal, manager });
         });
         let mut exchange = rx.await.map_err(|_| "request control exchange task lost".to_string())?;
         let result = exchange.result.take().expect("exchange result present");
@@ -153,14 +218,15 @@ struct Exchange {
     stream: Option<UnixStream>,
     result: Option<Result<ServerMessage, String>>,
     terminal: bool,
+    manager: Option<u64>,
 }
 impl Drop for Exchange {
     fn drop(&mut self) {
         match self.result.take() {
             Some(Ok(_)) if !self.terminal => {
-                if let Some(stream) = self.stream.take() { cancel_owned(stream, false); }
+                if let Some(stream) = self.stream.take() { cancel_owned(stream, false, self.manager); }
             }
-            Some(Err(error)) => crate::worker::control_lost(&error),
+            Some(Err(error)) => crate::worker::control_interrupted(self.manager, &error),
             _ => {}
         }
     }
@@ -169,11 +235,11 @@ impl Drop for Exchange {
 impl Drop for RemoteRequest {
     fn drop(&mut self) {
         if self.completed { return; }
-        if let Some(stream) = self.stream.take() { cancel_owned(stream, self.failure_pending); }
+        if let Some(stream) = self.stream.take() { cancel_owned(stream, self.failure_pending, self.manager); }
     }
 }
 
-fn cancel_owned(mut stream: UnixStream, failed: bool) {
+fn cancel_owned(mut stream: UnixStream, failed: bool, manager: Option<u64>) {
     // Move ownership into the task; it survives the HTTP context's destructor.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
@@ -185,9 +251,12 @@ fn cancel_owned(mut stream: UnixStream, failed: bool) {
                         _ => Err("connection failure was not acknowledged".to_string()),
                     }
                 }.await;
-                if let Err(error) = recorded { crate::worker::control_lost(&error); }
+                if let Err(error) = recorded {
+                    crate::worker::control_interrupted(manager, &error);
+                    return;
+                }
             }
-            if let Err(error) = cancel(&mut stream).await { crate::worker::control_lost(&error); }
+            if let Err(error) = cancel(&mut stream).await { crate::worker::control_interrupted(manager, &error); }
         });
     }
 }
@@ -221,7 +290,7 @@ pub enum RemoteDecision {
     Proxy,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 enum ClientMessage {
     Hello { version: u16 },
     Begin(WireHead),
@@ -235,7 +304,12 @@ enum ClientMessage {
 
 #[derive(Serialize, Deserialize)]
 enum ServerMessage {
-    Hello { version: u16 },
+    Hello {
+        version: u16,
+        /// Which manager answered. Absent from a manager older than takeover.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manager: Option<u64>,
+    },
     Decision { decision: WireDecision, backend_id: Option<String>, retry_allowed: bool },
     Peer { peer: WirePeer, sandbox_id: String, retry_allowed: bool },
     FailureRecorded { retry_allowed: bool },
@@ -244,7 +318,7 @@ enum ServerMessage {
     Error { message: String },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct WireHead {
     method: String,
     uri: String,
@@ -346,9 +420,10 @@ pub async fn serve(
     access_log: Option<LogSink>,
     security: Option<SecuritySink>,
     mut worker_exited: watch::Receiver<bool>,
+    manager: u64,
 ) -> Result<(), String> {
     match read_frame::<ClientMessage>(&mut stream).await? {
-        ClientMessage::Hello { version: VERSION } => write_frame(&mut stream, &ServerMessage::Hello { version: VERSION }).await?,
+        ClientMessage::Hello { version: VERSION } => write_frame(&mut stream, &ServerMessage::Hello { version: VERSION, manager: Some(manager) }).await?,
         ClientMessage::Hello { version } => {
             let error = check_version(version).unwrap_err();
             let _ = write_frame(&mut stream, &ServerMessage::Error { message: error.clone() }).await;
@@ -356,9 +431,11 @@ pub async fn serve(
         }
         _ => return Err("request control protocol error: handshake required".into()),
     }
-    let head = match read_frame::<ClientMessage>(&mut stream).await? {
-        ClientMessage::Begin(head) => head.into_head()?,
-        _ => return Err("request control protocol error: Begin required".into()),
+    let head = match read_frame::<ClientMessage>(&mut stream).await {
+        Ok(ClientMessage::Begin(head)) => head.into_head()?,
+        // A worker asking who the manager is, and nothing else.
+        Err(_) => return Ok(()),
+        Ok(_) => return Err("request control protocol error: Begin required".into()),
     };
     let mut state = RequestState::default();
     let decision = control.decide(&head, &mut state).await;
@@ -494,12 +571,78 @@ mod tests {
     #[tokio::test]
     async fn oversized_headers_are_rejected_before_control_connection() {
         let dir = tempfile::tempdir().unwrap();
-        let client = Client::new(dir.path().join("absent"));
+        let client = Client::with_wait(dir.path().join("absent"), Duration::ZERO);
         let mut head = RequestHead { method: http::Method::GET, uri: "/".parse().unwrap(), headers: http::HeaderMap::new(), peer: None, tls_terminated: false };
         head.headers.insert("x-large", http::HeaderValue::from_bytes(&vec![b'x'; 300_000]).unwrap());
         assert!(matches!(client.begin(head.clone()).await, Err(BeginError::HeadersTooLarge)));
         head.headers.insert("x-large", http::HeaderValue::from_bytes(&vec![b'x'; 200_000]).unwrap());
-        assert!(matches!(client.begin(head).await, Err(BeginError::Control(_))));
+        assert!(matches!(client.begin(head).await, Err(BeginError::Unavailable(_))));
+    }
+
+    fn head() -> RequestHead {
+        RequestHead { method: http::Method::GET, uri: "http://app.example/".parse().unwrap(), headers: http::HeaderMap::new(), peer: None, tls_terminated: false }
+    }
+
+    /// A manager that answers one request with a local response.
+    async fn answer_one(listener: tokio::net::UnixListener, id: Option<u64>) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(read_frame::<ClientMessage>(&mut stream).await.unwrap(), ClientMessage::Hello { .. }));
+        write_frame(&mut stream, &ServerMessage::Hello { version: VERSION, manager: id }).await.unwrap();
+        assert!(matches!(read_frame::<ClientMessage>(&mut stream).await.unwrap(), ClientMessage::Begin(_)));
+        let decision = WireDecision::Respond { status: 204, body: String::new(), content_type: "text/plain".into(), headers: vec![], cache_control: None };
+        write_frame(&mut stream, &ServerMessage::Decision { decision, backend_id: None, retry_allowed: false }).await.unwrap();
+        let _ = read_frame::<ClientMessage>(&mut stream).await;
+        let _ = write_frame(&mut stream, &ServerMessage::Ack).await;
+    }
+
+    #[tokio::test]
+    async fn a_request_waits_for_the_next_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests");
+        let client = Client::with_wait(path.clone(), Duration::from_secs(5));
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            answer_one(tokio::net::UnixListener::bind(&path).unwrap(), Some(9)).await;
+        });
+        let started = std::time::Instant::now();
+        let (request, decision) = client.begin(head()).await.ok().expect("begun once a manager answered");
+        assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
+        assert!(matches!(decision, RemoteDecision::Respond { status: 204, .. }));
+        assert_eq!(request.manager(), Some(9));
+        drop(request);
+        late.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn with_no_manager_a_request_is_unavailable_after_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_wait(dir.path().join("requests"), Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        assert!(matches!(client.begin(head()).await, Err(BeginError::Unavailable(_))));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn hello_names_the_manager_and_old_peers_still_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_frame::<ClientMessage>(&mut stream).await.unwrap();
+            write_frame(&mut stream, &ServerMessage::Hello { version: VERSION, manager: Some(42) }).await.unwrap();
+        });
+        assert_eq!(hello(&path).await.unwrap(), Some(42));
+        server.await.unwrap();
+
+        // A worker from before takeover reads a new manager's hello…
+        #[derive(Deserialize)]
+        enum OldServerMessage { Hello { version: u16 } }
+        let new = serde_json::to_vec(&ServerMessage::Hello { version: VERSION, manager: Some(42) }).unwrap();
+        assert!(matches!(serde_json::from_slice::<OldServerMessage>(&new).unwrap(), OldServerMessage::Hello { version: VERSION }));
+        // …and a new worker reads an old manager's, which names nobody.
+        let old = br#"{"Hello":{"version":1}}"#;
+        assert!(matches!(serde_json::from_slice::<ServerMessage>(old).unwrap(), ServerMessage::Hello { manager: None, .. }));
     }
 
     #[tokio::test]
@@ -514,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn drop_records_pending_connect_failure_before_cancellation() {
         let (client, mut manager) = UnixStream::pair().unwrap();
-        let mut request = RemoteRequest { stream: Some(client), backend_id: None, retry_allowed: true, failure_pending: false, completed: false };
+        let mut request = RemoteRequest { stream: Some(client), backend_id: None, retry_allowed: true, failure_pending: false, completed: false, manager: None };
         assert!(request.connection_failed());
         drop(request);
         assert!(matches!(read_frame::<ClientMessage>(&mut manager).await.unwrap(), ClientMessage::ConnectionFailed));
@@ -554,7 +697,7 @@ mod tests {
             write_frame(&mut manager, &ServerMessage::Ack).await.unwrap();
         });
         let request = tokio::spawn(async move {
-            let mut remote = RemoteRequest { stream: Some(client), backend_id: None, retry_allowed: false, failure_pending: false, completed: false };
+            let mut remote = RemoteRequest { stream: Some(client), backend_id: None, retry_allowed: false, failure_pending: false, completed: false, manager: None };
             remote.next_peer().await
         });
         waiting.await.unwrap();
@@ -582,7 +725,7 @@ mod tests {
     async fn cancellation_after_channel_delivery_still_notifies_manager() {
         let (client, mut manager) = UnixStream::pair().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        assert!(tx.send(Exchange { stream: Some(client), result: Some(Ok(ServerMessage::Error { message: "no backend".into() })), terminal: false }).is_ok());
+        assert!(tx.send(Exchange { stream: Some(client), result: Some(Ok(ServerMessage::Error { message: "no backend".into() })), terminal: false, manager: None }).is_ok());
         drop(rx);
         let message = tokio::time::timeout(Duration::from_secs(2), read_frame::<ClientMessage>(&mut manager)).await.unwrap().unwrap();
         assert!(matches!(message, ClientMessage::Cancel));
@@ -609,9 +752,9 @@ mod tests {
         ));
         let (mut client, manager) = UnixStream::pair().unwrap();
         let (exited, witness) = watch::channel(false);
-        let server = tokio::spawn(serve(manager, control, metrics, None, None, witness));
+        let server = tokio::spawn(serve(manager, control, metrics, None, None, witness, 7));
         write_frame(&mut client, &ClientMessage::Hello { version: VERSION }).await.unwrap();
-        assert!(matches!(read_frame::<ServerMessage>(&mut client).await.unwrap(), ServerMessage::Hello { .. }));
+        assert!(matches!(read_frame::<ServerMessage>(&mut client).await.unwrap(), ServerMessage::Hello { manager: Some(7), .. }));
         let head = RequestHead { method: http::Method::GET, uri: "http://app.example/".parse().unwrap(), headers: http::HeaderMap::new(), peer: None, tls_terminated: false };
         write_frame(&mut client, &ClientMessage::Begin(WireHead::from_head(&head).unwrap())).await.unwrap();
         assert!(matches!(read_frame::<ServerMessage>(&mut client).await.unwrap(), ServerMessage::Decision { decision: WireDecision::Proxy, .. }));

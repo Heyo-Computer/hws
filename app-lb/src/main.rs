@@ -392,7 +392,8 @@ fn init_tracing(events: Option<obs::LogSink>) {
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--forwarding-worker") {
         let path = std::env::args_os().nth(2).expect("worker control directory required");
-        worker::run(path.into());
+        let takeover = std::env::args().nth(3).as_deref() == Some("--takeover");
+        worker::run(path.into(), takeover);
     }
     if let Some(code) = host_update::helper_main() { std::process::exit(code); }
     // After the internal helper entry points above, which take their own
@@ -1103,7 +1104,18 @@ fn main() {
     // The one exception is the fleet store's worker thread, started only in
     // fleet mode: app-lb never daemonizes (`Server::new(None)` reads no
     // daemon option), and the stores above need the database before this.
-    let mut server = Server::new(None).expect("failed to create server");
+    // The manager holds no listener — the forwarding worker does — so it has
+    // nothing to drain: on SIGTERM it exits at once, where pingora's default
+    // grace period kept it for five minutes, until a supervisor's stop timeout
+    // killed it. Every moment it lingers is a moment requests wait in the
+    // worker for the next manager.
+    let mut server = {
+        let mut conf = pingora_core::server::configuration::ServerConf::new()
+            .expect("pingora's default configuration");
+        conf.grace_period_seconds = Some(0);
+        conf.graceful_shutdown_timeout_seconds = Some(5);
+        Server::new_with_opt_and_conf(None, conf)
+    };
     server.bootstrap();
 
     // One event feed, shared by the admin API (lifecycle events), the
@@ -1352,6 +1364,9 @@ fn main() {
         certs,
         proxy_addr: cfg.proxy_addr.clone(),
         tls_addr: cfg.tls_enabled().then(|| cfg.tls_addr.clone()),
+        dir: std::env::var_os("APP_LB_WORKER_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| worker::worker_dir(&cfg.state_path)),
     });
 
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");
