@@ -167,15 +167,6 @@ jobs:
         - rust-toolchain.toml
     env:
       CARGO_TERM_COLOR: never
-      # Empty mode means off. Provision dedicated cache storage/credentials
-      # before enabling; never reuse release-artifact or deployment credentials.
-      CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
-      SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
-      SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
-      SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
-      SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
-      CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
-      CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
     # Headroom over the sum of the steps below. A cold build of 510 packages —
     # iroh, quinn and hickory under heyo-sdk, async-nats, sqlx, axum — is most
     # of an hour; a warm VM reuses /var/cache/ci and relinks in minutes.
@@ -245,6 +236,15 @@ jobs:
         # is what tells them apart. Printing it here is safe — step output rides
         # the exec channel, not the serial console that carries the marker
         # protocol.
+        # Secrets/vars resolve at step execution, not matrix planning.
+        env: &rust_cache_env
+          CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
+          SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
+          SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
+          SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
+          CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
+          CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
         run: |
           set -eu
           started=$(date +%s)
@@ -264,6 +264,7 @@ jobs:
 
       - name: Test CI
         working-directory: /workspace/ci
+        env: *rust_cache_env
         run: sh /workspace/.ci/rust-cache.sh cargo test --release --locked -- --test-threads=1
         timeout-minutes: 10
 

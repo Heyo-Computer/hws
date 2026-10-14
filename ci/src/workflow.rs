@@ -1653,6 +1653,16 @@ mod repo_workflow {
         assert!(validate.steps.iter().any(|s| s.run.as_deref().is_some_and(|s|
             s == "sh /workspace/.ci/rust-cache.sh cargo test --release --locked -- --test-threads=1")));
 
+        // Cache configuration must survive planning until runtime secrets exist.
+        let mut runtime = crate::expr::Context::new();
+        runtime.set("vars", serde_json::json!({"CI_RUST_CACHE_MODE": "read-write"}));
+        runtime.set("secrets", serde_json::json!({"CI_RUST_CACHE_SECRET_ACCESS_KEY": "test-key"}));
+        for name in ["Build", "Test CI"] {
+            let step = validate.steps.iter().find(|s| s.name.as_deref() == Some(name)).unwrap();
+            assert_eq!(runtime.substitute(&step.env["CI_RUST_CACHE_MODE"]), "read-write");
+            assert_eq!(runtime.substitute(&step.env["CI_RUST_CACHE_SECRET_ACCESS_KEY"]), "test-key");
+        }
+
         // Every `uses:` step in it must name an action that exists, or the
         // build fails at the step rather than at parse time.
         for job in &plan.jobs {
