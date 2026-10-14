@@ -507,9 +507,29 @@ Found along the way: adding the `auth-key` kind to an already seeded fleet delet
 
 ### Phase 4: restarts that drop nothing
 
-- Hand the listening sockets over in place, or keep the proxy worker alive across a management restart.
-- Prove it on us4 under continuous load, with zero failed requests and held streams surviving.
-- Without this, phase 5 does not start.
+Both, in order: the proxy worker stays alive across a management restart, and the next manager then hands its listening sockets to a worker of its own build.
+
+**Before.** The forwarding worker was spawned with a parent-death signal, in the manager's process group, and exited on any loss of request control. So every restart closed :80 and :443 and cut what was in flight. Worse, the manager itself sat through pingora's default 300 s grace on `SIGTERM`, and every `supervisorctl restart` ended in supervisor's `SIGKILL` after `stopwaitsecs` (35 s on us4).
+
+**Now.**
+- **The worker outlives its manager.** It runs in its own session, so stopping the manager's process group does not reach it, and it keeps its listeners.
+  - A request that needs a decision while no manager answers waits for the next one, up to `APP_LB_WORKER_WAIT_SECS` (60). After that it gets a 503 with `Retry-After`; it is never dropped.
+  - Requests already forwarding finish without a manager.
+- **The control directory is fixed** (`app-lb-worker.d/` beside the state): `requests`, `bootstrap`, `upgrade` and `worker.json`. The next manager:
+  - binds the sockets;
+  - finds the worker still serving, and skips the startup port check it would otherwise fail;
+  - starts a worker from its own binary, and waits until that worker is listening on `upgrade`;
+  - then sends the old worker `SIGQUIT`. pingora hands the listening sockets across, the old worker keeps accepting for 5 s, then stops and drains for `APP_LB_DRAIN_SECS` (300) before exiting. A held stream survives a restart for that long. (pingora's runtime shutdown after the drain cancels tasks rather than waiting for them, so the drain is the whole of it.)
+  - The proxy app defers pingora's shutdown cleanup by 3 s. On shutdown pingora stops accepting and, in the same instant, drops every connection still waiting for its request. That includes one the old worker accepted a moment earlier whose request is still in flight: a request lost to the restart. With the delay, those requests arrive and are served, and only connections idle for the whole delay are closed.
+- **One manager at a time is unchanged.** The instance lock still keeps a second app-lb off the daemon. Only the worker, which never touches the daemon, outlives a manager.
+- **A lost request-control link is told apart.** If the manager that began the request still answers, the link failed under it: the worker exits as before, which releases the admission state it held. If that manager is gone, it was a restart, and the worker carries on.
+  - The handshake names the manager, in an optional field older peers ignore. Adjacent releases stay compatible across a takeover.
+- **Admission state** whose link broke is released when the worker that held it exits. That worker is the connection's peer pid (`SO_PEERCRED`), since a taken-over worker is no manager's child.
+- **A real stop:** a worker no manager returns to drains and exits after `APP_LB_WORKER_ORPHAN_SECS` (120). Setting it to `0` restores dying with the manager.
+- **The manager exits at once on `SIGTERM`** (grace 0): it holds no listener to drain.
+- **The worker logs to `app-lb-worker.d/worker.log`**, rotated at 50 MB. The manager's stdout is a supervisor pipe that closes when the manager exits.
+
+The first restart onto this build still drops: the old binary takes its worker down with it. Every restart after that hands over.
 
 ### Phase 5: us5 joins
 

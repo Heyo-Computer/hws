@@ -60,7 +60,13 @@ pub const WAIT_ENV: &str = "APP_LB_WORKER_WAIT_SECS";
 pub const DRAIN_ENV: &str = "APP_LB_DRAIN_SECS";
 const DEFAULT_ORPHAN: Duration = Duration::from_secs(120);
 const DEFAULT_WAIT: Duration = Duration::from_secs(60);
-const DEFAULT_DRAIN: u64 = 120;
+/// How long an old worker keeps serving what it holds after a takeover: the
+/// longest a held stream survives a restart.
+const DEFAULT_DRAIN: u64 = 300;
+/// Between an old worker's last accept and pingora dropping its connections
+/// that have not sent a request yet: long enough for one accepted at the last
+/// moment to send it.
+const LINGER: Duration = Duration::from_secs(3);
 /// After the drain, how long the old worker's runtimes get to finish.
 const SHUTDOWN_TIMEOUT: u64 = 60;
 /// How long a new worker waits for the old one's sockets, in pingora's
@@ -672,9 +678,16 @@ pub fn run(dir: PathBuf, takeover: bool) -> ! {
     if takeover {
         tracing::info!("received the listening sockets from the previous worker");
     }
-    let mut proxy = pingora_proxy::http_proxy_service(
-        &server.configuration,
+    let mut app = pingora_proxy::HttpProxy::new(
         crate::proxy::LbProxy::new(Client::new(dir.join("requests"))),
+        server.configuration.clone(),
+    );
+    app.handle_init_modules();
+    let mut proxy = pingora_core::services::listening::Service::new(
+        "Pingora HTTP Proxy Service".to_string(),
+        Lingering {
+            inner: Arc::new(app),
+        },
     );
     proxy.add_tcp(&initial.proxy_addr);
     if let Some(addr) = initial.tls_addr {
@@ -690,6 +703,46 @@ pub fn run(dir: PathBuf, takeover: bool) -> ! {
     ));
     server.add_service(proxy);
     server.run_forever();
+}
+
+/// The proxy, with pingora's shutdown cleanup deferred by [`LINGER`].
+///
+/// On shutdown pingora stops accepting and, in the same instant, drops every
+/// connection still waiting for its request — idle keep-alives, but also one
+/// accepted a moment ago whose request is still in flight. In a takeover the
+/// old worker accepts until that instant, so that second kind is a request
+/// lost to the restart. Cleanup runs only after the accept loops have ended,
+/// so waiting here lets those requests arrive and be served; only connections
+/// idle for the whole wait are closed.
+struct Lingering<T> {
+    inner: Arc<T>,
+}
+
+#[async_trait]
+impl<T> pingora_core::apps::HttpServerApp for Lingering<T>
+where
+    T: pingora_core::apps::HttpServerApp + Send + Sync + 'static,
+{
+    async fn process_new_http(
+        self: &Arc<Self>,
+        session: pingora_core::protocols::http::ServerSession,
+        shutdown: &ShutdownWatch,
+    ) -> Option<pingora_core::apps::ReusedHttpStream> {
+        self.inner.process_new_http(session, shutdown).await
+    }
+
+    fn h2_options(&self) -> Option<pingora_core::protocols::http::v2::server::H2Options> {
+        self.inner.h2_options()
+    }
+
+    fn server_options(&self) -> Option<&pingora_core::apps::HttpServerOptions> {
+        self.inner.server_options()
+    }
+
+    async fn http_cleanup(&self) {
+        tokio::time::sleep(LINGER).await;
+        self.inner.http_cleanup().await;
+    }
 }
 
 pub fn control_lost(error: &str) -> ! {
