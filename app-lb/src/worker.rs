@@ -545,7 +545,7 @@ impl BackgroundService for Supervisor {
 static REQUESTS: OnceLock<PathBuf> = OnceLock::new();
 
 /// The id of the manager answering now, if any answers.
-async fn current_manager() -> Option<u64> {
+pub(crate) async fn current_manager() -> Option<u64> {
     let path = REQUESTS.get()?;
     tokio::time::timeout(Duration::from_secs(2), worker_rpc::hello(path))
         .await
