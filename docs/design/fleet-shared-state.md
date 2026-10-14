@@ -1,6 +1,6 @@
 # Fleet shared state: one app-lb across hosts
 
-Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built (2026-10-14); its live gate on us4 is recorded under § Phase 2.
+Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built and live on us4 in fleet mode, with its gate passed (2026-10-14, § Phase 2).
 - Scope: a *fleet* of app-lb hosts that act as one tenant surface, starting with us4 and us5.
 - Supersedes, for the fleet scope only, the rule in `MULTI_REGION_DESIGN.md` § Proposed architecture: "do not turn app-lb into a scheduler and do not build a second service registry beside Orchestrator discovery". The reasons are in § Relation to the multi-region design.
 - The us3/eu1 regional platform and its gates are unchanged.
@@ -439,10 +439,17 @@ Built as specified, with the differences called out. Single-server app-lb is unc
 
 **Tests.** Against a real PostgreSQL when `APP_LB_FLEET_TEST_DATABASE_URL` is set, each in its own schema: CAS and conflicts, transactions, the feed's order and limit, seeding once, a lease's single holder and the fencing of a lapsed one, LISTEN, two hosts converging (including a forced conflict that succeeds after re-reading), offline start from a snapshot and the refusal without one, the reseed refusal, the fenced kind. Without a database: the registry split and merge, sealing, the admission rules, and the 503 with the store unreachable.
 
-**Live gate on us4.** Each with recorded evidence:
-- stop the database for 10 minutes under continuous load: zero failed requests, mutations 503;
-- kill the lease holder: the next process takes the lease under a higher epoch, and a write under the old epoch is refused;
-- force a CAS conflict: a change behind app-lb's back, then the admin API answers 409, and the retry succeeds.
+**Live gate on us4: passed 2026-10-14.** Scripts and raw evidence are in `us4:/root/phase2/`.
+- **Backward compatibility.** The phase 2 binary in file mode (no fleet variables) left the state, ACME files, modes, deployments and certificates byte-identical, and wrote no fleet file.
+- **Seeding.** Switching to fleet mode seeded the empty database with us4's 10 records. The files were unchanged apart from the new snapshot (`app-lb-fleet.d/`, `app-lb-fleet-snapshot.json`), and smoke-us4 kept serving over HTTP and HTTPS with no certificate reissued.
+- **Store outage.** pg-fc's pooler was stopped for 10 minutes (18:18:28–18:28:35) under continuous load. 257,023 requests got **0 failures**: HTTPS and HTTP to a static deployment back to back, plus a VM deployment over HTTPS at 2/s. All 30 mutations during the outage answered **503**. `/whoami` reported the snapshot age rising from 20 s to 601 s. The store was writable again within 20 s of the restart, and every mutation afterwards answered 201.
+- **Lease holder killed.** After `kill -9`, the next process took all three leases 15 s later (the TTL) at epoch 2. The dead process's `(holder, epoch)` no longer satisfies the fence.
+- **CAS conflict.** A change was committed behind app-lb's back while app-lb's write of the same record waited on the write lock. App-lb's write answered **409**, and the retry answered 200 on top of the re-read record.
+- **Fenced issuance.** A throwaway deployment on a `*.us4` name was issued a Let's Encrypt certificate in 5 s by the `acme` lease holder. Its key is sealed in the database, a `0600` PEM on disk, and served verified.
+
+Caveat: the VM deployment's backend is a one-connection `busybox nc` loop. At full speed its health checks fail and app-lb rightly answers "no healthy backend", which voided a first outage run. That is why the VM path is paced.
+
+Found along the way, and outside the fleet store: `pg-fc/Dockerfile.pg18` lacked `pg-fc-physical` (fixed in this phase). Deleting a namespace leaves the `heyo` auth provider the auth plugin auto-installed into it.
 
 ### Phase 3: shadow us5
 
