@@ -11,6 +11,11 @@
 # Defaults to `local` when run from a checkout that has the script, `remote`
 # otherwise — which is what makes `curl … | bash` work.
 #
+# The public copy of this script, and the release channel it reads, are served
+# from heyo.computer; `ci/publish-git-submit.sh` writes both into the marketing
+# site. No credential is involved anywhere: the client is a public script.
+#
+#   curl -fsSL https://heyo.computer/git-submit/install.sh | bash
 #   ./install-git-submit.sh
 #   GIT_SUBMIT_INSTALL_DIR=~/bin ./install-git-submit.sh
 #   GIT_SUBMIT_INSTALL_SOURCE=remote ./install-git-submit.sh
@@ -18,7 +23,7 @@ set -euo pipefail
 
 install_dir="${GIT_SUBMIT_INSTALL_DIR:-$HOME/.local/bin}"
 target="$install_dir/git-submit"
-base_url="${GIT_SUBMIT_INSTALL_BASE_URL:-https://heyo-cli-releases.s3.amazonaws.com/git-submit}"
+base_url="${GIT_SUBMIT_INSTALL_BASE_URL:-https://heyo.computer/git-submit}"
 
 # Piped into bash, `BASH_SOURCE[0]` is unset or `-`, so there is no checkout to
 # copy from and remote is the only possible source.
