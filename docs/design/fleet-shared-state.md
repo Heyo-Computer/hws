@@ -1,6 +1,6 @@
 # Fleet shared state: one app-lb across hosts
 
-Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built and live on us4 in fleet mode, with its gate passed (2026-10-14, § Phase 2).
+Status: proposal, 2026-10-13 (revised the same day: Postgres via pg-fc replicas; customer databases durable through S3; us4 rolled in without disrupting us5). Phase 1 is built and deployed to us4 (hws #272). Phase 2 is built and live on us4 in fleet mode, with its gate passed (2026-10-14, § Phase 2). Phase 3 is built and us4 shadows us5, gate passed (2026-10-14, § Phase 3).
 - Scope: a *fleet* of app-lb hosts that act as one tenant surface, starting with us4 and us5.
 - Supersedes, for the fleet scope only, the rule in `MULTI_REGION_DESIGN.md` § Proposed architecture: "do not turn app-lb into a scheduler and do not build a second service registry beside Orchestrator discovery". The reasons are in § Relation to the multi-region design.
 - The us3/eu1 regional platform and its gates are unchanged.
@@ -493,6 +493,17 @@ us4 holds a one-way, read-only copy of us5's tenant state, and runs, routes and 
 - the signing key is us5's, so a us5 session cookie verifies on us4;
 - us4 creates no VM, route or certificate for any us5 deployment;
 - us4 forwards one request for a us5 app to us5's ingress through a plain static upstream.
+
+**Gate on us4: passed 2026-10-14.** us5 was read, never written: the importer and us4's public key went to `/root/fleet-import/`, and the bundle was deleted after use.
+- **Export on us5.** 14 deployments, 15 namespaces, 17 auth providers, the secrets document (22 secrets, plaintext on us5), the tokens document (7) and the signing key. 0 unreadable. A 53 KB bundle, ciphertext wherever it travelled.
+- **Apply on us4.** 48 writes in one transaction. us5's `app-lb-admin` was kept as us4's, as designed. us4's feed applied the rest live: 13 deployments into the foreign view, plus namespaces, auth providers, secrets and tokens.
+- **Token.** us5's `prod` app token (admin, namespace `us5`) answers on us4's admin API as the same token id. It sees the same 4 secrets and 1 namespace as on us5, and `/whoami` on us4 reports the fleet store.
+- **Secrets.** Sealed (`aes-256-gcm`) in the fleet store and in us4's `0600` file, while us5 still holds them in plaintext.
+- **Signing key.** After the restart, us4's key file hashes the same as us5's. A us5 session cookie verifies on us4 *by construction* (same HMAC key, same gate code). No real browser session was presented: that part is configured, not executed.
+- **Nothing for us5 on us4.** Over a minute of ticks after the apply: heyvm sandboxes unchanged (smoke-us4, pg-fleet), certificates unchanged, no ACME attempt for a us5 name, and us5 hostnames answer 404 on us4.
+- **Forwarding.** A temporary static deployment on us4 routing `farm-rsvp.us5.heyo.work` to us5's IP answered 200 through us4, the same as direct. The deployment was then removed. Its one ACME attempt failed, as it must, on us4's own account.
+
+Found along the way: adding the `auth-key` kind to an already seeded fleet deleted us4's signing key file, because the snapshot sync replaced it with the nothing the fleet held. Fixed: the fleet now records the kinds it has seeded, and a kind new to it is seeded from the starting host's own records.
 
 ### Phase 4: restarts that drop nothing
 
