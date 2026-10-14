@@ -3628,6 +3628,90 @@ pub struct DeploymentSpec {
     /// proxy. See [`IngressSpec`]. Managed deployments only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<IngressSpec>,
+    /// Which host of an app-lb fleet runs this deployment's VMs. See
+    /// [`Placement`]. Absent means wherever the spec is loaded, which on a
+    /// single server is the only host there is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Placement>,
+}
+
+/// Where a deployment runs when several app-lb hosts share one fleet store
+/// (`docs/design/fleet-shared-state.md` § 4).
+///
+/// Only `pinned` is accepted today: every replica runs on `home`, and every
+/// other host keeps the spec but runs, routes and certifies nothing for it.
+/// `spread`, which lets replicas run on any listed host, arrives with the
+/// placement controller that decides how many go where.
+///
+/// A single-server app-lb accepts the field and ignores it: there is no other
+/// host for a deployment to be placed on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct Placement {
+    pub mode: PlacementMode,
+    /// The host a `pinned` deployment runs on, by its fleet name
+    /// (`APP_LB_FLEET_HOST`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// The hosts a `spread` deployment may run on; empty means all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PlacementMode {
+    Pinned,
+    Spread,
+}
+
+impl Placement {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn pinned(home: &str) -> Self {
+        Self {
+            mode: PlacementMode::Pinned,
+            home: Some(home.to_string()),
+            hosts: Vec::new(),
+        }
+    }
+
+    /// Whether `host` runs this deployment.
+    pub fn includes(&self, host: &str) -> bool {
+        match self.mode {
+            PlacementMode::Pinned => self.home.as_deref() == Some(host),
+            PlacementMode::Spread => self.hosts.is_empty() || self.hosts.iter().any(|h| h == host),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SpecError> {
+        let bad = |why: &str| Err(SpecError::InvalidPlacement(why.to_string()));
+        match self.mode {
+            PlacementMode::Spread => bad(
+                "placement.mode `spread` is not available yet: it needs the placement \
+                 controller (fleet phase 6). Use `pinned` with a `home`",
+            ),
+            PlacementMode::Pinned => {
+                let Some(home) = self.home.as_deref() else {
+                    return bad("placement.mode `pinned` needs a `home` host");
+                };
+                if !is_valid_fleet_host(home) {
+                    return bad("placement.home must be a host name: letters, digits, `-`, `_` and `.`");
+                }
+                if !self.hosts.is_empty() {
+                    return bad("placement.hosts is for `spread`; a pinned deployment runs on `home` only");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A fleet host name: what `APP_LB_FLEET_HOST` holds and `placement.home` names.
+pub fn is_valid_fleet_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 63
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// How a managed deployment is reached from the Heyo cloud.
@@ -3997,6 +4081,8 @@ pub enum SpecError {
     FeedExposeWithoutRoutes,
     /// `ingress.cloud` on a deployment with no VM pool to bind.
     IngressWithoutVm,
+    /// A `placement` that names no usable host, or a mode not yet available.
+    InvalidPlacement(String),
     /// Workflow ids are interpolated into NATS subjects and VM names unescaped.
     BadWorkflowId(String),
     EmptyWorkflowRepo,
@@ -4277,6 +4363,7 @@ impl std::fmt::Display for SpecError {
                 "feed.expose serves the feed on this deployment's routes, and this \
                  deployment has none"
             ),
+            Self::InvalidPlacement(why) => write!(f, "{why}"),
             Self::IngressWithoutVm => write!(
                 f,
                 "ingress.cloud binds a VM's port on the daemon, and this deployment \
@@ -5166,6 +5253,9 @@ impl DeploymentSpec {
         if IngressSpec::wants_cloud(self.ingress.as_ref()) && self.vm.is_none() {
             return Err(SpecError::IngressWithoutVm);
         }
+        if let Some(placement) = &self.placement {
+            placement.validate()?;
+        }
         // No routes means no ingress. For a *managed* deployment that is a
         // legitimate shape — an agent sandbox reached only through `exec` and
         // `shell`, never over HTTP — and it is the common one at fleet scale,
@@ -5781,6 +5871,42 @@ mod tests {
         }
     }
 
+    /// `placement` names the fleet host a deployment runs on. Only `pinned`
+    /// is accepted until the placement controller exists.
+    mod placement {
+        use super::*;
+
+        #[test]
+        fn pinned_needs_a_home_and_spread_waits_for_the_controller() {
+            let mut s = spec();
+            s.placement = Some(Placement::pinned("us5"));
+            assert!(s.validate().is_ok());
+            assert!(s.placement.as_ref().unwrap().includes("us5"));
+            assert!(!s.placement.as_ref().unwrap().includes("us4"));
+
+            for bad in [
+                serde_json::json!({"mode": "pinned"}),
+                serde_json::json!({"mode": "pinned", "home": "us 5"}),
+                serde_json::json!({"mode": "pinned", "home": "us5", "hosts": ["us4"]}),
+                serde_json::json!({"mode": "spread"}),
+            ] {
+                s.placement = Some(serde_json::from_value(bad.clone()).unwrap());
+                assert!(matches!(s.validate(), Err(SpecError::InvalidPlacement(_))), "{bad}");
+            }
+        }
+
+        #[test]
+        fn it_is_off_the_wire_unless_set_and_round_trips() {
+            let mut s = spec();
+            assert!(serde_json::to_value(&s).unwrap().get("placement").is_none());
+            s.placement = Some(Placement::pinned("us5"));
+            let v = serde_json::to_value(&s).unwrap();
+            assert_eq!(v["placement"], serde_json::json!({"mode": "pinned", "home": "us5"}));
+            let back: DeploymentSpec = serde_json::from_value(v).unwrap();
+            assert_eq!(back.placement, s.placement);
+        }
+    }
+
     /// `ingress.cloud` is a bind on a VM port, so only a managed deployment
     /// may ask for it; it is off the wire unless set, and public by default.
     mod cloud_ingress {
@@ -5974,6 +6100,7 @@ mod tests {
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,
@@ -6053,6 +6180,7 @@ mod tests {
     /// A static (proxy_pass) deployment: `upstreams` set, no `vm`.
     fn static_spec(upstreams: &[&str]) -> DeploymentSpec {
         DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,

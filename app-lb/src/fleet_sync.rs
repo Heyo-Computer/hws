@@ -49,8 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The key a [`Document`] is filed under: a document is a kind with one record.
-pub const DOC_KEY: &str = "document";
+pub use crate::fleet_store::DOC_KEY;
 
 /// Leases: who renews certificates, sweeps expired tokens and collects
 /// tombstones, fleet-wide.
@@ -67,10 +66,6 @@ const FEED_POLL: Duration = Duration::from_secs(1);
 const FEED_BATCH: usize = 500;
 const LISTEN_RETRY: Duration = Duration::from_secs(10);
 const TOMBSTONE_EVERY: Duration = Duration::from_secs(3600);
-
-const SEAL_MAGIC: &[u8] = b"applb-sealed-v1\0";
-const NONCE_LEN: usize = 12;
-const TAG_LEN: usize = 16;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -459,51 +454,11 @@ impl Fleet {
     // -- sealing --
 
     fn seal(&self, kind: &str, key: &str, plaintext: &[u8]) -> io::Result<Vec<u8>> {
-        use openssl::symm::{Cipher, encrypt_aead};
-        let mut nonce = [0u8; NONCE_LEN];
-        openssl::rand::rand_bytes(&mut nonce).map_err(io::Error::other)?;
-        let mut tag = [0u8; TAG_LEN];
-        let aad = format!("{kind}/{key}");
-        let ct = encrypt_aead(
-            Cipher::aes_256_gcm(),
-            &self.seal_key,
-            Some(&nonce),
-            aad.as_bytes(),
-            plaintext,
-            &mut tag,
-        )
-        .map_err(|e| io::Error::other(format!("seal failed: {e}")))?;
-        let mut out = Vec::with_capacity(SEAL_MAGIC.len() + NONCE_LEN + TAG_LEN + ct.len());
-        out.extend_from_slice(SEAL_MAGIC);
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&tag);
-        out.extend_from_slice(&ct);
-        Ok(out)
+        crate::fleet_seal::seal(&self.seal_key, kind, key, plaintext)
     }
 
     fn unseal(&self, kind: &str, key: &str, sealed: &[u8]) -> io::Result<Vec<u8>> {
-        use openssl::symm::{Cipher, decrypt_aead};
-        let rest = sealed.strip_prefix(SEAL_MAGIC).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{kind}/{key} is not sealed"),
-            )
-        })?;
-        if rest.len() < NONCE_LEN + TAG_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{kind}/{key} is truncated"),
-            ));
-        }
-        let (nonce, rest) = rest.split_at(NONCE_LEN);
-        let (tag, ct) = rest.split_at(TAG_LEN);
-        let aad = format!("{kind}/{key}");
-        decrypt_aead(Cipher::aes_256_gcm(), &self.seal_key, Some(nonce), aad.as_bytes(), ct, tag).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{kind}/{key} does not open with this APP_LB_SECRET_KEY; every fleet host needs the same one"),
-            )
-        })
+        crate::fleet_seal::unseal(&self.seal_key, kind, key, sealed)
     }
 
     fn sealed_for_store(
@@ -716,7 +671,8 @@ impl Fleet {
             (None, None) => {
                 let writes = self.seed_writes()?;
                 seeded = writes.len();
-                if self.pg.seed(writes).map_err(|e| e.to_string())? {
+                let kinds = lock(&self.kinds).keys().cloned().collect();
+                if self.pg.seed(writes, kinds).map_err(|e| e.to_string())? {
                     tracing::info!(
                         records = seeded,
                         "seeded the empty fleet store with this host's records"
@@ -728,6 +684,35 @@ impl Fleet {
                 self.pg.snapshot().map_err(|e| e.to_string())?
             }
             _ => snapshot,
+        };
+
+        // Kinds this binary keeps that the fleet has never been seeded with
+        // (added by a newer app-lb than the one that seeded it) are seeded
+        // from this host's own records, not replaced by an empty set.
+        let unseeded: Vec<String> = lock(&self.kinds)
+            .keys()
+            .filter(|k| !snapshot.kinds.contains(*k))
+            .cloned()
+            .collect();
+        let snapshot = if unseeded.is_empty() {
+            snapshot
+        } else {
+            for kind in &unseeded {
+                let records = self.seed_records(kind)?;
+                match self
+                    .pg
+                    .seed_kind(kind, records)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(n) => tracing::info!(
+                        kind,
+                        records = n,
+                        "seeded a kind new to the fleet store from this host"
+                    ),
+                    None => tracing::info!(kind, "another host seeded this kind first"),
+                }
+            }
+            self.pg.snapshot().map_err(|e| e.to_string())?
         };
 
         if previous.is_none() && seeded == 0 {
@@ -748,6 +733,28 @@ impl Fleet {
         } else {
             Started::Synced { records, cursor }
         })
+    }
+
+    /// One kind's records as this host would seed them: read from its
+    /// files (or its seed source) and sealed where the kind is.
+    fn seed_records(&self, kind: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let k = self
+            .kind(kind)
+            .ok_or_else(|| format!("unknown kind {kind}"))?;
+        let records = match &k.seed {
+            Some(seed) => seed(),
+            None => k.cache.records(),
+        }
+        .map_err(|e| format!("could not read this host's {kind} to seed the fleet store: {e}"))?;
+        records
+            .into_iter()
+            .map(|(key, body)| {
+                let body = self
+                    .sealed_for_store(&k, kind, &key, &body)
+                    .map_err(|e| e.to_string())?;
+                Ok((key, body))
+            })
+            .collect()
     }
 
     fn seed_writes(&self) -> Result<Vec<Write>, String> {
@@ -979,6 +986,9 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
 /// a single server, so the files are the same either way.
 pub struct FleetStores {
     pub fleet: Arc<Fleet>,
+    /// This host's fleet name (`APP_LB_FLEET_HOST`): what a deployment's
+    /// `placement.home` names.
+    pub host: String,
     pub deployments: Arc<FleetCollection>,
     pub namespaces: Arc<FleetCollection>,
     pub workflows: Arc<FleetCollection>,
@@ -992,10 +1002,18 @@ pub struct FleetStores {
     pub acme_backoff: Arc<FleetDocument>,
     pub cert_chains: Arc<FleetCollection>,
     pub cert_keys: Arc<FleetCollection>,
+    /// The data-plane session signing key (`APP_LB_AUTH_KEY`), so a sign-in
+    /// on one host is a sign-in on every host. Sealed.
+    pub auth_key: Arc<FleetDocument>,
 }
 
 impl FleetStores {
-    pub fn register(fleet: &Arc<Fleet>, layout: &crate::fleet_store::Layout) -> Self {
+    pub fn register(
+        fleet: &Arc<Fleet>,
+        layout: &crate::fleet_store::Layout,
+        host: &str,
+        auth_key_path: &Path,
+    ) -> Self {
         let plain = KindOptions::default();
         let acme = KindOptions {
             sealed: false,
@@ -1081,6 +1099,15 @@ impl FleetStores {
                 FileCollection::new(&certs, ".key.pem", private_dir),
                 acme_sealed,
             ),
+            auth_key: fleet.document(
+                "auth-key",
+                FileDocument::new(auth_key_path, FileOptions::PRIVATE),
+                KindOptions {
+                    sealed: true,
+                    fence: None,
+                },
+            ),
+            host: host.to_string(),
             fleet: fleet.clone(),
         }
     }
@@ -1446,7 +1473,7 @@ mod tests {
         assert_eq!(a.start().unwrap(), Started::Seeded { records: 2 });
         // Sealed in the database, plain in the file.
         let (stored, _) = pg_a.get("acme-account", DOC_KEY).unwrap().unwrap();
-        assert!(stored.starts_with(SEAL_MAGIC));
+        assert!(stored.starts_with(crate::fleet_seal::MAGIC));
         assert_eq!(a_account.read().unwrap().unwrap().0, b"secret-account");
 
         let b_dir = Dir::new("b");
@@ -1555,6 +1582,32 @@ mod tests {
         let empty = Dir::new("cold");
         let (cold, _, _) = host(dead(), &empty);
         assert!(cold.start().is_err(), "no snapshot and no database: refuse");
+    }
+
+    #[test]
+    fn a_kind_added_after_seeding_is_seeded_from_the_host_not_wiped() {
+        let pg = pg_or_skip!("newkind", "host-a");
+        let dir = Dir::new("nk");
+        let (a, _, _) = host(pg.clone(), &dir);
+        a.start().unwrap();
+        // The next binary keeps a new kind, and this host has a record of it.
+        std::fs::write(dir.0.join("app-lb-auth-key"), [5u8; 32]).unwrap();
+        let (again, _, _) = host(pg.clone(), &dir);
+        let key = again.document(
+            "auth-key",
+            FileDocument::new(dir.0.join("app-lb-auth-key"), FileOptions::PRIVATE),
+            KindOptions {
+                sealed: true,
+                fence: None,
+            },
+        );
+        again.start().unwrap();
+        assert_eq!(key.read().unwrap().unwrap().0, [5u8; 32], "kept, not wiped");
+        let (stored, _) = pg.get("auth-key", DOC_KEY).unwrap().unwrap();
+        assert!(
+            stored.starts_with(crate::fleet_seal::MAGIC),
+            "and sealed into the fleet"
+        );
     }
 
     #[test]

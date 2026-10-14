@@ -1138,6 +1138,9 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
             format!("vm (managed {driver} pool)")
         },
     );
+    if let Some(placement) = &d.spec.placement {
+        output::top_field("Placement", placement.summary());
+    }
 
     output::section("Routes");
     if d.spec.routes.is_empty() {

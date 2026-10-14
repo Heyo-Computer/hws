@@ -146,7 +146,15 @@ pub struct Snapshot {
     pub records: Vec<(String, String, Vec<u8>, Revision)>,
     /// Whether some host has already seeded this database.
     pub seeded: Option<String>,
+    /// The kinds of record the fleet has been seeded with. A kind a newer
+    /// app-lb adds is missing here until a host seeds it from its own files
+    /// ([`PgStore::seed_kind`]), rather than having those files replaced by
+    /// the nothing the fleet holds.
+    pub kinds: std::collections::BTreeSet<String>,
 }
+
+/// A live record with its last writer: `(key, body, revision, updated_by)`.
+pub type Written = (String, Vec<u8>, Revision, String);
 
 /// Why a call failed.
 #[derive(Debug)]
@@ -497,6 +505,24 @@ impl PgStore {
         })
     }
 
+    /// Every live record of `kind` with its last writer, for a writer that
+    /// must tell its own records from everyone else's (the importer).
+    #[allow(dead_code)]
+    pub fn list_records(&self, kind: &str) -> Result<Vec<Written>, PgFailure> {
+        let sql = self.sql(
+            "SELECT key, body, revision, updated_by FROM {s}.records WHERE kind = $1 AND body IS NOT NULL",
+        );
+        let kind = kind.to_string();
+        self.call_blocking(move |pool| async move {
+            let c = pool.get().await.map_err(pool_failure)?;
+            let rows = c.query(&sql, &[&kind]).await.map_err(classify)?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get::<_, i64>(2) as Revision, r.get(3)))
+                .collect())
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn list(&self, kind: &str) -> Result<Vec<(String, Vec<u8>, Revision)>, PgFailure> {
         let (sql, kind) = (self.sql(LIST), kind.to_string());
@@ -618,10 +644,31 @@ impl PgStore {
                 .await
                 .map_err(classify)?
                 .map(|r| r.get(0));
+            let mut kinds: std::collections::BTreeSet<String> = tx
+                .query(
+                    &format!("SELECT substr(name, 6) FROM {schema}.meta WHERE name LIKE 'kind:%'"),
+                    &[],
+                )
+                .await
+                .map_err(classify)?
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            // A kind with any row, live or deleted, has been written to, so
+            // seeded in effect — which also covers a store seeded before
+            // kinds were recorded.
+            kinds.extend(
+                tx.query(&format!("SELECT DISTINCT kind FROM {schema}.records"), &[])
+                    .await
+                    .map_err(classify)?
+                    .iter()
+                    .map(|r| r.get::<_, String>(0)),
+            );
             tx.commit().await.map_err(classify)?;
             Ok(Snapshot {
                 cursor: cursor as Revision,
                 records,
+                kinds,
                 seeded,
             })
         })
@@ -630,7 +677,7 @@ impl PgStore {
     /// Write a host's records into a database nobody has seeded yet, and mark
     /// it seeded, in one transaction. `Ok(false)` when another host got there
     /// first, in which case nothing was written.
-    pub fn seed(&self, writes: Vec<Write>) -> Result<bool, PgFailure> {
+    pub fn seed(&self, writes: Vec<Write>, kinds: Vec<String>) -> Result<bool, PgFailure> {
         let ctx = WriteCtx::new(self);
         let schema = self.schema.clone();
         self.call_blocking(move |pool| async move {
@@ -655,8 +702,70 @@ impl PgStore {
             for w in &writes {
                 ctx.apply(&tx, w).await?;
             }
+            for kind in &kinds {
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {schema}.meta (name, value) VALUES ('kind:' || $1, $2)
+                         ON CONFLICT (name) DO NOTHING"
+                    ),
+                    &[kind, &ctx.host],
+                )
+                .await
+                .map_err(classify)?;
+            }
             tx.commit().await.map_err(classify)?;
             Ok(true)
+        })
+    }
+
+    /// Seed one kind the fleet has never held, from this host's records:
+    /// each is inserted only where the fleet has no row for its key at all,
+    /// live or deleted, so nothing is overwritten or resurrected. `None`
+    /// when another host seeded the kind first.
+    pub fn seed_kind(
+        &self,
+        kind: &str,
+        records: Vec<(String, Vec<u8>)>,
+    ) -> Result<Option<usize>, PgFailure> {
+        let schema = self.schema.clone();
+        let host = self.host.clone();
+        let kind = kind.to_string();
+        self.call_blocking(move |pool| async move {
+            let mut c = pool.get().await.map_err(pool_failure)?;
+            let tx = c.transaction().await.map_err(classify)?;
+            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&WRITE_LOCK])
+                .await
+                .map_err(classify)?;
+            let claimed = tx
+                .query_opt(
+                    &format!(
+                        "INSERT INTO {schema}.meta (name, value) VALUES ('kind:' || $1, $2)
+                         ON CONFLICT (name) DO NOTHING RETURNING name"
+                    ),
+                    &[&kind, &host],
+                )
+                .await
+                .map_err(classify)?;
+            if claimed.is_none() {
+                return Ok(None);
+            }
+            let mut inserted = 0;
+            for (key, body) in &records {
+                let row = tx
+                    .query_opt(
+                        &format!(
+                            "INSERT INTO {schema}.records (kind, key, body, revision, updated_by)
+                             VALUES ($1, $2, $3, nextval('{schema}.revision'), $4)
+                             ON CONFLICT (kind, key) DO NOTHING RETURNING revision"
+                        ),
+                        &[&kind, key, body, &host],
+                    )
+                    .await
+                    .map_err(classify)?;
+                inserted += usize::from(row.is_some());
+            }
+            tx.commit().await.map_err(classify)?;
+            Ok(Some(inserted))
         })
     }
 
@@ -1102,13 +1211,40 @@ pub(crate) mod tests {
             body: b"x".to_vec(),
             expect: Expect::Absent,
         };
-        assert!(s.seed(vec![write("a")]).unwrap());
+        assert!(s.seed(vec![write("a")], vec!["ns".into()]).unwrap());
         let other = peer(&s, "host-b");
-        assert!(!other.seed(vec![write("b")]).unwrap(), "already seeded");
+        assert!(
+            !other.seed(vec![write("b")], vec!["ns".into()]).unwrap(),
+            "already seeded"
+        );
         let snap = other.snapshot().unwrap();
         assert_eq!(snap.seeded.as_deref(), Some("host-a"));
         assert_eq!(snap.records.len(), 1);
         assert_eq!(snap.cursor, snap.records[0].3);
+        assert_eq!(snap.kinds.iter().collect::<Vec<_>>(), ["ns"]);
+
+        // A kind added later: seeded once, inserting only keys the fleet has
+        // never had a row for.
+        s.delete("ns", "a", Expect::Any, None).unwrap();
+        s.put("later", "kept", b"fleet's", Expect::Any, None)
+            .unwrap();
+        let mine = vec![
+            ("kept".to_string(), b"mine".to_vec()),
+            ("new".to_string(), b"n".to_vec()),
+        ];
+        assert_eq!(s.seed_kind("later", mine.clone()).unwrap(), Some(1));
+        assert_eq!(s.get("later", "kept").unwrap().unwrap().0, b"fleet's");
+        assert_eq!(s.seed_kind("later", mine).unwrap(), None, "seeded once");
+        assert_eq!(
+            s.seed_kind("ns", vec![("a".into(), b"back".to_vec())])
+                .unwrap(),
+            None,
+            "a seeded kind is never re-seeded"
+        );
+        assert!(
+            s.get("ns", "a").unwrap().is_none(),
+            "and a deleted record stays deleted"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

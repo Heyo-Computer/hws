@@ -490,6 +490,7 @@ mod tests {
 
     fn deployment(scaling: ScalingPolicy) -> Arc<Deployment> {
         Arc::new(Deployment::new(DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,

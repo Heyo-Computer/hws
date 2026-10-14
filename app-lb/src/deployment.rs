@@ -744,6 +744,7 @@ mod tests {
 
     fn deployment(scaling: ScalingPolicy) -> Deployment {
         Deployment::new(DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,
@@ -796,6 +797,7 @@ mod tests {
     /// A static (proxy_pass) deployment with the given upstreams.
     fn static_deployment(upstreams: &[&str]) -> Deployment {
         Deployment::new(DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,

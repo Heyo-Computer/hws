@@ -2599,6 +2599,7 @@ mod tests {
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,
@@ -2651,6 +2652,7 @@ mod tests {
     /// A static (proxy_pass) deployment with fixed upstreams.
     fn static_spec() -> DeploymentSpec {
         DeploymentSpec {
+            placement: None,
             ingress: None,
             account_id: None,
             user_id: None,
