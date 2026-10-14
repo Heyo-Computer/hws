@@ -147,6 +147,31 @@ fn is_worker_for(pid: i32, dir: &Path) -> bool {
         && args.contains(&dir.as_os_str().as_encoded_bytes())
 }
 
+/// The pid of a forwarding worker still serving from `dir`, left by the last
+/// manager. The next manager takes its listeners over rather than binding
+/// them, so it must not treat them as taken.
+pub fn live_worker(dir: &Path) -> Option<i32> {
+    let record: WorkerRecord =
+        serde_json::from_slice(&std::fs::read(dir.join("worker.json")).ok()?).ok()?;
+    (alive(record) && is_worker_for(record.pid, dir)).then_some(record.pid)
+}
+
+/// The worker's log, in the control directory. Not the manager's stdout: a
+/// supervisor closes that pipe when the manager it ran exits, and a worker
+/// that outlives its manager would go on logging into nothing.
+const LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+
+fn worker_log(dir: &Path) -> std::io::Result<std::fs::File> {
+    let path = dir.join("worker.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_ROTATE_BYTES) {
+        let _ = std::fs::rename(&path, dir.join("worker.log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 /// Fires once per worker process when it exits, so a request's admission
 /// state is released when the worker that held it is gone.
 #[derive(Default)]
@@ -234,9 +259,10 @@ impl Supervisor {
     }
 
     fn inherited(&self) -> Option<WorkerRecord> {
+        let pid = live_worker(&self.dir)?;
         let record: WorkerRecord =
             serde_json::from_slice(&std::fs::read(self.record_path()).ok()?).ok()?;
-        (alive(record) && is_worker_for(record.pid, &self.dir)).then_some(record)
+        (record.pid == pid).then_some(record)
     }
 
     fn write_record(&self, record: WorkerRecord) {
@@ -260,6 +286,12 @@ impl Supervisor {
         }
         let handoff = handoff_enabled();
         command.kill_on_drop(!handoff);
+        if handoff {
+            let log = worker_log(&self.dir).map_err(|e| format!("worker log: {e}"))?;
+            command
+                .stdout(log.try_clone().map_err(|e| e.to_string())?)
+                .stderr(log);
+        }
         #[cfg(target_os = "linux")]
         unsafe {
             let parent = libc::getpid();

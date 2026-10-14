@@ -500,9 +500,20 @@ fn main() {
     // answering, and the supervisor reporting a healthy service. Checking here
     // turns that silent half-dead state into a startup failure naming the port
     // and the reason.
+    // Unless the last manager's forwarding worker is still serving them: this
+    // manager takes those listeners over (see `worker`), so they are meant to
+    // be taken.
+    let worker_dir = std::env::var_os("APP_LB_WORKER_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| worker::worker_dir(&cfg.state_path));
+    let inherited_worker = worker::live_worker(&worker_dir);
+    if let Some(pid) = inherited_worker {
+        tracing::info!(worker_pid = pid, "the last manager's forwarding worker holds the listeners; taking it over");
+    }
     for addr in [Some(&cfg.proxy_addr), cfg.tls_enabled().then_some(&cfg.tls_addr)]
         .into_iter()
         .flatten()
+        .filter(|_| inherited_worker.is_none())
     {
         if let Err(e) = std::net::TcpListener::bind(addr) {
             let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -1364,9 +1375,7 @@ fn main() {
         certs,
         proxy_addr: cfg.proxy_addr.clone(),
         tls_addr: cfg.tls_enabled().then(|| cfg.tls_addr.clone()),
-        dir: std::env::var_os("APP_LB_WORKER_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| worker::worker_dir(&cfg.state_path)),
+        dir: worker_dir,
     });
 
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");
