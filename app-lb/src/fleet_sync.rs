@@ -545,6 +545,17 @@ impl Fleet {
             note(WriteFailure::Unavailable(reason.clone()));
             return Err(StoreError::Io(io::Error::other(Unavailable(reason))));
         }
+        // Known to be down: fail now rather than make the caller (a sign-in
+        // on the data plane, say) wait out the timeout. The feed's next poll
+        // is what notices the store is back.
+        if !self.pg.available() {
+            let reason = self
+                .pg
+                .last_error()
+                .unwrap_or_else(|| "not reached yet".into());
+            note(WriteFailure::Unavailable(reason.clone()));
+            return Err(StoreError::Io(io::Error::other(Unavailable(reason))));
+        }
         // `Any` means "whatever this host last saw", so a write based on a
         // view another host has since changed is refused, not merged.
         let expect = match expect {
