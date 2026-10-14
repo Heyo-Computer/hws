@@ -378,7 +378,7 @@ A pure refactor: no database, no on-disk change, no behaviour change. Single-ser
 
 **Moved to the phases that first use them**
 - The `StoredDeployment` fleet/host split moves to phase 2. Its only consumer is `PgStore`, and splitting the file now would change the on-disk format for nothing.
-- The `placement` spec field moves to phase 3, where the importer first marks deployments pinned. Adding it earlier would publish an API field that does nothing.
+- The `placement` spec field moves to phase 3, where the importer first marks deployments pinned. Adding it earlier would publish an API field that does nothing. (Done in phase 3.)
 - `transaction` and `changes_since` move to phase 2 with `PgStore`.
 
 **`app-lb-fleet-import`** (`src/bin/`, its own binary)
@@ -453,13 +453,46 @@ Found along the way, and outside the fleet store: `pg-fc/Dockerfile.pg18` lacked
 
 ### Phase 3: shadow us5
 
-- us4 follows us5's tenant state one way, read-only. Credentials converge on us5's values, delivered through HeyoSecret.
-- The importer runs on us5 as a read-only process. It reads us5's state directory, never writes it, never starts app-lb, and pushes into us4's fleet database over TLS.
-- The `placement` spec field arrives here, modelled in `heyctl/src/types.rs` with the wire goldens updated. Existing deployments default to `pinned` on their current host.
-- Every us5 deployment arrives `pinned` to us5, so us4's placement target for it is zero and us4 creates nothing.
-- Gate, on us4 with test hostnames (`--resolve`, no DNS change):
-  - a us5 namespace token, secret and sign-in cookie work on us4's admin API, dashboard and data plane;
-  - us4 forwards one request for a us5 app to us5's ingress as a plain static upstream.
+us4 holds a one-way, read-only copy of us5's tenant state, and runs, routes and certifies nothing for it.
+
+**`placement`** (the spec field from § 4)
+- `{"mode": "pinned", "home": "<host>"}`. `spread` is refused until the placement controller exists (phase 6).
+- Modelled in `heyctl/src/types.rs` (`heyctl describe` prints it), the checked-in schema, the MCP server's advertised schema, and a wire golden.
+- A single server accepts it and ignores it. In fleet mode, a host's name is `APP_LB_FLEET_HOST`.
+
+**A deployment placed on another host**
+- It is kept in a separate *foreign* view in the registry, never in the map the autoscaler, adoption, proxy routing and ACME read. So a shadow host cannot boot, adopt, route or certify another host's deployment by construction, rather than by a check in each of those places.
+- It is never this host's to delete, by persisting or by forgetting.
+- The admin API refuses to register one placed elsewhere, or to reuse a foreign id (409): it is registered on its home host.
+- Live apply: the feed now reloads deployments. Foreign ones are replaced as they arrive. A change to one of this host's *own* deployments made by another writer is logged and applied at the next start; applying it live needs the admin path's care with pools and rollouts, and only phase 5 has a second writer of local deployments.
+
+**The session signing key is fleet state** (kind `auth-key`, sealed). A sign-in on one host is then a sign-in on all of them. The local key file is its snapshot, and a host offers a key it generated to a fleet that has none. This changes phase 1's "left as a host file".
+
+**Credentials move as ciphertext, not through HeyoSecret.** us5 has no `APP_LB_SECRET_KEY` (its secrets are plaintext at rest), and anything relayed through an operator's session is recorded. So:
+- The fleet key is us4's. us5 adopts it in phase 5.
+- us5's values are carried *to* the fleet encrypted to a key only the fleet host holds. That is the importer below.
+
+**`app-lb-fleet-import`**
+- **`--export`** runs on us5.
+  - It reads the state directory and writes one bundle, encrypted to us4's RSA public key (RSA-OAEP-SHA256 wrapping AES-256-GCM).
+  - It needs no fleet credential, never writes us5's state, and cannot start a server.
+  - An unreadable record stops the export rather than vanish from the bundle; otherwise apply would delete it.
+- **`--apply`** runs on us4.
+  - It decrypts the bundle with the private key, which never leaves us4.
+  - It writes into the fleet store in **one transaction**, as `import:us5`. Secrets are sealed in the secret store's own format, and the signing key in the fleet's.
+  - Records it wrote before that are gone at the source are deleted.
+  - The source's values win for tenant identity. For deployments, a fleet host's own record under the same id is kept and reported: each host's `app-lb-admin` admin route, for example.
+  - `--dry-run` reports counts only, and so does the real run. A repeat with nothing changed writes nothing.
+- **What is carried:** namespaces, auth providers, deployments (fleet half, pinned to the source), secrets, tokens, guard rules, the signing key.
+- **What is not carried:** plugin records, workflows, postgres ownership and ACME state. Carrying them would have us4 act on us5's behalf: run its CI, provision on its pg-fc, renew its certificates.
+- Shadowing is a re-run of export then apply, not a long-running process on us5. Phase 5 makes us5 a fleet member that writes directly.
+
+**Gate, on us4** (test hostnames via `--resolve`, no DNS change):
+- a us5 app token answers on us4's admin API;
+- us5's secrets are readable on us4, sealed in the store;
+- the signing key is us5's, so a us5 session cookie verifies on us4;
+- us4 creates no VM, route or certificate for any us5 deployment;
+- us4 forwards one request for a us5 app to us5's ingress through a plain static upstream.
 
 ### Phase 4: restarts that drop nothing
 
