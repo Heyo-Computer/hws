@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 pub struct Ctx {
     request: Option<RemoteRequest>,
+    /// The request as first read, kept so it can be begun again if the
+    /// manager that began it is replaced before it is forwarded.
+    head: Option<crate::request_control::RequestHead>,
     /// When the request entered the proxy, for latency. Set in `request_filter`
     /// so the measured span covers cold-start waits too, and `None` before then
     /// so a request rejected pre-routing simply isn't timed.
@@ -39,6 +42,28 @@ pub struct LbProxy {
 impl LbProxy {
     pub fn new(control: Client) -> Self {
         Self { control }
+    }
+
+    /// The manager that began this request has gone (a restart) before the
+    /// request was forwarded: begin it again with the next one. Refused when
+    /// that manager still answers — then the failure is its, and is handled
+    /// as before — or when the next manager would not simply proxy it.
+    async fn begin_again(&self, ctx: &mut Ctx) -> std::result::Result<(), String> {
+        let manager = ctx.request.as_ref().and_then(RemoteRequest::manager);
+        if manager.is_none() || crate::worker::current_manager().await == manager {
+            return Err("the manager that began this request still answers".into());
+        }
+        let head = ctx.head.clone().ok_or("the request head was not kept")?;
+        match self.control.begin(head).await {
+            Ok((request, RemoteDecision::Proxy)) => {
+                tracing::info!("began a request again with the manager that replaced the one that began it");
+                ctx.request = Some(request);
+                Ok(())
+            }
+            Ok(_) => Err("the next manager decided this request differently".into()),
+            Err(crate::worker_rpc::BeginError::Control(e) | crate::worker_rpc::BeginError::Unavailable(e)) => Err(e),
+            Err(crate::worker_rpc::BeginError::HeadersTooLarge) => Err("request headers exceed the control transport".into()),
+        }
     }
 }
 
@@ -68,6 +93,19 @@ fn http_peer(selected: crate::request_control::Peer) -> HttpPeer {
         user_timeout: UPSTREAM_USER_TIMEOUT,
     });
     peer
+}
+
+/// 503 with `Retry-After`: no manager answered while app-lb restarted.
+async fn write_unavailable(session: &mut Session) -> Result<()> {
+    let message = "app-lb is restarting; retry shortly\n";
+    let mut header = ResponseHeader::build(503, Some(3))?;
+    header.insert_header(http::header::CONTENT_LENGTH, message.len().to_string())?;
+    header.insert_header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")?;
+    header.insert_header(http::header::RETRY_AFTER, "1")?;
+    session.write_response_header(Box::new(header), false).await?;
+    session
+        .write_response_body(Some(bytes::Bytes::copy_from_slice(message.as_bytes())), true)
+        .await
 }
 
 async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<()> {
@@ -290,6 +328,7 @@ impl ProxyHttp for LbProxy {
             peer: session.client_addr().and_then(|a| a.as_inet().map(|a| *a)),
             tls_terminated: session.digest().is_some_and(|d| d.ssl_digest.is_some()),
         };
+        ctx.head = Some(head.clone());
         let (request, mut decision) = match self.control.begin(head).await {
             Ok(result) => result,
             Err(crate::worker_rpc::BeginError::HeadersTooLarge) => {
@@ -297,6 +336,13 @@ impl ProxyHttp for LbProxy {
                 return Ok(true);
             }
             Err(crate::worker_rpc::BeginError::Control(error)) => crate::worker::control_lost(&error),
+            // No manager within the wait: app-lb is restarting, or stopped.
+            // Say so and let the client retry, rather than drop it.
+            Err(crate::worker_rpc::BeginError::Unavailable(error)) => {
+                tracing::warn!(%error, "no manager answered within the wait; answering 503");
+                write_unavailable(session).await?;
+                return Ok(true);
+            }
         };
         ctx.request = Some(request);
         if matches!(decision, RemoteDecision::ReadLoginBody) {
@@ -343,8 +389,23 @@ impl ProxyHttp for LbProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         let request = ctx.request.as_mut().expect("request admitted");
-        let modifications = request.forwarding_modifications(&upstream.uri).await
-            .map_err(|error| control_error(request, error))?;
+        let modifications = match request.forwarding_modifications(&upstream.uri).await {
+            Ok(m) => m,
+            // The link dropped, not an answer: if a restart took the manager,
+            // begin again with the next one and ask it.
+            Err(error) if !request.connected() && self.begin_again(ctx).await.is_ok() => {
+                let request = ctx.request.as_mut().expect("begun again");
+                let again = async {
+                    request.next_peer().await?;
+                    request.forwarding_modifications(&upstream.uri).await
+                };
+                match again.await {
+                    Ok(m) => m,
+                    Err(_) => return Err(control_error(ctx.request.as_ref().expect("begun again"), error)),
+                }
+            }
+            Err(error) => return Err(control_error(ctx.request.as_ref().expect("request admitted"), error)),
+        };
         for modification in modifications {
             match modification {
                 crate::request_control::HeaderModification::Remove(name) => {
@@ -369,8 +430,16 @@ impl ProxyHttp for LbProxy {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let request = ctx.request.as_mut().expect("request admitted");
-        let selected = request.next_peer().await
-            .map_err(|error| control_error(request, error))?;
+        let selected = match request.next_peer().await {
+            Ok(selected) => selected,
+            // The link dropped, not an answer: if a restart took the manager,
+            // begin again with the next one and ask it.
+            Err(_) if !request.connected() && self.begin_again(ctx).await.is_ok() => {
+                let request = ctx.request.as_mut().expect("begun again");
+                request.next_peer().await.map_err(|e| control_error(request, e))?
+            }
+            Err(error) => return Err(control_error(ctx.request.as_ref().expect("request admitted"), error)),
+        };
         let mut peer = http_peer(selected.peer);
         // Pingora 0.9 otherwise strips this authenticated PostgreSQL tunnel's
         // handshake as a non-WebSocket upgrade. Keep the default sanitization
@@ -435,14 +504,14 @@ impl ProxyHttp for LbProxy {
                 error: e.map(ToString::to_string),
             };
             if let Err(error) = request.complete(completion).await {
-                crate::worker::control_lost(&error);
+                crate::worker::control_interrupted(request.manager(), &error);
             }
         }
     }
 }
 
 fn control_error(request: &RemoteRequest, error: String) -> Box<Error> {
-    if !request.connected() { crate::worker::control_lost(&error); }
+    if !request.connected() { crate::worker::control_interrupted(request.manager(), &error); }
     Error::explain(ErrorType::ConnectProxyFailure, error)
 }
 
