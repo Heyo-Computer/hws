@@ -27,6 +27,8 @@ mod dns;
 mod federated;
 mod fleet;
 mod fleet_store;
+mod fleet_pg;
+mod fleet_sync;
 #[cfg(test)]
 mod fleet_store_layout_tests;
 mod feed;
@@ -292,6 +294,73 @@ fn config_from_env() -> LbConfig {
 /// The `EnvFilter` sits in front of both, so `RUST_LOG` still decides what app-lb
 /// logs *at all* and shipping only ever sees a subset of that. The layer applies
 /// its own INFO floor on top — see `obs::EventLayer`.
+/// `APP_LB_SECRET_KEY`, derived, when set.
+fn secret_key_from_env() -> Option<Vec<u8>> {
+    std::env::var("APP_LB_SECRET_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .map(|k| secrets::derive_key(&k))
+}
+
+/// With `APP_LB_FLEET_DATABASE_URL` set: open the fleet store, register every
+/// store's backend with it, and bring the files in line with it. Exits rather
+/// than start a host that would serve state it cannot vouch for.
+fn fleet_mode(cfg: &LbConfig) -> Option<fleet_sync::FleetStores> {
+    let url = std::env::var(fleet_pg::URL_ENV).ok().filter(|u| !u.trim().is_empty())?;
+    let Some(key) = secret_key_from_env() else {
+        tracing::error!(
+            "{} needs APP_LB_SECRET_KEY: secrets and certificate keys are sealed with it in the \
+             fleet store, and every host in the fleet must have the same one",
+            fleet_pg::URL_ENV
+        );
+        std::process::exit(1);
+    };
+    // Who writes, in `updated_by` and on leases: the host, and this process,
+    // so a restarted app-lb is a new holder that cannot renew its
+    // predecessor's lease.
+    let host = std::env::var("APP_LB_FLEET_HOST")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|h| h.trim().to_string()))
+        .unwrap_or_else(|| "app-lb".into());
+    let holder = format!("{host}/{}", std::process::id());
+    let pg = match fleet_pg::PgStore::open(&url, &holder, fleet_pg::timeout_from_env()) {
+        Ok(pg) => pg,
+        Err(e) => {
+            tracing::error!(error = %e, "refusing to start");
+            std::process::exit(1);
+        }
+    };
+    let fleet = fleet_sync::Fleet::new(pg, fleet_sync::snapshot_meta_path(&cfg.state_path), key);
+    let layout = fleet_store::Layout {
+        state_path: cfg.state_path.clone().into(),
+        secrets_path: cfg.secrets_path.clone().into(),
+        tokens_path: cfg.tokens_path.clone().into(),
+        guard_path: cfg.guard_path.clone().into(),
+        acme_dir: cfg.acme_dir.clone().into(),
+    };
+    let stores = fleet_sync::FleetStores::register(&fleet, &layout);
+    match fleet.start() {
+        Ok(fleet_sync::Started::Seeded { records }) => {
+            tracing::info!(holder = %holder, records, "fleet mode: seeded the fleet store from this host")
+        }
+        Ok(fleet_sync::Started::Synced { records, cursor }) => {
+            tracing::info!(holder = %holder, records, cursor, "fleet mode: local snapshot matches the fleet store")
+        }
+        Ok(fleet_sync::Started::Offline { synced_at, error }) => tracing::warn!(
+            holder = %holder,
+            synced_at,
+            error = %error,
+            "fleet mode: the fleet store is not usable; serving the local snapshot and refusing mutations"
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "fleet mode: refusing to start");
+            std::process::exit(1);
+        }
+    }
+    Some(stores)
+}
+
 fn init_tracing(events: Option<obs::LogSink>) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -504,7 +573,14 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let registry = Arc::new(Registry::new(&cfg.state_path));
+    // Fleet mode: the stores below keep their files as the local snapshot of a
+    // shared PostgreSQL. Every kind is registered and synchronized here, before
+    // anything loads. See `fleet_sync`.
+    let fleet_stores = fleet_mode(&cfg);
+    let registry = Arc::new(match &fleet_stores {
+        Some(fs) => Registry::new(&cfg.state_path).with_fleet(fs.deployments.clone()),
+        None => Registry::new(&cfg.state_path),
+    });
     let _controller_lock = registry.controller_lock().unwrap_or_else(|e| {
         tracing::error!(error=%e,"cannot exclusively own deployment state; refusing controller startup");
         std::process::exit(1);
@@ -527,9 +603,11 @@ fn main() {
     // Beside the deployment state, derived the same way: `app-lb-state.json`
     // gives `app-lb-workflows.d/`. One directory per object kind keeps a
     // listing readable and a delete unambiguous.
-    let workflows = Arc::new(crate::workflows::WorkflowStore::new(
-        crate::workflows::workflow_dir(&cfg.state_path),
-    ));
+    let workflow_dir = crate::workflows::workflow_dir(&cfg.state_path);
+    let workflows = Arc::new(match &fleet_stores {
+        Some(fs) => crate::workflows::WorkflowStore::with_collection(workflow_dir, fs.workflows.clone()),
+        None => crate::workflows::WorkflowStore::new(workflow_dir),
+    });
     match workflows.load() {
         (0, 0) => tracing::info!(dir = %workflows.dir().display(), "no CI workflows"),
         (n, 0) => tracing::info!(count = n, "restored CI workflows"),
@@ -542,9 +620,11 @@ fn main() {
     }
     // Beside the others, same derivation: `app-lb-state.json` gives
     // `app-lb-namespaces.d/`.
-    let namespaces = Arc::new(crate::namespaces::NamespaceStore::new(
-        crate::namespaces::namespace_dir(&cfg.state_path),
-    ));
+    let namespace_dir = crate::namespaces::namespace_dir(&cfg.state_path);
+    let namespaces = Arc::new(match &fleet_stores {
+        Some(fs) => crate::namespaces::NamespaceStore::with_collection(namespace_dir, fs.namespaces.clone()),
+        None => crate::namespaces::NamespaceStore::new(namespace_dir),
+    });
     match namespaces.load() {
         (0, 0) => tracing::debug!(dir = %namespaces.dir().display(), "no declared namespaces"),
         (n, 0) => tracing::info!(count = n, "restored declared namespaces"),
@@ -558,7 +638,10 @@ fn main() {
     // Plugins: which built-in plugins run, and with what configuration, is an
     // object per plugin beside the other stores. The host is built once the
     // secret store exists, which plugins resolve their credentials through.
-    let plugin_store = plugins::PluginStore::new(plugins::plugin_dir(&cfg.state_path));
+    let plugin_store = match &fleet_stores {
+        Some(fs) => plugins::PluginStore::with_collection(plugins::plugin_dir(&cfg.state_path), fs.plugins.clone()),
+        None => plugins::PluginStore::new(plugins::plugin_dir(&cfg.state_path)),
+    };
     match plugin_store.load() {
         (0, 0) => tracing::debug!(dir = %plugin_store.dir().display(), "no plugin records"),
         (n, 0) => tracing::info!(count = n, "restored plugin records"),
@@ -569,9 +652,11 @@ fn main() {
             "restored plugin records; some were unreadable and were left on disk"
         ),
     }
-    let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
-        crate::auth_providers::auth_provider_dir(&cfg.state_path),
-    ));
+    let auth_provider_dir = crate::auth_providers::auth_provider_dir(&cfg.state_path);
+    let auth_providers = Arc::new(match &fleet_stores {
+        Some(fs) => crate::auth_providers::AuthProviderStore::with_collection(auth_provider_dir, fs.auth_providers.clone()),
+        None => crate::auth_providers::AuthProviderStore::new(auth_provider_dir),
+    });
     match auth_providers.load() {
         (0, 0) => tracing::debug!(dir = %auth_providers.dir().display(), "no declared auth providers"),
         (n, 0) => tracing::info!(count = n, "restored declared auth providers"),
@@ -595,11 +680,11 @@ fn main() {
     // Secrets are read straight from the environment rather than through
     // `LbConfig`, which derives `Debug` and `Serialize` — key material that is
     // never in the struct can never be printed out of it.
-    let secret_key = std::env::var("APP_LB_SECRET_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty())
-        .map(|k| secrets::derive_key(&k));
-    let secrets = Arc::new(SecretStore::new(&cfg.secrets_path, secret_key));
+    let secret_key = secret_key_from_env();
+    let secrets = Arc::new(match &fleet_stores {
+        Some(fs) => SecretStore::with_document(&cfg.secrets_path, fs.secrets.clone(), secret_key),
+        None => SecretStore::new(&cfg.secrets_path, secret_key),
+    });
     match secrets.load() {
         Ok(0) => tracing::info!(path = %secrets.path().display(), "no stored secrets"),
         Ok(n) => tracing::info!(
@@ -667,10 +752,16 @@ fn main() {
             ),
             // Its ownership file sits beside the plugin records, in a
             // directory of its own so the record loader never reads it.
-            plugins::postgres::PostgresPlugin::new(
-                secrets.clone(),
-                plugin_store.dir().join("state"),
-            ),
+            match &fleet_stores {
+                Some(fs) => plugins::postgres::PostgresPlugin::with_ownership_document(
+                    secrets.clone(),
+                    fs.pg_ownership.clone(),
+                ),
+                None => plugins::postgres::PostgresPlugin::new(
+                    secrets.clone(),
+                    plugin_store.dir().join("state"),
+                ),
+            },
         ],
         plugin_store,
     ));
@@ -686,7 +777,10 @@ fn main() {
             all.into_iter().collect()
         })
     };
-    let tokens = Arc::new(tokens::TokenStore::new(&cfg.tokens_path));
+    let tokens = Arc::new(match &fleet_stores {
+        Some(fs) => tokens::TokenStore::with_document(&cfg.tokens_path, fs.tokens.clone()),
+        None => tokens::TokenStore::new(&cfg.tokens_path),
+    });
     match tokens.load() {
         Ok(0) => tracing::info!(path = %tokens.path().display(), "no app-tokens"),
         Ok(n) => tracing::info!(count = n, "loaded app-tokens"),
@@ -698,8 +792,24 @@ fn main() {
             std::path::Path::new(&cfg.tokens_path).display()
         ),
     }
-    if tokens.sweep_expired(deployment::now_secs()) > 0 {
-        let _ = tokens.persist();
+    // In a fleet, sweeping is the token-sweep lease holder's job, on the feed's
+    // schedule: hosts sweeping at their own starts would conflict.
+    match &fleet_stores {
+        None => {
+            if tokens.sweep_expired(deployment::now_secs()) > 0 {
+                let _ = tokens.persist();
+            }
+        }
+        Some(fs) => {
+            let tokens = tokens.clone();
+            fs.fleet.duty(fleet_sync::LEASE_TOKEN_SWEEP, std::time::Duration::from_secs(3600), move || {
+                if tokens.sweep_expired(deployment::now_secs()) > 0
+                    && let Err(e) = tokens.persist()
+                {
+                    tracing::warn!(error = %e, "expired tokens swept but not saved to the fleet store");
+                }
+            });
+        }
     }
     // Fleet tokens last pulled from the token authority, so a restart while the
     // control plane is unreachable does not log those clients out here.
@@ -713,12 +823,55 @@ fn main() {
     // corrupt file, for the same reason the token store is: coming up with an
     // empty rule set would silently readmit whatever an operator blocked during
     // an incident, and would look exactly like a healthy server while doing it.
-    let guard = Arc::new(guard::Guard::from_env(&cfg.guard_path));
+    let guard = Arc::new(match &fleet_stores {
+        Some(fs) => guard::Guard::with_document(
+            &cfg.guard_path,
+            fs.guard.clone(),
+            obs::env_flag("APP_LB_GUARD_ENFORCE", true),
+        ),
+        None => guard::Guard::from_env(&cfg.guard_path),
+    });
     match guard.load(deployment::now_secs()) {
         Ok(0) => tracing::info!(path = %guard.path().display(), "no guard rules"),
         Ok(n) => tracing::info!(count = n, enforcing = guard.enforcing(), "loaded guard rules"),
         Err(e) => panic!("cannot read {}: {e}", guard.path().display()),
     }
+    // Another host's change to one of these lands in its files through the
+    // feed; this has the store that owns them pick it up.
+    if let Some(fs) = &fleet_stores {
+        let fleet = &fs.fleet;
+        let s = namespaces.clone();
+        fleet.on_reload("namespaces", move || {
+            s.load();
+        });
+        let s = workflows.clone();
+        fleet.on_reload("workflows", move || {
+            s.load();
+        });
+        let s = auth_providers.clone();
+        fleet.on_reload("auth-providers", move || {
+            s.load();
+        });
+        let s = secrets.clone();
+        fleet.on_reload("secrets", move || {
+            if let Err(e) = s.load() {
+                tracing::error!(error = %e, "could not apply the fleet's secrets; keeping the ones in memory");
+            }
+        });
+        let s = tokens.clone();
+        fleet.on_reload("tokens", move || {
+            if let Err(e) = s.load() {
+                tracing::error!(error = %e, "could not apply the fleet's tokens; keeping the ones in memory");
+            }
+        });
+        let s = guard.clone();
+        fleet.on_reload("guard", move || {
+            if let Err(e) = s.load(deployment::now_secs()) {
+                tracing::error!(error = %e, "could not apply the fleet's guard rules; keeping the ones in memory");
+            }
+        });
+    }
+
     if !guard.enforcing() {
         tracing::warn!(
             "APP_LB_GUARD_ENFORCE=0: guard rules are matched and counted but nothing is \
@@ -891,14 +1044,22 @@ fn main() {
     // Loaded from disk *before* the listener binds: the acceptor holds no
     // certificate of its own, so anything not in the store at bind time gets the
     // fallback (or a failed handshake) until ACME reissues it.
-    let certs = Arc::new(CertStore::new(
-        std::path::Path::new(&cfg.acme_dir).join("certs"),
-        fallback,
-    ));
+    let certs = Arc::new(match &fleet_stores {
+        Some(fs) => CertStore::with_collections(fs.cert_chains.clone(), fs.cert_keys.clone(), fallback),
+        None => CertStore::new(std::path::Path::new(&cfg.acme_dir).join("certs"), fallback),
+    });
     if cfg.tls_enabled() {
         match certs.load_from_disk() {
             0 => tracing::info!("no cached certificates"),
             n => tracing::info!(count = n, "loaded cached certificates"),
+        }
+        if let Some(fs) = &fleet_stores {
+            for kind in ["cert-chains", "cert-keys"] {
+                let certs = certs.clone();
+                fs.fleet.on_reload(kind, move || {
+                    certs.load_from_disk();
+                });
+            }
         }
     }
 
@@ -913,6 +1074,9 @@ fn main() {
 
     // Note: nothing above may spawn threads or build a runtime — `run_forever`
     // may fork for daemonization and anything created before it would be lost.
+    // The one exception is the fleet store's worker thread, started only in
+    // fleet mode: app-lb never daemonizes (`Server::new(None)` reads no
+    // daemon option), and the stores above need the database before this.
     let mut server = Server::new(None).expect("failed to create server");
     server.bootstrap();
 
@@ -1060,11 +1224,8 @@ fn main() {
     let acme_svc = cfg.acme_email.clone().map(|email| {
         background_service(
             "acme",
-            AcmeManager::new(
-                registry.clone(),
-                certs.clone(),
-                challenges.clone(),
-                AcmeConfig {
+            {
+                let config = AcmeConfig {
                     email,
                     dir: cfg.acme_dir.clone().into(),
                     directory_url: cfg.acme_directory.clone(),
@@ -1074,8 +1235,20 @@ fn main() {
                         .route53_zone_id
                         .clone()
                         .map(|zone| dns::Route53::new(cfg.aws_bin.clone(), zone)),
-                },
-            ),
+                };
+                match &fleet_stores {
+                    Some(fs) => AcmeManager::with_documents(
+                        registry.clone(),
+                        certs.clone(),
+                        challenges.clone(),
+                        config,
+                        fs.acme_account.clone(),
+                        fs.acme_backoff.clone(),
+                    )
+                    .with_lease(fs.fleet.lease(fleet_sync::LEASE_ACME)),
+                    None => AcmeManager::new(registry.clone(), certs.clone(), challenges.clone(), config),
+                }
+            },
         )
     });
     let acme_signal = acme_svc.as_ref().map(|svc| svc.task().signal());
@@ -1138,7 +1311,8 @@ fn main() {
             ["APP_LB_FLEET_FILE", "APP_LB_CONTROL_PLANE_FILE"].map(|key| std::env::var_os(key).map(Into::into)),
         ).unwrap_or_else(|error| panic!("invalid view configuration: {error}"))))
         .with_images(image_catalog.clone())
-        .with_artifact_store(store_slot.clone()),
+        .with_artifact_store(store_slot.clone())
+        .with_fleet_store(fleet_stores.as_ref().map(|fs| fs.fleet.clone())),
     );
 
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
@@ -1204,6 +1378,9 @@ fn main() {
         "workspaces",
         workspace::WorkspaceWorker::new(workspaces.clone()),
     ));
+    if let Some(fs) = &fleet_stores {
+        server.add_service(background_service("fleet-feed", fleet_sync::FleetFeed::new(fs.fleet.clone())));
+    }
     // Plugins own their tasks; this only starts the enabled ones and stops
     // them on shutdown. Not a dependency of the proxy, like the others.
     server.add_service(background_service("plugins", plugins::PluginService::new(plugin_host, known_namespaces)));

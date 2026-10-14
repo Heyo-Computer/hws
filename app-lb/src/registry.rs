@@ -243,6 +243,11 @@ pub struct Registry {
     records: Arc<dyn Collection>,
     /// Content-addressed copies of retired records (`app-lb-state.d/retired/`).
     retired: Arc<dyn Collection>,
+    /// In fleet mode, the fleet half of every record: the spec and the state
+    /// every host must agree on ([`FLEET_STATE_FIELDS`]). Written before the
+    /// whole record goes to `records`, which stays this host's own copy and
+    /// the only home of its host state. `None` on a single server.
+    fleet: Option<Arc<dyn Collection>>,
     /// Serializes compound admin mutations by deployment identity. Deployment
     /// objects are replaceable, so a mutex stored on one object cannot protect
     /// a drain from racing a spec replacement.
@@ -297,6 +302,7 @@ impl Registry {
             persist_path: persist_path.into(),
             records,
             retired,
+            fleet: None,
             change_lock: tokio::sync::Mutex::new(()),
             retirement_gate: Arc::new(tokio::sync::RwLock::new(())),
             persist_lock: std::sync::Mutex::new(()),
@@ -306,6 +312,14 @@ impl Registry {
             fail_after_rename: Default::default(),
             load_skipped: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Keep the fleet half of every record in `fleet` as well
+    /// (`docs/design/fleet-shared-state.md` § 1). The local records keep their
+    /// exact single-server format, so leaving fleet mode is a restart.
+    pub fn with_fleet(mut self, fleet: Arc<dyn Collection>) -> Self {
+        self.fleet = Some(fleet);
+        self
     }
 
     /// Hold across fetch → mutation/replacement → persistence. Administrative
@@ -772,11 +786,16 @@ impl Registry {
             state: state.clone(),
         };
         let json = serde_json::to_vec_pretty(&record)?;
+        let key = state_key(&deployment.spec.id);
+        // The fleet first: a write it refuses must not land here either, or
+        // this host would restart into a record the fleet never agreed to.
+        if let Some(fleet) = &self.fleet {
+            fleet.put(&key, &fleet_half(&json)?, Expect::Any)?;
+        }
         // Durable: fsynced, renamed into place, and the directory synced after,
         // so a successful drain cannot disappear after a host crash and
         // silently reopen traffic on restart.
-        self.records
-            .put(&state_key(&deployment.spec.id), &json, Expect::Any)?;
+        self.records.put(&key, &json, Expect::Any)?;
         Ok(())
     }
 
@@ -807,6 +826,9 @@ impl Registry {
     pub fn forget(&self, id: &str) -> std::io::Result<()> {
         if self.retirement_frozen(id) {
             return Err(std::io::Error::other("retirement preserves the deployment record"));
+        }
+        if let Some(fleet) = &self.fleet {
+            fleet.delete(&state_key(id), Expect::Any)?;
         }
         self.records.delete(&state_key(id), Expect::Any)?;
         Ok(())
@@ -862,7 +884,7 @@ impl Registry {
         let mut loaded = 0;
         let mut skipped = false;
         // A stray `.json.tmp` from an interrupted write is never listed.
-        for entry in self.records.list()? {
+        for entry in self.entries()? {
             let bytes = match entry.body {
                 Ok(b) => b,
                 Err(e) => {
@@ -907,6 +929,29 @@ impl Registry {
         self.load_skipped
             .store(skipped, std::sync::atomic::Ordering::Relaxed);
         Ok(loaded)
+    }
+
+    /// The records to load. On a single server, this host's files. In fleet
+    /// mode, the fleet's records, each with this host's state for it from its
+    /// own file (none for a deployment this host has never held). A local file
+    /// the fleet no longer has is not listed, so the orphan sweep removes it.
+    fn entries(&self) -> std::io::Result<Vec<crate::fleet_store::Entry>> {
+        let Some(fleet) = &self.fleet else {
+            return self.records.list();
+        };
+        let mut out = Vec::new();
+        for entry in fleet.list()? {
+            let body = entry.body.and_then(|fleet_bytes| {
+                let host = self.records.get(&entry.key)?.map(|(b, _)| b);
+                merge_halves(&fleet_bytes, host.as_deref())
+            });
+            out.push(crate::fleet_store::Entry {
+                key: entry.key,
+                location: entry.location,
+                body,
+            });
+        }
+        Ok(out)
     }
 
     /// Import a pre-directory `app-lb-state.json`, then move it aside.
@@ -981,6 +1026,64 @@ fn validate_handoff(flat: &DeploymentSpec, regional: &DeploymentSpec) -> Result<
         return Err("handoff must preserve authority, credentials, service identity and non-routing configuration".into());
     }
     Ok(())
+}
+
+/// The state fields every fleet host must agree on (`docs/design/fleet-shared-state.md`
+/// § 1). Everything else in [`DeploymentState`] — suspended sandboxes, create
+/// attempts, rollouts, the active prefix, a retirement freeze — describes this
+/// host's own daemon and stays in its own file. A field added later is host
+/// state until it is listed here.
+pub const FLEET_STATE_FIELDS: &[&str] = &["upstream_drains", "discovery_version", "route_handoff"];
+
+/// A whole record's fleet half: the spec and the [`FLEET_STATE_FIELDS`].
+pub fn fleet_half(record: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(record)?;
+    if let Some(state) = value.get_mut("state").and_then(|s| s.as_object_mut()) {
+        state.retain(|k, _| FLEET_STATE_FIELDS.contains(&k.as_str()));
+    }
+    Ok(serde_json::to_vec_pretty(&value)?)
+}
+
+/// A whole record from the fleet's half and this host's own record, if any:
+/// the fleet's spec and fleet fields, this host's everything else.
+pub fn merge_halves(fleet: &[u8], host: Option<&[u8]>) -> std::io::Result<Vec<u8>> {
+    let mut merged: serde_json::Value = serde_json::from_slice(fleet)?;
+    let mut state = match host {
+        Some(bytes) => {
+            let host: serde_json::Value = serde_json::from_slice(bytes)?;
+            host.get("state").and_then(|s| s.as_object()).cloned().unwrap_or_default()
+        }
+        None => serde_json::Map::new(),
+    };
+    state.retain(|k, _| !FLEET_STATE_FIELDS.contains(&k.as_str()));
+    if let Some(fleet_state) = merged.get("state").and_then(|s| s.as_object()) {
+        for (k, v) in fleet_state {
+            if FLEET_STATE_FIELDS.contains(&k.as_str()) {
+                state.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    merged["state"] = serde_json::Value::Object(state);
+    Ok(serde_json::to_vec_pretty(&merged)?)
+}
+
+/// Every local record's fleet half, to seed an empty fleet store from this
+/// host. A record that will not parse is left out (and stays on disk): the
+/// load that follows reports it, as it would on a single server.
+pub fn fleet_seed(state_path: &std::path::Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let records = FileCollection::new(
+        crate::fleet_store::registry_dir(state_path),
+        ".json",
+        FileOptions::SYNCED,
+    );
+    let mut out = Vec::new();
+    for entry in records.list()? {
+        match entry.body.and_then(|b| fleet_half(&b)) {
+            Ok(half) => out.push((entry.key, half)),
+            Err(e) => tracing::warn!(path = %entry.location, error = %e, "not seeding an unreadable deployment record"),
+        }
+    }
+    Ok(out)
 }
 
 /// One deployment's on-disk record: its spec, plus the runtime state that has
@@ -1666,6 +1769,90 @@ mod tests {
         assert_eq!(r2.route(None, "/b/x").unwrap().spec.id, "b");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fleet_mode_splits_each_record_into_a_fleet_half_and_keeps_the_whole_one_locally() {
+        let dir = std::env::temp_dir().join(format!("app-lb-fleet-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_file = dir.join("app-lb-state.json");
+        let fleet_dir = dir.join("fleet");
+        let fleet = || -> Arc<dyn Collection> {
+            Arc::new(FileCollection::new(&fleet_dir, ".json", FileOptions::SYNCED))
+        };
+
+        let r = Registry::new(&state_file).with_fleet(fleet());
+        let d = r.upsert(spec("a", vec![host("a.local")]));
+        let mut state = (*d.state()).clone();
+        state.discovery_version = Some(7); // fleet
+        state.suspended = vec!["applb-a-1".into()]; // this host's
+        d.set_state(state);
+        r.persist_one("a").unwrap();
+
+        let fleet_half: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fleet_dir.join("a.json")).unwrap()).unwrap();
+        assert_eq!(fleet_half["spec"]["id"], "a");
+        assert_eq!(fleet_half["state"]["discovery_version"], 7);
+        assert!(fleet_half["state"].get("suspended").is_none(), "host state stays home");
+        let local: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("app-lb-state.d/a.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(local["state"]["suspended"][0], "applb-a-1");
+        assert_eq!(local["state"]["discovery_version"], 7, "the whole record, as a single server writes it");
+
+        // Another host changes the fleet half; this host's own state survives.
+        let mut changed = fleet_half.clone();
+        changed["state"]["discovery_version"] = 9.into();
+        std::fs::write(fleet_dir.join("a.json"), serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        let r2 = Registry::new(&state_file).with_fleet(fleet());
+        assert_eq!(r2.load().unwrap(), 1);
+        let state = r2.get("a").unwrap().state();
+        assert_eq!(state.discovery_version, Some(9));
+        assert_eq!(state.suspended, ["applb-a-1"]);
+
+        // A deployment only the fleet has loads with empty host state; one
+        // only this host has is not loaded, and the sweep removes its file.
+        std::fs::write(
+            fleet_dir.join("b.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"spec": spec("b", vec![host("b.local")])})).unwrap(),
+        )
+        .unwrap();
+        r2.upsert(spec("c", vec![host("c.local")]));
+        std::fs::write(
+            dir.join("app-lb-state.d/c.json"),
+            std::fs::read(dir.join("app-lb-state.d/a.json")).unwrap(),
+        )
+        .unwrap();
+        let r3 = Registry::new(&state_file).with_fleet(fleet());
+        assert_eq!(r3.load().unwrap(), 2);
+        assert!(r3.get("b").unwrap().state().suspended.is_empty());
+        assert!(r3.get("c").is_none());
+        assert_eq!(r3.sweep_orphan_state().unwrap(), 1);
+
+        // Forgetting removes both halves.
+        r3.forget("a").unwrap();
+        assert!(!fleet_dir.join("a.json").exists());
+        assert!(!dir.join("app-lb-state.d/a.json").exists());
+
+        // And the seed is every local record's fleet half.
+        let seed = fleet_seed(&state_file).unwrap();
+        assert!(seed.is_empty(), "nothing local is left");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merging_takes_the_fleets_fields_and_this_hosts_others() {
+        let fleet = br#"{"spec":{"id":"x"},"state":{"discovery_version":3,"suspended":["ignored"]}}"#;
+        let host = br#"{"spec":{"id":"stale"},"state":{"discovery_version":1,"suspended":["mine"]}}"#;
+        let merged: serde_json::Value =
+            serde_json::from_slice(&merge_halves(fleet, Some(host)).unwrap()).unwrap();
+        assert_eq!(merged["spec"]["id"], "x");
+        assert_eq!(merged["state"]["discovery_version"], 3);
+        assert_eq!(merged["state"]["suspended"][0], "mine");
+        let alone: serde_json::Value =
+            serde_json::from_slice(&merge_halves(fleet, None).unwrap()).unwrap();
+        assert!(alone["state"].get("suspended").is_none());
     }
 
     #[test]
