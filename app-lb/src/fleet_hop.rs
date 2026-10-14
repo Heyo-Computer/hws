@@ -32,6 +32,8 @@ pub const HOP: &str = "x-heyo-fleet-hop";
 pub const TOKEN: &str = "x-heyo-fleet-token";
 pub const FORWARD_ENV: &str = "APP_LB_FLEET_FORWARD";
 pub const ADDRESS_ENV: &str = "APP_LB_FLEET_ADDRESS";
+/// How a forwarded request names its backend: the home host picks the VM.
+pub const BACKEND_PREFIX: &str = "fleet-hop:";
 /// Peers' ingress: the public HTTPS listener.
 const PEER_PORT: u16 = 443;
 

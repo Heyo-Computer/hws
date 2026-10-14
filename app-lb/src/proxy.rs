@@ -471,7 +471,10 @@ impl ProxyHttp for LbProxy {
         }
         // Makes it possible to see which VM served a request, which is how the
         // load-spreading and retry behaviour get verified.
-        if let Some(id) = ctx.request.as_ref().and_then(RemoteRequest::backend_id) {
+        // A hop's home host has already named its own VM.
+        if let Some(id) = ctx.request.as_ref().and_then(RemoteRequest::backend_id)
+            .filter(|id| !id.starts_with(crate::fleet_hop::BACKEND_PREFIX))
+        {
             upstream_response.insert_header("x-vm-id", id)?;
         }
         Ok(())

@@ -240,6 +240,10 @@ impl RequestState {
     pub fn backend(&self) -> Option<&Arc<VmBackend>> {
         self.backend.as_ref()
     }
+    /// The home host this request is being forwarded to, if it is a hop.
+    pub fn hop_target(&self) -> Option<&str> {
+        self.hop_out.as_ref().map(|h| h.home.as_str())
+    }
     pub fn regional_assignment(&self) -> Option<&Assignment> {
         self.regional_assignment.as_ref()
     }
