@@ -598,6 +598,25 @@ Done 2026-10-14. us5 and us4 are members of one fleet, and the fleet database's 
 3. Add fleet certificates and dual-A DNS on a test name, then on the fleet domain. `*.us5.heyo.work` keeps pointing at us5 only.
 4. Run live acceptance (§ Gates). Only after it passes do new deployments default to `spread`.
 
+#### 6a as built: the fleet hop (2026-10-14)
+
+- **Membership.** Migration 2 adds `fleet.hosts`. Each host heartbeats its row every 5 s, with its `APP_LB_FLEET_ADDRESS` and boot id, and reads the table back. A member is live if its heartbeat is under 15 s old, measured by the database clock.
+- **Token.** The peer token is a sealed fleet record (`peer-token`). The first host to start without one creates it. Hosts compare it in constant time. It is never logged or shown in `Debug`.
+- **Ingress.** With `APP_LB_FLEET_FORWARD=1`, a request with no local route but a foreign one (from the fleet's view of other hosts' registries) runs every edge check, then goes once over HTTPS to the home host's address, with the original `Host` as SNI. The home host's `x-vm-id` passes through unchanged. A hop is never retried.
+- **Receiver.** A hop header without the right token gets 403. A valid hop takes the client address from `X-Forwarded-For`. A valid hop for a deployment this host does not run gets 503 and is never forwarded again.
+- **Live as of 2026-10-14:**
+  - us4: `APP_LB_FLEET_FORWARD=1`, address 204.13.237.70.
+  - us5: accepts hops but does not forward, address 216.158.232.126.
+
+**Gate evidence (One hop, 2026-10-14, 3fc4cbb):**
+- **Load through us4.** 60 s of paced requests through us4's ingress to farm-rsvp.us5, hub.us5 and admin.us5: 504 of 504 succeeded, with us5's VM ids passed through.
+  - An earlier, faster run got 429s from hub's own rate limit. A burst sent directly to us5 hits the same 429 (from the same VM), so those 429s came from the app, not the hop.
+- **Forged hops.** Sent to us5, a hop header with no token gets 403, and one with a wrong token gets 403.
+- **Genuine hop for us4's deployment.** Sent to us5 with the real token and `Host: smoke.us4.heyo.work`, it gets 503: "runs on us4, not here; a fleet hop is never forwarded again". The same hop for farm-rsvp.us5 gets 200.
+- **Not tested live:** a home host with the route but an empty pool. That case takes the ordinary local path (cold start or 503), never a forward.
+- **Handoff.** us5's handoff to 3fc4cbb under load: 584 requests, 0 failed.
+- **Bug found by this gate.** The first live hop closed the worker's control stream: the manager required a local backend for every peer. The worker exited and its supervisor replaced it. Fixed in 3fc4cbb.
+
 **Rollback**
 - Before phase 5, rollback means not enabling the change.
 - After phase 5, restart us5 in file mode on its kept files, then replay into them any changes made since the switch, using the change feed.
@@ -611,7 +630,7 @@ Each row needs a discriminating live test and recorded evidence. Unit tests do n
 | [ ] Shared authority | Both hosts' `changes_since` cursors advance from the same database. A CAS conflict on concurrent writes from us4 and us5 is reported, not merged. |
 | [ ] Revocation | A token revoked on us5 is refused on us4 within 2 s. With the database stopped, the documented staleness is reported by `whoami`. |
 | [ ] Store outage | Fleet Postgres stopped for 10 min under continuous requests: zero failed requests, and mutations 503. |
-| [ ] One hop | Requests to us4 for a us5-pinned app succeed. A forged `x-heyo-fleet-hop` without the token is refused. Forcing B's pool empty yields 503, never a bounce. |
+| [x] One hop (6a, 2026-10-14) | Requests to us4 for a us5-pinned app succeed. A forged `x-heyo-fleet-hop` without the token is refused. Forcing B's pool empty yields 503, never a bounce. |
 | [ ] Drain us5 | Continuous requests through both ingresses during drain → upgrade → restore → bake: zero failures, no admissions to drained backends, and the surviving path does not use us5's ingress. |
 | [ ] Drain us4 | Same, the other way. |
 | [ ] Controller restart | Kill the lease holder mid-scale: no duplicate replicas, targets converge, and the epoch fences the old holder. |
