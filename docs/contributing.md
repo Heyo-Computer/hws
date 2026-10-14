@@ -226,6 +226,7 @@ Install the client from this repository and point it at your ci:
 
 ```sh
 ci/install-git-submit.sh                      # installs ~/.local/bin/git-submit
+# (without a checkout: curl -fsSL https://heyo.computer/git-submit/install.sh | bash)
 git config ci.endpoint https://ci.example.com
 git config ci.token <token>                   # from the ci dashboard's /repos page
 ```

@@ -279,7 +279,8 @@ Keep `/repos`, `/maintenance`, `/networks/*/join` and the `/vms` actions behind 
 ### Install and configure
 
 ```bash
-ci/install-git-submit.sh          # installs git-submit into ~/.local/bin
+curl -fsSL https://heyo.computer/git-submit/install.sh | bash   # installs git-submit into ~/.local/bin
+ci/install-git-submit.sh          # or from a checkout of this repository
 ```
 
 Register the repository on the dashboard's `/repos` page and mint a token. The page shows the token once, with the two lines to run in your clone:

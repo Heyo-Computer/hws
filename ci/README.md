@@ -414,6 +414,8 @@ the external update, and the cancelled run stays cancelled after reconciliation.
 
 ```bash
 ./install-git-submit.sh                  # installs `git-submit` onto PATH
+# or, without a checkout:
+# curl -fsSL https://heyo.computer/git-submit/install.sh | bash
 
 # From the dashboard's /repos page, which mints these two lines for you:
 git config ci.endpoint https://ci.us2.heyo.work

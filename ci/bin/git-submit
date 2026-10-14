@@ -2,7 +2,7 @@
 # git-submit: send a pinned, fetchable revision plus the exact patch to build.
 set -euo pipefail
 
-GIT_SUBMIT_VERSION="0.6.0"
+GIT_SUBMIT_VERSION="0.6.1"
 me="$(basename "$0")"
 cmd="git ${me#git-}"
 die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
     --workflow) [ $# -ge 2 ] || die "--workflow needs an id"; workflow="$2"; shift 2 ;;
     --only) [ $# -ge 2 ] || die "--only needs a workflow name"; only+=("$2"); shift 2 ;;
     --upgrade)
-      installer="${GIT_SUBMIT_INSTALL_URL:-https://heyo-cli-releases.s3.amazonaws.com/git-submit/latest/install-git-submit.sh}"
+      installer="${GIT_SUBMIT_INSTALL_URL:-https://heyo.computer/git-submit/install.sh}"
       command -v curl >/dev/null 2>&1 || die "--upgrade needs curl"
       curl --fail --show-error --silent --location "$installer" | GIT_SUBMIT_INSTALL_SOURCE=remote bash
       exit $?
