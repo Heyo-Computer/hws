@@ -789,8 +789,15 @@ impl Registry {
         let key = state_key(&deployment.spec.id);
         // The fleet first: a write it refuses must not land here either, or
         // this host would restart into a record the fleet never agreed to.
+        // Only when the fleet half changed, though: most persists are this
+        // host's own bookkeeping (create attempts, suspensions, rollouts),
+        // which must keep working while the fleet store is away.
         if let Some(fleet) = &self.fleet {
-            fleet.put(&key, &fleet_half(&json)?, Expect::Any)?;
+            let half = fleet_half(&json)?;
+            let unchanged = fleet.get(&key)?.is_some_and(|(current, _)| current == half);
+            if !unchanged {
+                fleet.put(&key, &half, Expect::Any)?;
+            }
         }
         // Durable: fsynced, renamed into place, and the directory synced after,
         // so a successful drain cannot disappear after a host crash and
@@ -1829,6 +1836,38 @@ mod tests {
         assert!(r3.get("b").unwrap().state().suspended.is_empty());
         assert!(r3.get("c").is_none());
         assert_eq!(r3.sweep_orphan_state().unwrap(), 1);
+
+        // A change to host state alone never reaches the fleet: it has to keep
+        // working while the fleet store is away.
+        #[derive(Debug)]
+        struct Refusing;
+        impl Collection for Refusing {
+            fn get(&self, _: &str) -> std::io::Result<Option<(Vec<u8>, crate::fleet_store::Revision)>> {
+                Ok(None)
+            }
+            fn list(&self) -> std::io::Result<Vec<crate::fleet_store::Entry>> {
+                Ok(Vec::new())
+            }
+            fn put(&self, _: &str, _: &[u8], _: Expect) -> Result<crate::fleet_store::Revision, crate::fleet_store::StoreError> {
+                Err(std::io::Error::other("fleet store away").into())
+            }
+            fn delete(&self, _: &str, _: Expect) -> Result<bool, crate::fleet_store::StoreError> {
+                Err(std::io::Error::other("fleet store away").into())
+            }
+            fn location(&self, _: &str) -> String {
+                String::new()
+            }
+        }
+        let before = std::fs::read(fleet_dir.join("a.json")).unwrap();
+        let d = r3.get("a").unwrap();
+        let mut state = (*d.state()).clone();
+        state.suspended.push("applb-a-2".into());
+        d.set_state(state);
+        r3.persist_one("a").unwrap();
+        assert_eq!(std::fs::read(fleet_dir.join("a.json")).unwrap(), before, "fleet half untouched");
+        let away = Registry::new(&state_file).with_fleet(Arc::new(Refusing));
+        away.upsert(d.spec.clone());
+        assert!(away.persist_one("a").is_err(), "a fleet half the fleet lacks must be written");
 
         // Forgetting removes both halves.
         r3.forget("a").unwrap();
