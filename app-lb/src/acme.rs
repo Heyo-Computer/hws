@@ -831,9 +831,10 @@ impl BackgroundService for AcmeManager {
         // actually accepting, since it answers the http-01 challenge and this
         // service starts before it binds.
         // A fleet host learns whether it holds the lease from the feed's first
-        // renewal, which may not have happened yet.
+        // renewal, which may not have happened yet. A restarted holder waits
+        // out its predecessor's TTL before it can take the lease, so allow two.
         if let Some(lease) = &self.lease {
-            let deadline = tokio::time::Instant::now() + crate::fleet_sync::LEASE_TTL;
+            let deadline = tokio::time::Instant::now() + 2 * crate::fleet_sync::LEASE_TTL;
             while lease.held().is_none() && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
