@@ -1437,6 +1437,34 @@ impl ImageCatalog {
         Ok(())
     }
 
+    /// Pull a `spread` deployment's image, pinned by digest, into the name
+    /// its spec gives. That spec is the fleet's, and the host that wrote it
+    /// chose the name (a candidate rollout's is named for its generation), so
+    /// a host without the image takes it under that name rather than
+    /// rewriting the spec for every host with a name of its own.
+    async fn fetch_as(&self, name: &str, artifact: &ArtifactSpec) -> Result<(), String> {
+        let _held = self.busy.lock().await;
+        let key = self.store_key(artifact.auth.as_ref()).await?;
+        let mut log = |line: String| tracing::info!(image = name, "fetch: {line}");
+        let pulled = self
+            .puller
+            .pull_as(name, artifact, key.as_deref(), &mut log)
+            .await?;
+        self.note_pulled(
+            &pulled.image,
+            &pulled.digest,
+            artifact,
+            pulled.size,
+            pulled.reused,
+        );
+        self.present_cache
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), Instant::now());
+        tracing::info!(image = name, digest = %pulled.digest, "image fetched under the fleet spec's name");
+        Ok(())
+    }
+
     async fn present(&self, name: &str) -> Result<bool, String> {
         if self
             .present_cache
@@ -1515,6 +1543,28 @@ impl ImageCatalog {
                 tokio::spawn(async move {
                     if let Err(e) = me.thaw(&name).await {
                         tracing::warn!(image = %name, error = %e, "thaw failed");
+                    }
+                    me.thawing.lock().unwrap().remove(&name);
+                });
+            }
+            return false;
+        }
+        let pinned = d.spec.artifact.clone().filter(|a| {
+            !a.store.trim().is_empty()
+                && a.artifact_ref.len() == 64
+                && a.artifact_ref
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+        if let (Some(name), Some(artifact)) = (image.clone(), pinned)
+            && crate::fleet_placement::spreads(&d.spec)
+        {
+            if self.thawing.lock().unwrap().insert(name.clone()) {
+                tracing::info!(deployment = %id, image = %name, "a spread deployment's image is not on heyvm; pulling it under its spec's name");
+                let me = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = me.fetch_as(&name, &artifact).await {
+                        tracing::warn!(image = %name, error = %e, "pulling a spread deployment's image failed");
                     }
                     me.thawing.lock().unwrap().remove(&name);
                 });
