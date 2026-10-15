@@ -544,7 +544,11 @@ impl RequestControl {
         };
         let mut routed = self.registry.route(host.as_deref(), &path);
         if routed.is_none() && let Some(foreign) = self.registry.route_foreign(host.as_deref(), &path) {
-            let home = foreign.spec.placement.as_ref().and_then(|p| p.home.clone()).unwrap_or_default();
+            // A pinned deployment's home, or, for a spread one this host does
+            // not run, the peer that should take it.
+            let home = foreign.spec.placement.as_ref().and_then(|p| p.home.clone())
+                .or_else(|| crate::fleet_placement::placer().and_then(|p| p.peer_ready(&foreign.spec.id).or_else(|| p.peer_targeted(&foreign.spec.id))))
+                .unwrap_or_default();
             if state.hop_in {
                 // Exactly one hop: never forward a forwarded request.
                 return RequestDecision::Respond(ResponseData::plain(503, format!("{} runs on {home}, not here; a fleet hop is never forwarded again\n", foreign.spec.id)));
