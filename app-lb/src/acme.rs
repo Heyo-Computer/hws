@@ -28,9 +28,16 @@
 //! A `host_suffix` rule still gets no certificate of its own; it names a subtree,
 //! and the certificate for a subtree is the wildcard. One that no configured
 //! wildcard covers is warned about once and served the static fallback.
+//!
+//! **In a fleet** a name's DNS may send the CA to any member, so challenge
+//! responses are fleet state ([`SharedChallenges`]): every host answers every
+//! outstanding challenge. Before a challenge is marked ready, the issuing host
+//! fetches it from each fleet member the name resolves to, and gives up on the
+//! order — before spending any of the CA's validation budget — if one cannot
+//! answer.
 
 use crate::deployment::now_secs;
-use crate::fleet_store::{Document, Expect, FileDocument, FileOptions};
+use crate::fleet_store::{Collection, Document, Expect, FileDocument, FileOptions};
 use crate::registry::Registry;
 use crate::tls::CertStore;
 use arc_swap::ArcSwap;
@@ -70,7 +77,11 @@ const POLL: RetryPolicy = RetryPolicy::new().timeout(Duration::from_secs(120));
 /// `/.well-known/acme-challenge/`. `ArcSwap` for the same reason the registry
 /// uses one: reads are on the request path, writes happen a few times a year.
 #[derive(Default)]
-pub struct ChallengeTable(ArcSwap<HashMap<String, String>>);
+pub struct ChallengeTable {
+    own: ArcSwap<HashMap<String, String>>,
+    /// The fleet's outstanding challenges, as of the last reload.
+    shared: ArcSwap<HashMap<String, String>>,
+}
 
 impl ChallengeTable {
     pub fn new() -> Self {
@@ -79,11 +90,19 @@ impl ChallengeTable {
 
     /// The key authorization to serve for `token`, if one is outstanding.
     pub fn get(&self, token: &str) -> Option<String> {
-        self.0.load().get(token).cloned()
+        if let Some(answer) = self.own.load().get(token) {
+            return Some(answer.clone());
+        }
+        self.shared.load().get(token).cloned()
+    }
+
+    /// Replace the fleet's challenges with `shared`.
+    pub fn set_shared(&self, shared: HashMap<String, String>) {
+        self.shared.store(Arc::new(shared));
     }
 
     pub(crate) fn publish(&self, token: String, key_authorization: String) {
-        self.0.rcu(|current| {
+        self.own.rcu(|current| {
             let mut next = HashMap::clone(current);
             next.insert(token.clone(), key_authorization.clone());
             next
@@ -96,13 +115,192 @@ impl ChallengeTable {
         if tokens.is_empty() {
             return;
         }
-        self.0.rcu(|current| {
+        self.own.rcu(|current| {
             let mut next = HashMap::clone(current);
             for token in tokens {
                 next.remove(token);
             }
             next
         });
+    }
+}
+
+/// How long a fleet member has to start answering a new challenge. The feed
+/// carries it in about a second.
+const PEER_ANSWER_WAIT: Duration = Duration::from_secs(20);
+
+/// A challenge record in the fleet store, keyed by token.
+#[derive(Serialize, Deserialize)]
+struct SharedChallenge {
+    /// The host whose order it belongs to.
+    issuer: String,
+    key_authorization: String,
+}
+
+/// The fleet's outstanding HTTP-01 challenges: written by the issuing host,
+/// loaded into every host's [`ChallengeTable`] by the feed.
+pub struct SharedChallenges {
+    records: Arc<dyn Collection>,
+    fleet: Arc<crate::fleet_sync::Fleet>,
+    host: String,
+}
+
+impl SharedChallenges {
+    pub fn new(
+        records: Arc<dyn Collection>,
+        fleet: Arc<crate::fleet_sync::Fleet>,
+        host: &str,
+    ) -> Self {
+        Self {
+            records,
+            fleet,
+            host: host.to_string(),
+        }
+    }
+
+    /// Every outstanding challenge, token → key authorization.
+    pub fn load(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for entry in self.records.list().unwrap_or_default() {
+            match entry
+                .body
+                .ok()
+                .and_then(|b| serde_json::from_slice::<SharedChallenge>(&b).ok())
+            {
+                Some(c) => {
+                    out.insert(entry.key, c.key_authorization);
+                }
+                None => {
+                    tracing::warn!(location = %entry.location, "unreadable fleet ACME challenge")
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn publish(&self, token: &str, key_authorization: &str) -> Result<(), AcmeError> {
+        let body = serde_json::to_vec(&SharedChallenge {
+            issuer: self.host.clone(),
+            key_authorization: key_authorization.to_string(),
+        })
+        .map_err(std::io::Error::other)?;
+        self.records
+            .put(token, &body, Expect::Any)
+            .map_err(|e| AcmeError::Fleet(format!("could not share the challenge: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn retract(&self, tokens: &[String]) {
+        for token in tokens {
+            if let Err(e) = self.records.delete(token, Expect::Any) {
+                tracing::warn!(%token, error = %e, "could not retract a fleet ACME challenge; this host retracts it at its next start");
+            }
+        }
+    }
+
+    /// Retract what an earlier process of this host left behind: no order of
+    /// its survives a restart.
+    pub(crate) fn sweep_own(&self) {
+        let own: Vec<String> = self
+            .records
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| {
+                e.body
+                    .as_ref()
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<SharedChallenge>(b).ok())
+                    .is_some_and(|c| c.issuer == self.host)
+            })
+            .map(|e| e.key)
+            .collect();
+        if !own.is_empty() {
+            tracing::info!(
+                count = own.len(),
+                "retracting fleet ACME challenges left by an earlier start"
+            );
+            self.retract(&own);
+        }
+    }
+
+    /// Wait until every other fleet member that `domain` resolves to answers
+    /// `token` with `key_authorization`. Members outside the name's DNS are
+    /// never asked: the CA will not ask them either.
+    async fn answerable(
+        &self,
+        domain: &str,
+        token: &str,
+        key_authorization: &str,
+    ) -> Result<(), AcmeError> {
+        let resolved: HashSet<std::net::IpAddr> = match tokio::net::lookup_host((domain, 80)).await
+        {
+            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+            Err(e) => {
+                tracing::debug!(%domain, error = %e, "name does not resolve; checking no fleet members");
+                return Ok(());
+            }
+        };
+        for member in self.fleet.live_members() {
+            if member.host == self.host {
+                continue;
+            }
+            let Some(address) = member.address.as_deref() else {
+                continue;
+            };
+            let Some(ip) = tokio::net::lookup_host((address, 80))
+                .await
+                .ok()
+                .and_then(|mut a| a.next())
+            else {
+                continue;
+            };
+            if !resolved.contains(&ip.ip()) {
+                continue;
+            }
+            peer_answers(domain, ip, token, key_authorization, PEER_ANSWER_WAIT)
+                .await
+                .map_err(|e| AcmeError::Fleet(format!("fleet host {} ({ip}) {e}", member.host)))?;
+            tracing::debug!(%domain, peer = %member.host, "fleet member answers the challenge");
+        }
+        Ok(())
+    }
+}
+
+/// Fetch `token` from `ip:80` as the CA would, until it answers
+/// `key_authorization` or `wait` runs out.
+async fn peer_answers(
+    domain: &str,
+    ip: std::net::SocketAddr,
+    token: &str,
+    key_authorization: &str,
+    wait: Duration,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .resolve(domain, ip)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("http://{domain}/.well-known/acme-challenge/{token}");
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let last = match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => match r.text().await {
+                Ok(body) if body == key_authorization => return Ok(()),
+                Ok(_) => "answered with the wrong key authorization".to_string(),
+                Err(e) => e.to_string(),
+            },
+            Ok(r) => format!("answered {}", r.status()),
+            Err(e) => e.to_string(),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "did not answer the challenge within {}s: {last}",
+                wait.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -121,6 +319,8 @@ pub enum AcmeError {
     Dns(crate::dns::DnsError),
     /// The order finished in a state other than valid.
     Order(OrderStatus),
+    /// A fleet member the name resolves to could not answer the challenge.
+    Fleet(String),
 }
 
 impl std::fmt::Display for AcmeError {
@@ -138,6 +338,7 @@ impl std::fmt::Display for AcmeError {
             ),
             Self::Dns(e) => write!(f, "{e}"),
             Self::Order(s) => write!(f, "order ended in state {s:?}"),
+            Self::Fleet(e) => write!(f, "{e}"),
         }
     }
 }
@@ -332,6 +533,8 @@ pub struct AcmeManager {
     /// In a fleet, only the holder of this lease issues and renews; every
     /// other host serves what the holder wrote. `None` on a single server.
     lease: Option<Arc<crate::fleet_sync::Lease>>,
+    /// In a fleet, where challenge responses are shared.
+    shared: Option<Arc<SharedChallenges>>,
 }
 
 impl AcmeManager {
@@ -374,6 +577,7 @@ impl AcmeManager {
             backoff_file,
             warned: Mutex::new(HashSet::new()),
             lease: None,
+            shared: None,
             config,
         }
     }
@@ -381,6 +585,12 @@ impl AcmeManager {
     /// Issue and renew only while holding `lease`.
     pub fn with_lease(mut self, lease: Arc<crate::fleet_sync::Lease>) -> Self {
         self.lease = Some(lease);
+        self
+    }
+
+    /// Share challenge responses through the fleet.
+    pub fn with_shared_challenges(mut self, shared: Arc<SharedChallenges>) -> Self {
+        self.shared = Some(shared);
         self
     }
 
@@ -772,9 +982,14 @@ impl AcmeManager {
                     return Err(AcmeError::NoHttp01);
                 };
                 let token = challenge.token.clone();
+                let key_authorization = challenge.key_authorization().as_str().to_string();
                 self.challenges
-                    .publish(token.clone(), challenge.key_authorization().as_str().to_string());
-                tokens.push(token);
+                    .publish(token.clone(), key_authorization.clone());
+                tokens.push(token.clone());
+                if let Some(shared) = &self.shared {
+                    shared.publish(&token, &key_authorization)?;
+                    shared.answerable(host, &token, &key_authorization).await?;
+                }
                 challenge.set_ready().await?;
             }
             Ok(())
@@ -788,6 +1003,9 @@ impl AcmeManager {
             Err(e) => Err(e),
         };
         self.challenges.retract(&tokens);
+        if let Some(shared) = &self.shared {
+            shared.retract(&tokens);
+        }
         result
     }
 
@@ -838,6 +1056,11 @@ impl BackgroundService for AcmeManager {
             while lease.held().is_none() && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
+        }
+        if let Some(shared) = &self.shared
+            && self.may_issue()
+        {
+            shared.sweep_own();
         }
         if wait_for_proxy(&self.config.proxy_addr, PROXY_WAIT).await {
             self.reconcile().await;
@@ -1090,6 +1313,52 @@ mod tests {
 
         assert_eq!(warned_after_first, 1);
         assert_eq!(warned_after_second, 1, "the sweep must not re-warn");
+    }
+
+    #[test]
+    fn the_fleets_challenges_are_answered_alongside_this_hosts() {
+        let table = ChallengeTable::new();
+        table.set_shared(HashMap::from([
+            ("theirs".to_string(), "theirs.thumb".to_string()),
+            ("both".to_string(), "stale".to_string()),
+        ]));
+        table.publish("both".into(), "both.thumb".into());
+        assert_eq!(table.get("theirs").as_deref(), Some("theirs.thumb"));
+        assert_eq!(table.get("both").as_deref(), Some("both.thumb"), "this host's own wins");
+        table.set_shared(HashMap::new());
+        assert_eq!(table.get("theirs"), None, "a reload drops what the fleet retracted");
+    }
+
+    /// A one-route HTTP server: answers `body` to every request.
+    async fn answering(body: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_peer_is_asked_for_the_challenge_as_the_ca_would() {
+        let good = answering("tok.thumb").await;
+        peer_answers("a.example", good, "tok", "tok.thumb", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let wrong = answering("other").await;
+        let e = peer_answers("a.example", wrong, "tok", "tok.thumb", Duration::from_millis(600))
+            .await
+            .unwrap_err();
+        assert!(e.contains("wrong key authorization"), "{e}");
     }
 
     #[test]

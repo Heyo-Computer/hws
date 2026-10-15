@@ -277,7 +277,7 @@ pub struct Fleet {
     kinds: Mutex<BTreeMap<String, Arc<Kind>>>,
     snapshot: Mutex<SnapshotMeta>,
     dirty: Mutex<BTreeSet<String>>,
-    reloads: Mutex<HashMap<String, Reload>>,
+    reloads: Mutex<HashMap<String, Vec<Reload>>>,
     seal_key: Vec<u8>,
     leases: Mutex<BTreeMap<String, Arc<Lease>>>,
     /// Set when the database cannot be trusted with this host's writes (an
@@ -347,6 +347,21 @@ impl Fleet {
             .find(|m| m.host == host)
             .filter(|m| m.age_secs + read_ago < MEMBER_LIVE.as_secs_f64())
             .cloned()
+    }
+
+    /// Every member whose heartbeat is live.
+    pub fn live_members(&self) -> Vec<crate::fleet_pg::HostRow> {
+        let members = lock(&self.members);
+        let Some(read) = members.0 else {
+            return Vec::new();
+        };
+        let read_ago = read.elapsed().as_secs_f64();
+        members
+            .1
+            .iter()
+            .filter(|m| m.age_secs + read_ago < MEMBER_LIVE.as_secs_f64())
+            .cloned()
+            .collect()
     }
 
     /// Heartbeat this host and re-read the members.
@@ -444,9 +459,13 @@ impl Fleet {
         })
     }
 
-    /// Called after another host's change to `kind` lands in the files.
+    /// Called after another host's change to `kind` lands in the files. A
+    /// kind may have several.
     pub fn on_reload(&self, kind: &str, f: impl Fn() + Send + Sync + 'static) {
-        lock(&self.reloads).insert(kind.to_string(), Arc::new(f));
+        lock(&self.reloads)
+            .entry(kind.to_string())
+            .or_default()
+            .push(Arc::new(f));
     }
 
     /// The lease named `name`, created on first ask. [`LeaseKeeper`] renews
@@ -1010,11 +1029,13 @@ impl Fleet {
     fn reload_dirty(&self) {
         let dirty = std::mem::take(&mut *lock(&self.dirty));
         for kind in dirty {
-            let hook = lock(&self.reloads).get(&kind).cloned();
-            match hook {
-                Some(reload) => {
+            let hooks = lock(&self.reloads).get(&kind).cloned();
+            match hooks {
+                Some(hooks) => {
                     tracing::info!(kind, "applying fleet changes");
-                    reload();
+                    for reload in hooks {
+                        reload();
+                    }
                 }
                 None => {
                     if lock(&self.warned).insert(kind.clone()) {
@@ -1074,6 +1095,9 @@ pub struct FleetStores {
     pub auth_key: Arc<FleetDocument>,
     /// The token fleet hops carry between members (`fleet_hop`). Sealed.
     pub peer_token: Arc<FleetDocument>,
+    /// Outstanding HTTP-01 challenge responses, so any member answers the CA
+    /// (`acme::SharedChallenges`). Fenced by the issuing host's ACME lease.
+    pub acme_challenges: Arc<FleetCollection>,
 }
 
 impl FleetStores {
@@ -1168,6 +1192,15 @@ impl FleetStores {
                 "cert-keys",
                 FileCollection::new(&certs, ".key.pem", private_dir),
                 acme_sealed,
+            ),
+            acme_challenges: fleet.collection(
+                "acme-challenges",
+                FileCollection::new(
+                    crate::fleet_store::sibling_dir(&state, "acme-challenges"),
+                    ".json",
+                    FileOptions::PLAIN,
+                ),
+                acme,
             ),
             peer_token: fleet.document(
                 "peer-token",
@@ -1707,6 +1740,62 @@ mod tests {
         assert!(again.status().blocked.is_some());
         assert!(again_ns.put("sam", b"v2", Expect::Any).is_err());
         assert!(fresh.snapshot().unwrap().seeded.is_none(), "nothing seeded");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_challenge_one_host_publishes_is_answered_by_another() {
+        use crate::acme::{ChallengeTable, SharedChallenges};
+        let pg_a = pg_or_skip!("challenges", "host-a");
+        let (a_dir, b_dir) = (Dir::new("ca"), Dir::new("cb"));
+        let records = |fleet: &Arc<Fleet>, dir: &Dir, host: &str| {
+            fleet.collection(
+                "acme-challenges",
+                FileCollection::new(dir.0.join("challenges"), ".json", FileOptions::PLAIN),
+                KindOptions {
+                    sealed: false,
+                    fence: Some(acme_lease(host)),
+                },
+            )
+        };
+        let a = Fleet::new(
+            pg_a.clone(),
+            snapshot_meta_path(&a_dir.state()),
+            KEY.to_vec(),
+        );
+        let a_shared = SharedChallenges::new(records(&a, &a_dir, "host-a"), a.clone(), "host-a");
+        a.start().unwrap();
+        let pg_b = peer(&pg_a, "host-b");
+        let b = Fleet::new(pg_b, snapshot_meta_path(&b_dir.state()), KEY.to_vec());
+        let b_shared = Arc::new(SharedChallenges::new(
+            records(&b, &b_dir, "host-b"),
+            b.clone(),
+            "host-b",
+        ));
+        b.start().unwrap();
+        // Two hooks on one kind both run.
+        let table = Arc::new(ChallengeTable::new());
+        let (s, t) = (b_shared.clone(), table.clone());
+        b.on_reload("acme-challenges", move || t.set_shared(s.load()));
+        let also = Arc::new(AtomicU64::new(0));
+        let r = also.clone();
+        b.on_reload("acme-challenges", move || {
+            r.fetch_add(1, Ordering::Relaxed);
+        });
+
+        a.lease(acme_lease("host-a")).tick(&pg_a).await;
+        a_shared.publish("tok", "tok.thumb").unwrap();
+        b.poll().await.unwrap();
+        b.reload_dirty();
+        assert_eq!(table.get("tok").as_deref(), Some("tok.thumb"));
+        assert_eq!(also.load(Ordering::Relaxed), 1);
+
+        // b cannot retract a's challenge, and a's next start retracts what
+        // its earlier process left.
+        b_shared.sweep_own();
+        a_shared.sweep_own();
+        b.poll().await.unwrap();
+        b.reload_dirty();
+        assert_eq!(table.get("tok"), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

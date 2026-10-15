@@ -1109,6 +1109,19 @@ fn main() {
     // Shared between the ACME manager (which publishes challenge responses) and
     // the proxy (which serves them).
     let challenges = Arc::new(ChallengeTable::new());
+    // In a fleet the CA may ask any member, so every host answers every
+    // host's outstanding challenges.
+    let shared_challenges = fleet_stores.as_ref().map(|fs| {
+        let shared = Arc::new(acme::SharedChallenges::new(
+            fs.acme_challenges.clone(),
+            fs.fleet.clone(),
+            &fs.host,
+        ));
+        challenges.set_shared(shared.load());
+        let (reloaded, table) = (shared.clone(), challenges.clone());
+        fs.fleet.on_reload("acme-challenges", move || table.set_shared(reloaded.load()));
+        shared
+    });
 
     // One metrics registry, shared by the proxy (request latency), the
     // autoscaler (cold-start timing, scaling activity), and the admin API
@@ -1300,13 +1313,22 @@ fn main() {
                         fs.acme_account.clone(),
                         fs.acme_backoff.clone(),
                     )
-                    .with_lease(fs.fleet.lease(fleet_sync::acme_lease(&fs.host))),
+                    .with_lease(fs.fleet.lease(fleet_sync::acme_lease(&fs.host)))
+                    .with_shared_challenges(
+                        shared_challenges.clone().expect("a fleet shares its challenges"),
+                    ),
                     None => AcmeManager::new(registry.clone(), certs.clone(), challenges.clone(), config),
                 }
             },
         )
     });
     let acme_signal = acme_svc.as_ref().map(|svc| svc.task().signal());
+    // A deployment registered through another host's admin API reaches this
+    // one by the feed, and its certificate is this host's to issue.
+    if let (Some(fs), Some(signal)) = (&fleet_stores, &acme_signal) {
+        let signal = signal.clone();
+        fs.fleet.on_reload("deployments", move || signal.notify_one());
+    }
 
     match cfg.deploy_host_base() {
         Some(base) => tracing::info!(
