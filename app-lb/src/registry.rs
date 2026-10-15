@@ -457,8 +457,26 @@ impl Registry {
             }
         }
         for spec in applied {
-            tracing::info!(deployment = %spec.id, "applying another fleet host's change to a spread deployment");
-            self.upsert(spec);
+            // The admin API's rule: a new VM template rebuilds the pool, and
+            // anything else keeps it.
+            match self.get(&spec.id) {
+                Some(old) if rebuilds(&old.spec, &spec) => {
+                    tracing::info!(deployment = %spec.id, "applying another fleet host's change to a spread deployment (backends changed; rebuilding)");
+                    self.upsert(spec);
+                    self.fleet_removed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(old);
+                }
+                Some(_) => {
+                    tracing::info!(deployment = %spec.id, "applying another fleet host's change to a spread deployment (pool preserved)");
+                    self.update(spec);
+                }
+                None => {
+                    tracing::info!(deployment = %spec.id, "a spread deployment arrived from another fleet host");
+                    self.upsert(spec);
+                }
+            }
         }
         for id in gone {
             if let Some(d) = self.remove(&id) {
@@ -497,8 +515,9 @@ impl Registry {
         self.change_lock.try_lock().ok()
     }
 
-    /// Spread deployments another fleet host removed, or moved off this host,
-    /// since the last call: out of routing already, their VMs still to go.
+    /// Spread deployments another fleet host removed, moved off this host or
+    /// rebuilt, since the last call: out of routing already, their VMs still
+    /// to go.
     pub fn take_fleet_removed(&self) -> Vec<Arc<Deployment>> {
         std::mem::take(&mut *self.fleet_removed.lock().unwrap_or_else(|e| e.into_inner()))
     }
@@ -1277,6 +1296,30 @@ fn state_key(id: &str) -> String {
         }
     }
     out
+}
+
+/// Whether moving from `old` to `new` needs a new pool: the admin API's
+/// rule (a different VM template or upstream list), except that a pull
+/// filling in `vm.image` for an unchanged artifact is the same template. Each
+/// host pulls for itself, so a peer's pull must not recycle this host's pool.
+fn rebuilds(old: &DeploymentSpec, new: &DeploymentSpec) -> bool {
+    if old.upstreams != new.upstreams || old.artifact != new.artifact {
+        return true;
+    }
+    let pulled_from = |s: &DeploymentSpec| s.artifact.is_some();
+    let template = |s: &DeploymentSpec| {
+        s.vm.clone().map(|mut vm| {
+            if pulled_from(s) {
+                vm.image = None;
+            }
+            vm
+        })
+    };
+    if pulled_from(old) {
+        template(old) != template(new)
+    } else {
+        old.vm != new.vm
+    }
 }
 
 #[cfg(test)]
@@ -2113,11 +2156,11 @@ mod tests {
         assert!(r.get("web").is_some() && r.route(Some("web.example"), "/").is_some());
         assert!(r.get("pin").is_none(), "a pinned change waits for this host's next start");
 
-        // Changed there: changed here.
+        // Changed there: changed here, and a new template rebuilds the pool.
         write("web", spread.clone(), 9090);
         r.apply_fleet_changes();
         assert_eq!(r.get("web").unwrap().spec.vm.as_ref().unwrap().port, 9090);
-        assert!(r.take_fleet_removed().is_empty());
+        assert_eq!(r.take_fleet_removed().len(), 1, "the old pool goes to teardown");
 
         // Moved off this host, then gone: out of routing, handed to teardown.
         write("web", serde_json::json!({"mode": "spread", "hosts": ["us5"]}), 9090);
@@ -2131,6 +2174,25 @@ mod tests {
         assert!(r.get("web2").is_none());
         assert_eq!(r.take_fleet_removed().iter().map(|d| d.spec.id.as_str()).collect::<Vec<_>>(), ["web2"]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_peers_pull_is_not_a_new_template() {
+        let mut old = spec("web", vec![]);
+        old.artifact = Some(serde_json::from_value(serde_json::json!({"ref": "heyo/alpine:3.24"})).unwrap());
+        old.vm.as_mut().unwrap().image = None;
+        let mut pulled = old.clone();
+        pulled.vm.as_mut().unwrap().image = Some("img-cb5f2d273ff38cdb".into());
+        assert!(!rebuilds(&old, &pulled));
+        let mut scaled = pulled.clone();
+        scaled.scaling.min_replicas = 3;
+        assert!(!rebuilds(&pulled, &scaled));
+        let mut new_cmd = pulled.clone();
+        new_cmd.vm.as_mut().unwrap().start_command = Some("other".into());
+        assert!(rebuilds(&pulled, &new_cmd));
+        let mut new_ref = pulled.clone();
+        new_ref.artifact = Some(serde_json::from_value(serde_json::json!({"ref": "heyo/alpine:3.25"})).unwrap());
+        assert!(rebuilds(&pulled, &new_ref));
     }
 
     #[test]
