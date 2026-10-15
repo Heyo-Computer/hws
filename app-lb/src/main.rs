@@ -1192,6 +1192,17 @@ fn main() {
     );
     let autoscaler = autoscaler_svc.task();
     let adopted = autoscaler.adopted();
+    // A spread deployment another host removed is out of routing once the
+    // registry applies the change; its VMs on this host's daemon go here.
+    if let Some(fs) = &fleet_stores {
+        let (registry, autoscaler) = (registry.clone(), autoscaler.clone());
+        fs.fleet.on_reload("deployments", move || {
+            for d in registry.take_fleet_removed() {
+                let autoscaler = autoscaler.clone();
+                tokio::spawn(async move { autoscaler.teardown(&d).await });
+            }
+        });
+    }
 
     let disks = {
         let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()).with_workspaces(workspaces.clone()));
