@@ -474,7 +474,11 @@ pub async fn serve(
             }
             ClientMessage::NextPeer => match control.next_peer(&mut state).await {
                 Ok(peer) => {
-                    let sandbox_id = state.backend().map(|b| b.sandbox_id.clone()).ok_or_else(|| "selected peer has no reserved backend".to_string())?;
+                    // A fleet hop reserves nothing here: its backend is the home
+                    // host's, named so access logs say where it went.
+                    let sandbox_id = state.backend().map(|b| b.sandbox_id.clone())
+                        .or_else(|| state.hop_target().map(|home| format!("{}{home}", crate::fleet_hop::BACKEND_PREFIX)))
+                        .ok_or_else(|| "selected peer has no reserved backend".to_string())?;
                     let wire = WirePeer { address: peer.address.to_string(), tls: peer.tls, sni: peer.sni };
                     send!(ServerMessage::Peer { peer: wire, sandbox_id, retry_allowed: state.retry_allowed() });
                 }

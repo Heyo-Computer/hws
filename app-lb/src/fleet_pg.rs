@@ -52,17 +52,22 @@ const CA_BUNDLES: &[&str] = &[
 /// source (`openssl-src`), so its default trust store is `/usr/local/ssl`,
 /// which no distribution fills: every certificate would fail to verify. Trust
 /// the system bundle instead, or `APP_LB_FLEET_CA_FILE`.
-fn tls_connector() -> io::Result<openssl::ssl::SslConnector> {
-    let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
-        .map_err(io::Error::other)?;
+/// The CA bundle every TLS client in this binary verifies servers with:
+/// `APP_LB_FLEET_CA_FILE`, else the first system bundle that exists.
+pub fn ca_bundle() -> Option<String> {
     let explicit = std::env::var(CA_ENV).ok().filter(|p| !p.trim().is_empty());
-    let bundle = explicit.or_else(|| {
+    explicit.or_else(|| {
         CA_BUNDLES
             .iter()
             .find(|p| std::path::Path::new(p).exists())
             .map(|p| p.to_string())
-    });
-    match bundle {
+    })
+}
+
+fn tls_connector() -> io::Result<openssl::ssl::SslConnector> {
+    let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
+        .map_err(io::Error::other)?;
+    match ca_bundle() {
         Some(path) => builder
             .set_ca_file(&path)
             .map_err(|e| io::Error::other(format!("{CA_ENV} {path}: {e}")))?,
@@ -86,9 +91,10 @@ const MIGRATE_LOCK: i64 = 0x6170_706c_626d_6967; // "applbmig"
 pub const TOMBSTONE_DAYS: i32 = 7;
 
 /// `{s}` is the schema.
-const MIGRATIONS: &[(i32, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        1,
+        r#"
 CREATE SEQUENCE {s}.revision;
 CREATE TABLE {s}.records (
     kind       text        NOT NULL,
@@ -119,7 +125,20 @@ END $$;
 CREATE TRIGGER records_notify AFTER INSERT OR UPDATE ON {s}.records
     FOR EACH ROW EXECUTE FUNCTION {s}.notify_change();
 "#,
-)];
+    ),
+    (
+        2,
+        r#"
+CREATE TABLE {s}.hosts (
+    host         text        PRIMARY KEY,
+    address      text,
+    boot_id      text        NOT NULL,
+    state        text        NOT NULL DEFAULT 'active',
+    heartbeat_at timestamptz NOT NULL DEFAULT now()
+);
+"#,
+    ),
+];
 
 const UPSERT_ANY: &str = "INSERT INTO {s}.records (kind, key, body, revision, updated_by)
      VALUES ($1, $2, $3, nextval('{s}.revision'), $4)
@@ -185,6 +204,19 @@ pub struct Snapshot {
     /// ([`PgStore::seed_kind`]), rather than having those files replaced by
     /// the nothing the fleet holds.
     pub kinds: std::collections::BTreeSet<String>,
+}
+
+/// One fleet member as the hosts table has it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostRow {
+    pub host: String,
+    /// Where peers reach its ingress (`APP_LB_FLEET_ADDRESS`); `None` when it
+    /// takes no hops.
+    pub address: Option<String>,
+    pub state: String,
+    pub boot_id: String,
+    /// Seconds since its last heartbeat.
+    pub age_secs: f64,
 }
 
 /// A live record with its last writer: `(key, body, revision, updated_by)`.
@@ -859,6 +891,59 @@ impl PgStore {
         .await
     }
 
+    /// Say this host is alive, and where its peers reach it. Its own row, so
+    /// a heartbeat never touches the change feed.
+    pub async fn heartbeat(
+        &self,
+        host: &str,
+        address: Option<&str>,
+        boot_id: &str,
+    ) -> Result<(), PgFailure> {
+        let sql = self.sql(
+            "INSERT INTO {s}.hosts (host, address, boot_id, heartbeat_at) VALUES ($1, $2, $3, now())
+             ON CONFLICT (host) DO UPDATE
+             SET address = EXCLUDED.address, boot_id = EXCLUDED.boot_id, heartbeat_at = now()",
+        );
+        let (host, address, boot_id) = (
+            host.to_string(),
+            address.map(str::to_string),
+            boot_id.to_string(),
+        );
+        self.call(move |pool| async move {
+            let c = pool.get().await.map_err(pool_failure)?;
+            c.execute(&sql, &[&host, &address, &boot_id])
+                .await
+                .map_err(classify)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every host that has ever heartbeated, with how long ago, by the
+    /// database's clock so hosts' clocks never need to agree.
+    pub async fn hosts(&self) -> Result<Vec<HostRow>, PgFailure> {
+        let sql = self.sql(
+            "SELECT host, address, state, boot_id,
+                    extract(epoch FROM now() - heartbeat_at)::float8
+             FROM {s}.hosts ORDER BY host",
+        );
+        self.call(move |pool| async move {
+            let c = pool.get().await.map_err(pool_failure)?;
+            let rows = c.query(&sql, &[]).await.map_err(classify)?;
+            Ok(rows
+                .iter()
+                .map(|r| HostRow {
+                    host: r.get(0),
+                    address: r.get(1),
+                    state: r.get(2),
+                    boot_id: r.get(3),
+                    age_secs: r.get::<_, f64>(4).max(0.0),
+                })
+                .collect())
+        })
+        .await
+    }
+
     /// Drop tombstones older than [`TOMBSTONE_DAYS`]. Returns how many.
     pub async fn collect_tombstones(&self) -> Result<u64, PgFailure> {
         let sql = self.sql(GC);
@@ -1310,6 +1395,35 @@ pub(crate) mod tests {
         assert_eq!(a.get("certs", "x").unwrap().unwrap().0, b"fresh");
         b.release("acme", next).await.unwrap();
         assert!(a.acquire("acme", ttl).await.unwrap().is_some(), "released");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hosts_heartbeat_into_their_own_rows() {
+        let Some(a) = test_store("hosts", "us5/1") else {
+            eprintln!("skipped: {TEST_URL_ENV} is not set");
+            return;
+        };
+        let cursor = a.snapshot().unwrap().cursor;
+        a.heartbeat("us5", Some("203.0.113.5"), "boot-1")
+            .await
+            .unwrap();
+        a.heartbeat("us4", None, "boot-2").await.unwrap();
+        a.heartbeat("us5", Some("203.0.113.6"), "boot-3")
+            .await
+            .unwrap();
+        let hosts = a.hosts().await.unwrap();
+        assert_eq!(
+            hosts.iter().map(|h| h.host.as_str()).collect::<Vec<_>>(),
+            ["us4", "us5"]
+        );
+        assert_eq!(hosts[1].address.as_deref(), Some("203.0.113.6"));
+        assert_eq!(hosts[1].boot_id, "boot-3");
+        assert!(hosts[1].age_secs < 5.0);
+        assert_eq!(
+            a.snapshot().unwrap().cursor,
+            cursor,
+            "heartbeats never reach the feed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

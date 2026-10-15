@@ -27,6 +27,7 @@ mod dns;
 mod federated;
 mod fleet;
 mod fleet_store;
+mod fleet_hop;
 mod fleet_pg;
 mod fleet_seal;
 mod fleet_split;
@@ -372,6 +373,10 @@ fn fleet_mode(cfg: &LbConfig) -> Option<fleet_sync::FleetStores> {
             std::process::exit(1);
         }
     }
+    stores.fleet.set_identity(
+        &host,
+        std::env::var(fleet_hop::ADDRESS_ENV).ok().filter(|a| !a.trim().is_empty()),
+    );
     Some(stores)
 }
 
@@ -1365,11 +1370,38 @@ fn main() {
         .with_fleet_store(fleet_stores.as_ref().map(|fs| fs.fleet.clone())),
     );
 
+    // Fleet mode: hops between members. The peer token is fleet state; the
+    // first host to need one makes it.
+    let fleet_hop = fleet_stores.as_ref().map(|fs| {
+        let forward = obs::env_flag(fleet_hop::FORWARD_ENV, false);
+        let hop = Arc::new(fleet_hop::FleetHop::new(&fs.host, fs.fleet.clone(), forward));
+        let read = {
+            let doc = fs.peer_token.clone();
+            move || {
+                fleet_store::Document::read(&*doc)
+                    .ok()
+                    .flatten()
+                    .and_then(|(b, _)| String::from_utf8(b).ok())
+                    .filter(|t| t.len() >= 32)
+            }
+        };
+        if read().is_none() {
+            match fleet_store::Document::write(&*fs.peer_token, fleet_hop::new_token().as_bytes(), fleet_store::Expect::Absent) {
+                Ok(_) => tracing::info!("made the fleet's peer token"),
+                Err(e) => tracing::warn!(error = %e, "could not make the fleet's peer token; another host's will arrive"),
+            }
+        }
+        hop.set_token(read());
+        let reloaded = hop.clone();
+        fs.fleet.on_reload("peer-token", move || reloaded.set_token(read()));
+        tracing::info!(forward, "fleet hops: accepted from peers{}", if forward { ", and made to them" } else { "" });
+        hop
+    });
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
         control: Arc::new(request_control::RequestControl::new(
             registry.clone(), metrics.clone(), challenges, auth, guard.clone(),
             event_feed, auth_providers.clone(), secrets.clone(),
-        ).with_stripped_cookies(cfg.strip_cookies.clone())),
+        ).with_stripped_cookies(cfg.strip_cookies.clone()).with_fleet_hop(fleet_hop)),
         metrics,
         access_log: obs.as_ref().and_then(|o| o.access.clone()),
         security: siem.as_ref().map(|s| s.sink.clone()),

@@ -686,6 +686,10 @@ pub fn run(dir: PathBuf, takeover: bool) -> ! {
     conf.grace_period_seconds = Some(env_secs(DRAIN_ENV).unwrap_or(DEFAULT_DRAIN));
     conf.graceful_shutdown_timeout_seconds = Some(SHUTDOWN_TIMEOUT);
     conf.upgrade_sock_connect_accept_max_retries = Some(TAKEOVER_RETRIES);
+    // Upstream TLS — a fleet hop to a peer, an HTTPS upstream — verifies
+    // against the system's roots: this binary's openssl is built from source,
+    // and its own default store is empty.
+    conf.ca_file = crate::fleet_pg::ca_bundle();
     let opt = Opt {
         upgrade: takeover,
         ..Opt::default()

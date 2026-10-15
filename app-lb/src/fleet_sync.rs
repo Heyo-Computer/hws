@@ -245,6 +245,18 @@ pub enum Started {
     Offline { synced_at: u64, error: String },
 }
 
+/// A member is live while its last heartbeat is this recent.
+pub const MEMBER_LIVE: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone)]
+struct Identity {
+    host: String,
+    /// Where peers reach this host's ingress; `None` when it takes no hops.
+    address: Option<String>,
+    /// Changes at every start, so a peer can tell a restart from a pause.
+    boot_id: String,
+}
+
 /// What `/whoami` and the logs report.
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
@@ -278,6 +290,10 @@ pub struct Fleet {
     /// Kinds whose changes this host cannot apply live, already warned about.
     warned: Mutex<BTreeSet<String>>,
     duties: Mutex<Vec<Duty>>,
+    /// This host as its peers know it: set once, then heartbeated.
+    identity: Mutex<Option<Identity>>,
+    /// The members as last read, and when.
+    members: Mutex<(Option<Instant>, Vec<crate::fleet_pg::HostRow>)>,
     synced_at: AtomicU64,
 }
 
@@ -304,8 +320,50 @@ impl Fleet {
             write_lock: Mutex::new(()),
             warned: Mutex::new(BTreeSet::new()),
             duties: Mutex::new(Vec::new()),
+            identity: Mutex::new(None),
+            members: Mutex::new((None, Vec::new())),
             synced_at: AtomicU64::new(0),
         })
+    }
+
+    /// Name this host to its peers: heartbeated from then on.
+    pub fn set_identity(&self, host: &str, address: Option<String>) {
+        let mut id = [0u8; 8];
+        let _ = openssl::rand::rand_bytes(&mut id);
+        *lock(&self.identity) = Some(Identity {
+            host: host.to_string(),
+            address,
+            boot_id: id.iter().map(|b| format!("{b:02x}")).collect(),
+        });
+    }
+
+    /// `host`, while its heartbeat is live.
+    pub fn live_member(&self, host: &str) -> Option<crate::fleet_pg::HostRow> {
+        let members = lock(&self.members);
+        let read_ago = members.0?.elapsed().as_secs_f64();
+        members
+            .1
+            .iter()
+            .find(|m| m.host == host)
+            .filter(|m| m.age_secs + read_ago < MEMBER_LIVE.as_secs_f64())
+            .cloned()
+    }
+
+    /// Heartbeat this host and re-read the members.
+    async fn membership(&self) {
+        let identity = lock(&self.identity).clone();
+        if let Some(id) = identity
+            && let Err(e) = self
+                .pg
+                .heartbeat(&id.host, id.address.as_deref(), &id.boot_id)
+                .await
+        {
+            tracing::debug!(error = %e, "fleet heartbeat failed");
+        }
+        match self.pg.hosts().await {
+            Ok(rows) => *lock(&self.members) = (Some(Instant::now()), rows),
+            Err(e) => tracing::debug!(error = %e, "could not read the fleet's members"),
+        }
     }
 
     /// Run `f` every `every` on whichever host holds `lease`.
@@ -1014,6 +1072,8 @@ pub struct FleetStores {
     /// The data-plane session signing key (`APP_LB_AUTH_KEY`), so a sign-in
     /// on one host is a sign-in on every host. Sealed.
     pub auth_key: Arc<FleetDocument>,
+    /// The token fleet hops carry between members (`fleet_hop`). Sealed.
+    pub peer_token: Arc<FleetDocument>,
 }
 
 impl FleetStores {
@@ -1108,6 +1168,17 @@ impl FleetStores {
                 "cert-keys",
                 FileCollection::new(&certs, ".key.pem", private_dir),
                 acme_sealed,
+            ),
+            peer_token: fleet.document(
+                "peer-token",
+                FileDocument::new(
+                    crate::fleet_store::sibling_dir(&state, "fleet").join("peer-token"),
+                    FileOptions::PRIVATE,
+                ),
+                KindOptions {
+                    sealed: true,
+                    fence: None,
+                },
             ),
             auth_key: fleet.document(
                 "auth-key",
@@ -1297,6 +1368,7 @@ impl BackgroundService for FleetFeed {
                 for lease in leases {
                     lease.tick(&pg).await;
                 }
+                fleet.membership().await;
             }
 
             if lock(&fleet.blocked).is_none()

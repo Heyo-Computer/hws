@@ -235,6 +235,9 @@ impl RouteTable {
     }
 }
 
+/// Deployments placed on other hosts, routable but holding no backends.
+type ForeignRoutes = (RouteTable, HashMap<Arc<str>, Arc<Deployment>>);
+
 #[derive(Debug)]
 pub struct Registry {
     deployments: ArcSwap<HashMap<Arc<str>, Arc<Deployment>>>,
@@ -257,6 +260,10 @@ pub struct Registry {
     /// certifies reads that map, so a deployment that is not this host's
     /// cannot reach any of it. Listed, never acted on.
     foreign: ArcSwap<HashMap<String, Arc<DeploymentSpec>>>,
+    /// How requests for [`Self::foreign`] deployments route: the same rules as
+    /// local ones, over deployments that hold no backends. Only the fleet hop
+    /// (`fleet_hop`) reads it, to forward such a request to its home host.
+    foreign_routes: ArcSwap<ForeignRoutes>,
     /// Serializes compound admin mutations by deployment identity. Deployment
     /// objects are replaceable, so a mutex stored on one object cannot protect
     /// a drain from racing a spec replacement.
@@ -314,6 +321,7 @@ impl Registry {
             fleet: None,
             fleet_host: None,
             foreign: ArcSwap::from_pointee(HashMap::new()),
+            foreign_routes: ArcSwap::from_pointee((RouteTable::default(), HashMap::new())),
             change_lock: tokio::sync::Mutex::new(()),
             retirement_gate: Arc::new(tokio::sync::RwLock::new(())),
             persist_lock: std::sync::Mutex::new(()),
@@ -346,6 +354,25 @@ impl Registry {
             (Some(host), Some(placement)) => placement.includes(host),
             _ => true,
         }
+    }
+
+    fn set_foreign(&self, foreign: HashMap<String, Arc<DeploymentSpec>>) {
+        let deployments: HashMap<Arc<str>, Arc<Deployment>> = foreign
+            .values()
+            .map(|spec| (Arc::from(spec.id.as_str()), Arc::new(Deployment::new((**spec).clone()))))
+            .collect();
+        self.foreign_routes
+            .store(Arc::new((RouteTable::build(&deployments), deployments)));
+        self.foreign.store(Arc::new(foreign));
+    }
+
+    /// The deployment placed on another host that a request would route to,
+    /// if no local one claims it. It holds no backends: it is there to be run
+    /// through the edge checks and forwarded home.
+    pub fn route_foreign(&self, host: Option<&str>, path: &str) -> Option<Arc<Deployment>> {
+        let table = self.foreign_routes.load();
+        let id = table.0.resolve(host, path)?;
+        table.1.get(id).cloned()
     }
 
     /// Fleet deployments this host keeps but does not run.
@@ -402,7 +429,7 @@ impl Registry {
         deferred.extend(local.keys().filter(|id| !seen.contains(id.as_ref())).map(|id| id.to_string()));
         let before = self.foreign.load().len();
         let after = foreign.len();
-        self.foreign.store(Arc::new(foreign));
+        self.set_foreign(foreign);
         if before != after {
             tracing::info!(before, after, "deployments placed on other hosts updated");
         }
@@ -1049,7 +1076,7 @@ impl Registry {
                 "fleet deployments placed on other hosts: kept and listed, never run here"
             );
         }
-        self.foreign.store(Arc::new(foreign));
+        self.set_foreign(foreign);
         Ok(loaded)
     }
 
