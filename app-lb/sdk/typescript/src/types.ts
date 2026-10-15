@@ -242,6 +242,12 @@ export interface SiteSpec {
   index?: string;
   not_found?: string;
   spa?: boolean;
+  /**
+   * With `spa`, the paths the client-side router owns; any other unmatched
+   * path is a 404. `*` or `:name` matches one segment, a final `**` the rest.
+   * Empty keeps the fallback for every path.
+   */
+  spa_routes?: string[];
   cache_control?: string;
 }
 

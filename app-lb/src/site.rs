@@ -131,10 +131,18 @@ pub fn resolve(spec: &SiteSpec, request_path: &str) -> Resolved {
     let candidate = root.join(&relative);
     let canonical = match candidate.canonicalize() {
         Ok(p) => p,
-        // Missing, or a path that cannot be resolved. For a single-page app an
-        // unknown path is the router's business, so fall back to the index.
+        // Missing, or a path that cannot be resolved.
         Err(_) => {
+            // `/pricing` for `pricing.html`: the clean URL every static host
+            // gives a page. It is also how a single-page app ships a route with
+            // its own `<title>` in the HTML the server sends.
+            if let Some(page) = html_page(root, &relative, request_path) {
+                return Resolved::File(page);
+            }
+            // For a single-page app an unknown path is the router's business,
+            // so fall back to the index — if the router claims it.
             if spec.spa
+                && spa_owns(&spec.spa_routes, &decoded)
                 && let Some(index) = existing_page(root, Some(&spec.index))
             {
                 return Resolved::File(index);
@@ -175,6 +183,60 @@ pub fn resolve(spec: &SiteSpec, request_path: &str) -> Resolved {
     } else {
         not_found()
     }
+}
+
+/// `<path>.html` for an extensionless request path, if that file is in the root.
+///
+/// Held to the same rule as every other file: it must still be under the root
+/// once symlinks are resolved.
+fn html_page(root: &Path, relative: &Path, request_path: &str) -> Option<PathBuf> {
+    if request_path.ends_with('/') {
+        return None;
+    }
+    let name = relative.file_name()?.to_str()?;
+    if name.contains('.') {
+        return None;
+    }
+    let page = root.join(relative.with_file_name(format!("{name}.html"))).canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    (page.starts_with(&root) && page.is_file()).then_some(page)
+}
+
+/// Whether `site.spa_routes` hands this (decoded) path to the client router.
+/// No routes means every path, which is what `spa` alone has always meant.
+fn spa_owns(routes: &[String], path: &str) -> bool {
+    if routes.is_empty() {
+        return true;
+    }
+    let segments = path_segments(path);
+    routes.iter().any(|route| route_matches(&path_segments(route), &segments))
+}
+
+/// A path's segments, ignoring the leading slash and a trailing one, so
+/// `/settings/` and `/settings` are the same route.
+fn path_segments(path: &str) -> Vec<&str> {
+    path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect()
+}
+
+fn route_matches(pattern: &[&str], path: &[&str]) -> bool {
+    match (pattern.split_first(), path.split_first()) {
+        (Some((&"**", _)), _) => true,
+        (None, None) => true,
+        (Some((p, rest)), Some((s, path_rest))) => {
+            (*p == "*" || p.starts_with(':') || p == s) && route_matches(rest, path_rest)
+        }
+        _ => false,
+    }
+}
+
+/// A `site.spa_routes` entry the matcher can read: rooted, with `**` (if any)
+/// only as the last segment.
+pub fn valid_spa_route(route: &str) -> bool {
+    if !route.starts_with('/') {
+        return false;
+    }
+    let segments = path_segments(route);
+    segments.iter().rev().skip(1).all(|s| *s != "**")
 }
 
 /// A page inside the root, if it is configured and actually present.
@@ -363,6 +425,7 @@ mod tests {
             index: "index.html".into(),
             not_found: None,
             spa: false,
+            spa_routes: vec![],
             cache_control: "public, max-age=300".into(),
         }
     }
@@ -520,6 +583,67 @@ mod tests {
     }
 
     #[test]
+    fn an_extensionless_path_serves_its_html_page() {
+        let dir = tmpdir("clean");
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("signup.html"), b"signup").unwrap();
+        std::fs::write(dir.join("docs/intro.html"), b"intro").unwrap();
+        std::fs::write(dir.join("docs/index.html"), b"docs").unwrap();
+        std::fs::write(dir.join("data"), b"raw").unwrap();
+        let s = spec(dir.to_str().unwrap());
+
+        let served = |path: &str| match resolve(&s, path) {
+            Resolved::File(p) => Some(std::fs::read_to_string(p).unwrap()),
+            _ => None,
+        };
+        assert_eq!(served("/signup").as_deref(), Some("signup"));
+        assert_eq!(served("/docs/intro").as_deref(), Some("intro"));
+        // A file that exists as named always wins.
+        assert_eq!(served("/data").as_deref(), Some("raw"));
+        // A directory is still a redirect to its index, not `docs.html`.
+        assert!(matches!(resolve(&s, "/docs"), Resolved::Redirect(_)));
+        // Only extensionless names, and never with a trailing slash.
+        assert!(matches!(resolve(&s, "/signup/"), Resolved::NotFound(_)));
+        assert!(matches!(resolve(&s, "/signup.htm"), Resolved::NotFound(_)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `spa_routes` narrows the fallback, so a path the router does not own is
+    /// a real 404 — with the configured page, which may be the app shell.
+    #[test]
+    fn spa_routes_limit_the_fallback() {
+        let dir = tmpdir("spa-routes");
+        std::fs::write(dir.join("index.html"), b"<div id=app>").unwrap();
+        let mut s = spec(dir.to_str().unwrap());
+        s.spa = true;
+        s.not_found = Some("index.html".into());
+        s.spa_routes = vec!["/login".into(), "/namespaces/:ns/deployments/*".into(), "/settings/**".into()];
+
+        for owned in ["/login", "/login/", "/namespaces/a/deployments/b", "/settings", "/settings/billing/x"] {
+            assert!(matches!(resolve(&s, owned), Resolved::File(_)), "{owned}");
+        }
+        for unknown in ["/nope", "/login/extra", "/namespaces/a/deployments", "/namespaces/a/x/b", "/settingsx"] {
+            match resolve(&s, unknown) {
+                Resolved::NotFound(Some(p)) => assert!(p.ends_with("index.html"), "{unknown}"),
+                other => panic!("{unknown}: expected a 404 with the shell, got {other:?}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spa_route_patterns_are_validated() {
+        for ok in ["/", "/login", "/a/*/b", "/a/:id", "/**", "/settings/**"] {
+            assert!(valid_spa_route(ok), "{ok}");
+        }
+        for bad in ["", "login", "/**/x", "/a/**/b"] {
+            assert!(!valid_spa_route(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn content_types_cover_what_a_build_emits() {
         for (name, want) in [
             ("index.html", "text/html; charset=utf-8"),
@@ -592,6 +716,7 @@ mod tests {
             index: "index.html".into(),
             not_found: None,
             spa: false,
+            spa_routes: vec![],
             cache_control: String::new(),
         };
         let missing = root_status(&spec(&dir));

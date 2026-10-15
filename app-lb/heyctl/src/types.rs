@@ -218,6 +218,7 @@ pub struct SiteSpec {
     pub index: String,
     pub not_found: Option<String>,
     pub spa: bool,
+    pub spa_routes: Vec<String>,
     pub cache_control: String,
 }
 
