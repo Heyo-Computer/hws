@@ -617,6 +617,24 @@ Done 2026-10-14. us5 and us4 are members of one fleet, and the fleet database's 
 - **Handoff.** us5's handoff to 3fc4cbb under load: 584 requests, 0 failed.
 - **Bug found by this gate.** The first live hop closed the worker's control stream: the manager required a local backend for every peer. The worker exited and its supervisor replaced it. Fixed in 3fc4cbb.
 
+#### 6b as built: shared ACME challenges (2026-10-15)
+
+- **Challenges are fleet state.** Outstanding HTTP-01 responses are a fleet kind (`acme-challenges`), keyed by token. Each record names its issuer and is fenced by that host's `acme:<host>` lease.
+  - The feed loads them into every member's challenge table, so any host answers any host's challenge.
+  - The responses are not sealed: they are public by design, and they are retracted when the order ends.
+- **Proof before ready.** Before marking a challenge ready, the issuing host fetches it, as the CA would, from each other live member whose address the name resolves to. It allows 20 s each.
+  - If one cannot answer, the order is abandoned before the CA spends any of its validation budget. The failure then goes into the usual backoff.
+  - Members outside the name's DNS are never asked, so host-scoped names (`*.us5.heyo.work`) behave as before.
+- **Clean starts.** A host retracts any challenges an earlier process of its own left behind.
+- **Cross-host nudge.** A deployment change arriving through the feed nudges this host's issuance, which closes the "issue-now is local" open question for deployments a host runs. (A fleet kind may now have several reload hooks.)
+- **Not yet decided:** which host issues for a spread deployment. That is 6c's.
+
+**Gate evidence (2026-10-15, f206556):**
+- **Negative.** us4 ran 6b; us5 still ran 6a. us4 registered `fleet-acme-test.us5.heyo.work`, a name that resolves to us5 only. us4 abandoned the order without telling the CA the challenge was ready: "fleet host us5 (216.158.232.126:80) did not answer the challenge within 20s: answered 404".
+- **Handoff.** us5 handed off to 6b under load: 584 requests, 0 failed.
+- **Positive.** us4 registered the same name again and got a Let's Encrypt certificate (CN=YE2, SAN fleet-acme-test.us5.heyo.work) about 10 s later. The CA could only have validated at us5, which answered us4's challenge from the fleet store. The challenge record was then retracted: its tombstone was written by us4, and no live challenge records remain.
+- **Not tested live:** the cross-host nudge.
+
 **Rollback**
 - Before phase 5, rollback means not enabling the change.
 - After phase 5, restart us5 in file mode on its kept files, then replay into them any changes made since the switch, using the change feed.
@@ -641,7 +659,7 @@ Each row needs a discriminating live test and recorded evidence. Unit tests do n
 ## Open questions
 
 - **Promoting a logical replica of the fleet database.** pg-fc replicates logically, which does not carry sequences: before a replica takes writes, `fleet.revision` must be set past `max(revision)`, or new revisions would repeat old ones and every feed would skip them. Phase 5 needs either that step in the promotion runbook or a physical replica.
-- **ACME across hosts.** Only the `acme` lease holder issues, but the admin API's "issue now" nudge is local, so a deployment registered on another host waits for the holder's next sweep (12 h). Phase 6 needs the nudge to travel (the feed can carry it).
+- **ACME across hosts.** Answered by 6b: challenges are shared, and the nudge travels with the feed. Which host issues for a `spread` deployment is 6c's.
 - **One token document.** Tokens are one fleet record, so two hosts minting at once conflict, and the loser's sign-in token is dropped from memory when its store reloads. Before two hosts serve sign-ins (phase 6), tokens should become one record each.
 
 - **Customer database snapshots:**
