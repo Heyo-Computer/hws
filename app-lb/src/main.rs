@@ -1438,6 +1438,13 @@ fn main() {
             fs.fleet.clone(),
             registry.clone(),
             fleet_hop.as_ref().is_some_and(|h| h.forwards()),
+        )
+        // DNS TTL plus health-check detection plus margin.
+        .with_drain_quiet(
+            std::env::var("APP_LB_FLEET_DRAIN_QUIET_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map_or(fleet_placement::DEFAULT_DRAIN_QUIET, std::time::Duration::from_secs),
         ));
         fleet_placement::install(placer.clone());
         placer

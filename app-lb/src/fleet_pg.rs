@@ -957,6 +957,20 @@ impl PgStore {
         .await
     }
 
+    /// Set `host`'s lifecycle state (`active`, `draining`, `maintenance`).
+    /// The heartbeat never writes it, so it outlives a restart. False when no
+    /// such host has ever heartbeated.
+    pub async fn set_host_state(&self, host: &str, state: &str) -> Result<bool, PgFailure> {
+        let sql = self.sql("UPDATE {s}.hosts SET state = $2 WHERE host = $1");
+        let (host, state) = (host.to_string(), state.to_string());
+        self.call(move |pool| async move {
+            let c = pool.get().await.map_err(pool_failure)?;
+            let n = c.execute(&sql, &[&host, &state]).await.map_err(classify)?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
     /// Every host that has ever heartbeated, with how long ago, by the
     /// database's clock so hosts' clocks never need to agree.
     pub async fn hosts(&self) -> Result<Vec<HostRow>, PgFailure> {
