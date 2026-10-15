@@ -3638,10 +3638,12 @@ pub struct DeploymentSpec {
 /// Where a deployment runs when several app-lb hosts share one fleet store
 /// (`docs/design/fleet-shared-state.md` § 4).
 ///
-/// Only `pinned` is accepted today: every replica runs on `home`, and every
-/// other host keeps the spec but runs, routes and certifies nothing for it.
-/// `spread`, which lets replicas run on any listed host, arrives with the
-/// placement controller that decides how many go where.
+/// - `pinned`: every replica runs on `home`, and every other host keeps the
+///   spec but runs, routes and certifies nothing for it.
+/// - `spread`: replicas run on any live listed host, as many on each as the
+///   fleet's placement controller (`fleet_placement`) decides. Only for a
+///   VM pool with no host-bound state; [`DeploymentSpec::validate`] refuses
+///   the rest.
 ///
 /// A single-server app-lb accepts the field and ignores it: there is no other
 /// host for a deployment to be placed on.
@@ -3684,10 +3686,15 @@ impl Placement {
     pub fn validate(&self) -> Result<(), SpecError> {
         let bad = |why: &str| Err(SpecError::InvalidPlacement(why.to_string()));
         match self.mode {
-            PlacementMode::Spread => bad(
-                "placement.mode `spread` is not available yet: it needs the placement \
-                 controller (fleet phase 6). Use `pinned` with a `home`",
-            ),
+            PlacementMode::Spread => {
+                if self.home.is_some() {
+                    return bad("placement.home is for `pinned`; a spread deployment runs on `hosts`");
+                }
+                if self.hosts.iter().any(|h| !is_valid_fleet_host(h)) {
+                    return bad("placement.hosts must be host names: letters, digits, `-`, `_` and `.`");
+                }
+                Ok(())
+            }
             PlacementMode::Pinned => {
                 let Some(home) = self.home.as_deref() else {
                     return bad("placement.mode `pinned` needs a `home` host");
@@ -5244,6 +5251,36 @@ impl DeploymentSpec {
             .any(|r| r.host.is_some() || r.host_suffix.is_some())
     }
 
+    /// Why this deployment's replicas could not run on just any fleet host,
+    /// if they could not: the state that would be split from its data.
+    pub fn host_bound(&self) -> Option<&'static str> {
+        let Some(vm) = &self.vm else {
+            return Some("this deployment has no VM pool (its upstreams or site files are on one host)");
+        };
+        if vm.workspace.is_some() {
+            return Some("vm.workspace lives on one host");
+        }
+        if !vm.mounts.is_empty() {
+            return Some("vm.mounts live on one host");
+        }
+        if vm.disk_size_gb.is_some() {
+            return Some("a vm.disk_size_gb disk lives on one host");
+        }
+        if self.scaling.idle_action == IdleAction::Retain {
+            return Some("idle_action `retain` keeps stopped VMs on one host");
+        }
+        if self.build.is_some() {
+            return Some("a vm.build image is built on one host");
+        }
+        if self.artifact.as_ref().is_some_and(|a| a.store.starts_with('/')) {
+            return Some("an artifact store given as a path is on one host");
+        }
+        if self.discovery.is_some() || self.gateway.is_some() {
+            return Some("regional discovery and gateways are placed per region, not per fleet host");
+        }
+        None
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
@@ -5284,6 +5321,14 @@ impl DeploymentSpec {
         }
         if let Some(placement) = &self.placement {
             placement.validate()?;
+            if placement.mode == PlacementMode::Spread
+                && let Some(why) = self.host_bound()
+            {
+                return Err(SpecError::InvalidPlacement(format!(
+                    "placement.mode `spread` needs a VM pool with no host-bound state, and {why}; \
+                     use `pinned` with a `home`"
+                )));
+            }
         }
         // No routes means no ingress. For a *managed* deployment that is a
         // legitimate shape — an agent sandbox reached only through `exec` and
@@ -5906,7 +5951,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn pinned_needs_a_home_and_spread_waits_for_the_controller() {
+        fn pinned_needs_a_home_and_spread_needs_no_host_bound_state() {
             let mut s = spec();
             s.placement = Some(Placement::pinned("us5"));
             assert!(s.validate().is_ok());
@@ -5917,11 +5962,27 @@ mod tests {
                 serde_json::json!({"mode": "pinned"}),
                 serde_json::json!({"mode": "pinned", "home": "us 5"}),
                 serde_json::json!({"mode": "pinned", "home": "us5", "hosts": ["us4"]}),
-                serde_json::json!({"mode": "spread"}),
+                serde_json::json!({"mode": "spread", "home": "us5"}),
+                serde_json::json!({"mode": "spread", "hosts": ["us 4"]}),
             ] {
                 s.placement = Some(serde_json::from_value(bad.clone()).unwrap());
                 assert!(matches!(s.validate(), Err(SpecError::InvalidPlacement(_))), "{bad}");
             }
+
+            s.placement = Some(serde_json::from_value(serde_json::json!({"mode": "spread"})).unwrap());
+            assert!(s.validate().is_ok(), "a plain VM pool spreads");
+            assert!(s.placement.as_ref().unwrap().includes("us4"), "empty hosts means every host");
+            s.placement.as_mut().unwrap().hosts = vec!["us5".into()];
+            assert!(!s.placement.as_ref().unwrap().includes("us4"));
+
+            s.scaling.idle_action = IdleAction::Retain;
+            let e = s.validate().unwrap_err().to_string();
+            assert!(e.contains("retain"), "{e}");
+            s.scaling.idle_action = IdleAction::Destroy;
+            s.vm.as_mut().unwrap().disk_size_gb = Some(4);
+            assert!(s.validate().is_err(), "a data disk is host-bound");
+            s.vm.as_mut().unwrap().disk_size_gb = None;
+            assert!(s.validate().is_ok());
         }
 
         #[test]

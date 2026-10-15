@@ -28,6 +28,7 @@ mod federated;
 mod fleet;
 mod fleet_store;
 mod fleet_hop;
+mod fleet_placement;
 mod fleet_pg;
 mod fleet_seal;
 mod fleet_split;
@@ -1191,6 +1192,17 @@ fn main() {
     );
     let autoscaler = autoscaler_svc.task();
     let adopted = autoscaler.adopted();
+    // A spread deployment another host removed is out of routing once the
+    // registry applies the change; its VMs on this host's daemon go here.
+    if let Some(fs) = &fleet_stores {
+        let (registry, autoscaler) = (registry.clone(), autoscaler.clone());
+        fs.fleet.on_reload("deployments", move || {
+            for d in registry.take_fleet_removed() {
+                let autoscaler = autoscaler.clone();
+                tokio::spawn(async move { autoscaler.teardown(&d).await });
+            }
+        });
+    }
 
     let disks = {
         let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()).with_workspaces(workspaces.clone()));
@@ -1419,6 +1431,17 @@ fn main() {
         tracing::info!(forward, "fleet hops: accepted from peers{}", if forward { ", and made to them" } else { "" });
         hop
     });
+    // Where `spread` deployments' replicas run, fleet-wide.
+    let placer = fleet_stores.as_ref().map(|fs| {
+        let placer = Arc::new(fleet_placement::Placer::new(
+            &fs.host,
+            fs.fleet.clone(),
+            registry.clone(),
+            fleet_hop.as_ref().is_some_and(|h| h.forwards()),
+        ));
+        fleet_placement::install(placer.clone());
+        placer
+    });
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
         control: Arc::new(request_control::RequestControl::new(
             registry.clone(), metrics.clone(), challenges, auth, guard.clone(),
@@ -1437,6 +1460,9 @@ fn main() {
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");
 
     let autoscaler_handle = server.add_service(autoscaler_svc);
+    if let Some(placer) = placer {
+        server.add_service(background_service("fleet-placement", fleet_placement::Service(placer)));
+    }
     server.add_service(admin_svc);
     server.add_service(background_service(
         "discovery",

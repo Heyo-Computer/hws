@@ -635,6 +635,49 @@ Done 2026-10-14. us5 and us4 are members of one fleet, and the fleet database's 
 - **Positive.** us4 registered the same name again and got a Let's Encrypt certificate (CN=YE2, SAN fleet-acme-test.us5.heyo.work) about 10 s later. The CA could only have validated at us5, which answered us4's challenge from the fleet store. The challenge record was then retracted: its tombstone was written by us4, and no live challenge records remain.
 - **Not tested live:** the cross-host nudge.
 
+#### 6c as built: spread placement and the controller (2026-10-15)
+
+- **Spec.** `placement.mode: spread` is accepted for VM pools with no host-bound state. Refused: no VM pool, `vm.workspace`, `vm.mounts`, `vm.disk_size_gb`, `idle_action: retain`, `vm.build`, an artifact store given as a path, and regional discovery or gateways.
+- **Tables (migration 3).**
+  - `host_demand(host, deployment, in_flight, waiters, ready, booting, idle_secs)`: each host writes its rows once a second, only when they change, and clears them at start.
+  - `placement_targets(deployment, host, desired, generation)`.
+  - Every host reads both into a cached view once a second. The data plane reads the view, never the database. This replaces the `/fleet/v1/pool` poll the design proposed.
+- **Controller** (`fleet_placement`, lease `placement`, every 2 s):
+  - It sizes each deployment once for the fleet with the single-host formula (`deployment::desired_for`) applied to the summed demand. It splits the result across live, active hosts: demand first, then hosts already running replicas, then by name.
+  - It writes in one transaction, fenced by the lease epoch.
+  - **Make before break:** while any host is short of its share, no host's target drops below what it has ready.
+- **Hosts.**
+  - The autoscaler runs this host's target. Until the first read of the view, a host sizes itself, so a restart keeps the replicas it adopts.
+  - A waiter on a host whose target is zero boots one replica there, and the controller absorbs it.
+  - Another host's change to a spread deployment applies at once, by the admin API's rule: a new template (VM, upstreams or artifact) rebuilds the pool, and anything else keeps it. A pull filling in `vm.image` is not a new template. Removal tears down this host's replicas.
+- **Routing.** A spread request with nothing ready locally goes once to the least-utilised peer that has ready replicas and still a target. Failing that, if this host has no target, it goes to the peer that does. Otherwise it waits locally. A spread deployment this host does not run is forwarded the same way.
+- **Certificates.** The first live host by name among those running a spread deployment issues its certificate.
+- **Forwarding is on for both hosts.** us5's `fleet.env` gained `APP_LB_FLEET_FORWARD=1`; its backup is `/root/phase5/fleet.env.bak-pre-forward`.
+
+**Gate evidence (2026-10-15, 85dabcf):** the `spread-smoke` test app, routed through both ingresses (us4 locally, and us5 at its public address).
+- **Spread.** With `min_replicas: 2`, each host runs exactly one VM (targets 1/1). Each ingress is served by its own host's VM: 20 of 20 through each.
+- **Template change under load.** A new VM template registered on us4 rebuilt the pool on both hosts.
+  - 729 requests through both ingresses, 0 failed.
+  - During the gap, each ingress served from the other host's new VM.
+  - One VM per host afterwards.
+- **Scale down under load.** At `min_replicas: 1`, us5 drained to zero, and its ingress forwarded every request to us4's VM: 664 requests, 0 failed.
+- **Scale from zero.** With every target at zero, a request through us5 booted a replica there on us5's own authority: 200 in 6.6 s.
+- **Controller restart.** The lease holder (us4, epoch 6) was restarted while scaling to 4.
+  - us5 took the lease at epoch 7, and the targets held at 2/2.
+  - Each host ended with exactly 2 VMs: no duplicates.
+  - 808 requests during it, 0 failed.
+  - The stale-epoch fence is covered against Postgres (`write_targets` refuses a stale epoch).
+- **Removal.** Deregistering on us4 tore down us5's replicas, and the targets were removed.
+- **Restarts.** us5 adopted and kept its spread replica across its own restart. Every production handoff dropped nothing (582, 582, 592 and 596 requests, 0 failed).
+
+**Found and fixed during the gate:**
+- another host's change to a spread deployment waited for a restart;
+- a restart drained adopted replicas against the empty view;
+- a request was forwarded to a peer that was about to drain;
+- a peer's template change kept this host's old pool.
+
+**Not changed (pre-existing):** with `min_replicas: 0` and `warm_pool: 0`, the sizing formula returns 0 as soon as demand is 0, so `scale_to_zero_after_secs` never delays the drain. A single host behaves the same.
+
 **Rollback**
 - Before phase 5, rollback means not enabling the change.
 - After phase 5, restart us5 in file mode on its kept files, then replay into them any changes made since the switch, using the change feed.
@@ -651,7 +694,7 @@ Each row needs a discriminating live test and recorded evidence. Unit tests do n
 | [x] One hop (6a, 2026-10-14) | Requests to us4 for a us5-pinned app succeed. A forged `x-heyo-fleet-hop` without the token is refused. Forcing B's pool empty yields 503, never a bounce. |
 | [ ] Drain us5 | Continuous requests through both ingresses during drain → upgrade → restore → bake: zero failures, no admissions to drained backends, and the surviving path does not use us5's ingress. |
 | [ ] Drain us4 | Same, the other way. |
-| [ ] Controller restart | Kill the lease holder mid-scale: no duplicate replicas, targets converge, and the epoch fences the old holder. |
+| [x] Controller restart (6c, 2026-10-15) | Kill the lease holder mid-scale: no duplicate replicas, targets converge, and the epoch fences the old holder. |
 | [ ] Unhealthy candidate and rollback | A `spread` rollout whose candidate fails health stops on both hosts and rolls back, with serving capacity preserved. |
 | [ ] app-lb restart | Restarting app-lb on one host (infrastructure maintenance, not app rollout) with traffic moved away first: zero failures. |
 | [ ] Never cross-daemon | Audit both heyvm logs across all gates: no host created, adopted or killed a VM on the other host's daemon. |

@@ -279,6 +279,9 @@ pub struct Registry {
     /// a restart terminates those connections, so there is nothing to restore.
     retired_discovery: std::sync::Mutex<HashMap<String, Vec<Arc<crate::deployment::VmBackend>>>>,
     staged: std::sync::Mutex<HashMap<String, Arc<Deployment>>>,
+    /// Spread deployments the fleet removed from this host, awaiting the
+    /// autoscaler's teardown ([`Self::take_fleet_removed`]).
+    fleet_removed: std::sync::Mutex<Vec<Arc<Deployment>>>,
     #[cfg(test)]
     pub(crate) fail_after_rename: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the last [`load`](Registry::load) left a file on disk that it
@@ -327,6 +330,7 @@ impl Registry {
             persist_lock: std::sync::Mutex::new(()),
             retired_discovery: std::sync::Mutex::new(HashMap::new()),
             staged: std::sync::Mutex::new(HashMap::new()),
+            fleet_removed: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             fail_after_rename: Default::default(),
             load_skipped: std::sync::atomic::AtomicBool::new(false),
@@ -402,6 +406,16 @@ impl Registry {
         let mut foreign = HashMap::new();
         let mut seen = HashSet::new();
         let mut deferred = Vec::new();
+        // A `spread` deployment is every listed host's own, so a change from
+        // another of them applies here at once. A pinned one has one home,
+        // the only host that may change it.
+        let spread = |s: &DeploymentSpec| {
+            s.placement
+                .as_ref()
+                .is_some_and(|p| p.mode == crate::config::PlacementMode::Spread)
+        };
+        let mut applied = Vec::new();
+        let mut gone = Vec::new();
         for entry in entries {
             let Some(mut record) = entry
                 .body
@@ -420,13 +434,59 @@ impl Registry {
             seen.insert(id.clone());
             if self.placed_here(&record.spec) {
                 if local.get(id.as_str()).is_none_or(|d| d.spec != record.spec) {
-                    deferred.push(id);
+                    if spread(&record.spec) {
+                        applied.push(record.spec);
+                    } else {
+                        deferred.push(id);
+                    }
                 }
             } else {
+                if local.get(id.as_str()).is_some_and(|d| spread(&d.spec)) {
+                    gone.push(id.clone());
+                }
                 foreign.insert(id, Arc::new(record.spec));
             }
         }
-        deferred.extend(local.keys().filter(|id| !seen.contains(id.as_ref())).map(|id| id.to_string()));
+        for (id, d) in local.iter() {
+            if !seen.contains(id.as_ref()) {
+                if spread(&d.spec) {
+                    gone.push(id.to_string());
+                } else {
+                    deferred.push(id.to_string());
+                }
+            }
+        }
+        for spec in applied {
+            // The admin API's rule: a new VM template rebuilds the pool, and
+            // anything else keeps it.
+            match self.get(&spec.id) {
+                Some(old) if rebuilds(&old.spec, &spec) => {
+                    tracing::info!(deployment = %spec.id, "applying another fleet host's change to a spread deployment (backends changed; rebuilding)");
+                    self.upsert(spec);
+                    self.fleet_removed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(old);
+                }
+                Some(_) => {
+                    tracing::info!(deployment = %spec.id, "applying another fleet host's change to a spread deployment (pool preserved)");
+                    self.update(spec);
+                }
+                None => {
+                    tracing::info!(deployment = %spec.id, "a spread deployment arrived from another fleet host");
+                    self.upsert(spec);
+                }
+            }
+        }
+        for id in gone {
+            if let Some(d) = self.remove(&id) {
+                tracing::info!(deployment = %id, "a spread deployment left this host; tearing down its replicas here");
+                self.fleet_removed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(d);
+            }
+        }
         let before = self.foreign.load().len();
         let after = foreign.len();
         self.set_foreign(foreign);
@@ -453,6 +513,13 @@ impl Registry {
     /// create permit that a replacement may itself be draining.
     pub(crate) fn try_change_guard(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         self.change_lock.try_lock().ok()
+    }
+
+    /// Spread deployments another fleet host removed, moved off this host or
+    /// rebuilt, since the last call: out of routing already, their VMs still
+    /// to go.
+    pub fn take_fleet_removed(&self) -> Vec<Arc<Deployment>> {
+        std::mem::take(&mut *self.fleet_removed.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub fn deployments(&self) -> Arc<HashMap<Arc<str>, Arc<Deployment>>> {
@@ -1229,6 +1296,30 @@ fn state_key(id: &str) -> String {
         }
     }
     out
+}
+
+/// Whether moving from `old` to `new` needs a new pool: the admin API's
+/// rule (a different VM template or upstream list), except that a pull
+/// filling in `vm.image` for an unchanged artifact is the same template. Each
+/// host pulls for itself, so a peer's pull must not recycle this host's pool.
+fn rebuilds(old: &DeploymentSpec, new: &DeploymentSpec) -> bool {
+    if old.upstreams != new.upstreams || old.artifact != new.artifact {
+        return true;
+    }
+    let pulled_from = |s: &DeploymentSpec| s.artifact.is_some();
+    let template = |s: &DeploymentSpec| {
+        s.vm.clone().map(|mut vm| {
+            if pulled_from(s) {
+                vm.image = None;
+            }
+            vm
+        })
+    };
+    if pulled_from(old) {
+        template(old) != template(new)
+    } else {
+        old.vm != new.vm
+    }
 }
 
 #[cfg(test)]
@@ -2033,6 +2124,75 @@ mod tests {
         s.placement = Some(crate::config::Placement::pinned("us5"));
         assert!(single.placed_here(&s));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn another_hosts_change_to_a_spread_deployment_applies_here_at_once() {
+        let dir = std::env::temp_dir().join(format!("app-lb-fleet-spread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fleet_dir = dir.join("fleet");
+        let fleet: Arc<dyn Collection> =
+            Arc::new(FileCollection::new(&fleet_dir, ".json", FileOptions::SYNCED));
+        let write = |id: &str, placement: serde_json::Value, port: u16| {
+            let mut s = spec(id, vec![host(&format!("{id}.example"))]);
+            s.placement = serde_json::from_value(placement).unwrap();
+            s.vm.as_mut().unwrap().port = port;
+            std::fs::create_dir_all(&fleet_dir).unwrap();
+            std::fs::write(
+                fleet_dir.join(format!("{id}.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({"spec": s})).unwrap(),
+            )
+            .unwrap();
+        };
+        let spread = serde_json::json!({"mode": "spread"});
+        let pinned = serde_json::json!({"mode": "pinned", "home": "us4"});
+        let r = Registry::new(dir.join("app-lb-state.json")).with_fleet(fleet.clone(), "us4");
+        r.load().unwrap();
+
+        // Registered on another host: it runs here too, at once.
+        write("web", spread.clone(), 8080);
+        write("pin", pinned.clone(), 8080);
+        r.apply_fleet_changes();
+        assert!(r.get("web").is_some() && r.route(Some("web.example"), "/").is_some());
+        assert!(r.get("pin").is_none(), "a pinned change waits for this host's next start");
+
+        // Changed there: changed here, and a new template rebuilds the pool.
+        write("web", spread.clone(), 9090);
+        r.apply_fleet_changes();
+        assert_eq!(r.get("web").unwrap().spec.vm.as_ref().unwrap().port, 9090);
+        assert_eq!(r.take_fleet_removed().len(), 1, "the old pool goes to teardown");
+
+        // Moved off this host, then gone: out of routing, handed to teardown.
+        write("web", serde_json::json!({"mode": "spread", "hosts": ["us5"]}), 9090);
+        r.apply_fleet_changes();
+        assert!(r.get("web").is_none() && r.foreign().contains_key("web"));
+        assert_eq!(r.take_fleet_removed().len(), 1);
+        write("web2", spread, 8080);
+        r.apply_fleet_changes();
+        std::fs::remove_file(fleet_dir.join("web2.json")).unwrap();
+        r.apply_fleet_changes();
+        assert!(r.get("web2").is_none());
+        assert_eq!(r.take_fleet_removed().iter().map(|d| d.spec.id.as_str()).collect::<Vec<_>>(), ["web2"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_peers_pull_is_not_a_new_template() {
+        let mut old = spec("web", vec![]);
+        old.artifact = Some(serde_json::from_value(serde_json::json!({"ref": "heyo/alpine:3.24"})).unwrap());
+        old.vm.as_mut().unwrap().image = None;
+        let mut pulled = old.clone();
+        pulled.vm.as_mut().unwrap().image = Some("img-cb5f2d273ff38cdb".into());
+        assert!(!rebuilds(&old, &pulled));
+        let mut scaled = pulled.clone();
+        scaled.scaling.min_replicas = 3;
+        assert!(!rebuilds(&pulled, &scaled));
+        let mut new_cmd = pulled.clone();
+        new_cmd.vm.as_mut().unwrap().start_command = Some("other".into());
+        assert!(rebuilds(&pulled, &new_cmd));
+        let mut new_ref = pulled.clone();
+        new_ref.artifact = Some(serde_json::from_value(serde_json::json!({"ref": "heyo/alpine:3.25"})).unwrap());
+        assert!(rebuilds(&pulled, &new_ref));
     }
 
     #[test]

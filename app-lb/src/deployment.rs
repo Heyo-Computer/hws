@@ -450,6 +450,21 @@ pub struct Deployment {
     boot_backoff_until: AtomicU64,
 }
 
+/// The replica count `policy` asks for under `demand` (in-flight plus
+/// waiting requests), for a pool idle for `idle_for` seconds. One host's
+/// pool and a whole fleet's (`fleet_placement`) are sized by the same rule.
+pub fn desired_for(policy: &crate::config::ScalingPolicy, demand: usize, idle_for: u64) -> u32 {
+    let needed = demand.div_ceil(policy.target_concurrency.max(1) as usize) as u32;
+    let mut desired = needed.saturating_add(policy.warm_pool);
+
+    let may_scale_to_zero = policy.min_replicas == 0 && policy.warm_pool == 0;
+    if may_scale_to_zero && demand == 0 && idle_for >= policy.scale_to_zero_after_secs {
+        desired = 0;
+    }
+
+    desired.clamp(policy.min_replicas, policy.max_replicas)
+}
+
 impl Deployment {
     pub fn new(spec: DeploymentSpec) -> Self {
         // A static (proxy_pass) deployment has a fixed set of backends known at
@@ -625,19 +640,14 @@ impl Deployment {
     /// absorb cold starts, so honouring both would be contradictory. It would
     /// also be unreachable in practice — an empty pool reports maximal idleness,
     /// so a warm pool that ever emptied could never refill itself.
+    ///
+    /// A `spread` deployment in a fleet runs what the fleet's placement
+    /// controller asks of this host instead (`fleet_placement::target`).
     pub fn desired_replicas(&self) -> u32 {
-        let policy = &self.spec.scaling;
-        let demand = self.demand();
-
-        let needed = demand.div_ceil(policy.target_concurrency.max(1) as usize) as u32;
-        let mut desired = needed.saturating_add(policy.warm_pool);
-
-        let may_scale_to_zero = policy.min_replicas == 0 && policy.warm_pool == 0;
-        if may_scale_to_zero && demand == 0 && self.idle_for() >= policy.scale_to_zero_after_secs {
-            desired = 0;
+        if let Some(target) = crate::fleet_placement::target(&self.spec, self.waiters()) {
+            return target;
         }
-
-        desired.clamp(policy.min_replicas, policy.max_replicas)
+        desired_for(&self.spec.scaling, self.demand(), self.idle_for())
     }
 
     /// Seconds since the pool last saw activity. An empty pool is treated as

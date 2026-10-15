@@ -503,6 +503,20 @@ impl RequestControl {
         state.next_peer(&self.registry, &self.metrics, &self.feed).await
     }
 
+    /// The peer a request for a `spread` deployment should go to, if this
+    /// host should not serve it: nothing ready here, and either a peer has
+    /// replicas ready or the controller asked a peer, not this host, to run it.
+    fn spread_peer(&self, deployment: &Deployment) -> Option<String> {
+        let spread = deployment.spec.placement.as_ref().is_some_and(|p| p.mode == crate::config::PlacementMode::Spread);
+        if !spread || deployment.backends().iter().any(|b| !b.is_draining()) {
+            return None;
+        }
+        let placer = crate::fleet_placement::placer()?;
+        placer.peer_ready(&deployment.spec.id).or_else(|| {
+            (placer.mine(&deployment.spec.id) == 0).then(|| placer.peer_targeted(&deployment.spec.id)).flatten()
+        })
+    }
+
     pub async fn decide(&self, head: &RequestHead, state: &mut RequestState) -> RequestDecision {
         let host = head.host();
         let path = head.uri.path().to_string();
@@ -530,7 +544,11 @@ impl RequestControl {
         };
         let mut routed = self.registry.route(host.as_deref(), &path);
         if routed.is_none() && let Some(foreign) = self.registry.route_foreign(host.as_deref(), &path) {
-            let home = foreign.spec.placement.as_ref().and_then(|p| p.home.clone()).unwrap_or_default();
+            // A pinned deployment's home, or, for a spread one this host does
+            // not run, the peer that should take it.
+            let home = foreign.spec.placement.as_ref().and_then(|p| p.home.clone())
+                .or_else(|| crate::fleet_placement::placer().and_then(|p| p.peer_ready(&foreign.spec.id).or_else(|| p.peer_targeted(&foreign.spec.id))))
+                .unwrap_or_default();
             if state.hop_in {
                 // Exactly one hop: never forward a forwarded request.
                 return RequestDecision::Respond(ResponseData::plain(503, format!("{} runs on {home}, not here; a fleet hop is never forwarded again\n", foreign.spec.id)));
@@ -614,6 +632,22 @@ impl RequestControl {
         if let Some((status, location)) = matched_redirect(&deployment, host.as_deref(), &head.uri) {
             state.set_deployment(deployment);
             return RequestDecision::Respond(ResponseData { status, body: String::new(), content_type: "text/plain; charset=utf-8", headers: vec![(http::header::LOCATION, location)], cache_control: None });
+        }
+        // A `spread` deployment with nothing ready here goes to a peer that
+        // has replicas ready, or that is asked to boot one when this host is
+        // not; otherwise it waits here for a cold start.
+        if state.hop_out.is_none() && !state.hop_in
+            && let Some(peer) = self.spread_peer(&deployment)
+            && let Some((hop, token)) = self.hop.as_ref().filter(|h| h.forwards()).and_then(|h| h.token().map(|t| (h, t)))
+        {
+            state.hop_out = Some(HopOut {
+                home: peer,
+                sni: host.clone().unwrap_or_default(),
+                origin: hop.host().to_string(),
+                token,
+                client: head.peer.map(|p| p.ip()),
+                proto: if head.secure() { "https" } else { "http" },
+            });
         }
         // Everything past here is the home host's to serve: its feed, its
         // site files, its backends.

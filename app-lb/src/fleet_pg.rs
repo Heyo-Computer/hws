@@ -138,6 +138,30 @@ CREATE TABLE {s}.hosts (
 );
 "#,
     ),
+    (
+        3,
+        r#"
+CREATE TABLE {s}.host_demand (
+    host        text        NOT NULL,
+    deployment  text        NOT NULL,
+    in_flight   bigint      NOT NULL,
+    waiters     bigint      NOT NULL,
+    ready       bigint      NOT NULL,
+    booting     bigint      NOT NULL,
+    idle_secs   bigint      NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (host, deployment)
+);
+CREATE TABLE {s}.placement_targets (
+    deployment  text        NOT NULL,
+    host        text        NOT NULL,
+    desired     bigint      NOT NULL,
+    generation  bigint      NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (deployment, host)
+);
+"#,
+    ),
 ];
 
 const UPSERT_ANY: &str = "INSERT INTO {s}.records (kind, key, body, revision, updated_by)
@@ -204,6 +228,20 @@ pub struct Snapshot {
     /// ([`PgStore::seed_kind`]), rather than having those files replaced by
     /// the nothing the fleet holds.
     pub kinds: std::collections::BTreeSet<String>,
+}
+
+/// One deployment's placement: `(deployment, generation, [(host, desired)])`.
+pub type PlacementPlan = (String, u64, Vec<(String, u32)>);
+
+/// One host's numbers for one `spread` deployment (`host_demand`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DemandReport {
+    pub in_flight: u64,
+    pub waiters: u64,
+    pub ready: u64,
+    pub booting: u64,
+    /// Seconds since the pool last saw activity; `u32::MAX` for an empty one.
+    pub idle_secs: u64,
 }
 
 /// One fleet member as the hosts table has it.
@@ -944,6 +982,153 @@ impl PgStore {
         .await
     }
 
+    /// Replace this host's demand rows: `rows` are upserted, `gone` deleted.
+    /// `clear` first drops every row this host has, for a fresh start.
+    pub async fn report_demand(
+        &self,
+        host: &str,
+        rows: Vec<(String, DemandReport)>,
+        gone: Vec<String>,
+        clear: bool,
+    ) -> Result<(), PgFailure> {
+        let upsert = self.sql(
+            "INSERT INTO {s}.host_demand (host, deployment, in_flight, waiters, ready, booting, idle_secs, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+             ON CONFLICT (host, deployment) DO UPDATE
+             SET in_flight = EXCLUDED.in_flight, waiters = EXCLUDED.waiters, ready = EXCLUDED.ready,
+                 booting = EXCLUDED.booting, idle_secs = EXCLUDED.idle_secs, updated_at = now()",
+        );
+        let delete = self.sql("DELETE FROM {s}.host_demand WHERE host = $1 AND deployment = $2");
+        let wipe = self.sql("DELETE FROM {s}.host_demand WHERE host = $1");
+        let host = host.to_string();
+        self.call(move |pool| async move {
+            let mut c = pool.get().await.map_err(pool_failure)?;
+            let t = c.transaction().await.map_err(classify)?;
+            if clear {
+                t.execute(&wipe, &[&host]).await.map_err(classify)?;
+            }
+            for id in &gone {
+                t.execute(&delete, &[&host, id]).await.map_err(classify)?;
+            }
+            for (id, r) in &rows {
+                let n = |v: u64| v.min(i64::MAX as u64) as i64;
+                t.execute(
+                    &upsert,
+                    &[
+                        &host,
+                        id,
+                        &n(r.in_flight),
+                        &n(r.waiters),
+                        &n(r.ready),
+                        &n(r.booting),
+                        &n(r.idle_secs),
+                    ],
+                )
+                .await
+                .map_err(classify)?;
+            }
+            t.commit().await.map_err(classify)
+        })
+        .await
+    }
+
+    /// Every host's demand rows: `(host, deployment, report)`.
+    pub async fn demand(&self) -> Result<Vec<(String, String, DemandReport)>, PgFailure> {
+        let sql = self.sql(
+            "SELECT host, deployment, in_flight, waiters, ready, booting, idle_secs FROM {s}.host_demand",
+        );
+        self.call(move |pool| async move {
+            let c = pool.get().await.map_err(pool_failure)?;
+            let rows = c.query(&sql, &[]).await.map_err(classify)?;
+            let n = |r: &tokio_postgres::Row, i: usize| r.get::<_, i64>(i).max(0) as u64;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get(0),
+                        r.get(1),
+                        DemandReport {
+                            in_flight: n(r, 2),
+                            waiters: n(r, 3),
+                            ready: n(r, 4),
+                            booting: n(r, 5),
+                            idle_secs: n(r, 6),
+                        },
+                    )
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// Every placement target: `(deployment, host, desired, generation)`.
+    pub async fn targets(&self) -> Result<Vec<(String, String, u32, u64)>, PgFailure> {
+        let sql =
+            self.sql("SELECT deployment, host, desired, generation FROM {s}.placement_targets");
+        self.call(move |pool| async move {
+            let c = pool.get().await.map_err(pool_failure)?;
+            let rows = c.query(&sql, &[]).await.map_err(classify)?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get(0),
+                        r.get(1),
+                        r.get::<_, i64>(2).clamp(0, u32::MAX as i64) as u32,
+                        r.get::<_, i64>(3).max(0) as u64,
+                    )
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// Write the placement controller's plan, fenced by `lease` at `epoch`:
+    /// one row per (deployment, host), replacing each deployment's rows, and
+    /// every target for a deployment not in `plan` dropped. `Ok(false)` when
+    /// the lease is no longer this host's, in which case nothing was written.
+    pub async fn write_targets(
+        &self,
+        lease: &str,
+        epoch: u64,
+        plan: Vec<PlacementPlan>,
+    ) -> Result<bool, PgFailure> {
+        let fence = self.sql(FENCE);
+        let clear = self.sql("DELETE FROM {s}.placement_targets WHERE deployment = $1");
+        let insert = self.sql(
+            "INSERT INTO {s}.placement_targets (deployment, host, desired, generation) VALUES ($1, $2, $3, $4)",
+        );
+        let prune = self.sql("DELETE FROM {s}.placement_targets WHERE NOT (deployment = ANY($1))");
+        let (lease, holder) = (lease.to_string(), self.host.clone());
+        self.call(move |pool| async move {
+            let mut c = pool.get().await.map_err(pool_failure)?;
+            let t = c.transaction().await.map_err(classify)?;
+            if t.query_opt(&fence, &[&lease, &holder, &(epoch as i64)])
+                .await
+                .map_err(classify)?
+                .is_none()
+            {
+                return Ok(false);
+            }
+            let ids: Vec<String> = plan.iter().map(|(id, _, _)| id.clone()).collect();
+            t.execute(&prune, &[&ids]).await.map_err(classify)?;
+            for (id, generation, hosts) in &plan {
+                t.execute(&clear, &[id]).await.map_err(classify)?;
+                for (host, desired) in hosts {
+                    t.execute(
+                        &insert,
+                        &[id, host, &(*desired as i64), &(*generation as i64)],
+                    )
+                    .await
+                    .map_err(classify)?;
+                }
+            }
+            t.commit().await.map_err(classify)?;
+            Ok(true)
+        })
+        .await
+    }
+
     /// Drop tombstones older than [`TOMBSTONE_DAYS`]. Returns how many.
     pub async fn collect_tombstones(&self) -> Result<u64, PgFailure> {
         let sql = self.sql(GC);
@@ -1423,6 +1608,77 @@ pub(crate) mod tests {
             a.snapshot().unwrap().cursor,
             cursor,
             "heartbeats never reach the feed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn demand_and_targets_round_trip_and_targets_are_fenced() {
+        let Some(a) = test_store("placement", "us5/1") else {
+            eprintln!("skipped: {TEST_URL_ENV} is not set");
+            return;
+        };
+        let report = DemandReport {
+            in_flight: 2,
+            waiters: 1,
+            ready: 1,
+            booting: 0,
+            idle_secs: 0,
+        };
+        a.report_demand(
+            "us5",
+            vec![("web".into(), report), ("api".into(), report)],
+            vec![],
+            true,
+        )
+        .await
+        .unwrap();
+        a.report_demand("us5", vec![], vec!["api".into()], false)
+            .await
+            .unwrap();
+        let rows = a.demand().await.unwrap();
+        assert_eq!(rows, vec![("us5".to_string(), "web".to_string(), report)]);
+        a.report_demand("us5", vec![], vec![], true).await.unwrap();
+        assert!(
+            a.demand().await.unwrap().is_empty(),
+            "a fresh start clears this host's rows"
+        );
+
+        let plan = |n: u32| {
+            vec![(
+                "web".to_string(),
+                1,
+                vec![("us4".to_string(), n), ("us5".to_string(), 1)],
+            )]
+        };
+        assert!(
+            !a.write_targets("placement", 1, plan(1)).await.unwrap(),
+            "no lease, no write"
+        );
+        let epoch = a
+            .acquire("placement", Duration::from_secs(15))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(a.write_targets("placement", epoch, plan(2)).await.unwrap());
+        let mut t = a.targets().await.unwrap();
+        t.sort();
+        assert_eq!(
+            t,
+            vec![
+                ("web".into(), "us4".into(), 2, 1),
+                ("web".into(), "us5".into(), 1, 1)
+            ]
+        );
+        assert!(a.write_targets("placement", epoch, vec![]).await.unwrap());
+        assert!(
+            a.targets().await.unwrap().is_empty(),
+            "a deployment gone from the plan loses its targets"
+        );
+        assert!(
+            !a.write_targets("placement", epoch + 1, plan(1))
+                .await
+                .unwrap(),
+            "a stale epoch is fenced"
         );
     }
 

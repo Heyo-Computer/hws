@@ -349,6 +349,17 @@ impl Fleet {
             .cloned()
     }
 
+    /// Replace the members as if just read from the hosts table.
+    #[cfg(test)]
+    pub fn set_members(&self, rows: Vec<crate::fleet_pg::HostRow>) {
+        *lock(&self.members) = (Some(Instant::now()), rows);
+    }
+
+    /// The store, for the fleet's own tables beyond records and leases.
+    pub fn pg(&self) -> Arc<PgStore> {
+        self.pg.clone()
+    }
+
     /// Every member whose heartbeat is live.
     pub fn live_members(&self) -> Vec<crate::fleet_pg::HostRow> {
         let members = lock(&self.members);
