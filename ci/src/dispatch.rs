@@ -1130,13 +1130,14 @@ impl Dispatcher {
             if self.store.queue_job(&job.id).await? {
                 let published = self
                     .bus
-                    .publish_job(
+                    .publish_job_after_attempt(
                         &route,
                         &JobMessage {
                             run_id: run_id.to_string(),
                             job_id: job.id.clone(),
                             job_key: plan.key.clone(),
                         },
+                        if job.started_at.is_none() { 0 } else { job.attempt },
                     )
                     .await;
 
@@ -1618,8 +1619,17 @@ impl Dispatcher {
             "running"
         );
 
+        let boot = vm.ensure_running(BOOT_TIMEOUT).await;
+        if !plan.target.is_existing_vm() && boot.as_ref().is_err_and(VmError::is_memory_capacity) {
+            let detail = format!("Waiting for host memory capacity: {}", boot.unwrap_err());
+            crate::vm_cleanup::wait_for_capacity(self, &msg.job_id, &runner, attempt, vm.id(), &detail)
+                .await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+            // Cleanup survives this executor and owns the retry. No checkout,
+            // commands, failure count, or terminal validation result here.
+            return Ok(JobStatus::Running);
+        }
         let outcome = async {
-            vm.ensure_running(BOOT_TIMEOUT).await?;
+            boot?;
             self.ensure_sized(&plan, &runner, &vm).await?;
             self.checkout(msg, &plan, &vm).await?;
             self.run_steps(msg, &plan, &vm, attempt).await
@@ -1752,15 +1762,21 @@ impl Dispatcher {
         let vm = placement.vm.map(str::to_string);
 
         let driver = driver_name(plan.vm.driver);
+        let capacity_wait: Vec<String> = sqlx::query_scalar("SELECT runner_hd_id FROM ci_runner_capacity_wait WHERE until_at>now()")
+            .fetch_all(self.store.pool()).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
 
         let mut pinned = placement.node;
         if let Some(node) = pinned {
             let cordoned = crate::host_maintenance::cordoned(&self.store, &node.id).await
                 .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
-            if (cordoned || !node.status.is_dispatchable()) && plan.fallback == Fallback::Any && vm.is_none() {
+            let full = vm.is_none() && capacity_wait.contains(&node.id);
+            if (cordoned || full || !node.status.is_dispatchable()) && plan.fallback == Fallback::Any && vm.is_none() {
                 pinned = None;
             } else if cordoned {
                 return Err(DispatchError::MaintenancePaused);
+            } else if full {
+                return Err(DispatchError::CapacityPaused);
             }
         }
         if let Some(node) = pinned {
@@ -1798,9 +1814,11 @@ impl Dispatcher {
         let mut candidates = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
         let mut maintenance = false;
+        let mut capacity = false;
         for candidate in placement.network.dispatchable() {
             if crate::host_maintenance::cordoned(&self.store, &candidate.id).await
                 .map_err(|e| DispatchError::StepFailed(e.to_string()))? { maintenance = true; continue; }
+            if capacity_wait.contains(&candidate.id) { capacity = true; continue; }
             match self.runners.supported_drivers(&candidate.id).await {
                 Ok(Some(supported)) if !host_can_run(Some(&supported), driver) => {
                     skipped.push(format!(
@@ -1836,6 +1854,7 @@ impl Dispatcher {
         if let Some(runner) = roomiest_runner(candidates, required) {
             return Ok((runner, vm));
         }
+        if capacity { return Err(DispatchError::CapacityPaused); }
         if maintenance { return Err(DispatchError::MaintenancePaused); }
         if skipped.is_empty() {
             return Err(DispatchError::NoOnlineRunner(
@@ -3816,6 +3835,13 @@ async fn process_delivery(
     job: JobMessage,
     attempt: i32,
 ) {
+    // A capacity retry is a new message, whose broker delivery count starts
+    // at one again. Never reuse an earlier executor's fencing attempt.
+    let attempt = match dispatcher.store.get_job(&job.job_id).await {
+        Ok(Some(row)) => if row.started_at.is_none() { attempt } else { attempt.max(row.attempt.saturating_add(1)) },
+        Ok(None) => { let _ = msg.ack().await; return; }
+        Err(e) => { tracing::warn!(job = %job.job_key, "cannot read attempt: {e}"); return; }
+    };
     // Tell JetStream this job is still being worked on, for as long as
     // it is. `ack_wait` is deliberately short so a dispatcher that dies
     // releases its job in about a minute; this is what stops that same
@@ -3862,7 +3888,7 @@ async fn process_delivery(
             break Err(DispatchError::InstanceDraining);
         }
         let result = bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
-        if matches!(result, Err(DispatchError::MaintenancePaused)) {
+        if matches!(result, Err(DispatchError::MaintenancePaused | DispatchError::CapacityPaused)) {
             // Preserve this delivery and its retry budget. Re-select on every
             // pass so unpinned work can use another runner immediately.
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -5049,6 +5075,7 @@ pub enum DispatchError {
     ResultRecording { step: String, exit_code: i32, error: String },
     InstanceDraining,
     MaintenancePaused,
+    CapacityPaused,
     ControllerUnavailable(String),
     DiskPressure(String),
     Native(String),
@@ -5259,6 +5286,7 @@ impl std::fmt::Display for DispatchError {
             Self::UnknownJob(id) => write!(f, "no job {id} exists"),
             Self::InstanceDraining => write!(f, "CI instance is draining; job returned to the shared queue"),
             Self::MaintenancePaused => write!(f, "runner is cordoned for host maintenance; job remains queued"),
+            Self::CapacityPaused => write!(f, "eligible runners recently rejected memory admission; job remains queued"),
             Self::UnknownRunner { wanted, network } => write!(
                 f,
                 "no runner {wanted:?} is a host member of network {network:?}. Add it \
@@ -7501,6 +7529,72 @@ jobs:
             d.executor.quiesce(drain).await.expect("verified cleanup unblocks instance drain");
             d.executor.resume(drain).await.unwrap();
             sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_debug_report WHERE job_id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
+        }
+        for cancelled in [false, true] {
+            *remote.lock().unwrap() = Remote::default();
+            let workflow = crate::workflow::Workflow::parse("capacity.yml", "jobs:\n  build:\n    uses: default\n    steps: [{run: echo test}]\n").unwrap();
+            let plan = crate::plan::Plan::build(&workflow).unwrap();
+            let run = crate::vm::new_id(); let sandbox = format!("sb-{run}");
+            d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
+            let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+            assert_eq!(d.store.claim_job_for_boot(&job.id, "hd-local", 1, d.executor.boot_id()).await.unwrap(), JobClaim::Claimed);
+            d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
+            d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
+            crate::vm_cleanup::wait_for_capacity(&d, &job.id, "hd-local", 1, &sandbox, "host memory capacity unavailable: requested=8192 MiB").await.unwrap();
+            assert_eq!(d.store.roll_up_run(&run).await.unwrap(), RunStatus::Running, "capacity rejection must not fail validation");
+            if cancelled { d.store.cancel_run(&run).await.unwrap(); }
+            // No immediate retry storm, and failed cleanup must retain ownership.
+            reconcile(&d).await.unwrap();
+            assert_eq!(remote.lock().unwrap().stops, 0);
+            remote.lock().unwrap().ineffective = true;
+            sqlx::query("UPDATE ci_vm_cleanup SET next_attempt_at=now() WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            reconcile(&d).await.unwrap();
+            assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, if cancelled { "cancelled" } else { "running" });
+            assert_eq!(d.store.claim_job_for_boot(&job.id, "other-host", 2, d.executor.boot_id()).await.unwrap(), JobClaim::Unavailable);
+            remote.lock().unwrap().ineffective = false;
+            sqlx::query("UPDATE ci_vm_cleanup SET next_attempt_at=now() WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            let restarted = test_dispatcher(workspace.path()).await;
+            reconcile(&restarted).await.unwrap();
+            let row = d.store.get_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(row.status, if cancelled { "cancelled" } else { "pending" });
+            assert!(remote.lock().unwrap().removed);
+            assert!(!d.store.has_host_work(&job.id).await.unwrap());
+            if !cancelled {
+                assert!(row.executor_boot.is_none() && row.sandbox_id.is_none());
+                assert_eq!(d.store.claim_job_for_boot(&job.id, "hd-local", 1, d.executor.boot_id()).await.unwrap(), JobClaim::Unavailable, "a delayed old delivery cannot reuse an execution attempt");
+                assert!(matches!(restarted.pick_runner(&plan.jobs[0], &run).await, Err(DispatchError::CapacityPaused)), "capacity feedback survives controller restart");
+                let mut networks = restarted.runners.snapshot().networks.clone();
+                networks[0].runners.push(crate::runners::Runner { id: "hd-other".into(), name: "other".into(), status: crate::runners::RunnerStatus::Online, last_seen_at: None });
+                restarted.runners.set_test_pool(crate::runners::Pool { networks, default_network_id: "local".into(), default_node_id: "hd-local".into(), ..Default::default() });
+                let mut movable = plan.jobs[0].clone();
+                movable.target.local = false;
+                movable.target.node = None;
+                assert_eq!(restarted.pick_runner(&movable, &run).await.unwrap().0, "hd-other", "try another healthy host after admission rejection");
+                sqlx::query("INSERT INTO ci_runner_capacity_wait VALUES('hd-other',now()+interval '5 minutes')").execute(d.store.pool()).await.unwrap();
+                assert!(matches!(restarted.pick_runner(&movable, &run).await, Err(DispatchError::CapacityPaused)), "all hosts full means wait, not failure");
+                sqlx::query("UPDATE ci_runner_capacity_wait SET until_at=now()-interval '1 second' WHERE runner_hd_id='hd-local'").execute(d.store.pool()).await.unwrap();
+                assert_eq!(restarted.pick_runner(&movable, &run).await.unwrap().0, "hd-local", "expired feedback permits fresh admission");
+                sqlx::query("DELETE FROM ci_runner_capacity_wait WHERE runner_hd_id='hd-other'").execute(d.store.pool()).await.unwrap();
+                let route = d.route_for(&plan.jobs[0]).await.unwrap();
+                let consumer = d.bus.consumer_for(&route).await.unwrap();
+                let retry = JobMessage { run_id: run.clone(), job_id: job.id.clone(), job_key: job.job_key.clone() };
+                // The prior message can still be inside JetStream's dedup
+                // window even though its delivery has been acknowledged.
+                d.bus.publish_job(&route, &retry).await.unwrap();
+                use futures::StreamExt;
+                let mut first = consumer.batch().max_messages(1).expires(Duration::from_secs(2)).messages().await.unwrap();
+                first.next().await.unwrap().unwrap().ack().await.unwrap();
+                d.advance_run(&run).await.unwrap();
+                d.bus.publish_job_after_attempt(&route, &retry, 1).await.unwrap();
+                let mut messages = consumer.batch().max_messages(1).expires(Duration::from_secs(2)).messages().await.unwrap();
+                let message = messages.next().await.unwrap().unwrap();
+                let delivered: JobMessage = serde_json::from_slice(&message.payload).unwrap();
+                assert_eq!(delivered.job_id, job.id, "cleanup must make the same job schedulable again");
+                message.ack().await.unwrap();
+            }
+            sqlx::query("DELETE FROM ci_runner_capacity_wait WHERE runner_hd_id='hd-local'").execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_debug_report WHERE job_id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
         }

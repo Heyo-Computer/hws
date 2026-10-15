@@ -257,10 +257,17 @@ impl Bus {
     /// publish — which happens whenever a submit is retried by a client that did
     /// not see the response.
     pub async fn publish_job(&self, route: &Route, msg: &JobMessage) -> Result<(), BusError> {
+        self.publish_job_after_attempt(route, msg, 0).await
+    }
+
+    /// Capacity retries need a new deduplication identity after the prior
+    /// delivery was ACKed. Retries of this publication still collapse.
+    pub async fn publish_job_after_attempt(&self, route: &Route, msg: &JobMessage, attempt: i32) -> Result<(), BusError> {
         let subject = self.subject_for(route)?;
         let payload = serde_json::to_vec(msg).map_err(|e| BusError::Encode(e.to_string()))?;
         let mut headers = async_nats::HeaderMap::new();
-        headers.insert("Nats-Msg-Id", msg.job_id.as_str());
+        let id = if attempt == 0 { msg.job_id.clone() } else { format!("{}:after-{attempt}", msg.job_id) };
+        headers.insert("Nats-Msg-Id", id.as_str());
 
         self.js
             .publish_with_headers(subject.clone(), headers, payload.into())

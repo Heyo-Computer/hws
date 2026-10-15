@@ -625,6 +625,20 @@ can require additional space. The check is conservative for warm VMs whose disks
 already exist. It does not change queues, create a scheduler service, or require
 an app-lb endpoint or configuration change.
 
+If HeyVM explicitly rejects a new VM for **host memory capacity**, CI keeps the
+job nonterminal and hands the rejected VM to durable cleanup before retrying.
+Cleanup waits at least 60 seconds and must confirm the exact VM is gone before
+the same job returns to the queue. This survives controller restarts; cancellation
+suppresses the retry. No guest command has run at this point. Boot timeouts,
+transport errors, and failures after execution begins are not admission retries.
+
+The rejecting host gets a shared five-minute admission cooldown. Unpinned jobs
+try another healthy compatible host in their assigned network; explicit host
+pins wait unless they specify `fallback: any`. Existing-VM targets do not move.
+If all eligible hosts are cooling down, jobs wait without spending their failure
+retry budget. The host becomes eligible for a fresh admission attempt after its
+cooldown; this feedback is not a reservation or a guarantee of free memory.
+
 **`uses:` carries everything needed to place the job**, and the third form is
 why that matters. A sandbox does not record which host it is on — `SandboxInfo`
 has no daemon field and there is no cloud-proxied exec — so `<network>/*/<vm>`
