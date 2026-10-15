@@ -241,7 +241,7 @@ client ─DNS (both A records)─▶ app-lb A (ingress)
 ### 6. Ingress, DNS and TLS
 
 **Names**
-- Fleet tenant hostnames are `<name>.<fleet domain>`. The domain is `heyo.work` names or a new fleet zone; this is an open question.
+- Fleet tenant hostnames are `<name>.<fleet domain>`. The fleet domain is `us.heyo.work` (6d).
 - Their DNS holds one A record per active host.
 - Custom domains CNAME to a fleet name.
 - Per-host names (`*.us5.heyo.work`) keep resolving to their host, for operators and debugging.
@@ -595,7 +595,7 @@ Done 2026-10-14. us5 and us4 are members of one fleet, and the fleet database's 
 
 1. Enable the fleet hop (`APP_LB_FLEET_FORWARD=1`), us4 first.
 2. Enable the placement controller and opt-in `spread`: the smoke app, then new stateless apps, then remote and artifacts.
-3. Add fleet certificates and dual-A DNS on a test name, then on the fleet domain. `*.us5.heyo.work` keeps pointing at us5 only.
+3. Add fleet certificates and dual-A DNS on a test name, then on the fleet domain. `*.us5.heyo.work` keeps pointing at us5 only. Done in 6d: `*.us.heyo.work`.
 4. Run live acceptance (§ Gates). Only after it passes do new deployments default to `spread`.
 
 #### 6a as built: the fleet hop (2026-10-14)
@@ -678,6 +678,24 @@ Done 2026-10-14. us5 and us4 are members of one fleet, and the fleet database's 
 
 **Not changed (pre-existing):** with `min_replicas: 0` and `warm_pool: 0`, the sizing formula returns 0 as soon as demand is 0, so `scale_to_zero_after_secs` never delays the drain. A single host behaves the same.
 
+#### 6d as built: one name on both hosts (2026-10-15)
+
+- **DNS.** `heyo.work` is in Route 53, where an operator adds records by hand. `fleet-smoke.us.heyo.work` and `*.us.heyo.work` are weighted records with equal weights, one per host (204.13.237.70 for us4, 216.158.232.126 for us5). Each answer names one host, and a drain will set that host's weight to 0. There are no health checks yet, because app-lb has no `/fleet/v1/healthz` for them to probe. That is 6e's.
+- **Certificates need no new mechanism.** The issuer (6c) runs an HTTP-01 order and every host answers the challenge from the fleet store (6b). The certificate and key are fleet records, so every host loads them.
+- **Fix: the pre-check on spread names.** 6b chose which peers to check with one DNS lookup. Against weighted records that lookup sees one host: at most one peer was checked, and none when the answer was the issuer itself. A `spread` deployment's name now checks every live member. Any other name keeps the DNS rule.
+- **Remaining gap.** A *pinned* deployment on a fleet name is still checked only where one lookup points. Its order still succeeds, because every host answers every challenge. Only the protection against spending the CA's validation budget on a broken peer is partial.
+
+**Gate evidence (2026-10-15, 760baff on both hosts; us5's handoff to it: 584 requests, 0 failed):**
+- **Test name.** `spread-smoke` (spread, `min_replicas: 2`) on `fleet-smoke.us.heyo.work`:
+  - Certificate: us4 issued it (Let's Encrypt YE1) 11 s after registration, and both IPs served it.
+  - Requests: 40 of 40 resolved through public DNS succeeded (16 to us4, 24 to us5), each served by its own host's VM. 60 s of paced load through both IPs: 531 requests, 0 failed.
+  - Cleanup: the challenge was retracted, and no challenge records remain.
+  - us5 logged one transient "no private key" warning: the certificate chain arrived over the feed before its key. The next reload loaded both.
+- **Wildcard.** `wild-smoke` on `wild-smoke.us.heyo.work`, covered only by `*.us.heyo.work`:
+  - Certificate: issued in 11 s (YE2), and both IPs served it.
+  - Requests: 40 of 40 through public DNS (7 to us4, 33 to us5). 60 s of paced load: 528 requests, 0 failed.
+- **TTL.** Route 53 still answers with TTL 300 for both names, though 60 was asked for on the wildcard. A drain must outlast it.
+
 **Rollback**
 - Before phase 5, rollback means not enabling the change.
 - After phase 5, restart us5 in file mode on its kept files, then replay into them any changes made since the switch, using the change feed.
@@ -709,6 +727,6 @@ Each row needs a discriminating live test and recorded evidence. Unit tests do n
   - the snapshot interval, which is the recovery point;
   - the method (`pg_basebackup`, or `fsfreeze` plus reflink);
   - how far back S3 retention goes.
-- **The fleet tenant domain**, and whether existing `*.us5.heyo.work` customer routes are migrated or kept host-scoped.
+- **The fleet tenant domain** is `us.heyo.work` (6d). Still open: whether existing `*.us5.heyo.work` customer routes are migrated or kept host-scoped.
 - **Whether us2** joins this fleet, or stays a separate single host.
 - **The staleness bound** after which a host should refuse authenticated requests rather than serve from an old snapshot (revocation versus availability).
