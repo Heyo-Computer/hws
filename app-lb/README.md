@@ -982,6 +982,7 @@ heyctl create deployment docs --host docs.example.com \
 | `index` | `index.html` | Served for a directory. `""` makes those a 404 |
 | `not_found` | *(none)* | Body for a 404, relative to `root`. Absent = plain text |
 | `spa` | `false` | Serve `index` for any unmatched path, with a 200 |
+| `spa_routes` | *(all paths)* | With `spa`, the only paths that fall back to `index`; the rest 404 |
 | `cache_control` | `public, max-age=300` | `Cache-Control` on served files |
 
 What you get: an index, a custom 404, content types, `ETag` with `304` on
@@ -1007,6 +1008,26 @@ of a different file.
 `spa: true` is for single-page apps: any path matching no file is served the
 index with a 200, so a client-side router owns the URL space. Off by default,
 because it turns every typo into a 200. It never rescues a traversal.
+
+`spa_routes` keeps the typos as 404s: list the paths the client-side router
+owns, and only those fall back to the index. A literal segment matches itself,
+`*` or `:name` matches any one segment, and a final `**` matches the rest of the
+path (including nothing). Set `not_found: "index.html"` as well and an unknown
+path gets the app shell under a real `404`, so the router still draws its own
+not-found page:
+
+```jsonc
+"site": {
+  "spa": true,
+  "not_found": "index.html",
+  "spa_routes": ["/login", "/settings/**", "/namespaces/:ns/deployments/:id"]
+}
+```
+
+An extensionless path that matches no file is tried as `<path>.html` before
+any fallback, so `/pricing` serves `pricing.html`. That is also how a
+single-page app gives one route its own `<title>` and meta tags in the HTML the
+server sends: build a copy of the shell as `signup.html`.
 
 **Deploying one.** A site takes an `update` block, the same as a static
 deployment — commands run in a directory on the app-lb host:

@@ -407,9 +407,10 @@ A remote pull asks the store for the blob as `application/vnd.art.sparse.v1` and
 | `index` | `index.html` | Served for a directory. `""` makes directories return 404. |
 | `not_found` | plain text | 404 body, relative to `root`. |
 | `spa` | `false` | Serve `index` with 200 for any unmatched path. |
+| `spa_routes` | all paths | With `spa`, only these paths fall back to `index`; the rest 404. `*`/`:name` match one segment, a final `**` the rest. |
 | `cache_control` | `public, max-age=300` | `Cache-Control` on served files. |
 
-Sites support `ETag`/`304`, byte ranges, `HEAD`, and a `301` from `/dir` to `/dir/`. They don't do rewrites, redirects, directory listings or compression. A site gets its files from either `update` or `artifact`, not both.
+Sites support `ETag`/`304`, byte ranges, `HEAD`, a `301` from `/dir` to `/dir/`, and clean URLs (`/about` serves `about.html` when no `about` exists). They don't do rewrites, redirects, directory listings or compression. A site gets its files from either `update` or `artifact`, not both.
 
 ### `update`
 

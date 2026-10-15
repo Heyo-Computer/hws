@@ -1232,6 +1232,13 @@
           "description": "Serve `index` (with a 200) for any path that matches no file, so a\nclient-side router owns the URL space. The single-page-app switch; off\nby default because it turns every typo into a 200.",
           "type": "boolean",
           "default": false
+        },
+        "spa_routes": {
+          "description": "Narrow the SPA fallback to the paths the client-side router actually\nowns, so everything else is a real 404 rather than a 200 shell. Each\nentry is a `/`-separated pattern: a literal segment matches itself, `*`\n(or `:name`) matches any one segment, and a final `**` matches the rest\nof the path, including nothing. Empty — the default — keeps the\nfallback for every unmatched path. Pair it with `not_found:\n\"index.html\"` to let the app render its own 404 page under a 404 status.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
