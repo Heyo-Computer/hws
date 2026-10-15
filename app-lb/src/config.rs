@@ -5242,6 +5242,9 @@ impl DeploymentSpec {
         if self.build.is_some() {
             return Some("a vm.build image is built on one host");
         }
+        if self.artifact.as_ref().is_some_and(|a| a.store.starts_with('/')) {
+            return Some("an artifact store given as a path is on one host");
+        }
         if self.discovery.is_some() || self.gateway.is_some() {
             return Some("regional discovery and gateways are placed per region, not per fleet host");
         }
