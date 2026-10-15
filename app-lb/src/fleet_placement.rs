@@ -70,6 +70,11 @@ pub fn target(spec: &DeploymentSpec, waiters: usize) -> Option<u32> {
     }
     let placer = placer()?;
     let view = placer.view.load();
+    // Before the first read, the host sizes itself: a restart must keep the
+    // replicas it adopts, not drain them for an empty view.
+    if !view.loaded {
+        return None;
+    }
     let mine = view
         .targets
         .get(&spec.id)
@@ -84,6 +89,8 @@ pub fn target(spec: &DeploymentSpec, waiters: usize) -> Option<u32> {
 /// The cached state of the fleet's placement, as of the last sync.
 #[derive(Debug, Default)]
 pub struct View {
+    /// Whether this was read from the fleet, not the empty start.
+    loaded: bool,
     /// deployment → (generation, host → desired).
     targets: HashMap<String, (u64, HashMap<String, u32>)>,
     /// deployment → host → report.
@@ -123,10 +130,17 @@ impl Placer {
     /// request goes when this host has none ready.
     pub fn peer_ready(&self, id: &str) -> Option<String> {
         let view = self.view.load();
+        // A peer the controller no longer asks to run any is about to drain
+        // the ones it has, so it is passed over.
+        let targets = view.targets.get(id).map(|(_, t)| t);
         view.demand
             .get(id)?
             .iter()
-            .filter(|(h, r)| r.ready > 0 && self.reachable(h))
+            .filter(|(h, r)| {
+                r.ready > 0
+                    && targets.is_none_or(|t| t.get(*h).is_some_and(|n| *n > 0))
+                    && self.reachable(h)
+            })
             // in_flight / ready, compared without division.
             .min_by(|(ha, a), (hb, b)| {
                 (a.in_flight * b.ready)
@@ -196,7 +210,10 @@ impl Placer {
         let pg = self.fleet.pg();
         match (pg.demand().await, pg.targets().await) {
             (Ok(demand), Ok(targets)) => {
-                let mut view = View::default();
+                let mut view = View {
+                    loaded: true,
+                    ..View::default()
+                };
                 for (host, id, report) in demand {
                     view.demand.entry(id).or_default().insert(host, report);
                 }
@@ -553,7 +570,13 @@ mod tests {
             "placement": {"mode": "spread"}
         }))
         .unwrap();
-        // No targets yet: nothing, unless a request is waiting here.
+        // Before the first read the host sizes itself.
+        assert_eq!(target(&spec, 1), None);
+        placer.view.store(Arc::new(View {
+            loaded: true,
+            ..View::default()
+        }));
+        // Read, with no targets yet: nothing, unless a request is waiting here.
         assert_eq!(target(&spec, 0), Some(0));
         assert_eq!(
             target(&spec, 1),
@@ -561,7 +584,10 @@ mod tests {
             "a stranded waiter boots one here"
         );
 
-        let mut view = View::default();
+        let mut view = View {
+            loaded: true,
+            ..View::default()
+        };
         view.targets.insert(
             "web".into(),
             (
@@ -604,6 +630,32 @@ mod tests {
         assert_eq!(placer.peer_targeted("web").as_deref(), Some("us5"));
         fleet.set_members(vec![member("us4"), member("us5")]);
         assert_eq!(placer.peer_ready("web").as_deref(), Some("us5"));
+        // A ready peer whose target went to zero is about to drain.
+        let mut view = View {
+            loaded: true,
+            ..View::default()
+        };
+        view.targets.insert(
+            "web".into(),
+            (4, HashMap::from([("us4".into(), 1), ("us5".into(), 0)])),
+        );
+        view.demand.insert(
+            "web".into(),
+            HashMap::from([(
+                "us5".to_string(),
+                DemandReport {
+                    ready: 1,
+                    ..Default::default()
+                },
+            )]),
+        );
+        placer.view.store(Arc::new(view));
+        assert_eq!(placer.peer_ready("web"), None);
+        assert_eq!(
+            placer.peer_targeted("web"),
+            None,
+            "and nobody else is asked"
+        );
 
         // The first live host by name certifies a spread deployment.
         assert!(placer.issues_certificate(&spec), "us4 < us5");
