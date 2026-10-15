@@ -37,6 +37,7 @@ on:
       # `app-obs.yml`, so editing it rebuilds all three, which is the one change
       # that genuinely must.
       - '.ci/workflows/queue.yml'
+      - '.ci/rust-cache.sh'
       - '.ci/image/apps/**'
 
 jobs:
@@ -144,6 +145,14 @@ jobs:
         # `--locked`, because the VM's fingerprint is a claim about the
         # lockfile. `--bins` to skip test and example targets. No `--workspace`:
         # this is a lone package with no members.
+        env: &rust_cache_env
+          CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
+          SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
+          SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
+          SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
+          CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
+          CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
         run: |
           df -P / "$CARGO_TARGET_DIR"
           free -m || true
@@ -157,7 +166,7 @@ jobs:
           # *with a log* rather than a daemon-side kill with nothing. Exit 124
           # is the in-guest timeout itself.
           timeout -k 60 1800 env CARGO_TERM_PROGRESS_WHEN=never \
-            cargo build --release --locked --bins > "$log" 2>&1 || rc=$?
+            sh /workspace/.ci/rust-cache.sh sh -c 'cargo build --release --locked --bins > "$1" 2>&1' sh "$log" || rc=$?
           if [ "$rc" -ne 0 ]; then
             [ "$rc" -eq 124 ] && echo "=== the in-guest timeout killed the build after 1800s ==="
             echo "=== build failed (exit $rc); last 100 log lines ==="

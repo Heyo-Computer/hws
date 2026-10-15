@@ -6,6 +6,7 @@ on:
       - 'pg-fc/**'
       - 'ui/**'
       - '.ci/workflows/pg-fc.yml'
+      - '.ci/rust-cache.sh'
       - '.ci/workflows/regional-release.yml'
       - '.ci/image/ci/**'
 
@@ -38,6 +39,14 @@ jobs:
       - name: Test and build pg-fc
         working-directory: /workspace/pg-fc
         timeout-minutes: 75
+        env: &rust_cache_env
+          CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
+          SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
+          SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
+          SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
+          CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
+          CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
         run: |
           set -eu
           python3 -m unittest discover -s deploy -p 'test_sync_traefik_cert.py' -v
@@ -45,8 +54,8 @@ jobs:
           sh -n init.sh
           sh -n physical.sh
           python3 -m py_compile deploy/test_physical_seed.py
-          cargo test --locked --workspace
-          cargo build --release --locked --bin pg-vm-pool
+          sh /workspace/.ci/rust-cache.sh cargo test --locked --workspace
+          sh /workspace/.ci/rust-cache.sh cargo build --release --locked --bin pg-vm-pool
           mkdir -p /workspace/dist
           mkdir -p /workspace/dist/guest
           cp Dockerfile init.sh physical.sh /workspace/dist/guest/

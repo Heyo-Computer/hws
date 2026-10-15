@@ -36,6 +36,7 @@ on:
       # rebuild this one. The image is shared with `app-lb.yml`, so editing it
       # rebuilds both, which is the one change that genuinely must.
       - '.ci/workflows/app-obs.yml'
+      - '.ci/rust-cache.sh'
       - '.ci/image/apps/**'
 
 jobs:
@@ -184,6 +185,14 @@ jobs:
         #   marker still reaches the daemon, and this step comes back as a
         #   *failure with a log* instead of a daemon-side kill with nothing.
         #   Exit 124 is the in-guest timeout itself.
+        env: &rust_cache_env
+          CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
+          SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
+          SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
+          SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
+          CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
+          CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
         run: |
           df -P / "$CARGO_TARGET_DIR"
           free -m || true
@@ -194,7 +203,8 @@ jobs:
           echo "cpus: $(nproc)  load: $(cat /proc/loadavg)"
           log="$CARGO_TARGET_DIR/app-obs-build.log"
           rc=0
-          timeout -k 60 11400 env CARGO_TERM_PROGRESS_WHEN=never             cargo build --release --locked --bins > "$log" 2>&1 || rc=$?
+          timeout -k 60 11400 env CARGO_TERM_PROGRESS_WHEN=never \
+            sh /workspace/.ci/rust-cache.sh sh -c 'cargo build --release --locked --bins > "$1" 2>&1' sh "$log" || rc=$?
           if [ "$rc" -ne 0 ]; then
             if [ "$rc" -eq 124 ]; then
               echo "=== the in-guest timeout killed the build after 11400s ==="

@@ -1620,6 +1620,36 @@ jobs:
 mod repo_workflow {
     use super::*;
 
+    #[test]
+    fn rust_compilation_steps_keep_shared_cache_configuration_until_runtime() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.ci/workflows"));
+        let reference = Workflow::parse("ci.yml", &std::fs::read_to_string(dir.join("ci.yml")).unwrap()).unwrap();
+        let expected = &reference.jobs[0].1.steps.iter()
+            .find(|s| s.name.as_deref() == Some("Build")).unwrap().env;
+        for (file, phases) in [
+            ("ci", 2), ("app-lb", 2), ("app-obs", 1), ("art", 1),
+            ("codegraph", 1), ("heyosecret", 2), ("orchestrator", 1),
+            ("pg-fc", 1), ("queue", 1), ("regional-drain-validation", 2),
+        ] {
+            let path = dir.join(format!("{file}.yml"));
+            let wf = Workflow::parse(&path.display().to_string(), &std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(wf.on_submit.admits("main", &Changes::known(vec![".ci/rust-cache.sh".into()])).is_ok());
+            let plan = crate::plan::Plan::build(&wf).unwrap();
+            let mut checked = 0;
+            for job in &plan.jobs {
+                for step in &job.steps {
+                    if step.run.as_deref().is_some_and(|s| s.contains("sh /workspace/.ci/rust-cache.sh")) {
+                        for (key, value) in expected {
+                            assert_eq!(step.env.get(key), Some(value), "{file}: {:?}: {key} must survive planning", step.name);
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+            assert_eq!(checked, phases, "{file}: every compiling step must use the wrapper");
+        }
+    }
+
     /// This crate's own `.ci/workflows/ci.yml` must parse and plan.
     ///
     /// It is the worked example the README points at, so a change that breaks

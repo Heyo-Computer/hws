@@ -37,13 +37,23 @@ artifact is deployed by hand or by `ci/deploy/ci.json`'s `update` block, never b
 the run itself — and a restart mid-run is redelivered off the JetStream work
 queue, so the self-reference costs less than it looks like it should.
 
-## Shared Rust compiler cache pilot
+## Shared Rust compiler cache
 
-`ci.yml` measures dependency-fetch and Cargo phase time and can use
-[`rust-cache.sh`](rust-cache.sh) with pinned sccache 0.18.0. The first pilot is
-the CI crate, not all Rust workflows. Job VMs and disks remain disposable.
+All active Linux Rust build/test workflows use [`rust-cache.sh`](rust-cache.sh)
+with pinned sccache 0.18.0: ci, app-lb (including protocol checks), app-obs,
+art, codegraph, heyosecret, orchestrator, pg-fc, queue and regional-drain-validation.
+Job VMs and disks remain disposable. `ci.yml` also measures dependency-fetch time.
 The script downloads a checksum-verified Linux binary into the job's data disk;
 it does not rebuild the base image or change the Rust toolchain.
+
+Cache variables and secrets belong in **step-level** `env` anchors, not job
+`env`: job planning substitutes expressions before runtime secrets are available.
+Every compiling phase uses the wrapper; repeated integration invocations that
+reuse the same compiled targets need not restart it. Keep their Cargo settings
+identical (including `CARGO_INCREMENTAL=0` for debug tests). For file-backed Cargo
+logs, redirect only the command inside the wrapper, not the wrapper itself, so
+cache timing and full statistics stay visible even when Cargo output is tailed.
+Include `.ci/rust-cache.sh` in workflow path filters when adding a workflow.
 
 Caching defaults to **off**. Configure these operator variables in the existing
 `ci/heyo-public/default/` HeyoSecret scope (tag variables `public`):

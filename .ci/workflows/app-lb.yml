@@ -40,6 +40,7 @@ on:
       # rebuild this one. The image is shared with `app-obs.yml`, so editing
       # it rebuilds both, which is the one change that genuinely must.
       - '.ci/workflows/app-lb.yml'
+      - '.ci/rust-cache.sh'
       - '.ci/image/apps/**'
       - '.ci/workflows/regional-release.yml'
 
@@ -192,12 +193,20 @@ jobs:
         # is what tells them apart. Printing it here is safe — step output rides
         # the exec channel, not the serial console that carries the marker
         # protocol.
+        env: &rust_cache_env
+          CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
+          SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
+          SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
+          SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
+          CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
+          CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
         run: |
           export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
           cargo fetch --locked
           df -P / "$CARGO_TARGET_DIR"
-          cargo test --locked --bin app-lb || exit $?
-          if ! cargo build --release --locked --workspace --bins; then
+          sh /workspace/.ci/rust-cache.sh cargo test --locked --bin app-lb || exit $?
+          if ! sh /workspace/.ci/rust-cache.sh cargo build --release --locked --workspace --bins; then
             echo "=== build failed; guest kernel log tail ==="
             dmesg | tail -100 || true
             df -P / "$CARGO_TARGET_DIR"
@@ -332,10 +341,11 @@ jobs:
       # Keep the disposable CA feature out of the shipped release binary.
       - name: Build protocol test binary
         working-directory: /workspace
+        env: *rust_cache_env
         run: |
           set -eu
           export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
-          cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
+          sh /workspace/.ci/rust-cache.sh cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
         timeout-minutes: 15
 
       - name: Verify proxy protocol compatibility

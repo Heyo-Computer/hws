@@ -7,6 +7,7 @@ on:
       - 'app-lb/src/**'
       - 'orchestrator/src/handlers/regional*.rs'
       - '.ci/workflows/regional-drain-validation.yml'
+      - '.ci/rust-cache.sh'
 
 jobs:
   drain-contract:
@@ -37,18 +38,27 @@ jobs:
       - name: Test app-lb request control and build protocol binary
         working-directory: /workspace/app-lb
         timeout-minutes: 60
+        env: &rust_cache_env
+          CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
+          SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
+          SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
+          SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
+          CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
+          CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
         run: |
           set -eu
           export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
-          cargo test --locked --bin app-lb
-          cargo build --locked --bin app-lb --features reqwest/rustls-tls-native-roots
+          sh /workspace/.ci/rust-cache.sh cargo test --locked --bin app-lb
+          sh /workspace/.ci/rust-cache.sh cargo build --locked --bin app-lb --features reqwest/rustls-tls-native-roots
 
       - name: Verify real gateway drain and stale-authority rejection
         working-directory: /workspace/orchestrator
         timeout-minutes: 75
+        env: *rust_cache_env
         run: |
           set -eu
           export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
           export APP_LB_TEST_BINARY="$CARGO_TARGET_DIR/debug/app-lb"
           export ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/postgres
-          cargo test --locked --bin orchestrator handlers::regional_integration_tests::two_real_gateways_drain_through_authenticated_durable_barriers -- --ignored --exact
+          sh /workspace/.ci/rust-cache.sh cargo test --locked --bin orchestrator handlers::regional_integration_tests::two_real_gateways_drain_through_authenticated_durable_barriers -- --ignored --exact

@@ -29,6 +29,7 @@ on:
       # as `.ci/**`, so adding a workflow for another crate here does not
       # rebuild this one.
       - '.ci/workflows/codegraph.yml'
+      - '.ci/rust-cache.sh'
       - '.ci/image/codegraph/**'
 
 jobs:
@@ -146,10 +147,18 @@ jobs:
         # is what tells them apart. Printing it here is safe — step output
         # rides the exec channel, not the serial console that carries the
         # marker protocol.
+        env: &rust_cache_env
+          CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
+          SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
+          SCCACHE_ENDPOINT: ${{ vars.CI_RUST_CACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.CI_RUST_CACHE_REGION }}
+          SCCACHE_S3_KEY_PREFIX: ${{ vars.CI_RUST_CACHE_PREFIX }}
+          CI_RUST_CACHE_ACCESS_KEY_ID: ${{ secrets.CI_RUST_CACHE_ACCESS_KEY_ID }}
+          CI_RUST_CACHE_SECRET_ACCESS_KEY: ${{ secrets.CI_RUST_CACHE_SECRET_ACCESS_KEY }}
         run: |
           cargo fetch --locked
           df -P / "$CARGO_TARGET_DIR"
-          if ! cargo build --release --locked --bin codegraph; then
+          if ! sh /workspace/.ci/rust-cache.sh cargo build --release --locked --bin codegraph; then
             echo "=== build failed; guest kernel log tail ==="
             dmesg | tail -100 || true
             df -P / "$CARGO_TARGET_DIR"
