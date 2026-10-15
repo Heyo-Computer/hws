@@ -55,7 +55,7 @@ pub fn placer() -> Option<&'static Arc<Placer>> {
     PLACER.get()
 }
 
-fn spreads(spec: &DeploymentSpec) -> bool {
+pub(crate) fn spreads(spec: &DeploymentSpec) -> bool {
     spec.placement
         .as_ref()
         .is_some_and(|p| p.mode == PlacementMode::Spread)

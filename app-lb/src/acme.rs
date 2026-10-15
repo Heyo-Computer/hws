@@ -227,18 +227,26 @@ impl SharedChallenges {
     /// Wait until every other fleet member that `domain` resolves to answers
     /// `token` with `key_authorization`. Members outside the name's DNS are
     /// never asked: the CA will not ask them either.
+    ///
+    /// A `spread` deployment's name (`every_member`) asks every live member.
+    /// Its DNS names the fleet, often as weighted records, of which one
+    /// lookup sees a single host — the CA's several vantage points see more.
     async fn answerable(
         &self,
         domain: &str,
         token: &str,
         key_authorization: &str,
+        every_member: bool,
     ) -> Result<(), AcmeError> {
-        let resolved: HashSet<std::net::IpAddr> = match tokio::net::lookup_host((domain, 80)).await
-        {
-            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
-            Err(e) => {
-                tracing::debug!(%domain, error = %e, "name does not resolve; checking no fleet members");
-                return Ok(());
+        let resolved: Option<HashSet<std::net::IpAddr>> = if every_member {
+            None
+        } else {
+            match tokio::net::lookup_host((domain, 80)).await {
+                Ok(addrs) => Some(addrs.map(|a| a.ip()).collect()),
+                Err(e) => {
+                    tracing::debug!(%domain, error = %e, "name does not resolve; checking no fleet members");
+                    return Ok(());
+                }
             }
         };
         for member in self.fleet.live_members() {
@@ -255,7 +263,7 @@ impl SharedChallenges {
             else {
                 continue;
             };
-            if !resolved.contains(&ip.ip()) {
+            if resolved.as_ref().is_some_and(|r| !r.contains(&ip.ip())) {
                 continue;
             }
             peer_answers(domain, ip, token, key_authorization, PEER_ANSWER_WAIT)
@@ -717,6 +725,19 @@ impl AcmeManager {
         hosts
     }
 
+    /// Whether `host` is a route of a `spread` deployment, whose DNS names
+    /// the whole fleet.
+    fn spreads(&self, host: &str) -> bool {
+        self.registry.deployments().values().any(|d| {
+            crate::fleet_placement::spreads(&d.spec)
+                && d.spec.routes.iter().any(|r| {
+                    r.host
+                        .as_deref()
+                        .is_some_and(|h| h.trim().eq_ignore_ascii_case(host))
+                })
+        })
+    }
+
     /// Whether `domain` is one of the domains we issue a wildcard for.
     fn certifies(&self, domain: &str) -> bool {
         self.config.wildcards.iter().any(|w| w == domain)
@@ -993,7 +1014,9 @@ impl AcmeManager {
                 tokens.push(token.clone());
                 if let Some(shared) = &self.shared {
                     shared.publish(&token, &key_authorization)?;
-                    shared.answerable(host, &token, &key_authorization).await?;
+                    shared
+                        .answerable(host, &token, &key_authorization, self.spreads(host))
+                        .await?;
                 }
                 challenge.set_ready().await?;
             }
@@ -1163,6 +1186,34 @@ mod tests {
 
     fn manager(tag: &str, registry: Arc<Registry>) -> AcmeManager {
         manager_in(&tmpdir(tag), registry)
+    }
+
+    /// A `spread` deployment's name is checked at every fleet member before
+    /// the CA is told to validate; any other name only where its DNS points.
+    #[test]
+    fn a_spread_deployments_name_asks_every_member() {
+        let route = |host: &str| RouteRule {
+            host: Some(host.into()),
+            host_suffix: None,
+            path_prefix: None,
+            strip_prefix: false,
+            redirect: None,
+        };
+        let registry = registry_with(vec![route("pinned.example.com")]);
+        let mut spec = registry.deployments().values().next().unwrap().spec.clone();
+        spec.id = "spread".into();
+        spec.routes = vec![route("Fleet.Example.com")];
+        spec.placement = Some(crate::config::Placement {
+            mode: crate::config::PlacementMode::Spread,
+            home: None,
+            hosts: Vec::new(),
+        });
+        registry.upsert(spec);
+        let manager = manager("spreads", registry);
+
+        assert!(manager.spreads("fleet.example.com"));
+        assert!(!manager.spreads("pinned.example.com"));
+        assert!(!manager.spreads("other.example.com"));
     }
 
     /// The single most important consequence of configuring a wildcard: hosts
