@@ -10,6 +10,18 @@ use std::time::Duration;
 pub async fn handoff(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
     sandbox: &str, status: JobStatus, error: Option<&str>) -> Result<()> {
     ensure!(status.is_terminal(), "cleanup requires a terminal executor outcome");
+    handoff_inner(d, job, runner, attempt, sandbox, status, error, false).await
+}
+
+/// Admission was conclusively rejected before checkout or execution. Keep the
+/// job nonterminal until cleanup proves it is safe to request another VM.
+pub async fn wait_for_capacity(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
+    sandbox: &str, error: &str) -> Result<()> {
+    handoff_inner(d, job, runner, attempt, sandbox, JobStatus::Running, Some(error), true).await
+}
+
+async fn handoff_inner(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
+    sandbox: &str, status: JobStatus, error: Option<&str>, requeue: bool) -> Result<()> {
     let mut tx = d.store.pool().begin().await?;
     let j = sqlx::query("SELECT run_id,job_key,attempt,status,executor_boot FROM ci_job WHERE id=$1 FOR UPDATE")
         .bind(job).fetch_one(&mut *tx).await?;
@@ -25,8 +37,12 @@ pub async fn handoff(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
     let work: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_work WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3)")
         .bind(job).bind(runner).bind(attempt).fetch_one(&mut *tx).await?;
     ensure!(work, "cleanup has no executor ownership evidence");
-    sqlx::query("INSERT INTO ci_vm_cleanup(sandbox_id,job_id,runner_hd_id,attempt,destroy) VALUES($1,$2,$3,$4,$5)")
-        .bind(sandbox).bind(job).bind(runner).bind(attempt).bind(true).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO ci_vm_cleanup(sandbox_id,job_id,runner_hd_id,attempt,destroy,requeue,next_attempt_at) VALUES($1,$2,$3,$4,true,$5,now()+CASE WHEN $5 THEN interval '60 seconds' ELSE interval '0 seconds' END)")
+        .bind(sandbox).bind(job).bind(runner).bind(attempt).bind(requeue).execute(&mut *tx).await?;
+    if requeue {
+        sqlx::query("INSERT INTO ci_runner_capacity_wait(runner_hd_id,until_at) VALUES($1,now()+interval '5 minutes') ON CONFLICT(runner_hd_id) DO UPDATE SET until_at=EXCLUDED.until_at")
+            .bind(runner).execute(&mut *tx).await?;
+    }
     // Change the pool tuple too: an orphan UPDATE already waiting on this row
     // must recheck a non-expiring lease, even if its snapshot predates the intent.
     // Cleanup now owns release; process heartbeats no longer own this lease.
@@ -36,7 +52,7 @@ pub async fn handoff(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
     // Cleanup must preserve that outcome, not overwrite it.
     let existing = j.get::<String,_>("status");
     let final_status = if JobStatus::parse(&existing).is_some_and(|s| s.is_terminal()) { existing.as_str() } else { status.as_str() };
-    let updated = sqlx::query("UPDATE ci_job SET status=$2,error=COALESCE($3,error),finished_at=now() WHERE id=$1 AND attempt=$4 AND executor_boot=$5")
+    let updated = sqlx::query("UPDATE ci_job SET status=$2,error=COALESCE($3,error),finished_at=CASE WHEN $2='running' THEN NULL ELSE now() END WHERE id=$1 AND attempt=$4 AND executor_boot=$5")
         .bind(job).bind(final_status).bind(error).bind(attempt).bind(d.executor.boot_id())
         .execute(&mut *tx).await?;
     ensure!(updated.rows_affected() == 1, "cleanup executor ownership changed");
@@ -102,8 +118,9 @@ async fn finish(d: &Dispatcher, sandbox: &str, phase: &mut &'static str) -> Resu
         && p.get::<Option<String>,_>("claimed_by_job").as_deref() == Some(job.as_str())
         && p.get::<String,_>("runner_hd_id") == runner, "cleanup pool ownership changed");
     *phase = "verify job ownership";
-    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_job WHERE id=$1 AND attempt=$2 AND status IN ('success','failure','skipped','cancelled')) AND NOT EXISTS(SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=$1)")
-        .bind(&job).bind(attempt).fetch_one(&mut *tx).await?;
+    let requeue: bool = c.get("requeue");
+    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_job WHERE id=$1 AND attempt=$2 AND (status IN ('success','failure','skipped','cancelled') OR ($3 AND status='running'))) AND NOT EXISTS(SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=$1)")
+        .bind(&job).bind(attempt).bind(requeue).fetch_one(&mut *tx).await?;
     ensure!(valid, "cleanup job identity or lifecycle owner changed");
     // Covers cleanup intents created by older controllers that requested a
     // stopped warm cache. CI-owned job VMs are now always ephemeral.
@@ -138,6 +155,16 @@ async fn finish(d: &Dispatcher, sandbox: &str, phase: &mut &'static str) -> Resu
     sqlx::query("DELETE FROM ci_host_work WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3")
         .bind(&job).bind(&runner).bind(attempt).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM ci_vm_cleanup WHERE sandbox_id=$1").bind(sandbox).execute(&mut *tx).await?;
+    if requeue {
+        // Cancellation wins. No pending job is visible until its exact VM and
+        // executor obligation have both been removed in this transaction.
+        let row = sqlx::query("UPDATE ci_job SET status='pending',runner_hd_id=NULL,sandbox_id=NULL,fingerprint=NULL,executor_boot=NULL,finished_at=NULL WHERE id=$1 AND attempt=$2 AND status='running' RETURNING run_id,job_key")
+            .bind(&job).bind(attempt).fetch_optional(&mut *tx).await?;
+        if let Some(row) = row {
+            Store::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(&job), Some(&row.get::<String,_>("job_key")),
+                None, "ci.job.status.v1", "pending", Some("Waiting for host memory capacity; rejected VM removed")).await?;
+        }
+    }
     *phase = "commit cleanup";
     tx.commit().await?;
     Ok(())

@@ -1611,6 +1611,19 @@ pub enum VmError {
 }
 
 impl VmError {
+    /// A terminal admission verdict, not a transport error or a boot timeout.
+    /// Used only before any guest commands have been issued.
+    pub fn is_memory_capacity(&self) -> bool {
+        const VERDICT: &str = "host memory capacity unavailable:";
+        match self {
+            Self::NotRunnable { status, reason: Some(reason), .. } if status == "Failed" =>
+                reason.contains(VERDICT),
+            Self::Daemon { source: HeyoError::SandboxFailed { reason, .. }, .. } =>
+                reason.contains(VERDICT),
+            _ => false,
+        }
+    }
+
     /// True when the failure was reaching the daemon at all, not anything the
     /// daemon said. See [`is_transport`] — the caller's right move is to drop
     /// the tunnel this rode in on so the retry redials.
@@ -1854,6 +1867,7 @@ mod tests {
     async fn failed_boot_still_returns_a_cleanup_identity() {
         use super::*;
         use axum::{Json, Router, routing::{get, post}};
+        for (reason, capacity) in [("boot failed", false), ("Failed to create sandbox: host memory capacity unavailable: requested=8192 MiB", true)] {
         let probes = Arc::new(AtomicU64::new(0));
         let reads = probes.clone();
         let app = Router::new()
@@ -1862,7 +1876,7 @@ mod tests {
                 let reads = reads.clone();
                 async move {
                     reads.fetch_add(1, Ordering::SeqCst);
-                    Json(serde_json::json!({"id":"sb-failed-boot","status":"failed","status_changed_at":"2026-09-25T00:00:00Z","error_message":"boot failed"}))
+                    Json(serde_json::json!({"id":"sb-failed-boot","status":"failed","status_changed_at":"2026-09-25T00:00:00Z","error_message":reason}))
                 }
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1873,9 +1887,10 @@ mod tests {
             "job", &spec, Duration::from_secs(600)).await.unwrap();
         assert_eq!(vm.id(), "sb-failed-boot");
         assert_eq!(probes.load(Ordering::SeqCst), 0, "boot must not be polled before ownership is persisted");
-        assert!(vm.ensure_running(Duration::from_secs(1)).await.is_err());
+        assert_eq!(vm.ensure_running(Duration::from_secs(1)).await.unwrap_err().is_memory_capacity(), capacity);
         assert_eq!(vm.id(), "sb-failed-boot", "failed boot must retain the deletion handle");
         server.abort();
+        }
     }
 
     #[tokio::test]
