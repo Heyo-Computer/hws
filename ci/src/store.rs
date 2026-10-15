@@ -1524,6 +1524,7 @@ impl Store {
                     started_at = COALESCE(started_at, now())
               WHERE id = $1
                 AND status IN ('pending','queued')
+                AND (started_at IS NULL OR attempt < $3)
                 AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=ci_job.id)
                 AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=ci_job.id)
                 AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_heyvm_bootstrap h ON h.id=s.id WHERE s.job_id=ci_job.id)

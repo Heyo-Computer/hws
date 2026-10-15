@@ -1137,7 +1137,7 @@ impl Dispatcher {
                             job_id: job.id.clone(),
                             job_key: plan.key.clone(),
                         },
-                        job.attempt,
+                        if job.started_at.is_none() { 0 } else { job.attempt },
                     )
                     .await;
 
@@ -3838,7 +3838,7 @@ async fn process_delivery(
     // A capacity retry is a new message, whose broker delivery count starts
     // at one again. Never reuse an earlier executor's fencing attempt.
     let attempt = match dispatcher.store.get_job(&job.job_id).await {
-        Ok(Some(row)) => attempt.max(row.attempt.saturating_add(1)),
+        Ok(Some(row)) => if row.started_at.is_none() { attempt } else { attempt.max(row.attempt.saturating_add(1)) },
         Ok(None) => { let _ = msg.ack().await; return; }
         Err(e) => { tracing::warn!(job = %job.job_key, "cannot read attempt: {e}"); return; }
     };
@@ -7563,6 +7563,7 @@ jobs:
             assert!(!d.store.has_host_work(&job.id).await.unwrap());
             if !cancelled {
                 assert!(row.executor_boot.is_none() && row.sandbox_id.is_none());
+                assert_eq!(d.store.claim_job_for_boot(&job.id, "hd-local", 1, d.executor.boot_id()).await.unwrap(), JobClaim::Unavailable, "a delayed old delivery cannot reuse an execution attempt");
                 assert!(matches!(restarted.pick_runner(&plan.jobs[0], &run).await, Err(DispatchError::CapacityPaused)), "capacity feedback survives controller restart");
                 let mut networks = restarted.runners.snapshot().networks.clone();
                 networks[0].runners.push(crate::runners::Runner { id: "hd-other".into(), name: "other".into(), status: crate::runners::RunnerStatus::Online, last_seen_at: None });
