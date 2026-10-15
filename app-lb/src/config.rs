@@ -4014,6 +4014,15 @@ pub struct SiteSpec {
     /// by default because it turns every typo into a 200.
     #[serde(default)]
     pub spa: bool,
+    /// Narrow the SPA fallback to the paths the client-side router actually
+    /// owns, so everything else is a real 404 rather than a 200 shell. Each
+    /// entry is a `/`-separated pattern: a literal segment matches itself, `*`
+    /// (or `:name`) matches any one segment, and a final `**` matches the rest
+    /// of the path, including nothing. Empty — the default — keeps the
+    /// fallback for every unmatched path. Pair it with `not_found:
+    /// "index.html"` to let the app render its own 404 page under a 404 status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spa_routes: Vec<String>,
     /// `Cache-Control` for served files. The default is deliberately short:
     /// a wrong long max-age is not something you can take back, since the
     /// client will not ask again until it expires.
@@ -4060,6 +4069,14 @@ impl SiteSpec {
         }
         if self.spa && self.index.trim().is_empty() {
             return Err(SpecError::SpaWithoutIndex);
+        }
+        if !self.spa_routes.is_empty() && !self.spa {
+            return Err(SpecError::SpaRoutesWithoutSpa);
+        }
+        for route in &self.spa_routes {
+            if !crate::site::valid_spa_route(route) {
+                return Err(SpecError::BadSpaRoute(route.clone()));
+            }
         }
         Ok(())
     }
@@ -4126,6 +4143,11 @@ pub enum SpecError {
     },
     /// `spa` needs an `index` to fall back *to*.
     SpaWithoutIndex,
+    /// `spa_routes` narrows a fallback that `spa` is not turning on.
+    SpaRoutesWithoutSpa,
+    /// A `spa_routes` entry that is not an absolute pattern, or has `**`
+    /// anywhere but last.
+    BadSpaRoute(String),
     /// A `site` alongside a `vm` or `upstreams`: a deployment serves from one
     /// place, and three ways to answer a request has no defined precedence.
     SiteWithOtherBackend,
@@ -4398,6 +4420,14 @@ impl std::fmt::Display for SpecError {
             Self::SpaWithoutIndex => {
                 write!(f, "site.spa needs a site.index to fall back to")
             }
+            Self::SpaRoutesWithoutSpa => {
+                write!(f, "site.spa_routes narrows the SPA fallback, so it needs site.spa: true")
+            }
+            Self::BadSpaRoute(r) => write!(
+                f,
+                "site.spa_routes entry {r:?} must start with '/', and may use `**` only as \
+                 its last segment"
+            ),
             Self::SiteWithOtherBackend => write!(
                 f,
                 "a deployment serves from exactly one place: `site` cannot be combined \
@@ -7905,6 +7935,7 @@ mod tests {
                 index: "index.html".into(),
                 not_found: None,
                 spa: false,
+                spa_routes: vec![],
                 cache_control: "public, max-age=300".into(),
             });
             s
@@ -8094,6 +8125,21 @@ mod tests {
             s.site.as_mut().unwrap().spa = true;
             s.site.as_mut().unwrap().index = "".into();
             assert_eq!(s.validate(), Err(SpecError::SpaWithoutIndex));
+        }
+
+        #[test]
+        fn spa_routes_need_spa_and_well_formed_patterns() {
+            let mut s = site_spec();
+            s.site.as_mut().unwrap().spa_routes = vec!["/settings/**".into()];
+            assert_eq!(s.validate(), Err(SpecError::SpaRoutesWithoutSpa));
+
+            s.site.as_mut().unwrap().spa = true;
+            assert_eq!(s.validate(), Ok(()));
+
+            for bad in ["settings", "/**/x", ""] {
+                s.site.as_mut().unwrap().spa_routes = vec![bad.into()];
+                assert_eq!(s.validate(), Err(SpecError::BadSpaRoute(bad.into())), "{bad:?}");
+            }
         }
 
         /// A site is only reachable through the proxy, so an unrouted one is

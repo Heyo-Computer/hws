@@ -262,6 +262,7 @@ fn site_spec() -> DeploymentSpec {
             index: "index.html".into(),
             not_found: Some("404.html".into()),
             spa: true,
+            spa_routes: vec![],
             cache_control: "public, max-age=300".into(),
         }),
         update: Some(crate::config::UpdateSpec {

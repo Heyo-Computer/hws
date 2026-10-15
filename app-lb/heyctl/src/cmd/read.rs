@@ -1158,14 +1158,15 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
             if site.index.is_empty() { "none (directories 404)" } else { &site.index },
         );
         output::field("404 page", site.not_found.as_deref().unwrap_or("none (plain text)"));
-        output::field(
-            "Unmatched paths",
-            if site.spa {
-                "served the index (SPA mode)"
-            } else {
-                "404"
-            },
-        );
+        let unmatched = match (site.spa, site.spa_routes.is_empty()) {
+            (false, _) => "404".to_string(),
+            (true, true) => "served the index (SPA mode)".to_string(),
+            (true, false) => format!(
+                "served the index for {}; otherwise 404",
+                site.spa_routes.join(", ")
+            ),
+        };
+        output::field("Unmatched paths", &unmatched);
         output::field("Cache-Control", &site.cache_control);
     }
 
