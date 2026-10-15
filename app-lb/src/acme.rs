@@ -676,6 +676,11 @@ impl AcmeManager {
         let mut unsupported = Vec::new();
 
         for deployment in self.registry.deployments().values() {
+            // A `spread` deployment runs on several hosts; one of them
+            // certifies it, and the rest load what it wrote.
+            if crate::fleet_placement::placer().is_some_and(|p| !p.issues_certificate(&deployment.spec)) {
+                continue;
+            }
             for rule in &deployment.spec.routes {
                 if let Some(host) = &rule.host {
                     let host = host.trim().to_ascii_lowercase();
