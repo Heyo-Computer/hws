@@ -17,6 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
+/// A fleet host's own health, for DNS health checks: 200 while it takes
+/// clients, 503 once it drains, on any name and either listener.
+pub const FLEET_HEALTHZ: &str = "/fleet/v1/healthz";
 const MAX_SCANNED_UA: usize = 512;
 pub const MAX_LOGIN_BODY: usize = 8192;
 pub const FEED_PAGE: usize = 100;
@@ -524,6 +527,11 @@ impl RequestControl {
             tracing::debug!(%path, "answering ACME http-01 challenge");
             return RequestDecision::Respond(ResponseData::plain(200, answer));
         }
+        if path == FLEET_HEALTHZ && let Some(placer) = crate::fleet_placement::placer() {
+            let state = placer.state();
+            let status = if state == crate::fleet_placement::ACTIVE { 200 } else { 503 };
+            return RequestDecision::Respond(ResponseData::plain(status, format!("{state}\n")));
+        }
         // A peer's hop: admitted with the fleet's token only, and then judged
         // as the client it carries.
         let hopped;
@@ -636,6 +644,11 @@ impl RequestControl {
         // A `spread` deployment with nothing ready here goes to a peer that
         // has replicas ready, or that is asked to boot one when this host is
         // not; otherwise it waits here for a cold start.
+        // A client that still comes here directly is what a drain waits out.
+        if !state.hop_in && let Some(placer) = crate::fleet_placement::placer()
+            && deployment.spec.placement.as_ref().is_some_and(|p| p.mode == crate::config::PlacementMode::Spread) {
+            placer.note_direct();
+        }
         if state.hop_out.is_none() && !state.hop_in
             && let Some(peer) = self.spread_peer(&deployment)
             && let Some((hop, token)) = self.hop.as_ref().filter(|h| h.forwards()).and_then(|h| h.token().map(|t| (h, t)))

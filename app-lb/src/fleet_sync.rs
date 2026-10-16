@@ -375,6 +375,27 @@ impl Fleet {
             .collect()
     }
 
+    /// `host`'s row as last read, live or not.
+    pub fn member(&self, host: &str) -> Option<crate::fleet_pg::HostRow> {
+        lock(&self.members)
+            .1
+            .iter()
+            .find(|m| m.host == host)
+            .cloned()
+    }
+
+    /// Set `host`'s lifecycle state, and this host's copy of it at once.
+    pub async fn set_host_state(&self, host: &str, state: &str) -> Result<bool, PgFailure> {
+        let found = self.pg.set_host_state(host, state).await?;
+        if found {
+            let mut members = lock(&self.members);
+            if let Some(m) = members.1.iter_mut().find(|m| m.host == host) {
+                m.state = state.to_string();
+            }
+        }
+        Ok(found)
+    }
+
     /// Heartbeat this host and re-read the members.
     async fn membership(&self) {
         let identity = lock(&self.identity).clone();

@@ -7051,6 +7051,12 @@ fn router(state: AdminState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(),retirement_admission))
         .route_layer(middleware::from_fn_with_state(state.clone(),require_crud_auth));
 
+    // A fleet host's lifecycle (drain, maintenance, restore). Never ungated.
+    let fleet_hosts = Router::new()
+        .route("/fleet-hosts", get(list_fleet_hosts))
+        .route("/fleet-hosts/:host", put(set_fleet_host_state))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
+
     let fleet = Router::new()
         .route("/fleet", get(fleet_snapshot))
         .route("/fleet/deployments", get(fleet_deployments))
@@ -7105,6 +7111,7 @@ fn router(state: AdminState) -> Router {
         .merge(releases)
         .merge(views)
         .merge(fleet)
+        .merge(fleet_hosts)
         .merge(regional)
         .merge(recovery)
         .merge(view)
@@ -7161,6 +7168,7 @@ fn mutates_fleet_state(method: &axum::http::Method, path: &str) -> bool {
         "/tokens",
         "/security",
         "/api/plugins",
+        "/fleet-hosts",
     ];
     const HOST: &[&str] = &["/exec", "/shell", "/regional-probe", "/regional-active-probe"];
     FLEET.iter().any(|p| {
@@ -7168,6 +7176,87 @@ fn mutates_fleet_state(method: &axum::http::Method, path: &str) -> bool {
         path == base || path.strip_prefix(base).is_some_and(|rest| rest.starts_with('/'))
     }) && !HOST.iter().any(|h| path.ends_with(h))
         && !path.contains("/machine/")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetHostState {
+    state: String,
+}
+
+/// `GET /fleet-hosts` — the fleet's hosts and their lifecycle states, and,
+/// for this host, what a drain is still waiting for.
+async fn list_fleet_hosts(
+    State(state): State<AdminState>,
+    axum::Extension(caller): axum::Extension<Caller>,
+) -> Response {
+    if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
+        return forbidden("fleet hosts are fleet-wide");
+    }
+    let (Some(fleet), Some(placer)) = (state.fleet_store.clone(), crate::fleet_placement::placer()) else {
+        return err(StatusCode::NOT_FOUND, "this host is not in fleet mode").into_response();
+    };
+    let live: std::collections::HashSet<String> = fleet.live_members().into_iter().map(|m| m.host).collect();
+    let hosts = match fleet.pg().hosts().await {
+        Ok(rows) => rows,
+        Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, format!("fleet store unavailable: {e}")).into_response(),
+    };
+    let me = placer.host().to_string();
+    // A drain moves `spread` replicas only; these stay, and are served here.
+    let pinned: Vec<String> = state
+        .registry
+        .deployments()
+        .values()
+        .filter(|d| d.spec.placement.as_ref().is_none_or(|p| p.mode != crate::config::PlacementMode::Spread))
+        .map(|d| d.spec.id.clone())
+        .collect();
+    let hosts: Vec<serde_json::Value> = hosts
+        .into_iter()
+        .map(|m| serde_json::json!({
+            "host": m.host, "address": m.address, "state": m.state,
+            "live": live.contains(&m.host), "heartbeat_age_secs": m.age_secs.round(),
+        }))
+        .collect();
+    ([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({
+        "this_host": me,
+        "hosts": hosts,
+        "drain": {
+            "spread_replicas_here": placer.spread_replicas(),
+            "secs_since_direct_spread_request": placer.quiet_secs(),
+            "quiet_secs_before_maintenance": placer.drain_quiet().as_secs(),
+            "not_moved_by_a_drain": pinned,
+        },
+    }))).into_response()
+}
+
+/// `PUT /fleet-hosts/:host` `{"state": "draining" | "maintenance" | "active"}`
+/// — drain a host (its `spread` replicas move to the active hosts, make
+/// before break, and its `/fleet/v1/healthz` answers 503 so DNS health
+/// checks withdraw it), or restore it. Any host may set any host's state.
+async fn set_fleet_host_state(
+    State(state): State<AdminState>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Path(host): Path<String>,
+    Json(body): Json<FleetHostState>,
+) -> Response {
+    use crate::fleet_placement::{ACTIVE, DRAINING, MAINTENANCE};
+    if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
+        return forbidden("fleet hosts are fleet-wide");
+    }
+    let Some(fleet) = state.fleet_store.clone() else {
+        return err(StatusCode::NOT_FOUND, "this host is not in fleet mode").into_response();
+    };
+    if ![ACTIVE, DRAINING, MAINTENANCE].contains(&body.state.as_str()) {
+        return err(StatusCode::BAD_REQUEST, format!("state must be {ACTIVE:?}, {DRAINING:?} or {MAINTENANCE:?}, not {:?}", body.state)).into_response();
+    }
+    match fleet.set_host_state(&host, &body.state).await {
+        Ok(true) => {
+            tracing::info!(%host, state = %body.state, "fleet host state set");
+            Json(serde_json::json!({"host": host, "state": body.state})).into_response()
+        }
+        Ok(false) => err(StatusCode::NOT_FOUND, format!("no fleet host {host:?} has ever joined")).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, format!("fleet store unavailable: {e}")).into_response(),
+    }
 }
 
 /// Fleet mode only. Refuses a fleet-state mutation up front while the store
@@ -11581,6 +11670,8 @@ mod tests {
             // are not about the one deployment this token was given.
             for route in [
                 "/fleet",
+                "/fleet-hosts",
+                "/fleet-hosts/:host",
                 "/fleet/deployments",
                 "/fleet/gateways/:id/metrics",
                 "/fleet/network",

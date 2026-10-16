@@ -14,6 +14,8 @@
 //!   once for the fleet;
 //! - splits it over the live, active hosts the deployment may run on,
 //!   preferring hosts with demand, then hosts already running replicas;
+//! - gives a draining host nothing, but lets it keep the replicas it has
+//!   ready until the active hosts have theirs (make before break);
 //! - writes `placement_targets`, fenced by the lease's epoch.
 //!
 //! It never creates a VM. Each host's autoscaler reconciles its own daemon to
@@ -37,6 +39,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const LEASE_PLACEMENT: &str = "placement";
+/// A host's lifecycle states (`fleet.hosts.state`, design § 7).
+pub const ACTIVE: &str = "active";
+pub const DRAINING: &str = "draining";
+pub const MAINTENANCE: &str = "maintenance";
+/// How long a draining host must see no direct client request for a
+/// `spread` deployment, with none of their replicas left, before it is in
+/// maintenance: DNS TTL plus the health check's detection time plus margin.
+pub const DEFAULT_DRAIN_QUIET: Duration = Duration::from_secs(360);
 const SYNC_EVERY: Duration = Duration::from_secs(1);
 const PLAN_EVERY: Duration = Duration::from_secs(2);
 /// The controller rewrites an unchanged plan this often, so a target lost
@@ -108,6 +118,10 @@ pub struct Placer {
     reported: Mutex<Option<HashMap<String, DemandReport>>>,
     planned: Mutex<Option<Instant>>,
     last_write: Mutex<Option<Instant>>,
+    /// The last request for a `spread` deployment that a client sent here
+    /// directly, not by hop: what a drain waits to stop.
+    last_direct: Mutex<Instant>,
+    drain_quiet: Duration,
 }
 
 impl Placer {
@@ -123,6 +137,71 @@ impl Placer {
             reported: Mutex::new(None),
             planned: Mutex::new(None),
             last_write: Mutex::new(None),
+            last_direct: Mutex::new(Instant::now()),
+            drain_quiet: DEFAULT_DRAIN_QUIET,
+        }
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn drain_quiet(&self) -> Duration {
+        self.drain_quiet
+    }
+
+    pub fn with_drain_quiet(mut self, quiet: Duration) -> Self {
+        self.drain_quiet = quiet;
+        self
+    }
+
+    /// This host's lifecycle state, as last read; `active` before the first.
+    pub fn state(&self) -> String {
+        self.fleet
+            .member(&self.host)
+            .map_or_else(|| ACTIVE.to_string(), |m| m.state)
+    }
+
+    /// A client sent a request for a `spread` deployment straight here.
+    pub fn note_direct(&self) {
+        *self.last_direct.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    /// Seconds since the last direct request for a `spread` deployment.
+    pub fn quiet_secs(&self) -> u64 {
+        self.last_direct
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            .as_secs()
+    }
+
+    /// Replicas of `spread` deployments this host still runs or boots.
+    pub fn spread_replicas(&self) -> usize {
+        self.registry
+            .deployments()
+            .values()
+            .filter(|d| spreads(&d.spec))
+            .map(|d| d.backends().len() + d.pending().len())
+            .sum()
+    }
+
+    /// A draining host enters maintenance once clients have stopped coming
+    /// (DNS has moved them) and its `spread` replicas are gone.
+    async fn settle_drain(&self) {
+        if self.state() != DRAINING
+            || self.spread_replicas() > 0
+            || self.quiet_secs() < self.drain_quiet.as_secs()
+        {
+            return;
+        }
+        match self.fleet.set_host_state(&self.host, MAINTENANCE).await {
+            Ok(_) => tracing::info!(
+                host = %self.host,
+                quiet_secs = self.quiet_secs(),
+                "drained: no spread replicas and no direct requests; this host is in maintenance"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not enter maintenance"),
         }
     }
 
@@ -188,20 +267,23 @@ impl Placer {
         let Some(placement) = spec.placement.as_ref().filter(|_| spreads(spec)) else {
             return true;
         };
-        let mut hosts: Vec<String> = self
+        // Active hosts first: a draining one may be about to restart.
+        let mut hosts: Vec<(bool, String)> = self
             .fleet
             .live_members()
             .into_iter()
-            .filter(|m| m.state == "active" && placement.includes(&m.host))
-            .map(|m| m.host)
+            .filter(|m| {
+                m.state != MAINTENANCE && placement.includes(&m.host) && m.host != self.host
+            })
+            .map(|m| (m.state != ACTIVE, m.host))
             .collect();
         if placement.includes(&self.host) {
-            hosts.push(self.host.clone());
+            hosts.push((self.state() != ACTIVE, self.host.clone()));
         }
         hosts
             .into_iter()
             .min()
-            .is_none_or(|first| first == self.host)
+            .is_none_or(|(_, first)| first == self.host)
     }
 
     /// Report, read, and — holding the lease — plan.
@@ -233,6 +315,7 @@ impl Placer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_none_or(|t| t.elapsed() >= PLAN_EVERY);
+        self.settle_drain().await;
         if due && let Some(epoch) = self.lease.held() {
             *self.planned.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             self.plan(epoch).await;
@@ -292,12 +375,7 @@ impl Placer {
 
     /// The controller's tick.
     async fn plan(&self, epoch: u64) {
-        let members: Vec<HostRow> = self
-            .fleet
-            .live_members()
-            .into_iter()
-            .filter(|m| m.state == "active")
-            .collect();
+        let members: Vec<HostRow> = self.fleet.live_members();
         if members.is_empty() {
             // Not even this host: the member list is not readable yet.
             return;
@@ -314,13 +392,21 @@ impl Placer {
         let mut changed = false;
         for spec in specs {
             let placement = spec.placement.as_ref().expect("spread has a placement");
-            let eligible: Vec<&str> = members
-                .iter()
-                .map(|m| m.host.as_str())
-                .filter(|h| placement.includes(h))
-                .collect();
+            let (mut eligible, mut draining) = (Vec::new(), Vec::new());
+            for m in members.iter().filter(|m| placement.includes(&m.host)) {
+                if m.state == ACTIVE {
+                    &mut eligible
+                } else {
+                    &mut draining
+                }
+                .push(m.host.as_str());
+            }
+            // The last hosts are never drained to nothing.
+            if eligible.is_empty() {
+                eligible = std::mem::take(&mut draining);
+            }
             let reports = view.demand.get(&spec.id);
-            let assigned = assign(&spec.scaling, &eligible, reports);
+            let assigned = assign(&spec.scaling, &eligible, &draining, reports);
             let (generation, current) = view.targets.get(&spec.id).cloned().unwrap_or_default();
             let same = assigned.len() == current.len()
                 && assigned.iter().all(|(h, n)| current.get(h) == Some(n));
@@ -368,15 +454,18 @@ impl Placer {
 }
 
 /// Split `spec`'s fleet-wide replica count over `eligible` hosts. Every
-/// eligible host gets a row, zero included, so a host that should run nothing
-/// is told so.
+/// eligible and every `draining` host gets a row, zero included, so a host
+/// that should run nothing is told so. A draining host's requests count
+/// toward the fleet's demand, and it keeps its ready replicas only while an
+/// eligible host is short of its share.
 pub fn assign(
     policy: &ScalingPolicy,
     eligible: &[&str],
+    draining: &[&str],
     reports: Option<&HashMap<String, DemandReport>>,
 ) -> Vec<(String, u32)> {
     let report = |h: &str| reports.and_then(|r| r.get(h)).copied().unwrap_or_default();
-    let counted: Vec<DemandReport> = eligible.iter().map(|h| report(h)).collect();
+    let counted: Vec<DemandReport> = eligible.iter().chain(draining).map(|h| report(h)).collect();
     let demand: u64 = counted.iter().map(|r| r.in_flight + r.waiters).sum();
     let idle = counted
         .iter()
@@ -409,12 +498,20 @@ pub fn assign(
     let hold = shares
         .iter()
         .any(|(h, share)| u64::from(*share) > report(h).ready);
+    let ready = |h: &str| report(h).ready.min(u64::from(u32::MAX)) as u32;
     shares
         .into_iter()
         .map(|(h, share)| {
-            let ready = report(h).ready.min(u64::from(u32::MAX)) as u32;
-            (h.to_string(), if hold { share.max(ready) } else { share })
+            (
+                h.to_string(),
+                if hold { share.max(ready(h)) } else { share },
+            )
         })
+        .chain(
+            draining
+                .iter()
+                .map(|h| (h.to_string(), if hold { ready(h) } else { 0 })),
+        )
         .collect()
 }
 
@@ -475,16 +572,16 @@ mod tests {
 
     #[test]
     fn min_replicas_count_once_for_the_fleet() {
-        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], None);
+        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], &[], None);
         assert_eq!(a, vec![("us4".into(), 1), ("us5".into(), 1)]);
-        let a = assign(&policy(3, 5, 0, 10), &["us4", "us5"], None);
+        let a = assign(&policy(3, 5, 0, 10), &["us4", "us5"], &[], None);
         assert_eq!(a.iter().map(|(_, n)| n).sum::<u32>(), 3);
     }
 
     #[test]
     fn a_lone_replica_goes_where_the_demand_is() {
         let r = reports(&[("us5", 0, 1, 0)]);
-        let a = assign(&policy(0, 5, 0, 10), &["us4", "us5"], Some(&r));
+        let a = assign(&policy(0, 5, 0, 10), &["us4", "us5"], &[], Some(&r));
         assert_eq!(a, vec![("us5".into(), 1), ("us4".into(), 0)]);
     }
 
@@ -493,14 +590,14 @@ mod tests {
         // 12 + 9 in flight at 10 per replica: 3 replicas for the fleet,
         // where one host alone would have asked for 2 and the other for 1.
         let r = reports(&[("us4", 12, 0, 2), ("us5", 9, 0, 1)]);
-        let a = assign(&policy(0, 10, 0, 10), &["us4", "us5"], Some(&r));
+        let a = assign(&policy(0, 10, 0, 10), &["us4", "us5"], &[], Some(&r));
         assert_eq!(a, vec![("us4".into(), 2), ("us5".into(), 1)]);
     }
 
     #[test]
     fn with_no_demand_running_replicas_stay_put() {
         let r = reports(&[("us5", 0, 0, 1)]);
-        let a = assign(&policy(1, 5, 0, 10), &["us4", "us5"], Some(&r));
+        let a = assign(&policy(1, 5, 0, 10), &["us4", "us5"], &[], Some(&r));
         assert_eq!(a, vec![("us5".into(), 1), ("us4".into(), 0)]);
     }
 
@@ -509,11 +606,12 @@ mod tests {
         // Both of min 2 on us4; us5 joins. us5 is asked for one while us4
         // keeps both until us5's is ready, then gives one up.
         let joining = reports(&[("us4", 0, 0, 2)]);
-        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], Some(&joining));
+        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], &[], Some(&joining));
         assert_eq!(a, vec![("us4".into(), 2), ("us5".into(), 1)]);
         let a = assign(
             &policy(2, 5, 0, 10),
             &["us4", "us5"],
+            &[],
             Some(&reports(&[("us4", 0, 0, 2), ("us5", 0, 0, 0)])),
         );
         assert_eq!(
@@ -522,14 +620,31 @@ mod tests {
             "still booting"
         );
         let ready = reports(&[("us4", 0, 0, 2), ("us5", 0, 0, 1)]);
-        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], Some(&ready));
+        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], &[], Some(&ready));
         assert_eq!(a, vec![("us4".into(), 1), ("us5".into(), 1)]);
+    }
+
+    #[test]
+    fn a_draining_host_keeps_its_replicas_until_the_active_ones_are_ready() {
+        // min 2, one on each; us5 drains. us4 is asked for both, and us5
+        // keeps its one until us4 has two ready.
+        let before = reports(&[("us4", 0, 0, 1), ("us5", 3, 0, 1)]);
+        let a = assign(&policy(2, 5, 0, 10), &["us4"], &["us5"], Some(&before));
+        assert_eq!(a, vec![("us4".into(), 2), ("us5".into(), 1)]);
+        let after = reports(&[("us4", 0, 0, 2), ("us5", 3, 0, 1)]);
+        let a = assign(&policy(2, 5, 0, 10), &["us4"], &["us5"], Some(&after));
+        assert_eq!(a, vec![("us4".into(), 2), ("us5".into(), 0)]);
+        // A draining host's requests still count: scale-from-zero demand
+        // that arrives there is the fleet's.
+        let waiting = reports(&[("us5", 0, 2, 0)]);
+        let a = assign(&policy(0, 5, 0, 10), &["us4"], &["us5"], Some(&waiting));
+        assert_eq!(a, vec![("us4".into(), 1), ("us5".into(), 0)]);
     }
 
     #[test]
     fn max_replicas_caps_the_fleet() {
         let r = reports(&[("us4", 100, 0, 1), ("us5", 100, 0, 1)]);
-        let a = assign(&policy(0, 3, 0, 10), &["us4", "us5"], Some(&r));
+        let a = assign(&policy(0, 3, 0, 10), &["us4", "us5"], &[], Some(&r));
         assert_eq!(a.iter().map(|(_, n)| n).sum::<u32>(), 3);
     }
 
@@ -664,6 +779,22 @@ mod tests {
         fleet.set_members(vec![member("us3"), member("us4")]);
         spec.placement.as_mut().unwrap().hosts = vec![];
         assert!(!placer.issues_certificate(&spec), "us3 < us4");
+        // An active host issues before a draining one, and a host in
+        // maintenance never.
+        let mut draining = member("us3");
+        draining.state = DRAINING.into();
+        fleet.set_members(vec![draining, member("us4")]);
+        assert!(placer.issues_certificate(&spec), "us3 is draining");
+        let mut down = member("us3");
+        down.state = MAINTENANCE.into();
+        let mut us4 = member("us4");
+        us4.state = DRAINING.into();
+        fleet.set_members(vec![down, us4]);
+        assert!(
+            placer.issues_certificate(&spec),
+            "the draining us4 is all there is"
+        );
+        assert_eq!(placer.state(), DRAINING);
 
         // Anything not spread is not the placer's.
         spec.placement = None;
@@ -673,6 +804,6 @@ mod tests {
 
     #[test]
     fn no_eligible_host_gets_nothing() {
-        assert!(assign(&policy(2, 5, 0, 10), &[], None).is_empty());
+        assert!(assign(&policy(2, 5, 0, 10), &[], &[], None).is_empty());
     }
 }
