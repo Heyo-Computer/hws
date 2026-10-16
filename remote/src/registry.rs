@@ -9,6 +9,7 @@
 //! <account bucket>/ns/<ns>/repos/<repo>/meta.json
 //! <account bucket>/ns/<ns>/repos/<repo>/state.json   → RepoState, the authority
 //! <account bucket>/ns/<ns>/repos/<repo>/packs/pack-<sha>.{pack,idx}
+//! <account bucket>/ns/<ns>/repos/<repo>/retired/pack-<sha>.json  → crate::compact::Retired
 //! ```
 //!
 //! One bucket per Heyo **account**, named from a hash of the account id so the
@@ -19,7 +20,9 @@
 //!
 //! `state.json` lists the refs *and* the packs. A pack is uploaded before the
 //! state that names it, so a reader never sees a ref whose objects are missing;
-//! a pack no state names is garbage from a push that lost its race.
+//! a pack no state names is garbage from a push that lost its race, or one a
+//! compaction replaced. Only the second kind is deleted, and only after its
+//! `retired/` marker has aged past the grace period (see [`crate::compact`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -144,6 +147,11 @@ pub fn state_key(ns: &str, repo: &str) -> String {
 
 pub fn pack_key(ns: &str, repo: &str, file: &str) -> String {
     format!("{}packs/{file}", repo_prefix(ns, repo))
+}
+
+/// The marker a compaction leaves for a pack it replaced.
+pub fn retired_key(ns: &str, repo: &str, pack: &str) -> String {
+    format!("{}retired/{pack}.json", repo_prefix(ns, repo))
 }
 
 fn meta_key(ns: &str, repo: &str) -> String {

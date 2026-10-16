@@ -40,6 +40,8 @@ pub struct Config {
     /// app-lb's `remote` plugin's bearer (`REMOTE_PLUGIN_API_TOKEN`). Without
     /// it the plugin surface (`crate::plugin`) is not mounted.
     pub plugin_api_token: Option<String>,
+    /// When and how packs are merged (`REMOTE_COMPACT*`, see `crate::compact`).
+    pub compact: crate::compact::Policy,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +109,19 @@ impl Config {
             web: !get("REMOTE_WEB")
                 .is_some_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "no")),
             plugin_api_token: get("REMOTE_PLUGIN_API_TOKEN"),
+            compact: {
+                let d = crate::compact::Policy::default();
+                crate::compact::Policy {
+                    enabled: !get("REMOTE_COMPACT")
+                        .is_some_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "no")),
+                    factor: num("REMOTE_COMPACT_FACTOR", d.factor as u64) as usize,
+                    max_pack_bytes: num("REMOTE_COMPACT_MAX_PACK_MB", d.max_pack_bytes >> 20)
+                        * 1024
+                        * 1024,
+                    grace_secs: num("REMOTE_COMPACT_GRACE_SECS", d.grace_secs),
+                    delay_secs: num("REMOTE_COMPACT_DELAY_SECS", d.delay_secs),
+                }
+            },
             listen,
         }
     }
@@ -125,6 +140,9 @@ impl Config {
             return Err(format!(
                 "REMOTE_BUCKET_PREFIX {p:?} must be 1-38 lowercase letters, digits or '-'"
             ));
+        }
+        if self.compact.factor < 2 {
+            return Err("REMOTE_COMPACT_FACTOR must be at least 2".into());
         }
         Ok(())
     }

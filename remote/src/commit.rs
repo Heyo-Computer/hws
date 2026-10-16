@@ -382,6 +382,7 @@ pub async fn commit(
         }
     })?;
     drop(ex);
+    git.wrote(r);
 
     Ok(CommitResult {
         commit,

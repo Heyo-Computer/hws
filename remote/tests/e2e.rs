@@ -1024,3 +1024,167 @@ async fn a_public_repo_reads_by_url_but_is_never_listed() {
     let (good, _) = git(&work, &["clone", &clone_url, "anon-again"]);
     assert!(!good);
 }
+
+/// The `state.json` of the only repo in a directory store, for reading and
+/// rewriting it behind the service's back.
+fn find_state(root: &Path) -> std::path::PathBuf {
+    fn walk(dir: &Path) -> Option<std::path::PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(found) = walk(&p) {
+                    return Some(found);
+                }
+            } else if p.file_name().is_some_and(|n| n == "state.json") {
+                return Some(p);
+            }
+        }
+        None
+    }
+    walk(root).expect("a state.json in the store")
+}
+
+#[tokio::test]
+async fn compaction_merges_packs_under_pushes_from_another_instance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_root = tmp.path().join("store");
+    let env = store_env(&store_root);
+    let fs_store = std::env::var("REMOTE_TEST_S3_ENDPOINT").is_err();
+    let prefix = format!("t{}", rand::random::<u32>());
+    // A compacts four packs at a time, at once, and deletes what it replaced
+    // straight away. B never compacts, as an instance from before compaction.
+    let compacting = [
+        ("REMOTE_COMPACT_FACTOR", "4"),
+        ("REMOTE_COMPACT_DELAY_SECS", "0"),
+        ("REMOTE_COMPACT_GRACE_SECS", "0"),
+    ];
+    let a = start_with(&env, &tmp.path().join("cache-a"), &prefix, &compacting);
+    let b = start_with(
+        &env,
+        &tmp.path().join("cache-b"),
+        &prefix,
+        &[("REMOTE_COMPACT", "0")],
+    );
+
+    let (st, repo) = call(
+        "POST",
+        &format!("{}/api/repos/team-c", a.url),
+        ADMIN,
+        Some(json!({"name": "busy"})),
+    )
+    .await;
+    assert_eq!(st, 201, "{repo}");
+    let clone_url = repo["clone_url"].as_str().unwrap();
+    let a_url = with_creds(clone_url, ADMIN);
+    let b_url = with_creds(&clone_url.replace(&a.url, &b.url), ADMIN);
+    let api = |base: &str| format!("{base}/api/repos/team-c/busy");
+    let packs = |base: String| async move {
+        call("GET", &base, ADMIN, None).await.1["packs"]
+            .as_u64()
+            .unwrap()
+    };
+
+    let work = tmp.path().join("work");
+    let proj = work.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    ok(&proj, &["init", "-q", "-b", "main"]);
+    let mut commits = 0;
+    let mut push = |url: &str| {
+        commits += 1;
+        std::fs::write(proj.join(format!("f{commits}.txt")), format!("{commits}\n")).unwrap();
+        ok(&proj, &["add", "."]);
+        ok(&proj, &["commit", "-q", "-m", &format!("c{commits}")]);
+        ok(&proj, &["push", "-q", url, "HEAD:main"]);
+    };
+
+    // Five pushes through B: five packs, and nobody merges them.
+    for _ in 0..5 {
+        push(&b_url);
+    }
+    assert_eq!(packs(api(&a.url)).await, 5);
+
+    let (st, report) = call("POST", &format!("{}/compact", api(&a.url)), ADMIN, None).await;
+    assert_eq!(st, 200, "{report}");
+    assert_eq!(report["outcome"], "compacted", "{report}");
+    assert_eq!(report["merged"].as_array().unwrap().len(), 5, "{report}");
+    assert_eq!(report["packs_listed"], 1, "{report}");
+    assert_eq!(report["sweep"]["deleted_packs"], 5, "{report}");
+    // B's cache still holds the five packs; it drops them and serves the
+    // merged one, and a push through it lands on the compacted state.
+    ok(&work, &["clone", "-q", &b_url, "via-b"]);
+    ok(&work.join("via-b"), &["fsck", "--full"]);
+    let b_cache_packs = || {
+        std::fs::read_dir(tmp.path().join("cache-b"))
+            .unwrap()
+            .flatten()
+            .flat_map(|bucket| {
+                std::fs::read_dir(bucket.path().join("team-c/busy.git/objects/pack"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".idx"))
+            .count()
+    };
+    assert_eq!(b_cache_packs(), 1, "B pruned the replaced packs");
+    push(&b_url);
+    assert_eq!(packs(api(&a.url)).await, 2);
+
+    // Pushes through A queue compaction by themselves.
+    for _ in 0..2 {
+        push(&a_url);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while packs(api(&a.url)).await > 1 {
+        assert!(
+            Instant::now() < deadline,
+            "A never compacted after its pushes"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Both instances, and a cold cache, serve all of it.
+    let _ = std::fs::remove_dir_all(tmp.path().join("cache-a"));
+    for (name, url) in [("a2", &a_url), ("b2", &b_url)] {
+        ok(&work, &["clone", "-q", url, name]);
+        ok(&work.join(name), &["fsck", "--full"]);
+        let log = ok(&work.join(name), &["rev-list", "--count", "HEAD"]);
+        assert_eq!(log.trim(), commits.to_string(), "{name}");
+    }
+
+    if fs_store {
+        // A push re-lists a name a compaction already swept (it pushed the
+        // very same pack again just as the sweep deleted it). Its objects are
+        // in the merged pack, so a cold cache passes over it, and the next
+        // compaction drops it from the state.
+        let path = find_state(&store_root);
+        let repo_dir = path.parent().unwrap();
+        // A pack the last compaction swept, whose marker is still there.
+        let swept = std::fs::read_dir(repo_dir.join("retired"))
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".json")
+                    .to_string()
+            })
+            .find(|p| !repo_dir.join(format!("packs/{p}.pack")).exists())
+            .expect("a swept pack with its marker");
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state["packs"].as_array_mut().unwrap().push(json!(swept));
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(tmp.path().join("cache-b"));
+        ok(&work, &["clone", "-q", &b_url, "b3"]);
+        ok(&work.join("b3"), &["fsck", "--full"]);
+        let (_, report) = call("POST", &format!("{}/compact", api(&a.url)), ADMIN, None).await;
+        assert_eq!(report["dropped"], json!([swept]), "{report}");
+        assert_eq!(report["packs_listed"], 1, "{report}");
+    }
+
+    // Once every marker has waited out its (zero) grace period twice, nothing
+    // is left behind.
+    let (_, report) = call("POST", &format!("{}/compact", api(&a.url)), ADMIN, None).await;
+    assert_eq!(report["outcome"], "nothing to do", "{report}");
+    assert_eq!(report["sweep"]["pending"], 0, "{report}");
+}
