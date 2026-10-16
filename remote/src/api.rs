@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
             "/api/repos/{ns}/{repo}/commits",
             post(create_commit).layer(DefaultBodyLimit::max(commit_limit)),
         )
+        .route("/api/repos/{ns}/{repo}/compact", post(compact_repo))
         .route("/api/tokens", get(list_tokens).post(mint_token))
         .route("/api/tokens/{id}", delete(revoke_token))
         .route("/{ns}/{repo}/info/refs", get(info_refs))
@@ -388,6 +389,7 @@ async fn get_repo(
     out["head"] = state.head.clone().into();
     out["refs"] = json!(state.refs);
     out["empty"] = state.refs.is_empty().into();
+    out["packs"] = state.packs.len().into();
     out["version"] = state.version.into();
     out["updated_at"] = state.updated_at.into();
     Ok(Json(out))
@@ -464,6 +466,27 @@ pub async fn remove_repo(s: &AppState, p: &Principal, ns: &str, repo: &str) -> A
     drop(ex);
     tracing::info!(namespace = %ns, repo = %repo, by = %p.subject, "deleted repo");
     Ok(objects)
+}
+
+/// Merge `ns/repo`'s small packs now, and sweep what earlier compactions
+/// replaced, rather than waiting for the next write to queue it.
+async fn compact_repo(
+    State(s): State<AppState>,
+    Path((ns, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let p = caller(&s, &headers).await?;
+    check_names(&ns, Some(&repo))?;
+    require(&p, &ns, None, Tier::Admin)?;
+    let (b, _) = existing(&s, &ns, &repo).await?;
+    let r = RepoRef {
+        bucket: b.bucket.clone(),
+        ns: ns.clone(),
+        name: repo.clone(),
+    };
+    let report = crate::compact::run(&s.git, &r, &s.cfg.compact).await?;
+    tracing::info!(namespace = %ns, repo = %repo, by = %p.subject, outcome = %report.outcome, "compaction requested");
+    Ok(Json(json!(report)))
 }
 
 async fn create_commit(

@@ -29,6 +29,7 @@ S3 is the authority. Local disk is only a cache.
 <account bucket>/ns/<ns>/repos/<repo>/meta.json
 <account bucket>/ns/<ns>/repos/<repo>/state.json        refs + pack list
 <account bucket>/ns/<ns>/repos/<repo>/packs/pack-<sha>.{pack,idx}
+<account bucket>/ns/<ns>/repos/<repo>/retired/pack-<sha>.json   packs a compaction replaced
 ```
 
 **Before every operation**, a repo's bare cache (`REMOTE_CACHE_DIR`) is
@@ -50,6 +51,46 @@ the same repo with no lock service, and a cache can be deleted at any time.
 
 **A server-side commit** is built in a scratch repo and `git push`ed into the
 cache. That goes through the same hook, so there is one write path.
+
+### Compaction
+
+Every push adds a pack, so a repo's state would otherwise list one pack per
+push. Each cold cache downloads all of them, and each fetch searches all of
+them. A few seconds after a write (`REMOTE_COMPACT_DELAY_SECS`), the instance
+that took it compacts the repo (`src/compact.rs`):
+
+- **Which packs.** Packs fall into size classes `REMOTE_COMPACT_FACTOR` (8)
+  apart, starting at 64 KiB. When that many packs sit at or below some class,
+  the smallest such class, they merge. Each byte is rewritten about once per
+  class. No output exceeds `REMOTE_COMPACT_MAX_PACK_MB`.
+- **How.** `git pack-objects --stdin-packs` copies every object in the inputs,
+  reachable or not, into one pack. Before anything is uploaded, the output is
+  checked to hold every input object.
+- **The swap.**
+  1. The merged pack is uploaded.
+  2. A `retired/` marker is written for each input.
+  3. `state.json` is replaced with `If-Match`: the inputs are removed and the
+     merged pack is added.
+
+  If a push lands first, the swap is reapplied to the newer state. No lock is
+  held while git packs, so pushes never wait for a compaction. If another
+  compaction took the inputs first, this one gives up.
+- **Deletion.** A reader in another region may still be downloading the old
+  packs. A replaced pack is therefore deleted only once its marker is
+  `REMOTE_COMPACT_GRACE_SECS` (6 h) old, and the marker stays for one more
+  grace period. Hydration deletes local packs the state no longer lists. A
+  listed pack missing from the store is skipped only when a marker vouches
+  that its objects are in another listed pack.
+- **Compatibility.** The state format is unchanged. An instance without
+  compaction, or a repo that was never compacted, works as before. Such an
+  instance downloads a merged pack like any other, and its pushes keep the
+  swap. Its cache keeps replaced packs until it is upgraded or deleted, which
+  takes extra disk but is not wrong.
+
+The sweep runs with each compaction, and again a grace period after markers
+are left pending. An instance restart forgets that schedule, so a repo nobody
+writes to keeps its replaced packs until its next write, or until
+`POST /api/repos/{ns}/{repo}/compact`.
 
 **Buckets** are created on first use:
 
@@ -157,9 +198,10 @@ That grants nothing a namespace's own `applb_` tokens cannot already do here.
 | --- | --- |
 | `POST /api/repos/{ns}` `{name, description?, default_branch?, public?}` | create (admin) |
 | `GET /api/repos/{ns}` | list |
-| `GET /api/repos/{ns}/{repo}` | meta, HEAD, refs |
+| `GET /api/repos/{ns}/{repo}` | meta, HEAD, refs, pack count |
 | `PATCH /api/repos/{ns}/{repo}` `{public}` | make public or private (admin). A public repo is cloned, fetched, read and browsed without a credential by anyone with its URL; it is never listed outside its namespace, and pushing still needs a write token |
 | `DELETE /api/repos/{ns}/{repo}` | delete (admin) |
+| `POST /api/repos/{ns}/{repo}/compact` | compact and sweep now, returning what happened (admin) |
 | `POST /api/repos/{ns}/{repo}/commits` | JSON `{message, files:[{path, content, encoding?, executable?, delete?}], branch?, base?, replace?}`, or a `application/gzip` tarball with `?message=&branch=&replace=` |
 | `POST /api/tokens` `{namespace, access, repos?, ttl_secs?, name?}` | mint; `ttl_secs: 0` never expires |
 | `GET /api/tokens?namespace=` / `DELETE /api/tokens/{id}` | list / revoke (admin) |
@@ -190,6 +232,11 @@ That grants nothing a namespace's own `applb_` tokens cannot already do here.
 | `REMOTE_MAX_TOKEN_TTL_SECS` | 30 days | cap on a token's `ttl_secs`; `0` (no expiry) is allowed |
 | `REMOTE_WEB` | on | `0` serves the API and git only, with no web UI |
 | `REMOTE_PLUGIN_API_TOKEN` | | app-lb's `remote` plugin bearer; mounts `/-/ns/<ns>/…` (see above) |
+| `REMOTE_COMPACT` | on | `0` stops compacting after writes; the admin endpoint still compacts |
+| `REMOTE_COMPACT_FACTOR` | `8` | packs per size class, and the ratio between classes |
+| `REMOTE_COMPACT_MAX_PACK_MB` | `128` | no merged pack is larger; it is held in memory to upload |
+| `REMOTE_COMPACT_GRACE_SECS` | 6 hours | how long a replaced pack outlives its replacement; under an hour is for tests |
+| `REMOTE_COMPACT_DELAY_SECS` | `30` | how long after a write the repo is looked at |
 
 The S3 credential needs these permissions on `<prefix>-*`:
 
@@ -248,12 +295,19 @@ real `git` client. It covers:
 - a stale concurrent push refused, then landed after a rebase;
 - a commit with no git, and a stale `base` refused with 409;
 - delete;
+- compaction of packs pushed through an instance that never compacts. That
+  instance prunes its cache and keeps pushing onto the compacted state, both
+  instances serve from cold caches, and a swept pack re-listed by a push is
+  skipped and then dropped;
 - the web UI: each session sees only the namespaces a stub app-lb and auth
   service grant it, and browsing, forms, origin checks and handoff all work.
 
 ## Not done yet
 
-- **Pack compaction.** Every push adds a pack, and nothing merges them yet.
 - **Garbage collection** of packs a lost race uploaded but no state names.
+  Compaction deletes only packs it replaced, because a lost push's pack name
+  can be pushed again.
+- **Streaming uploads.** Pushed and merged packs are read into memory to
+  upload, which is why `REMOTE_COMPACT_MAX_PACK_MB` exists.
 - **Cache eviction.**
 - **Bucket deletion** when an account goes away.

@@ -25,6 +25,7 @@ mod api;
 mod auth;
 mod browse;
 mod commit;
+mod compact;
 mod config;
 mod git;
 // The shared look, theme cookie and top bar, included rather than depended on
@@ -102,6 +103,19 @@ async fn main() {
         resolved.store.clone(),
         resolved.hook_env().to_vec(),
     ));
+    if cfg.compact.enabled {
+        compact::spawn(git.clone(), cfg.compact.clone());
+    } else {
+        tracing::warn!(
+            "REMOTE_COMPACT is off: pushes keep adding packs, and only the admin endpoint merges them"
+        );
+    }
+    if cfg.compact.grace_secs < 3600 {
+        tracing::warn!(
+            grace_secs = cfg.compact.grace_secs,
+            "REMOTE_COMPACT_GRACE_SECS is under an hour: a slow reader in another region can lose a pack it is downloading"
+        );
+    }
     if auth.providers().len() == 1 {
         tracing::warn!(
             "no REMOTE_AUTH_URL, REMOTE_APPLB_URL or REMOTE_ADMIN_TOKEN: only hrm_ tokens are \

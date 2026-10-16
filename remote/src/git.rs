@@ -24,17 +24,25 @@
 //! The server-side commit path ([`crate::commit`]) pushes into the cache with a
 //! local `git push`. That goes through the same receive-pack and the same hook,
 //! so there is one write path.
+//!
+//! Every push adds a pack, so after each write the repo is queued for
+//! [`crate::compact`], which merges small packs into one and swaps it into the
+//! state under the same `If-Match`. Hydration follows that: it deletes local
+//! packs the state no longer lists, and it passes over a listed pack that is
+//! gone from the store only when a retirement marker says a compaction already
+//! copied its objects into another listed pack.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::registry::{self, RepoState};
@@ -87,6 +95,11 @@ pub struct GitService {
     pub store: Store,
     pub hook_env: Vec<(String, String)>,
     locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
+    /// Where [`wrote`](Self::wrote) queues a repo for compaction, once the
+    /// background compactor is running.
+    compactor: OnceLock<UnboundedSender<RepoRef>>,
+    /// One compaction at a time on this instance, whoever asked for it.
+    pub(crate) compact_gate: tokio::sync::Mutex<()>,
 }
 
 /// An error that reaches a git client as text, and an HTTP status.
@@ -159,10 +172,23 @@ impl GitService {
             store,
             hook_env,
             locks: Mutex::new(HashMap::new()),
+            compactor: OnceLock::new(),
+            compact_gate: tokio::sync::Mutex::new(()),
         }
     }
 
-    fn lock_for(&self, r: &RepoRef) -> Arc<RwLock<()>> {
+    pub fn set_compactor(&self, tx: UnboundedSender<RepoRef>) {
+        let _ = self.compactor.set(tx);
+    }
+
+    /// `r` took a write: let the compactor look at it.
+    pub fn wrote(&self, r: &RepoRef) {
+        if let Some(tx) = self.compactor.get() {
+            let _ = tx.send(r.clone());
+        }
+    }
+
+    pub(crate) fn lock_for(&self, r: &RepoRef) -> Arc<RwLock<()>> {
         let key = format!("{}/{}/{}", r.bucket, r.ns, r.name);
         self.locks
             .lock()
@@ -277,7 +303,7 @@ impl GitService {
     }
 
     /// Bring the cache in line with the authority. Caller holds the write lock.
-    async fn hydrate(
+    pub(crate) async fn hydrate(
         &self,
         r: &RepoRef,
         path: &Path,
@@ -288,7 +314,7 @@ impl GitService {
         tokio::fs::create_dir_all(&pack_dir)
             .await
             .map_err(|e| GitError::internal(e.to_string()))?;
-        for pack in &state.packs {
+        'packs: for pack in &state.packs {
             if !valid_pack_name(pack) {
                 return Err(GitError::internal(format!(
                     "state lists a bad pack name {pack:?}"
@@ -301,16 +327,32 @@ impl GitService {
             // an index only ever appears beside a complete pack.
             for ext in ["pack", "idx"] {
                 let file = format!("{pack}.{ext}");
-                let obj = self
+                let store_err = |e: crate::store::StoreError| GitError::internal(e.to_string());
+                let Some(obj) = self
                     .store
                     .get(&r.bucket, &registry::pack_key(&r.ns, &r.name, &file))
                     .await
-                    .map_err(|e| GitError::internal(e.to_string()))?
-                    .ok_or_else(|| {
-                        GitError::internal(format!(
-                            "pack {file} is listed but missing from the store"
-                        ))
-                    })?;
+                    .map_err(store_err)?
+                else {
+                    let marker = registry::retired_key(&r.ns, &r.name, pack);
+                    if self
+                        .store
+                        .get(&r.bucket, &marker)
+                        .await
+                        .map_err(store_err)?
+                        .is_some()
+                    {
+                        // A compaction copied this pack's objects into another
+                        // listed pack before it was swept; the next compaction
+                        // drops it from the state.
+                        tracing::warn!(repo = %format!("{}/{}", r.ns, r.name), %pack, "listed pack was retired and swept; passing over it");
+                        let _ = tokio::fs::remove_file(pack_dir.join(format!("{pack}.pack"))).await;
+                        continue 'packs;
+                    }
+                    return Err(GitError::internal(format!(
+                        "pack {file} is listed but missing from the store"
+                    )));
+                };
                 let tmp = pack_dir.join(format!("{file}.tmp"));
                 tokio::fs::write(&tmp, &obj.bytes)
                     .await
@@ -320,6 +362,9 @@ impl GitService {
                     .map_err(|e| GitError::internal(e.to_string()))?;
             }
         }
+        prune_packs(&pack_dir, &state.packs)
+            .await
+            .map_err(|e| GitError::internal(e.to_string()))?;
         write_refs(path, &state)
             .await
             .map_err(|e| GitError::internal(e.to_string()))?;
@@ -453,6 +498,10 @@ impl GitService {
         let mut stderr = child.stderr.take().expect("piped");
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
         let label = format!("{}/{}/{}", r.ns, r.name, svc.subcommand());
+        let wrote = (svc == Service::ReceivePack)
+            .then(|| self.compactor.get().cloned())
+            .flatten()
+            .map(|tx| (tx, r.clone()));
         tokio::spawn(async move {
             let _held = held;
             let _input = input;
@@ -483,7 +532,12 @@ impl GitService {
             let status = child.wait().await;
             let err = err_task.await.unwrap_or_default();
             match status {
-                Ok(s) if s.success() => tracing::debug!(op = %label, "git rpc done"),
+                Ok(s) if s.success() => {
+                    tracing::debug!(op = %label, "git rpc done");
+                    if let Some((tx, r)) = wrote {
+                        let _ = tx.send(r);
+                    }
+                }
                 other => {
                     tracing::warn!(op = %label, status = ?other, stderr = %err.trim(), "git rpc failed")
                 }
@@ -519,7 +573,7 @@ pub fn pkt_line(s: &str) -> Vec<u8> {
     format!("{:04x}{s}", s.len() + 4).into_bytes()
 }
 
-fn valid_pack_name(p: &str) -> bool {
+pub(crate) fn valid_pack_name(p: &str) -> bool {
     p.strip_prefix("pack-").is_some_and(|h| {
         (h.len() == 40 || h.len() == 64) && h.bytes().all(|b| b.is_ascii_hexdigit())
     })
@@ -533,6 +587,31 @@ fn set_executable(p: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn set_executable(_: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Delete the local packs `listed` does not name: a compaction replaced them.
+/// The index goes first, so git stops finding a pack before its data goes.
+pub(crate) async fn prune_packs(pack_dir: &Path, listed: &[String]) -> std::io::Result<()> {
+    let mut stale = Vec::new();
+    let mut dir = tokio::fs::read_dir(pack_dir).await?;
+    while let Some(e) = dir.next_entry().await? {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(base) = name.strip_suffix(".idx")
+            && valid_pack_name(base)
+            && !listed.iter().any(|p| p == base)
+        {
+            stale.push(base.to_string());
+        }
+    }
+    for base in stale {
+        for ext in ["idx", "pack", "rev", "bitmap", "mtimes", "keep"] {
+            match tokio::fs::remove_file(pack_dir.join(format!("{base}.{ext}"))).await {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+    }
     Ok(())
 }
 
