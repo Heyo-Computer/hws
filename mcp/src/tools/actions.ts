@@ -109,7 +109,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
       return undefined;
     }
     const build = spec.build as Record<string, unknown> | undefined;
-    const onRemote = build ? remoteRepoOf(config, build.repo) : undefined;
+    const onRemote = build ? await remoteRepoOf(config, clients.remote, build.repo) : undefined;
     if (build && onRemote) {
       const derived = await remoteStartInfo(
         clients.remote,
@@ -533,7 +533,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         // `build.auth`, app-lb clones it anonymously and the build dies at
         // "could not read Username". Add the credential `repo_deploy` would.
         const build = spec.build as Record<string, unknown> | undefined;
-        const onRemote = build && !build.auth ? remoteRepoOf(config, build.repo) : undefined;
+        const onRemote = build && !build.auth ? await remoteRepoOf(config, clients.remote, build.repo) : undefined;
         if (build && onRemote) {
           const ns =
             (typeof spec.namespace === "string" && spec.namespace) ||

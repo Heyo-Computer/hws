@@ -284,6 +284,8 @@ test("the deploy prompt names the tools for the kind it was asked about", async 
 });
 
 test("a build.repo on the Heyo git remote gets a build credential; other repos do not", async () => {
+  // The server reaches the remote at git.us5; the remote hands out clone URLs
+  // on its public name, remote.example.com (REMOTE_PUBLIC_URL), as us5 does.
   const config = loadConfig({
     APPLB_URL: "http://127.0.0.1:9090",
     APPLB_TOKEN: "applb_x",
@@ -293,7 +295,12 @@ test("a build.repo on the Heyo git remote gets a build credential; other repos d
   assert.ok(deploy);
   for (const [repo, expectAuth] of [
     ["https://git.us5.example.com/us5/newsfeed-app.git", true],
+    ["https://remote.example.com/us5/newsfeed-app.git", true],
+    ["https://remote.example.com/us5/newsfeed-app", true],
     ["https://github.com/someone/public.git", false],
+    // The remote holds us5/newsfeed-app, but under another URL: a token must
+    // never be minted for a host that only borrows the path.
+    ["https://evil.example.com/us5/newsfeed-app.git", false],
   ] as const) {
     const calls: Call[] = [];
     const original = globalThis.fetch;
@@ -305,6 +312,10 @@ test("a build.repo on the Heyo git remote gets a build credential; other repos d
       const reply = (status: number, b: unknown) =>
         new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
       if (url.endsWith("/api/tokens")) return reply(201, { token: "hrm_1_s", id: "t1" });
+      if (url === "https://git.us5.example.com/api/repos/us5/newsfeed-app") {
+        return reply(200, { name: "newsfeed-app", clone_url: "https://remote.example.com/us5/newsfeed-app.git" });
+      }
+      if (url.includes("/api/repos/")) return reply(404, { error: "no such repo" });
       if (method === "GET" && /\/deployments\/[^/]+$/.test(url)) return reply(404, { error: "not found" });
       if (method === "POST" && /\/build$/.test(url)) return reply(202, { id: "job-1", status: "queued" });
       return reply(200, { id: "newsfeed-app" });
