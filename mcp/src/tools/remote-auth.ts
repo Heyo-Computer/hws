@@ -10,6 +10,7 @@
  */
 
 import type { Clients } from "../clients/index.js";
+import type { Requester } from "../http.js";
 import type { Config } from "../config.js";
 
 export interface RemoteRepo {
@@ -17,8 +18,36 @@ export interface RemoteRepo {
   repo: string;
 }
 
-/** `ns/repo` when `url` is a clone URL on this server's git remote. */
-export function remoteRepoOf(config: Config, url: unknown): RemoteRepo | undefined {
+/** `{ns, repo}` from a `https://host/<ns>/<repo>[.git]` URL, whatever the host. */
+function repoPath(url: URL): RemoteRepo | undefined {
+  const [namespace, repo, ...rest] = url.pathname.split("/").filter(Boolean);
+  if (!namespace || !repo || rest.length > 0) return undefined;
+  return { namespace, repo: repo.replace(/\.git$/, "") };
+}
+
+/** A clone URL compared the way git would treat it: host case and `.git` aside. */
+function sameCloneUrl(a: URL, b: URL): boolean {
+  const norm = (u: URL) =>
+    `${u.protocol}//${u.host.toLowerCase()}${u.pathname.replace(/\/+$/, "").replace(/\.git$/, "")}`;
+  return norm(a) === norm(b);
+}
+
+/**
+ * `ns/repo` when `url` is a clone URL on this server's git remote.
+ *
+ * The remote does not hand out clone URLs on the address this server reaches
+ * it by: on us5 the server talks to `https://git.us5.heyo.work` while
+ * `repo_create` returns `https://remote.heyo.work/us5/<repo>.git`
+ * (`REMOTE_PUBLIC_URL`). A host match alone missed exactly the URL an agent
+ * copies from `repo_create`, and its build cloned anonymously and failed. So
+ * a URL on another host is asked about: it is on the remote when the remote
+ * holds `<ns>/<repo>` and reports that very URL as its clone URL.
+ */
+export async function remoteRepoOf(
+  config: Config,
+  remote: Requester,
+  url: unknown,
+): Promise<RemoteRepo | undefined> {
   if (!config.remote || typeof url !== "string") return undefined;
   let u: URL;
   let base: URL;
@@ -28,10 +57,19 @@ export function remoteRepoOf(config: Config, url: unknown): RemoteRepo | undefin
   } catch {
     return undefined;
   }
-  if (u.host.toLowerCase() !== base.host.toLowerCase()) return undefined;
-  const [namespace, repo, ...rest] = u.pathname.split("/").filter(Boolean);
-  if (!namespace || !repo || rest.length > 0) return undefined;
-  return { namespace, repo: repo.replace(/\.git$/, "") };
+  const found = repoPath(u);
+  if (!found) return undefined;
+  if (u.host.toLowerCase() === base.host.toLowerCase()) return found;
+  if (u.protocol !== "https:" && u.protocol !== "http:") return undefined;
+  const info = (await remote({
+    path: `/api/repos/${encodeURIComponent(found.namespace)}/${encodeURIComponent(found.repo)}`,
+  }).catch(() => undefined)) as { clone_url?: unknown } | undefined;
+  if (typeof info?.clone_url !== "string") return undefined;
+  try {
+    return sameCloneUrl(new URL(info.clone_url), u) ? found : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The app-lb secret id a deployment's build credential is stored under. */
