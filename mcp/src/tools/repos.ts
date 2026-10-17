@@ -50,10 +50,11 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
   /** The namespace a call means: named, configured, or app-lb's. */
   const namespaceOf = async (a: Record<string, unknown>): Promise<string> => {
     const named = typeof a.namespace === "string" ? a.namespace.trim() : "";
-    const ns = named || config.remoteNamespace || (await clients.applbNamespace().catch(() => undefined));
+    const ns = named || config.remoteNamespace || (await clients.callerNamespace());
     if (!ns) {
       throw new Error(
-        "no namespace: pass `namespace`, or set REMOTE_NAMESPACE (or APPLB_NAMESPACE). Repos " +
+        "no namespace: pass `namespace`, set REMOTE_NAMESPACE (or APPLB_NAMESPACE), or use a " +
+          "namespace's app-lb token. Repos " +
           "live in a namespace the same way deployments do.",
       );
     }
@@ -333,7 +334,7 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           // namespace token drops an existing one too: app-lb refuses a
           // tenant's root outside its namespace, and reassigns the right one.
           const prev = { ...((existing?.site as Record<string, unknown> | undefined) ?? {}) };
-          if (await clients.applbNamespace().catch(() => undefined)) delete prev.root;
+          if (await clients.callerNamespace()) delete prev.root;
           const site = {
             ...prev,
             ...(a.spa !== undefined ? { spa: Boolean(a.spa) } : {}),

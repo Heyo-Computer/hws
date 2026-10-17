@@ -38,6 +38,13 @@ export interface Clients {
    * self-hosted app-lb, which has no namespace.
    */
   applbNamespace: () => Promise<string | undefined>;
+  /**
+   * The namespace the caller works in: the managed one, else the one app-lb's
+   * `GET /whoami` confines the credential to. `undefined` when neither names
+   * one (a self-hosted app-lb, a fleet token). What tools that would
+   * otherwise make a namespace-token caller repeat their namespace ask.
+   */
+  callerNamespace: () => Promise<string | undefined>;
 }
 
 export const CLOUD_SERVICE = "heyo cloud";
@@ -64,6 +71,7 @@ export function makeClients(config: Config): Clients {
     artifactNamespace,
     remote: bind("git remote", config.remote, "REMOTE_URL", config),
     applbNamespace,
+    callerNamespace: () => artifactNamespace().catch(() => undefined),
   };
 }
 

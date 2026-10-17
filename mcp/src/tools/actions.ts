@@ -191,7 +191,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
     acknowledged: boolean,
   ): Promise<{ refusal?: string; sections: Section[] }> => {
     const sections: Section[] = [];
-    const ownNs = await clients.applbNamespace().catch(() => undefined);
+    const ownNs = await clients.callerNamespace();
     const problems = checkSpec(spec, { confined: Boolean(ownNs) });
     const artNote = artifactWarning(spec, ownNs);
     if (artNote) sections.push(artNote);
@@ -501,7 +501,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         // A namespace token's own namespace: fill it in when the spec leaves it
         // out (app-lb refuses a spec it cannot place), and check the spec as a
         // tenant's.
-        const ownNs = await clients.applbNamespace().catch(() => undefined);
+        const ownNs = await clients.callerNamespace();
         if (ownNs && spec && typeof spec === "object" && !spec.namespace) {
           spec.namespace = ownNs;
           sections.push({ title: "Namespace", body: `\`namespace\` was not set; using your token's, ${ownNs}.` });
@@ -537,7 +537,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         if (build && onRemote) {
           const ns =
             (typeof spec.namespace === "string" && spec.namespace) ||
-            (await clients.applbNamespace().catch(() => undefined));
+            (await clients.callerNamespace());
           const cred = await storeBuildCredential(clients, onRemote, id, ns || undefined);
           build.auth = cred.auth;
           sections.push({
