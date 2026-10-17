@@ -16,7 +16,9 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use hws::types::{
-    ArtifactStoreInfo, AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView, PostgresDatabases,
+    ArtifactStoreInfo, AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase,
+    DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, FileRead, FileWritten, JobRecord,
+    MetricsResponse, NamespacePlugin, Operation, PluginInstalls, PluginView, PostgresDatabases,
     UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
@@ -753,4 +755,18 @@ fn artifact_store_info_is_understood() {
     assert!(info.extra.is_empty(), "unknown fields: {:?}", info.extra.keys().collect::<Vec<_>>());
     assert!(info.available && info.writable);
     assert_eq!((info.namespace.as_str(), info.prefix.as_str()), ("team-a", "team-a/"));
+}
+
+#[test]
+fn operations_and_files_parse_with_nothing_left_over() {
+    let op: Operation = serde_json::from_str(&fixture("operation")).unwrap();
+    assert!(op.extra.is_empty(), "unread fields {:?}", op.extra);
+    let page = op.output.expect("a page");
+    assert!(page.extra.is_empty(), "unread page fields {:?}", page.extra);
+    assert_eq!((op.state.as_str(), op.exit_code), ("failed", Some(1)));
+    let read: FileRead = serde_json::from_str(&fixture("file-read")).unwrap();
+    assert!(read.extra.is_empty(), "unread fields {:?}", read.extra);
+    assert_eq!(read.next_offset, Some(98_304));
+    let wrote: FileWritten = serde_json::from_str(&fixture("file-written")).unwrap();
+    assert!(wrote.extra.is_empty(), "unread fields {:?}", wrote.extra);
 }

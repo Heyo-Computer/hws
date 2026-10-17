@@ -176,6 +176,11 @@ impl VmBackend {
         self.last_active.load(Ordering::Relaxed)
     }
 
+    /// Mark the VM active now, as releasing a slot would.
+    pub fn touch(&self) {
+        self.last_active.store(now_secs(), Ordering::Relaxed);
+    }
+
     pub fn acquire(&self) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         self.last_active.store(now_secs(), Ordering::Relaxed);

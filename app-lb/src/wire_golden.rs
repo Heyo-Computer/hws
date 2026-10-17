@@ -1073,6 +1073,66 @@ fn the_small_responses_are_stable() {
     );
 
     golden(
+        "operation",
+        &OperationView {
+            operation: crate::operations::Operation {
+                id: "op_0123456789abcdef".into(),
+                deployment: "sb-acme".into(),
+                sandbox_id: "applb-sandbox-a1b2c3".into(),
+                boot_id: "6a1f0c2e-1b2c-4d5e-8f90-123456789abc".into(),
+                dir: "/workspace/.heyo/ops/op_0123456789abcdef".into(),
+                command: "cd /workspace/app && npm test".into(),
+                cwd: Some("/workspace".into()),
+                env_keys: vec!["CI".into()],
+                created_at: 1_760_000_000,
+                finished_at: Some(1_760_000_420),
+                max_runtime_secs: 3600,
+                state: crate::operations::OpState::Failed,
+                exit_code: Some(1),
+                output_bytes: 2048,
+                error: None,
+                cancel_requested_at: None,
+                timed_out: false,
+            },
+            output: Some(crate::operations::OutputPage {
+                offset: 2000,
+                bytes: 48,
+                next_offset: 2048,
+                total_bytes: 2048,
+                encoding: "utf-8",
+                data: "Tests: 41 passed, 1 failed\nnpm ERR! Test failed.\n".into(),
+            }),
+            stale: false,
+        },
+    );
+
+    golden(
+        "file-read",
+        &FileRead {
+            sandbox_id: "applb-sandbox-a1b2c3".into(),
+            path: "/workspace/app/package.json".into(),
+            size: 200_000,
+            offset: 0,
+            bytes: 98_304,
+            next_offset: Some(98_304),
+            content: FileContent {
+                encoding: "utf-8",
+                content: "{\"name\": \"app\"}".into(),
+            },
+        },
+    );
+
+    golden(
+        "file-written",
+        &FileWritten {
+            sandbox_id: "applb-sandbox-a1b2c3".into(),
+            path: "/workspace/app/.env".into(),
+            wrote: 42,
+            size: 42,
+        },
+    );
+
+    golden(
         "evict-response",
         &EvictResponse {
             sandbox_id: "applb-sandbox-a1b2c3".into(),

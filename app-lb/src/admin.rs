@@ -170,6 +170,9 @@ fn html_escape(s: &str) -> String {
 #[derive(Clone)]
 struct AdminState {
     views: Option<Arc<crate::fleet::ViewStore>>,
+    /// Background commands in sandboxes. Absent in tests that do not need them,
+    /// where the routes answer 501.
+    operations: Option<Arc<crate::operations::Operations>>,
     /// The shared fleet store, in fleet mode. Mutations are refused while it
     /// cannot be written, and a write it refuses answers 409 or 503.
     fleet_store: Option<Arc<crate::fleet_sync::Fleet>>,
@@ -395,6 +398,7 @@ impl AdminApi {
             addr,
             state: AdminState {
                 views: None,
+                operations: None,
                 fleet_store: None,
                 token_sync: Default::default(),
                 images: None,
@@ -443,6 +447,11 @@ impl AdminApi {
                 onboarding: Arc::new(crate::onboarding::Onboarding::from_env()),
             },
         }
+    }
+
+    pub fn with_operations(mut self, operations: Arc<crate::operations::Operations>) -> Self {
+        self.state.operations = Some(operations);
+        self
     }
 
     pub fn with_views(mut self, views: Arc<crate::fleet::ViewStore>) -> Self {
@@ -5669,6 +5678,452 @@ fn booting_vm(d: &std::sync::Arc<crate::deployment::Deployment>) -> Option<Strin
         .map(|p| p.sandbox_id.clone())
 }
 
+// --- operations: background commands --------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct StartOperation {
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    max_runtime_secs: Option<u64>,
+    #[serde(default = "default_true")]
+    wake: bool,
+    #[serde(default)]
+    sandbox_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OperationQuery {
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    /// Page the last `max_bytes` instead of from `offset`.
+    #[serde(default)]
+    tail: bool,
+    /// `DELETE` only: forget a finished operation and remove its directory.
+    #[serde(default)]
+    purge: bool,
+}
+
+#[derive(Serialize)]
+struct OperationView {
+    #[serde(flatten)]
+    operation: crate::operations::Operation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<crate::operations::OutputPage>,
+    /// The guest could not be asked just now (its console was busy, or the VM
+    /// is waking); this is the last known record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stale: bool,
+}
+
+fn operations_of(state: &AdminState) -> Result<Arc<crate::operations::Operations>, Response> {
+    state.operations.clone().ok_or_else(|| {
+        err(
+            StatusCode::NOT_IMPLEMENTED,
+            "background operations are not enabled on this app-lb",
+        )
+        .into_response()
+    })
+}
+
+/// `POST /deployments/:id/operations` — start a command detached in the
+/// deployment's VM and return at once.
+async fn start_operation(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<StartOperation>,
+) -> impl IntoResponse {
+    let ops = match operations_of(&state) {
+        Ok(ops) => ops,
+        Err(r) => return r,
+    };
+    if req.command.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "command must not be empty").into_response();
+    }
+    if let Some(cwd) = &req.cwd
+        && let Err(e) = crate::guest_files::valid_path(cwd)
+    {
+        return err(StatusCode::BAD_REQUEST, format!("cwd: {e}")).into_response();
+    }
+    let max_runtime = req
+        .max_runtime_secs
+        .unwrap_or(crate::operations::DEFAULT_MAX_RUNTIME_SECS);
+    if max_runtime == 0 || max_runtime > crate::operations::MAX_RUNTIME_SECS {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "max_runtime_secs must be 1..={}",
+                crate::operations::MAX_RUNTIME_SECS
+            ),
+        )
+        .into_response();
+    }
+    if ops.running(&id) >= crate::operations::MAX_RUNNING_PER_DEPLOYMENT {
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "deployment {id:?} already runs {} operations; wait for one or cancel it",
+                crate::operations::MAX_RUNNING_PER_DEPLOYMENT
+            ),
+        )
+        .into_response();
+    }
+    let target = match hold_a_vm(&state, &id, req.wake, req.sandbox_id.as_deref()).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let Some(d) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    let sandbox_id = target.sandbox_id().to_string();
+    let op_id = crate::operations::new_id();
+    let script = crate::operations::start_script(&op_id, &req.command, req.cwd.as_deref());
+    let options = heyo_sdk::CommandRunOptions {
+        cwd: None,
+        env: req.env.clone(),
+        timeout: Some(std::time::Duration::from_secs(20)),
+    };
+    let out = match ops.vms().exec(&sandbox_id, &script, options).await {
+        Ok(out) => out,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("could not start the operation in {sandbox_id}: {e}"),
+            )
+            .into_response();
+        }
+    };
+    let (dir, boot) = match crate::operations::parse_start(&out.stdout) {
+        Ok(started) => started,
+        Err(e) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+    };
+    let mut env_keys: Vec<String> = req.env.iter().flat_map(|e| e.keys().cloned()).collect();
+    env_keys.sort();
+    let op = crate::operations::record(
+        op_id,
+        &id,
+        &sandbox_id,
+        boot,
+        dir,
+        &req.command,
+        req.cwd.clone(),
+        env_keys,
+        max_runtime,
+    );
+    ops.insert(op.clone(), &d);
+    drop(target);
+    tracing::info!(deployment = %id, sandbox = %sandbox_id, op = %op.id, "operation started");
+    (
+        StatusCode::CREATED,
+        Json(OperationView {
+            operation: op,
+            output: None,
+            stale: false,
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /deployments/:id/operations` — this deployment's operations, newest
+/// first, without output.
+async fn list_operations(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match operations_of(&state) {
+        Ok(ops) => Json(serde_json::json!({ "operations": ops.list(&id) })).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `GET /deployments/:id/operations/:op` — the record, fresh from the guest,
+/// and a page of output.
+async fn get_operation(
+    State(state): State<AdminState>,
+    Path((id, op_id)): Path<(String, String)>,
+    Query(q): Query<OperationQuery>,
+) -> impl IntoResponse {
+    let ops = match operations_of(&state) {
+        Ok(ops) => ops,
+        Err(r) => return r,
+    };
+    let Some(op) = ops.get(&id, &op_id) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no operation {op_id:?} in deployment {id:?}"),
+        )
+        .into_response();
+    };
+    let max = q
+        .max_bytes
+        .unwrap_or(crate::operations::DEFAULT_PAGE_BYTES)
+        .min(crate::operations::MAX_PAGE_BYTES);
+    let offset = if q.tail {
+        op.output_bytes.saturating_sub(max)
+    } else {
+        q.offset.unwrap_or(0)
+    };
+    let (operation, output, stale) = ops.read(&op, offset, max).await;
+    Json(OperationView {
+        operation,
+        output,
+        stale,
+    })
+    .into_response()
+}
+
+/// `DELETE /deployments/:id/operations/:op` — cancel it, or with `purge`
+/// forget a finished one and remove its directory.
+async fn cancel_operation(
+    State(state): State<AdminState>,
+    Path((id, op_id)): Path<(String, String)>,
+    Query(q): Query<OperationQuery>,
+) -> impl IntoResponse {
+    let ops = match operations_of(&state) {
+        Ok(ops) => ops,
+        Err(r) => return r,
+    };
+    let Some(op) = ops.get(&id, &op_id) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no operation {op_id:?} in deployment {id:?}"),
+        )
+        .into_response();
+    };
+    if q.purge {
+        return match ops.purge(&op).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+        };
+    }
+    match ops.cancel(&op).await {
+        Ok(operation) => {
+            let status = if operation.state.finished() {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (
+                status,
+                Json(OperationView {
+                    operation,
+                    output: None,
+                    stale: false,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            format!("could not signal the operation: {e}"),
+        )
+        .into_response(),
+    }
+}
+
+// --- files in a running guest ---------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct FileQuery {
+    path: String,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    length: Option<u64>,
+    /// `PUT` only: append instead of replacing.
+    #[serde(default)]
+    append: bool,
+    #[serde(default)]
+    sandbox_id: Option<String>,
+    #[serde(default = "default_true")]
+    wake: bool,
+}
+
+#[derive(Serialize)]
+struct FileRead {
+    sandbox_id: String,
+    path: String,
+    size: u64,
+    offset: u64,
+    bytes: u64,
+    /// Where the next read starts, or absent at the end of the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_offset: Option<u64>,
+    #[serde(flatten)]
+    content: FileContent,
+}
+
+#[derive(Serialize)]
+struct FileContent {
+    /// `utf-8` or `base64`.
+    encoding: &'static str,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct FileWritten {
+    sandbox_id: String,
+    path: String,
+    wrote: usize,
+    size: u64,
+}
+
+/// `GET /deployments/:id/files?path=` — a byte range of a file in the guest.
+async fn read_guest_file(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = crate::guest_files::valid_path(&q.path) {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let target = match hold_a_vm(&state, &id, q.wake, q.sandbox_id.as_deref()).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let sandbox_id = target.sandbox_id().to_string();
+    let offset = q.offset.unwrap_or(0);
+    let length = q
+        .length
+        .unwrap_or(crate::guest_files::DEFAULT_READ_BYTES)
+        .min(crate::guest_files::MAX_READ_BYTES);
+    let script = crate::guest_files::read_script(&q.path, offset, length);
+    let run = state.autoscaler.vms().exec(
+        &sandbox_id,
+        &script,
+        heyo_sdk::CommandRunOptions {
+            cwd: None,
+            env: None,
+            timeout: Some(std::time::Duration::from_secs(30)),
+        },
+    );
+    let out = match run.await {
+        Ok(out) => out,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("could not read {} in {sandbox_id}: {e}", q.path),
+            )
+            .into_response();
+        }
+    };
+    drop(target);
+    let (size, bytes) = match crate::guest_files::parse_read(&out.stdout) {
+        Ok(read) => read,
+        Err(e) if e == "no such file" => {
+            return err(
+                StatusCode::NOT_FOUND,
+                format!("no file {} in {sandbox_id}", q.path),
+            )
+            .into_response();
+        }
+        Err(e) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+    };
+    let n = bytes.len() as u64;
+    let next = offset + n;
+    let content = match String::from_utf8(bytes) {
+        Ok(text) => FileContent {
+            encoding: "utf-8",
+            content: text,
+        },
+        Err(e) => {
+            use base64::Engine as _;
+            FileContent {
+                encoding: "base64",
+                content: base64::engine::general_purpose::STANDARD.encode(e.into_bytes()),
+            }
+        }
+    };
+    Json(FileRead {
+        sandbox_id,
+        path: q.path,
+        size,
+        offset,
+        bytes: n,
+        next_offset: (next < size).then_some(next),
+        content,
+    })
+    .into_response()
+}
+
+/// `PUT /deployments/:id/files?path=` — write the request body to a file in
+/// the guest, replacing it or (`append`) adding to it.
+async fn write_guest_file(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = crate::guest_files::valid_path(&q.path) {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    if body.len() > crate::guest_files::MAX_WRITE_BYTES {
+        return err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "{} bytes is more than one write carries ({}); use a transfer",
+                body.len(),
+                crate::guest_files::MAX_WRITE_BYTES
+            ),
+        )
+        .into_response();
+    }
+    let target = match hold_a_vm(&state, &id, q.wake, q.sandbox_id.as_deref()).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let sandbox_id = target.sandbox_id().to_string();
+    let mut size = None;
+    for script in crate::guest_files::write_scripts(&q.path, &body, q.append) {
+        let run = state.autoscaler.vms().exec(
+            &sandbox_id,
+            &script,
+            heyo_sdk::CommandRunOptions {
+                cwd: None,
+                env: None,
+                timeout: Some(std::time::Duration::from_secs(60)),
+            },
+        );
+        match run.await {
+            Ok(out) if out.exit_code == 0 => {
+                size = crate::guest_files::parse_written(&out.stdout).or(size)
+            }
+            Ok(out) => {
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "writing {} failed (exit {}): {}",
+                        q.path,
+                        out.exit_code,
+                        out.output.trim()
+                    ),
+                )
+                .into_response();
+            }
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    format!("could not write {} in {sandbox_id}: {e}", q.path),
+                )
+                .into_response();
+            }
+        }
+    }
+    drop(target);
+    Json(FileWritten {
+        sandbox_id,
+        path: q.path,
+        wrote: body.len(),
+        size: size.unwrap_or(0),
+    })
+    .into_response()
+}
+
 /// `POST /deployments/:id/exec` — run one command in the deployment's VM.
 async fn exec(
     State(state): State<AdminState>,
@@ -6901,6 +7356,22 @@ fn router(state: AdminState) -> Router {
         // CRUD-tier on purpose: running a command in a VM is at least as
         // powerful as editing the spec that boots it.
         .route("/deployments/:id/exec", post(exec))
+        .route(
+            "/deployments/:id/operations",
+            post(start_operation).get(list_operations),
+        )
+        .route(
+            "/deployments/:id/operations/:op_id",
+            get(get_operation).delete(cancel_operation),
+        )
+        .route(
+            "/deployments/:id/files",
+            get(read_guest_file)
+                .put(write_guest_file)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::guest_files::MAX_WRITE_BYTES + 1024,
+                )),
+        )
         .route("/deployments/:id/shell", get(shell))
         // Grouped with the CRUD routes so it inherits the `APP_LB_ADMIN_AUTH`
         // gate: it reports which hostnames app-lb holds keys for.
@@ -7171,10 +7642,19 @@ fn mutates_fleet_state(method: &axum::http::Method, path: &str) -> bool {
         "/fleet-hosts",
     ];
     const HOST: &[&str] = &["/exec", "/shell", "/regional-probe", "/regional-active-probe"];
+    // Routes that act on a VM on this host, matched by the segment after the
+    // deployment id rather than by suffix: `DELETE …/operations/op_1` ends in
+    // an id, not in `/operations`, and is no more a fleet write than its POST.
+    const HOST_SEGMENTS: &[&str] = &["exec", "shell", "operations", "files", "transfers"];
+    let host_segment = path
+        .strip_prefix("/deployments/")
+        .and_then(|rest| rest.split('/').nth(1))
+        .is_some_and(|segment| HOST_SEGMENTS.contains(&segment));
     FLEET.iter().any(|p| {
         let base = p.trim_end_matches('/');
         path == base || path.strip_prefix(base).is_some_and(|rest| rest.starts_with('/'))
     }) && !HOST.iter().any(|h| path.ends_with(h))
+        && !host_segment
         && !path.contains("/machine/")
 }
 
@@ -8152,6 +8632,277 @@ mod tests {
             Fixture { state: api.state, registry, root, mutations, inactive }
         }
 
+        /// Operations and files, end to end: the fake daemon runs every exec
+        /// in a real local `sh`, with the guest's operation directory moved
+        /// into the fixture's root.
+        mod operations_and_files {
+            use super::*;
+            use axum::routing::post;
+            use serde_json::{Value, json};
+
+            fn local_daemon(root: PathBuf) -> Router {
+                Router::new().route(
+                    "/sandbox/:id/exec",
+                    post(move |Json(body): Json<Value>| {
+                        let root = root.clone();
+                        async move {
+                            let command = body["command"].as_str().unwrap().replace(
+                                "/var/tmp/heyo-ops",
+                                &root.join("ops").display().to_string(),
+                            );
+                            let mut cmd = std::process::Command::new("sh");
+                            cmd.arg("-c").arg(&command);
+                            if let Some(env) = body["env"].as_object() {
+                                for (k, v) in env {
+                                    cmd.env(k, v.as_str().unwrap());
+                                }
+                            }
+                            let out = cmd.output().unwrap();
+                            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                            Json(json!({
+                                "stdout": stdout, "stderr": stderr,
+                                "output": format!("{stdout}{stderr}"),
+                                "exit_code": out.status.code().unwrap_or(-1),
+                            }))
+                        }
+                    }),
+                )
+            }
+
+            async fn call(
+                f: &Fixture,
+                method: &str,
+                path: &str,
+                body: Body,
+            ) -> (StatusCode, Value) {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| {
+                    <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)
+                })
+                .await
+                .unwrap();
+                let response = app.call(req).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                )
+            }
+
+            /// Removes the fake guest's directory with the test.
+            struct GuestRoot(PathBuf);
+            impl Drop for GuestRoot {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+
+            async fn fixture_with_vm() -> (
+                Fixture,
+                Arc<crate::deployment::VmBackend>,
+                Arc<crate::operations::Operations>,
+                GuestRoot,
+            ) {
+                let root = std::env::temp_dir().join(format!(
+                    "app-lb-ops-{}-{}",
+                    std::process::id(),
+                    FIXTURE.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir_all(&root).unwrap();
+                let mut f = fixture_with_backend(true, local_daemon(root.clone()), None).await;
+                let ops = crate::operations::Operations::open(
+                    f.root.join("operations.json"),
+                    f.registry.clone(),
+                    f.state.autoscaler.vms().clone(),
+                );
+                f.state.operations = Some(ops.clone());
+                let vm = Arc::new(crate::deployment::VmBackend::new(
+                    "sb-1".into(),
+                    "127.0.0.1:1".parse().unwrap(),
+                ));
+                f.registry
+                    .get("obsolete")
+                    .unwrap()
+                    .set_backends(vec![vm.clone()]);
+                (f, vm, ops, GuestRoot(root))
+            }
+
+            fn json_body(v: Value) -> Body {
+                Body::from(v.to_string())
+            }
+
+            #[tokio::test]
+            async fn an_operation_runs_detached_and_its_output_and_exit_code_come_back() {
+                let (f, vm, ops, _guest) = fixture_with_vm().await;
+                let (status, started) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/operations",
+                    json_body(
+                        json!({"command": "echo hi; echo \"$GREETING\"; sleep 1; echo bye; exit 4",
+                                     "env": {"GREETING": "hello there"}}),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{started}");
+                assert_eq!(started["state"], "running");
+                assert_eq!(started["env_keys"], json!(["GREETING"]));
+                let id = started["id"].as_str().unwrap().to_string();
+                assert_eq!(vm.in_flight(), 1, "a running operation holds its VM");
+
+                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                ops.tick().await;
+                assert_eq!(
+                    vm.in_flight(),
+                    0,
+                    "the slot goes when the last operation ends"
+                );
+
+                let (status, read) = call(
+                    &f,
+                    "GET",
+                    &format!("/deployments/obsolete/operations/{id}"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{read}");
+                assert_eq!(read["state"], "failed");
+                assert_eq!(read["exit_code"], 4);
+                assert_eq!(read["output"]["data"], "hi\nhello there\nbye\n");
+                assert_eq!(read["output"]["next_offset"], read["output"]["total_bytes"]);
+
+                let (_, page) = call(
+                    &f,
+                    "GET",
+                    &format!("/deployments/obsolete/operations/{id}?offset=3&max_bytes=5"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(page["output"]["data"], "hello");
+                assert_eq!(page["output"]["next_offset"], 8);
+
+                let (_, list) =
+                    call(&f, "GET", "/deployments/obsolete/operations", Body::empty()).await;
+                assert_eq!(list["operations"].as_array().unwrap().len(), 1);
+            }
+
+            #[tokio::test]
+            async fn a_cancelled_operation_and_its_children_stop() {
+                let (f, _vm, ops, _guest) = fixture_with_vm().await;
+                let (_, started) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/operations",
+                    json_body(json!({"command": "sleep 300 & sleep 300"})),
+                )
+                .await;
+                let id = started["id"].as_str().unwrap().to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let (status, cancelled) = call(
+                    &f,
+                    "DELETE",
+                    &format!("/deployments/obsolete/operations/{id}"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{cancelled}");
+                assert_eq!(cancelled["state"], "cancelling");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                ops.tick().await;
+                let op = ops.get("obsolete", &id).unwrap();
+                assert_eq!(op.state, crate::operations::OpState::Cancelled);
+                let pid: i32 = std::fs::read_to_string(format!("{}/pid", op.dir))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let group = std::process::Command::new("ps")
+                    .args(["-o", "pid=", "-g", &pid.to_string()])
+                    .output()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&group.stdout).trim().is_empty(),
+                    "the whole group is gone"
+                );
+
+                let (status, _) = call(
+                    &f,
+                    "DELETE",
+                    &format!("/deployments/obsolete/operations/{id}?purge=true"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+                assert!(!std::path::Path::new(&op.dir).exists());
+            }
+
+            #[tokio::test]
+            async fn files_round_trip_through_the_console() {
+                let (f, _vm, _ops, _guest) = fixture_with_vm().await;
+                let path = f.root.join("guest").join("notes.txt").display().to_string();
+                let (status, wrote) = call(
+                    &f,
+                    "PUT",
+                    &format!("/deployments/obsolete/files?path={path}"),
+                    Body::from("hello"),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{wrote}");
+                assert_eq!(
+                    (wrote["wrote"].as_u64(), wrote["size"].as_u64()),
+                    (Some(5), Some(5))
+                );
+                call(
+                    &f,
+                    "PUT",
+                    &format!("/deployments/obsolete/files?path={path}&append=true"),
+                    Body::from(" world"),
+                )
+                .await;
+
+                let (status, read) = call(
+                    &f,
+                    "GET",
+                    &format!("/deployments/obsolete/files?path={path}&offset=6"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{read}");
+                assert_eq!(
+                    (read["content"].as_str(), read["size"].as_u64()),
+                    (Some("world"), Some(11))
+                );
+                assert!(read.get("next_offset").is_none());
+
+                let (status, _) = call(
+                    &f,
+                    "GET",
+                    "/deployments/obsolete/files?path=/no/such/file",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                let (status, _) = call(
+                    &f,
+                    "GET",
+                    "/deployments/obsolete/files?path=relative",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+        }
+
         /// Fleet tokens: minted only where gateways are configured, exported
         /// only to fleet-wide callers, and read-only where they are mirrored.
         mod fleet_tokens {
@@ -8980,12 +9731,16 @@ mod tests {
                 (Method::POST, "/tokens"),
                 (Method::PATCH, "/security/rules/r1"),
                 (Method::PUT, "/api/plugins/obs"),
+                (Method::POST, "/deployments/files"),
             ] {
                 assert!(mutates_fleet_state(&method, path), "{method} {path}");
             }
             for (method, path) in [
                 (Method::GET, "/deployments"),
                 (Method::POST, "/deployments/web/exec"),
+                (Method::POST, "/deployments/web/operations"),
+                (Method::DELETE, "/deployments/web/operations/op_1"),
+                (Method::PUT, "/deployments/web/files"),
                 (Method::POST, "/deployments/web/regional-probe"),
                 (Method::POST, "/login"),
                 (Method::POST, "/disks/sweep"),
@@ -11637,6 +12392,15 @@ mod tests {
             for route in [
                 ("/deployments/:id", "/deployments/sb-1"),
                 ("/deployments/:id/exec", "/deployments/sb-1/exec"),
+                (
+                    "/deployments/:id/operations",
+                    "/deployments/sb-1/operations",
+                ),
+                (
+                    "/deployments/:id/operations/:op_id",
+                    "/deployments/sb-1/operations/op_1",
+                ),
+                ("/deployments/:id/files", "/deployments/sb-1/files"),
                 ("/deployments/:id/shell", "/deployments/sb-1/shell"),
                 ("/deployments/:id/scaling", "/deployments/sb-1/scaling"),
                 ("/deployments/:id/jobs", "/deployments/sb-1/jobs"),

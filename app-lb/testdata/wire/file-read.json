@@ -1,0 +1,10 @@
+{
+  "sandbox_id": "applb-sandbox-a1b2c3",
+  "path": "/workspace/app/package.json",
+  "size": 200000,
+  "offset": 0,
+  "bytes": 98304,
+  "next_offset": 98304,
+  "encoding": "utf-8",
+  "content": "{\"name\": \"app\"}"
+}

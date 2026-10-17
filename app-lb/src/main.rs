@@ -38,6 +38,7 @@ mod fleet_sync;
 mod fleet_store_layout_tests;
 mod feed;
 mod gateway;
+mod guest_files;
 mod regional;
 mod guard;
 mod health;
@@ -52,6 +53,7 @@ mod metrics;
 mod mounts;
 mod namespaces;
 mod obs;
+mod operations;
 mod onboarding;
 mod plugins;
 mod proxy;
@@ -1354,6 +1356,15 @@ fn main() {
         ),
     }
 
+    // Background commands in sandboxes: the records sit beside the state file,
+    // and the watcher holds each busy VM and follows its operations.
+    let operations = operations::Operations::open(
+        std::path::Path::new(&cfg.state_path).with_extension("operations.json"),
+        registry.clone(),
+        vms.clone(),
+    );
+    tokio::spawn(operations.clone().watch());
+
     let admin_svc = background_service(
         "admin",
         AdminApi::new(
@@ -1401,7 +1412,8 @@ fn main() {
         ).unwrap_or_else(|error| panic!("invalid view configuration: {error}"))))
         .with_images(image_catalog.clone())
         .with_artifact_store(store_slot.clone())
-        .with_fleet_store(fleet_stores.as_ref().map(|fs| fs.fleet.clone())),
+        .with_fleet_store(fleet_stores.as_ref().map(|fs| fs.fleet.clone()))
+        .with_operations(operations),
     );
 
     // Fleet mode: hops between members. The peer token is fleet state; the
