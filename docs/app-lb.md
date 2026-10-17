@@ -312,8 +312,9 @@ When a base domain is configured (`APP_LB_DEPLOY_BASE_DOMAIN`, or the first `APP
 | `port` | required | Guest port traffic is proxied to. |
 | `start_command` | | Shell command run once per replica after boot. It must return, so daemonize the workload (`setsid nohup prog </dev/null &`). Its stdout and stderr go to `/var/log/heyvm-start.log` and `.err.log` inside the guest, and from there to app-obs when the image has `socat` (see below). Don't redirect them to a file of your own: that output then never leaves the guest. |
 | `working_directory` | guest default | Directory `start_command` runs in. |
-| `size_class` | daemon default | `micro`, `mini`, `small`, `medium`, `large`, `xlarge`. This is the only CPU and memory setting. |
-| `disk_size_gb` | none | Per-sandbox data disk mounted at `/workspace` (ext4, formatted on first boot by the image's init; an image with its own `/init.sh` must mount `/dev/vdb` itself). It belongs to one sandbox: a restart, rollout or `vm` edit boots a replica with a fresh disk. |
+| `size_class` | `small` | `micro`, `mini`, `small`, `medium`, `large`, `xlarge`. This is the only CPU and memory setting. On Firecracker and KVM: micro 1 vCPU / 512 MiB, mini 1 vCPU / 1 GiB, small 1 vCPU / 2 GiB, medium 2 vCPU / 4 GiB, large 4 vCPU / 8 GiB, xlarge 8 vCPU / 16 GiB. The CPU caps micro and mini carry elsewhere (25% and 50%) are not applied on Firecracker. |
+| `disk_size_gb` | none | Per-sandbox data disk mounted at `/workspace`. It belongs to one sandbox: a restart, rollout or `vm` edit boots a replica with a fresh disk. |
+
 | `env_vars` | | Plain environment variables. These are readable from `GET /deployments` and the state file. |
 | `env_from` | | Secrets exported as environment variables when a replica is created: `[{"secret": "db", "key": "url", "as": "DATABASE_URL"}]`. `key` defaults to `token`, and `as` defaults to the key upper-cased. |
 | `open_ports` | | Extra guest ports to open alongside `port`. |
@@ -337,7 +338,7 @@ Changing anything in `vm` is a template change and recycles the pool. `build`, `
 | `max_replicas` | `5` | Ceiling. Must be at most 1 with `vm.workspace`. |
 | `warm_pool` | `0` | Idle ready spares on top of demand. Must be 0 with `vm.workspace`. |
 | `target_concurrency` | `10` | In-flight requests per VM the autoscaler aims for. |
-| `scale_to_zero_after_secs` | `300` | Idle time before a `min_replicas: 0`, `warm_pool: 0` pool is torn down. `0` tears it down on the first idle tick. |
+| `scale_to_zero_after_secs` | `300` | How long a `min_replicas: 0`, `warm_pool: 0` pool keeps a replica after its last request, `exec` or shell ends. `0` tears it down on the first idle tick. |
 | `cold_start_timeout_secs` | `120` | How long a request waits for a VM to boot before getting a 503. |
 | `drain_timeout_secs` | `30` | How long a draining VM may keep serving in-flight requests. |
 | `boot_timeout_secs` | `300` | How long a booting VM has to pass health before it is killed and replaced. `0` waits indefinitely. |
@@ -346,6 +347,12 @@ Changing anything in `vm` is a template change and recycles the pool. `build`, `
 Desired replicas is `ceil(demand / target_concurrency) + warm_pool`, clamped to `[min_replicas, max_replicas]`, where demand counts in-flight requests plus requests waiting on a cold start. A request that arrives at an empty pool is held while a VM boots.
 
 `retain` preserves only the `/workspace` data disk. Writes to the rootfs and memory are lost in both modes, because the rootfs is recopied from the image on every cold boot. So `retain` is only meaningfully stateful with `disk_size_gb` set and state kept under `/workspace`. For interchangeable replicas, use `destroy`.
+
+What `retain` keeps, and when:
+
+- **A stop is not a shutdown.** heyvmd stops a guest by killing it. app-lb runs `sync` in the guest first (10 seconds at most), so everything written before the stop reaches the disk. A process still writing when the stop lands is cut off mid-write, like a power loss. End a step whose output must survive with `sync`, or keep long work in the foreground of the `exec` that owns it.
+- **The same sandbox comes back.** A scale-up resumes the stopped sandbox, with its disk, before it creates a new one. A resume that fails, or that never becomes healthy inside `boot_timeout_secs`, is stopped and retried on the next scale-up. Only after 3 failed resumes in a row is the sandbox destroyed, and its disk with it.
+- **Some changes always start fresh.** Any `vm` edit (including `start_command`), a build or pull that rolls out a new image, `restart` and `evict` all boot a new sandbox with an empty disk. Only `vm.workspace` carries contents across those. A build of an unchanged commit with unchanged build inputs reuses the running image and leaves the pool alone.
 
 Consecutive failed boots back off the next create exponentially, from 30 seconds up to one hour, and reset on the first healthy boot. Any spec write also resets them (even a scaling patch that changes nothing), so a fix is tried at once. While a pool is held off, `/metrics` reports the streak and the wait in `pool.boot_failures` and `pool.boot_backoff_secs`, and `heyctl describe` prints a **Boot backoff** line; without them a held-off pool reads as `pending: 0, ready: 0` with nothing booting.
 
@@ -376,7 +383,7 @@ Builds a new rootfs with `heyvm mvm build`. On success, app-lb rewrites `vm.imag
 
 **The guest's PID 1.** heyvm boots every Firecracker guest with `init=/init.sh`. A Dockerfile written for Docker has none, so its kernel would panic on every boot. If the Dockerfile never mentions `/init.sh`, app-lb adds its standard guest init (`app-lb/src/guest_init.sh`). It writes the script into the build context as `heyo-guest-init.sh` and builds from a copy of the Dockerfile ending in `COPY heyo-guest-init.sh /init.sh`.
 
-The init mounts `/proc`, `/sys` and `/dev`, finishes network setup and starts `sshd` if the image has one. It then prints `HEYVM_READY` and never exits. It does **not** start the app: `vm.start_command` does that after boot, and must return (`setsid nohup … &`).
+The init mounts `/proc`, `/sys` and `/dev`, finishes network setup, formats (on first boot) and mounts the `disk_size_gb` disk at `/workspace`, and starts `sshd` if the image has one. It then prints `HEYVM_READY` and never exits. It does **not** start the app: `vm.start_command` does that after boot, and must return (`setsid nohup … &`). It is the whole of PID 1: there is no systemd or other service manager, so anything that must keep running is started by `start_command`.
 
 The image's `CMD`, `ENTRYPOINT` and `ENV` do not survive the rootfs export, so put what they did into `start_command`. A Dockerfile that mentions `/init.sh` is built as written.
 
@@ -625,7 +632,11 @@ curl -XPOST localhost:9090/deployments/sb-7f3a9c/exec -H 'content-type: applicat
 heyctl shell sb-7f3a9c
 ```
 
-Without `sandbox_id`, the pool picks a VM. With it, you get that VM, a 404 (not in the deployment), or a 409 (not ready or draining). `wake` defaults to true, so a scaled-to-zero sandbox boots or resumes, bounded by `cold_start_timeout_secs`. An open command or shell counts as in-flight work, so the VM is not reaped under you. A command that fails returns 200 with a non-zero `exit_code`. app-lb failing to run the command returns 502.
+Without `sandbox_id`, the pool picks a VM. With it, you get that VM, a 404 (not in the deployment), or a 409 (not ready or draining). `wake` defaults to true, so a scaled-to-zero sandbox boots or resumes, bounded by `cold_start_timeout_secs`. An open command or shell counts as in-flight work, so the VM is not reaped under you, and the scale-to-zero clock starts when it ends. A command that fails returns 200 with a non-zero `exit_code`. app-lb failing to run the command returns 502.
+
+Commands on one VM run one at a time: they share the guest's serial console, so concurrent `exec` calls queue, and their wall time adds up. `timeout_secs` defaults to 60 and is capped at 3600. A command still running when its timeout expires is interrupted. On a guest whose console shell has no controlling terminal (the init app-lb adds is one), the interrupt cannot reach it, and later commands on that VM wait behind it. Run long work detached (`setsid nohup … > /workspace/step.log 2>&1 &`) and poll the log instead. Callers with their own HTTP timeout, like the hosted MCP server at 30 seconds, should do the same for anything that takes longer.
+
+A VM an `exec` woke appears in `GET /deployments/:id` under `pending_vms` until it passes its health check, then under `vms`. `sandbox_id` in the response says which VM ran the command; after a stop and resume it is the same sandbox, and after a `vm` edit or rollout it is a new one.
 
 ## Dashboards
 
