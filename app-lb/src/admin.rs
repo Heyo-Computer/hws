@@ -170,6 +170,9 @@ fn html_escape(s: &str) -> String {
 #[derive(Clone)]
 struct AdminState {
     views: Option<Arc<crate::fleet::ViewStore>>,
+    /// Background commands in sandboxes. Absent in tests that do not need them,
+    /// where the routes answer 501.
+    operations: Option<Arc<crate::operations::Operations>>,
     /// One-time transfer URLs for large files. Absent without
     /// `APP_LB_TRANSFER_URL`, where the routes answer 501.
     transfers: Option<Arc<crate::transfers::Transfers>>,
@@ -398,6 +401,7 @@ impl AdminApi {
             addr,
             state: AdminState {
                 views: None,
+                operations: None,
                 transfers: None,
                 fleet_store: None,
                 token_sync: Default::default(),
@@ -451,6 +455,11 @@ impl AdminApi {
 
     pub fn with_transfers(mut self, transfers: Option<Arc<crate::transfers::Transfers>>) -> Self {
         self.state.transfers = transfers;
+        self
+    }
+
+    pub fn with_operations(mut self, operations: Arc<crate::operations::Operations>) -> Self {
+        self.state.operations = Some(operations);
         self
     }
 
@@ -703,6 +712,7 @@ fn narrows_itself(matched: &str) -> bool {
     matches!(
         matched,
         "/" | "/metrics"
+            | "/capacity"
             | "/dashboard"
             | "/security"
             | "/siem"
@@ -1218,6 +1228,10 @@ struct DeploymentStatus {
     pending: usize,
     total_in_flight: usize,
     vms: Vec<VmStatus>,
+    /// VMs created or resumed but not yet past their health check, oldest
+    /// first. A VM an `exec` woke is here, not in `vms`, until it is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_vms: Vec<PendingVmView>,
     /// The deployment's workspace, when the spec declares one: which snapshot
     /// the pool runs from, whether the store has it, and what — if anything —
     /// is holding the pool at zero. See [`crate::workspace`].
@@ -1337,6 +1351,7 @@ fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> Depl
                 draining: b.is_draining(),
             })
             .collect(),
+        pending_vms: pending_vms_of(d),
     }
 }
 
@@ -4492,18 +4507,76 @@ async fn scale(
     Path(id): Path<String>,
     Json(patch): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _change = state.registry.change_guard().await;
-    let Some(old) = state.registry.get(&id) else {
-        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    let Some(patch) = patch.as_object().cloned() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "scaling patch must be a JSON object",
+        )
+        .into_response();
+    };
+    let change = state.registry.change_guard().await;
+    let deployment = match patch_scaling(&state, &id, |current| {
+        // Merge the patch onto the current policy, then re-parse so unknown/typed
+        // fields are validated by serde.
+        let mut merged = match serde_json::to_value(current) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not read scaling policy",
+                )
+                .into_response());
+            }
+        };
+        for (k, v) in patch {
+            merged.insert(k, v);
+        }
+        serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid scaling policy: {e}"),
+            )
+            .into_response()
+        })
+    }) {
+        Ok(d) => d,
+        Err(response) => return response,
+    };
+    drop(change);
+    tracing::info!(deployment = %id, "scaled");
+    Json(status_of(&state, &deployment)).into_response()
+}
+
+/// Replace a managed deployment's scaling policy with what `f` makes of it.
+///
+/// The one path every scaling change takes — `PATCH …/scaling`, stop and start
+/// — so the refusals (rollout, workspace recovery, a deployment with no pool)
+/// and the validation are the same for all of them. The caller holds the
+/// registry's change guard.
+fn patch_scaling(
+    state: &AdminState,
+    id: &str,
+    f: impl FnOnce(&crate::config::ScalingPolicy) -> Result<crate::config::ScalingPolicy, Response>,
+) -> Result<Arc<crate::deployment::Deployment>, Response> {
+    let Some(old) = state.registry.get(id) else {
+        return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
     };
     if crate::rollout::reserved(&old) {
-        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+        return Err(err(
+            StatusCode::CONFLICT,
+            "candidate rollout reserves this deployment",
+        )
+        .into_response());
     }
 
     // Only a managed deployment is autoscaled; for the others the scaling policy
     // is inert, so a scale request is a mistake rather than a no-op.
-    if state.autoscaler.workspaces().recovery_active(&id) {
-        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    if state.autoscaler.workspaces().recovery_active(id) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "workspace recovery reserves this deployment",
+        )
+        .into_response());
     }
     if !old.spec.is_managed() {
         let fix = if old.spec.is_site() {
@@ -4511,48 +4584,322 @@ async fn scale(
         } else {
             "edit its `upstreams` via PUT instead"
         };
-        return err(
+        return Err(err(
             StatusCode::BAD_REQUEST,
             format!("deployment {id:?} has no VM pool and cannot be scaled; {fix}"),
         )
-        .into_response();
+        .into_response());
     }
-
-    let Some(patch) = patch.as_object() else {
-        return err(StatusCode::BAD_REQUEST, "scaling patch must be a JSON object").into_response();
-    };
-
-    // Merge the patch onto the current policy, then re-parse so unknown/typed
-    // fields are validated by serde.
-    let mut merged = match serde_json::to_value(&old.spec.scaling) {
-        Ok(serde_json::Value::Object(m)) => m,
-        _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "could not read scaling policy").into_response(),
-    };
-    for (k, v) in patch {
-        merged.insert(k.clone(), v.clone());
-    }
-    let scaling: crate::config::ScalingPolicy = match serde_json::from_value(serde_json::Value::Object(merged)) {
-        Ok(s) => s,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid scaling policy: {e}")).into_response(),
-    };
 
     let mut spec = old.spec.clone();
-    spec.scaling = scaling;
+    spec.scaling = f(&old.spec.scaling)?;
     // Catches min > max, zero target_concurrency, etc.
     if let Err(e) = spec.validate() {
-        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        return Err(err(StatusCode::BAD_REQUEST, e.to_string()).into_response());
     }
 
     let Some(deployment) = state.registry.update(spec) else {
-        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+        return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
     };
-    if let Err(e) = state.registry.persist_one(&id) {
+    if let Err(e) = state.registry.persist_one(id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
     }
-    tracing::info!(deployment = %id, "scaled");
     deployment.scale_signal.notify_one();
+    Ok(deployment)
+}
 
-    Json(status_of(&state, &deployment)).into_response()
+// --- stop, start, restart -------------------------------------------------
+//
+// A sandbox is paused between an agent's steps and resumed for the next one.
+// Scaling already does both: a pool whose ceiling is 0 drains its VMs (and,
+// under `idle_action: retain`, syncs and suspends them with their data disk),
+// and nothing — not a request, not an exec — can wake it. Stop is that ceiling,
+// start puts the old policy back. No second notion of "stopped" exists to
+// disagree with the scaling policy.
+
+/// Default and ceiling for how long stop, start and restart wait to report a
+/// settled state before answering `202` with where things stand.
+const LIFECYCLE_WAIT_SECS: u64 = 30;
+const MAX_LIFECYCLE_WAIT_SECS: u64 = 300;
+
+#[derive(Deserialize, Default)]
+struct LifecycleRequest {
+    /// Seconds to wait for the pool to settle. `0` answers at once.
+    #[serde(default)]
+    wait_secs: Option<u64>,
+    /// `restart` only: evict the VM so a new one boots from the image, with a
+    /// fresh data disk, instead of stopping and resuming the same sandbox.
+    #[serde(default)]
+    fresh: bool,
+}
+
+#[derive(Serialize)]
+struct LifecycleResponse {
+    /// `stopped`/`stopping` or `running`/`starting`.
+    state: &'static str,
+    /// Whether the stopped VM keeps its data disk (`idle_action: retain`).
+    retained: bool,
+    /// The VM now serving, once one is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+fn lifecycle_wait(req: &LifecycleRequest) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        req.wait_secs
+            .unwrap_or(LIFECYCLE_WAIT_SECS)
+            .min(MAX_LIFECYCLE_WAIT_SECS),
+    )
+}
+
+/// `POST /deployments/:id/stop` — drain the pool and keep it at zero.
+async fn stop_deployment(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<LifecycleRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match stop_pool(&state, &id, lifecycle_wait(&req)).await {
+        Ok(response) => response,
+        Err(response) => response,
+    }
+}
+
+async fn stop_pool(
+    state: &AdminState,
+    id: &str,
+    wait: std::time::Duration,
+) -> Result<Response, Response> {
+    let change = state.registry.change_guard().await;
+    let previous = state.registry.get(id).map(|d| d.spec.scaling.clone());
+    let deployment = patch_scaling(state, id, |current| {
+        let mut stopped = current.clone();
+        stopped.min_replicas = 0;
+        stopped.max_replicas = 0;
+        stopped.warm_pool = 0;
+        Ok(stopped)
+    })?;
+    // The policy to put back on start. Kept from the first stop: stopping a
+    // stopped pool must not record the zero ceiling as the thing to restore.
+    if let Some(previous) = previous.filter(|p| p.max_replicas > 0) {
+        deployment.mutate_state(|s| {
+            if s.stopped_scaling.is_none() {
+                s.stopped_scaling = Some(previous);
+            }
+        });
+        if let Err(e) = state.registry.persist_one(id) {
+            tracing::error!(deployment = %id, error = %e, "failed to persist state");
+        }
+    }
+    drop(change);
+    let retained = deployment.spec.scaling.idle_action == crate::config::IdleAction::Retain;
+    let settled = wait_until(wait, || {
+        state
+            .registry
+            .get(id)
+            .is_none_or(|d| d.backends().is_empty() && d.pending().is_empty())
+    })
+    .await;
+    let body = LifecycleResponse {
+        state: if settled { "stopped" } else { "stopping" },
+        retained,
+        sandbox_id: None,
+        warning: (!retained).then(|| {
+            "idle_action is destroy: the stopped VM and its /workspace disk are gone; set \
+             scaling.idle_action to retain to keep them across a stop"
+                .to_string()
+        }),
+    };
+    let status = if settled {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(body)).into_response())
+}
+
+/// `POST /deployments/:id/start` — restore the policy stop replaced and wait
+/// for a VM, resuming the retained one if there is one.
+async fn start_deployment(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<LifecycleRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match start_pool(&state, &id, lifecycle_wait(&req)).await {
+        Ok(response) => response,
+        Err(response) => response,
+    }
+}
+
+async fn start_pool(
+    state: &AdminState,
+    id: &str,
+    wait: std::time::Duration,
+) -> Result<Response, Response> {
+    let change = state.registry.change_guard().await;
+    let restore = state
+        .registry
+        .get(id)
+        .and_then(|d| d.state().stopped_scaling.clone());
+    let deployment = patch_scaling(state, id, |current| {
+        Ok(match restore {
+            Some(previous) => previous,
+            // Stopped by a scaling edit rather than by stop: a ceiling of one
+            // is the least that can serve.
+            None if current.max_replicas == 0 => {
+                let mut started = current.clone();
+                started.max_replicas = 1;
+                started
+            }
+            None => current.clone(),
+        })
+    })?;
+    deployment.mutate_state(|s| s.stopped_scaling = None);
+    if let Err(e) = state.registry.persist_one(id) {
+        tracing::error!(deployment = %id, error = %e, "failed to persist state");
+    }
+    drop(change);
+
+    let retained = deployment.spec.scaling.idle_action == crate::config::IdleAction::Retain;
+    let ready = tokio::time::timeout(
+        wait,
+        crate::request_control::wait_for_capacity(&deployment, &[], &state.metrics, &state.feed),
+    )
+    .await
+    .ok()
+    .flatten();
+    let body = LifecycleResponse {
+        state: if ready.is_some() {
+            "running"
+        } else {
+            "starting"
+        },
+        retained,
+        sandbox_id: ready.map(|b| b.sandbox_id.clone()),
+        warning: None,
+    };
+    let status = if body.sandbox_id.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(body)).into_response())
+}
+
+/// `POST /deployments/:id/restart` — the same sandbox, stopped and resumed
+/// with its data disk; or, with `fresh`, a new VM from the image.
+async fn restart_deployment(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<LifecycleRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let wait = lifecycle_wait(&req);
+    if req.fresh {
+        let Some(d) = state.registry.get(&id) else {
+            return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+        };
+        if !d.spec.is_managed() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("deployment {id:?} has no VM to restart"),
+            )
+            .into_response();
+        }
+        for b in d.backends().iter() {
+            if let EvictOutcome::KillFailed(e) =
+                state.autoscaler.evict(&d, &b.sandbox_id, true).await
+            {
+                return err(StatusCode::BAD_GATEWAY, format!("failed to evict VM: {e}"))
+                    .into_response();
+            }
+        }
+        // A suspended sandbox would be resumed in preference to a new one, and
+        // resuming it is the opposite of fresh.
+        for sandbox_id in d.state().suspended.clone() {
+            if let Err(e) = state.autoscaler.discard_suspended(&d, &sandbox_id).await {
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to discard {sandbox_id}: {e}"),
+                )
+                .into_response();
+            }
+        }
+        return match start_pool(&state, &id, wait).await {
+            Ok(r) | Err(r) => r,
+        };
+    }
+    if let Err(response) = stop_pool(&state, &id, wait).await {
+        return response;
+    }
+    match start_pool(&state, &id, wait).await {
+        Ok(r) | Err(r) => r,
+    }
+}
+
+/// `GET /capacity`: what the host has left, and what the caller's
+/// deployments hold of it. Narrowed to the caller's own deployments.
+#[derive(Serialize)]
+struct CapacityResponse {
+    host: HostUsageSnapshot,
+    /// The daemon's data filesystem, where VM disks live. Absent when the
+    /// daemon did not answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_total_bytes: Option<u64>,
+    /// The caller's managed deployments and their VMs.
+    deployments: usize,
+    running_vms: usize,
+    booting_vms: usize,
+    /// Suspended under `idle_action: retain`: holding a disk, not CPU or memory.
+    stopped_vms: usize,
+}
+
+async fn capacity(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let scope = visible_ids(&state, caller.as_ref().map(|c| &c.0));
+    let deployments = state.registry.deployments();
+    let mine: Vec<_> = deployments
+        .values()
+        .filter(|d| d.spec.is_managed())
+        .filter(|d| scope.as_deref().is_none_or(|ids| ids.contains(&d.spec.id)))
+        .collect();
+    let storage = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.autoscaler.vms().storage(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    Json(CapacityResponse {
+        host: state.metrics.host_snapshot(),
+        disk_free_bytes: storage.as_ref().map(|s| s.free_bytes),
+        disk_total_bytes: storage.as_ref().map(|s| s.total_bytes),
+        deployments: mine.len(),
+        running_vms: mine.iter().map(|d| d.backends().len()).sum(),
+        booting_vms: mine.iter().map(|d| d.pending().len()).sum(),
+        stopped_vms: mine.iter().map(|d| d.state().suspended.len()).sum(),
+    })
+}
+
+/// Poll `done` until it holds or `wait` passes. Whether it held.
+async fn wait_until(wait: std::time::Duration, done: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if done() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -5520,14 +5867,49 @@ struct ShellQuery {
 enum VmTarget {
     Ready(crate::deployment::BackendSlot),
     /// A VM the daemon reports `Running` that has not passed its health check.
-    Booting(String),
+    Booting(BootingHold),
 }
 
 impl VmTarget {
     fn sandbox_id(&self) -> &str {
         match self {
             Self::Ready(slot) => slot.sandbox_id(),
-            Self::Booting(id) => id,
+            Self::Booting(hold) => &hold.sandbox_id,
+        }
+    }
+}
+
+/// What a command running in a still-booting VM holds instead of a slot.
+///
+/// A pending VM has no backend to take a slot on, so the command counts as a
+/// waiter: demand that keeps the pool from scaling to zero while it runs, even
+/// if the VM is promoted meanwhile. When it ends, the VM's activity clock is
+/// reset as a released slot would reset it, so the idle window starts then.
+struct BootingHold {
+    sandbox_id: String,
+    deployment: std::sync::Arc<crate::deployment::Deployment>,
+    _waiter: crate::deployment::WaiterGuard,
+}
+
+impl BootingHold {
+    fn new(d: &std::sync::Arc<crate::deployment::Deployment>, sandbox_id: String) -> Self {
+        Self {
+            sandbox_id,
+            deployment: d.clone(),
+            _waiter: d.track_waiter(),
+        }
+    }
+}
+
+impl Drop for BootingHold {
+    fn drop(&mut self) {
+        if let Some(b) = self
+            .deployment
+            .backends()
+            .iter()
+            .find(|b| b.sandbox_id == self.sandbox_id)
+        {
+            b.touch();
         }
     }
 }
@@ -5574,6 +5956,15 @@ async fn hold_a_vm(
     if let Some(want) = sandbox_id {
         return hold_this_vm(&d, id, want);
     }
+    // A ceiling of zero is a stopped deployment: nothing can wake it, so say so
+    // now rather than after waiting out the cold-start timeout.
+    if d.spec.scaling.max_replicas == 0 && d.backends().is_empty() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("deployment {id:?} is stopped; POST /deployments/{id}/start first"),
+        )
+        .into_response());
+    }
 
     if let Some(slot) = d.select(&[]).and_then(|backend| backend.try_hold()) {
         return Ok(VmTarget::Ready(slot));
@@ -5584,7 +5975,7 @@ async fn hold_a_vm(
             sandbox = %sandbox_id,
             "no VM has passed its health check; running in one that is still booting",
         );
-        return Ok(VmTarget::Booting(sandbox_id));
+        return Ok(VmTarget::Booting(BootingHold::new(&d, sandbox_id)));
     }
     if !wake {
         return Err(err(
@@ -5607,7 +5998,7 @@ async fn hold_a_vm(
         // still something to run a command in, and answering 503 here would send
         // the caller away from the VM their own request had just started.
         None => match booting_vm(&d) {
-            Some(sandbox_id) => Ok(VmTarget::Booting(sandbox_id)),
+            Some(sandbox_id) => Ok(VmTarget::Booting(BootingHold::new(&d, sandbox_id))),
             None => Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
@@ -5645,7 +6036,7 @@ fn hold_this_vm(
     }
     match d.pending().iter().find(|p| p.sandbox_id == want) {
         Some(p) if p.status == Some(heyo_sdk::SandboxStatus::Running) => {
-            Ok(VmTarget::Booting(want.to_string()))
+            Ok(VmTarget::Booting(BootingHold::new(d, want.to_string())))
         }
         Some(_) => Err(err(
             StatusCode::CONFLICT,
@@ -5676,6 +6067,452 @@ fn booting_vm(d: &std::sync::Arc<crate::deployment::Deployment>) -> Option<Strin
         .filter(|p| p.status == Some(heyo_sdk::SandboxStatus::Running))
         .min_by_key(|p| p.created_at)
         .map(|p| p.sandbox_id.clone())
+}
+
+// --- operations: background commands --------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct StartOperation {
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    max_runtime_secs: Option<u64>,
+    #[serde(default = "default_true")]
+    wake: bool,
+    #[serde(default)]
+    sandbox_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OperationQuery {
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    /// Page the last `max_bytes` instead of from `offset`.
+    #[serde(default)]
+    tail: bool,
+    /// `DELETE` only: forget a finished operation and remove its directory.
+    #[serde(default)]
+    purge: bool,
+}
+
+#[derive(Serialize)]
+struct OperationView {
+    #[serde(flatten)]
+    operation: crate::operations::Operation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<crate::operations::OutputPage>,
+    /// The guest could not be asked just now (its console was busy, or the VM
+    /// is waking); this is the last known record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stale: bool,
+}
+
+fn operations_of(state: &AdminState) -> Result<Arc<crate::operations::Operations>, Response> {
+    state.operations.clone().ok_or_else(|| {
+        err(
+            StatusCode::NOT_IMPLEMENTED,
+            "background operations are not enabled on this app-lb",
+        )
+        .into_response()
+    })
+}
+
+/// `POST /deployments/:id/operations` — start a command detached in the
+/// deployment's VM and return at once.
+async fn start_operation(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<StartOperation>,
+) -> impl IntoResponse {
+    let ops = match operations_of(&state) {
+        Ok(ops) => ops,
+        Err(r) => return r,
+    };
+    if req.command.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "command must not be empty").into_response();
+    }
+    if let Some(cwd) = &req.cwd
+        && let Err(e) = crate::guest_files::valid_path(cwd)
+    {
+        return err(StatusCode::BAD_REQUEST, format!("cwd: {e}")).into_response();
+    }
+    let max_runtime = req
+        .max_runtime_secs
+        .unwrap_or(crate::operations::DEFAULT_MAX_RUNTIME_SECS);
+    if max_runtime == 0 || max_runtime > crate::operations::MAX_RUNTIME_SECS {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "max_runtime_secs must be 1..={}",
+                crate::operations::MAX_RUNTIME_SECS
+            ),
+        )
+        .into_response();
+    }
+    if ops.running(&id) >= crate::operations::MAX_RUNNING_PER_DEPLOYMENT {
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "deployment {id:?} already runs {} operations; wait for one or cancel it",
+                crate::operations::MAX_RUNNING_PER_DEPLOYMENT
+            ),
+        )
+        .into_response();
+    }
+    let target = match hold_a_vm(&state, &id, req.wake, req.sandbox_id.as_deref()).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let Some(d) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    let sandbox_id = target.sandbox_id().to_string();
+    let op_id = crate::operations::new_id();
+    let script = crate::operations::start_script(&op_id, &req.command, req.cwd.as_deref());
+    let options = heyo_sdk::CommandRunOptions {
+        cwd: None,
+        env: req.env.clone(),
+        timeout: Some(std::time::Duration::from_secs(20)),
+    };
+    let out = match ops.vms().exec(&sandbox_id, &script, options).await {
+        Ok(out) => out,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("could not start the operation in {sandbox_id}: {e}"),
+            )
+            .into_response();
+        }
+    };
+    let (dir, boot) = match crate::operations::parse_start(&out.stdout) {
+        Ok(started) => started,
+        Err(e) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+    };
+    let mut env_keys: Vec<String> = req.env.iter().flat_map(|e| e.keys().cloned()).collect();
+    env_keys.sort();
+    let op = crate::operations::record(
+        op_id,
+        &id,
+        &sandbox_id,
+        boot,
+        dir,
+        &req.command,
+        req.cwd.clone(),
+        env_keys,
+        max_runtime,
+    );
+    ops.insert(op.clone(), &d);
+    drop(target);
+    tracing::info!(deployment = %id, sandbox = %sandbox_id, op = %op.id, "operation started");
+    (
+        StatusCode::CREATED,
+        Json(OperationView {
+            operation: op,
+            output: None,
+            stale: false,
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /deployments/:id/operations` — this deployment's operations, newest
+/// first, without output.
+async fn list_operations(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match operations_of(&state) {
+        Ok(ops) => Json(serde_json::json!({ "operations": ops.list(&id) })).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `GET /deployments/:id/operations/:op` — the record, fresh from the guest,
+/// and a page of output.
+async fn get_operation(
+    State(state): State<AdminState>,
+    Path((id, op_id)): Path<(String, String)>,
+    Query(q): Query<OperationQuery>,
+) -> impl IntoResponse {
+    let ops = match operations_of(&state) {
+        Ok(ops) => ops,
+        Err(r) => return r,
+    };
+    let Some(op) = ops.get(&id, &op_id) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no operation {op_id:?} in deployment {id:?}"),
+        )
+        .into_response();
+    };
+    let max = q
+        .max_bytes
+        .unwrap_or(crate::operations::DEFAULT_PAGE_BYTES)
+        .min(crate::operations::MAX_PAGE_BYTES);
+    let offset = if q.tail {
+        op.output_bytes.saturating_sub(max)
+    } else {
+        q.offset.unwrap_or(0)
+    };
+    let (operation, output, stale) = ops.read(&op, offset, max).await;
+    Json(OperationView {
+        operation,
+        output,
+        stale,
+    })
+    .into_response()
+}
+
+/// `DELETE /deployments/:id/operations/:op` — cancel it, or with `purge`
+/// forget a finished one and remove its directory.
+async fn cancel_operation(
+    State(state): State<AdminState>,
+    Path((id, op_id)): Path<(String, String)>,
+    Query(q): Query<OperationQuery>,
+) -> impl IntoResponse {
+    let ops = match operations_of(&state) {
+        Ok(ops) => ops,
+        Err(r) => return r,
+    };
+    let Some(op) = ops.get(&id, &op_id) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no operation {op_id:?} in deployment {id:?}"),
+        )
+        .into_response();
+    };
+    if q.purge {
+        return match ops.purge(&op).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+        };
+    }
+    match ops.cancel(&op).await {
+        Ok(operation) => {
+            let status = if operation.state.finished() {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (
+                status,
+                Json(OperationView {
+                    operation,
+                    output: None,
+                    stale: false,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            format!("could not signal the operation: {e}"),
+        )
+        .into_response(),
+    }
+}
+
+// --- files in a running guest ---------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct FileQuery {
+    path: String,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    length: Option<u64>,
+    /// `PUT` only: append instead of replacing.
+    #[serde(default)]
+    append: bool,
+    #[serde(default)]
+    sandbox_id: Option<String>,
+    #[serde(default = "default_true")]
+    wake: bool,
+}
+
+#[derive(Serialize)]
+struct FileRead {
+    sandbox_id: String,
+    path: String,
+    size: u64,
+    offset: u64,
+    bytes: u64,
+    /// Where the next read starts, or absent at the end of the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_offset: Option<u64>,
+    #[serde(flatten)]
+    content: FileContent,
+}
+
+#[derive(Serialize)]
+struct FileContent {
+    /// `utf-8` or `base64`.
+    encoding: &'static str,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct FileWritten {
+    sandbox_id: String,
+    path: String,
+    wrote: usize,
+    size: u64,
+}
+
+/// `GET /deployments/:id/files?path=` — a byte range of a file in the guest.
+async fn read_guest_file(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = crate::guest_files::valid_path(&q.path) {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let target = match hold_a_vm(&state, &id, q.wake, q.sandbox_id.as_deref()).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let sandbox_id = target.sandbox_id().to_string();
+    let offset = q.offset.unwrap_or(0);
+    let length = q
+        .length
+        .unwrap_or(crate::guest_files::DEFAULT_READ_BYTES)
+        .min(crate::guest_files::MAX_READ_BYTES);
+    let script = crate::guest_files::read_script(&q.path, offset, length);
+    let run = state.autoscaler.vms().exec(
+        &sandbox_id,
+        &script,
+        heyo_sdk::CommandRunOptions {
+            cwd: None,
+            env: None,
+            timeout: Some(std::time::Duration::from_secs(30)),
+        },
+    );
+    let out = match run.await {
+        Ok(out) => out,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("could not read {} in {sandbox_id}: {e}", q.path),
+            )
+            .into_response();
+        }
+    };
+    drop(target);
+    let (size, bytes) = match crate::guest_files::parse_read(&out.stdout) {
+        Ok(read) => read,
+        Err(e) if e == "no such file" => {
+            return err(
+                StatusCode::NOT_FOUND,
+                format!("no file {} in {sandbox_id}", q.path),
+            )
+            .into_response();
+        }
+        Err(e) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+    };
+    let n = bytes.len() as u64;
+    let next = offset + n;
+    let content = match String::from_utf8(bytes) {
+        Ok(text) => FileContent {
+            encoding: "utf-8",
+            content: text,
+        },
+        Err(e) => {
+            use base64::Engine as _;
+            FileContent {
+                encoding: "base64",
+                content: base64::engine::general_purpose::STANDARD.encode(e.into_bytes()),
+            }
+        }
+    };
+    Json(FileRead {
+        sandbox_id,
+        path: q.path,
+        size,
+        offset,
+        bytes: n,
+        next_offset: (next < size).then_some(next),
+        content,
+    })
+    .into_response()
+}
+
+/// `PUT /deployments/:id/files?path=` — write the request body to a file in
+/// the guest, replacing it or (`append`) adding to it.
+async fn write_guest_file(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = crate::guest_files::valid_path(&q.path) {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    if body.len() > crate::guest_files::MAX_WRITE_BYTES {
+        return err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "{} bytes is more than one write carries ({}); use a transfer",
+                body.len(),
+                crate::guest_files::MAX_WRITE_BYTES
+            ),
+        )
+        .into_response();
+    }
+    let target = match hold_a_vm(&state, &id, q.wake, q.sandbox_id.as_deref()).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let sandbox_id = target.sandbox_id().to_string();
+    let mut size = None;
+    for script in crate::guest_files::write_scripts(&q.path, &body, q.append) {
+        let run = state.autoscaler.vms().exec(
+            &sandbox_id,
+            &script,
+            heyo_sdk::CommandRunOptions {
+                cwd: None,
+                env: None,
+                timeout: Some(std::time::Duration::from_secs(60)),
+            },
+        );
+        match run.await {
+            Ok(out) if out.exit_code == 0 => {
+                size = crate::guest_files::parse_written(&out.stdout).or(size)
+            }
+            Ok(out) => {
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "writing {} failed (exit {}): {}",
+                        q.path,
+                        out.exit_code,
+                        out.output.trim()
+                    ),
+                )
+                .into_response();
+            }
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    format!("could not write {} in {sandbox_id}: {e}", q.path),
+                )
+                .into_response();
+            }
+        }
+    }
+    drop(target);
+    Json(FileWritten {
+        sandbox_id,
+        path: q.path,
+        wrote: body.len(),
+        size: size.unwrap_or(0),
+    })
+    .into_response()
 }
 
 // --- transfers: large files through one-time URLs ------------------------
@@ -6522,6 +7359,10 @@ struct BuildRequest {
     /// is left alone, so a hotfix tag doesn't quietly become the new default.
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
+    /// Build even when the image this would produce is already built from the
+    /// same commit and inputs and running — for a base image that moved.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -6587,7 +7428,7 @@ async fn start_build(
     body: Option<Json<BuildRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_build(&id, req.git_ref) {
+    match state.jobs.start_build(&id, req.git_ref, req.force) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "image build started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
@@ -7044,6 +7885,7 @@ fn router(state: AdminState) -> Router {
         // this app-lb routes, which is the same inventory `/metrics` exposes.
         .route("/", get(directory))
         .route("/metrics", get(metrics_snapshot))
+        .route("/capacity", get(capacity))
         .route("/dashboard", get(dashboard))
         // View tier, not CRUD: the dashboard is its consumer, so the browser's
         // cached view credentials have to work. It must never be ungated — it
@@ -7125,6 +7967,9 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/retired-record", axum::routing::delete(deregister_retired_record))
         .route("/deployments/:id/discovery-status", get(discovery_status))
         .route("/deployments/:id/scaling", patch(scale))
+        .route("/deployments/:id/stop", post(stop_deployment))
+        .route("/deployments/:id/start", post(start_deployment))
+        .route("/deployments/:id/restart", post(restart_deployment))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
         .route(
             "/deployments/:id/upstreams/:upstream/drain",
@@ -7133,6 +7978,22 @@ fn router(state: AdminState) -> Router {
         // CRUD-tier on purpose: running a command in a VM is at least as
         // powerful as editing the spec that boots it.
         .route("/deployments/:id/exec", post(exec))
+        .route(
+            "/deployments/:id/operations",
+            post(start_operation).get(list_operations),
+        )
+        .route(
+            "/deployments/:id/operations/:op_id",
+            get(get_operation).delete(cancel_operation),
+        )
+        .route(
+            "/deployments/:id/files",
+            get(read_guest_file)
+                .put(write_guest_file)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::guest_files::MAX_WRITE_BYTES + 1024,
+                )),
+        )
         .route(
             "/deployments/:id/transfers",
             post(create_transfer).get(list_transfers),
@@ -8414,6 +9275,399 @@ mod tests {
             Fixture { state: api.state, registry, root, mutations, inactive }
         }
 
+        /// Operations and files, end to end: the fake daemon runs every exec
+        /// in a real local `sh`, with the guest's operation directory moved
+        /// into the fixture's root.
+        mod operations_and_files {
+            use super::*;
+            use axum::routing::post;
+            use serde_json::{Value, json};
+
+            fn local_daemon(root: PathBuf) -> Router {
+                Router::new().route(
+                    "/sandbox/:id/exec",
+                    post(move |Json(body): Json<Value>| {
+                        let root = root.clone();
+                        async move {
+                            let command = body["command"].as_str().unwrap().replace(
+                                "/var/tmp/heyo-ops",
+                                &root.join("ops").display().to_string(),
+                            );
+                            let mut cmd = std::process::Command::new("sh");
+                            cmd.arg("-c").arg(&command);
+                            if let Some(env) = body["env"].as_object() {
+                                for (k, v) in env {
+                                    cmd.env(k, v.as_str().unwrap());
+                                }
+                            }
+                            let out = cmd.output().unwrap();
+                            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                            Json(json!({
+                                "stdout": stdout, "stderr": stderr,
+                                "output": format!("{stdout}{stderr}"),
+                                "exit_code": out.status.code().unwrap_or(-1),
+                            }))
+                        }
+                    }),
+                )
+            }
+
+            async fn call(
+                f: &Fixture,
+                method: &str,
+                path: &str,
+                body: Body,
+            ) -> (StatusCode, Value) {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| {
+                    <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)
+                })
+                .await
+                .unwrap();
+                let response = app.call(req).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                )
+            }
+
+            /// Removes the fake guest's directory with the test.
+            struct GuestRoot(PathBuf);
+            impl Drop for GuestRoot {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+
+            async fn fixture_with_vm() -> (
+                Fixture,
+                Arc<crate::deployment::VmBackend>,
+                Arc<crate::operations::Operations>,
+                GuestRoot,
+            ) {
+                let root = std::env::temp_dir().join(format!(
+                    "app-lb-ops-{}-{}",
+                    std::process::id(),
+                    FIXTURE.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir_all(&root).unwrap();
+                let mut f = fixture_with_backend(true, local_daemon(root.clone()), None).await;
+                let ops = crate::operations::Operations::open(
+                    f.root.join("operations.json"),
+                    f.registry.clone(),
+                    f.state.autoscaler.vms().clone(),
+                );
+                f.state.operations = Some(ops.clone());
+                let vm = Arc::new(crate::deployment::VmBackend::new(
+                    "sb-1".into(),
+                    "127.0.0.1:1".parse().unwrap(),
+                ));
+                f.registry
+                    .get("obsolete")
+                    .unwrap()
+                    .set_backends(vec![vm.clone()]);
+                (f, vm, ops, GuestRoot(root))
+            }
+
+            fn json_body(v: Value) -> Body {
+                Body::from(v.to_string())
+            }
+
+            #[tokio::test]
+            async fn an_operation_runs_detached_and_its_output_and_exit_code_come_back() {
+                let (f, vm, ops, _guest) = fixture_with_vm().await;
+                let (status, started) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/operations",
+                    json_body(
+                        json!({"command": "echo hi; echo \"$GREETING\"; sleep 1; echo bye; exit 4",
+                                     "env": {"GREETING": "hello there"}}),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{started}");
+                assert_eq!(started["state"], "running");
+                assert_eq!(started["env_keys"], json!(["GREETING"]));
+                let id = started["id"].as_str().unwrap().to_string();
+                assert_eq!(vm.in_flight(), 1, "a running operation holds its VM");
+
+                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                ops.tick().await;
+                assert_eq!(
+                    vm.in_flight(),
+                    0,
+                    "the slot goes when the last operation ends"
+                );
+
+                let (status, read) = call(
+                    &f,
+                    "GET",
+                    &format!("/deployments/obsolete/operations/{id}"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{read}");
+                assert_eq!(read["state"], "failed");
+                assert_eq!(read["exit_code"], 4);
+                assert_eq!(read["output"]["data"], "hi\nhello there\nbye\n");
+                assert_eq!(read["output"]["next_offset"], read["output"]["total_bytes"]);
+
+                let (_, page) = call(
+                    &f,
+                    "GET",
+                    &format!("/deployments/obsolete/operations/{id}?offset=3&max_bytes=5"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(page["output"]["data"], "hello");
+                assert_eq!(page["output"]["next_offset"], 8);
+
+                let (_, list) =
+                    call(&f, "GET", "/deployments/obsolete/operations", Body::empty()).await;
+                assert_eq!(list["operations"].as_array().unwrap().len(), 1);
+            }
+
+            #[tokio::test]
+            async fn a_cancelled_operation_and_its_children_stop() {
+                let (f, _vm, ops, _guest) = fixture_with_vm().await;
+                let (_, started) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/operations",
+                    json_body(json!({"command": "sleep 300 & sleep 300"})),
+                )
+                .await;
+                let id = started["id"].as_str().unwrap().to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let (status, cancelled) = call(
+                    &f,
+                    "DELETE",
+                    &format!("/deployments/obsolete/operations/{id}"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{cancelled}");
+                assert_eq!(cancelled["state"], "cancelling");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                ops.tick().await;
+                let op = ops.get("obsolete", &id).unwrap();
+                assert_eq!(op.state, crate::operations::OpState::Cancelled);
+                let pid: i32 = std::fs::read_to_string(format!("{}/pid", op.dir))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let group = std::process::Command::new("ps")
+                    .args(["-o", "pid=", "-g", &pid.to_string()])
+                    .output()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&group.stdout).trim().is_empty(),
+                    "the whole group is gone"
+                );
+
+                let (status, _) = call(
+                    &f,
+                    "DELETE",
+                    &format!("/deployments/obsolete/operations/{id}?purge=true"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+                assert!(!std::path::Path::new(&op.dir).exists());
+            }
+
+            #[tokio::test]
+            async fn files_round_trip_through_the_console() {
+                let (f, _vm, _ops, _guest) = fixture_with_vm().await;
+                let path = f.root.join("guest").join("notes.txt").display().to_string();
+                let (status, wrote) = call(
+                    &f,
+                    "PUT",
+                    &format!("/deployments/obsolete/files?path={path}"),
+                    Body::from("hello"),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{wrote}");
+                assert_eq!(
+                    (wrote["wrote"].as_u64(), wrote["size"].as_u64()),
+                    (Some(5), Some(5))
+                );
+                call(
+                    &f,
+                    "PUT",
+                    &format!("/deployments/obsolete/files?path={path}&append=true"),
+                    Body::from(" world"),
+                )
+                .await;
+
+                let (status, read) = call(
+                    &f,
+                    "GET",
+                    &format!("/deployments/obsolete/files?path={path}&offset=6"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{read}");
+                assert_eq!(
+                    (read["content"].as_str(), read["size"].as_u64()),
+                    (Some("world"), Some(11))
+                );
+                assert!(read.get("next_offset").is_none());
+
+                let (status, _) = call(
+                    &f,
+                    "GET",
+                    "/deployments/obsolete/files?path=/no/such/file",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                let (status, _) = call(
+                    &f,
+                    "GET",
+                    "/deployments/obsolete/files?path=relative",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+        }
+
+        /// Stop, start and capacity: the lifecycle an agent drives a sandbox
+        /// through between steps.
+        mod sandbox_lifecycle {
+            use super::*;
+            use serde_json::{Value, json};
+
+            async fn call(
+                f: &Fixture,
+                method: &str,
+                path: &str,
+                body: Value,
+            ) -> (StatusCode, Value) {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| {
+                    <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)
+                })
+                .await
+                .unwrap();
+                let response = app.call(req).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                )
+            }
+
+            fn sandbox(f: &Fixture) {
+                f.registry.upsert(
+                    serde_json::from_value(json!({
+                        "id": "sb", "routes": [],
+                        "vm": {"driver": "firecracker", "port": 8080, "disk_size_gb": 4},
+                        "scaling": {"min_replicas": 0, "max_replicas": 3, "idle_action": "retain",
+                                    "scale_to_zero_after_secs": 600}
+                    }))
+                    .unwrap(),
+                );
+            }
+
+            #[tokio::test]
+            async fn stop_holds_the_pool_at_zero_and_start_puts_the_policy_back() {
+                let f = fixture(true).await;
+                sandbox(&f);
+
+                let (status, body) =
+                    call(&f, "POST", "/deployments/sb/stop", json!({"wait_secs": 0})).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["state"], "stopped");
+                assert_eq!(body["retained"], true);
+                let d = f.registry.get("sb").unwrap();
+                assert_eq!(d.spec.scaling.max_replicas, 0);
+                assert_eq!(d.state().stopped_scaling.as_ref().unwrap().max_replicas, 3);
+
+                // A second stop must not record the zero ceiling as the policy.
+                call(&f, "POST", "/deployments/sb/stop", json!({"wait_secs": 0})).await;
+                let d = f.registry.get("sb").unwrap();
+                assert_eq!(d.state().stopped_scaling.as_ref().unwrap().max_replicas, 3);
+
+                // Nothing wakes a stopped sandbox, and exec says so at once.
+                let (status, body) = call(
+                    &f,
+                    "POST",
+                    "/deployments/sb/exec",
+                    json!({"command": "true"}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert!(body["error"].as_str().unwrap().contains("/start"), "{body}");
+
+                let (status, body) =
+                    call(&f, "POST", "/deployments/sb/start", json!({"wait_secs": 0})).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "no VM can boot here: {body}");
+                assert_eq!(body["state"], "starting");
+                let d = f.registry.get("sb").unwrap();
+                assert_eq!(d.spec.scaling.max_replicas, 3);
+                assert_eq!(d.spec.scaling.scale_to_zero_after_secs, 600);
+                assert!(d.state().stopped_scaling.is_none());
+            }
+
+            #[tokio::test]
+            async fn a_stop_that_destroys_the_disk_says_so() {
+                let f = fixture(true).await;
+                let (status, body) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/stop",
+                    json!({"wait_secs": 0}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["retained"], false);
+                assert!(
+                    body["warning"].as_str().unwrap().contains("retain"),
+                    "{body}"
+                );
+            }
+
+            #[tokio::test]
+            async fn capacity_reports_the_host_and_the_callers_pools() {
+                let f = fixture(true).await;
+                sandbox(&f);
+                f.registry
+                    .get("sb")
+                    .unwrap()
+                    .mutate_state(|s| s.suspended.push("sb-old".into()));
+                let (status, body) = call(&f, "GET", "/capacity", Value::Null).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["deployments"], 2);
+                assert_eq!(body["stopped_vms"], 1);
+                assert_eq!(body["disk_free_bytes"], 10);
+                assert!(body["host"].is_object());
+            }
+        }
+
         /// Transfers end to end: a listening admin API, and a fake daemon
         /// that runs each exec in a local `sh`, so the guest side really
         /// fetches and pushes with curl.
@@ -9499,12 +10753,16 @@ mod tests {
                 (Method::POST, "/tokens"),
                 (Method::PATCH, "/security/rules/r1"),
                 (Method::PUT, "/api/plugins/obs"),
+                (Method::POST, "/deployments/files"),
             ] {
                 assert!(mutates_fleet_state(&method, path), "{method} {path}");
             }
             for (method, path) in [
                 (Method::GET, "/deployments"),
                 (Method::POST, "/deployments/web/exec"),
+                (Method::POST, "/deployments/web/operations"),
+                (Method::DELETE, "/deployments/web/operations/op_1"),
+                (Method::PUT, "/deployments/web/files"),
                 (Method::POST, "/deployments/web/transfers"),
                 (Method::POST, "/deployments/web/transfers/tr_1/apply"),
                 (Method::DELETE, "/deployments/web/transfers/tr_1"),
@@ -10340,6 +11598,31 @@ mod tests {
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-cold")), Err(StatusCode::CONFLICT));
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-unknown")), Err(StatusCode::CONFLICT));
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-nope")), Err(StatusCode::NOT_FOUND));
+        }
+
+        /// Regression: a command in a booting VM held nothing, so it was no
+        /// demand, and a scale-to-zero pool could drain the VM under it once
+        /// it was promoted.
+        #[test]
+        fn a_command_in_a_booting_vm_is_demand_until_it_ends() {
+            let d = deployment();
+            d.set_pending(vec![pending("sb-boot", 100, Some(SandboxStatus::Running))]);
+            let Ok(held) = hold_this_vm(&d, "demo", "sb-boot") else {
+                panic!("a booting VM is a target");
+            };
+            assert_eq!(d.demand(), 1);
+
+            // Promoted while the command runs: ending the command releases the
+            // demand and leaves the promoted VM freshly active.
+            let b = std::sync::Arc::new(crate::deployment::VmBackend::new(
+                "sb-boot".into(),
+                "127.0.0.1:1".parse().unwrap(),
+            ));
+            d.set_pending(vec![]);
+            d.set_backends(vec![b.clone()]);
+            drop(held);
+            assert_eq!(d.demand(), 0);
+            assert!(crate::deployment::now_secs() - b.last_active() <= 1);
         }
     }
 
@@ -12160,6 +13443,15 @@ mod tests {
             for route in [
                 ("/deployments/:id", "/deployments/sb-1"),
                 ("/deployments/:id/exec", "/deployments/sb-1/exec"),
+                (
+                    "/deployments/:id/operations",
+                    "/deployments/sb-1/operations",
+                ),
+                (
+                    "/deployments/:id/operations/:op_id",
+                    "/deployments/sb-1/operations/op_1",
+                ),
+                ("/deployments/:id/files", "/deployments/sb-1/files"),
                 ("/deployments/:id/transfers", "/deployments/sb-1/transfers"),
                 (
                     "/deployments/:id/transfers/:tid",
@@ -12171,6 +13463,9 @@ mod tests {
                 ),
                 ("/deployments/:id/shell", "/deployments/sb-1/shell"),
                 ("/deployments/:id/scaling", "/deployments/sb-1/scaling"),
+                ("/deployments/:id/stop", "/deployments/sb-1/stop"),
+                ("/deployments/:id/start", "/deployments/sb-1/start"),
+                ("/deployments/:id/restart", "/deployments/sb-1/restart"),
                 ("/deployments/:id/jobs", "/deployments/sb-1/jobs"),
                 (
                     "/deployments/:id/vms/:sandbox_id",

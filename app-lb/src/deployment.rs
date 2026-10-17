@@ -176,6 +176,11 @@ impl VmBackend {
         self.last_active.load(Ordering::Relaxed)
     }
 
+    /// Mark the VM active now, as releasing a slot would.
+    pub fn touch(&self) {
+        self.last_active.store(now_secs(), Ordering::Relaxed);
+    }
+
     pub fn acquire(&self) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         self.last_active.store(now_secs(), Ordering::Relaxed);
@@ -393,6 +398,10 @@ pub struct DeploymentState {
     /// the fleet list cannot be asked what we suspended.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspended: Vec<String>,
+    /// The scaling policy `POST …/stop` replaced with a zero ceiling, for
+    /// `POST …/start` to put back. Absent while the deployment is not stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_scaling: Option<crate::config::ScalingPolicy>,
     /// Static upstreams administratively removed from new-request selection.
     ///
     /// Separate from health: a failed probe may recover by itself; an operator
@@ -457,9 +466,13 @@ pub fn desired_for(policy: &crate::config::ScalingPolicy, demand: usize, idle_fo
     let needed = demand.div_ceil(policy.target_concurrency.max(1) as usize) as u32;
     let mut desired = needed.saturating_add(policy.warm_pool);
 
+    // With no warm pool, demand alone asks for zero the moment the last
+    // request ends. A pool that has a replica keeps one until it has been idle
+    // for `scale_to_zero_after_secs`; an empty pool (`idle_for == u64::MAX`)
+    // is not woken by this.
     let may_scale_to_zero = policy.min_replicas == 0 && policy.warm_pool == 0;
-    if may_scale_to_zero && demand == 0 && idle_for >= policy.scale_to_zero_after_secs {
-        desired = 0;
+    if may_scale_to_zero && demand == 0 {
+        desired = u32::from(idle_for < policy.scale_to_zero_after_secs);
     }
 
     desired.clamp(policy.min_replicas, policy.max_replicas)
@@ -1078,6 +1091,34 @@ mod tests {
         // In-flight work blocks scale-to-zero even when "idle" by time.
         a.acquire();
         assert_eq!(d.desired_replicas(), 1);
+    }
+
+    /// Regression: with `min_replicas: 0` and no warm pool, demand 0 already
+    /// asked for zero replicas, so `scale_to_zero_after_secs` never held a VM
+    /// and the pool was drained the tick after its last request.
+    #[test]
+    fn an_idle_replica_is_kept_until_the_scale_to_zero_window_ends() {
+        let policy = ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 4,
+            warm_pool: 0,
+            scale_to_zero_after_secs: 60,
+            ..Default::default()
+        };
+        let d = deployment(policy.clone());
+        let a = backend("10.0.0.1:80");
+        a.acquire();
+        a.release();
+        d.set_backends(vec![a]);
+        assert_eq!(d.desired_replicas(), 1);
+
+        assert_eq!(desired_for(&policy, 0, 59), 1);
+        assert_eq!(desired_for(&policy, 0, 60), 0);
+        assert_eq!(
+            desired_for(&policy, 0, u64::MAX),
+            0,
+            "an empty pool is not woken"
+        );
     }
 
     #[test]

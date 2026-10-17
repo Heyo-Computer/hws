@@ -104,6 +104,20 @@ const GUEST_LOG_LINES: usize = 20;
 /// between stopping a VM and recording that we did.
 const SUSPENDED_SWEEP: Duration = Duration::from_secs(300);
 
+/// How long a `retain` suspend waits for the guest to `sync` before stopping
+/// it anyway. A healthy guest flushes in well under a second; this bounds how
+/// long a wedged one (its serial shell still busy with a timed-out exec) can
+/// hold up the tick.
+const RETAIN_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Failed resumes of one retained replica before the pool gives up on it.
+///
+/// Destroying a retained replica destroys its `/workspace` disk, so a resume
+/// that fails or never becomes healthy parks the sandbox again instead, and
+/// the next scale-up retries it. Only a sandbox that fails this many times in
+/// a row — whatever is on its disk is what breaks it — is destroyed.
+const MAX_RESUME_ATTEMPTS: u32 = 3;
+
 pub struct Autoscaler {
     rollout_gate: tokio::sync::RwLock<()>,
     /// Set once [`Autoscaler::adopt_existing`] has put the VMs already on the
@@ -139,6 +153,9 @@ pub struct Autoscaler {
     /// The image inventory, asked before a VM is created whether its image is
     /// on heyvm. Unset (tests, and a host with no inventory) creates as before.
     images: std::sync::OnceLock<Arc<crate::images::ImageCatalog>>,
+    /// Consecutive failed resumes per retained sandbox. See
+    /// [`MAX_RESUME_ATTEMPTS`].
+    resume_failures: std::sync::Mutex<HashMap<String, u32>>,
 }
 
 impl Autoscaler {
@@ -167,6 +184,7 @@ impl Autoscaler {
             workspaces,
             secrets,
             images: std::sync::OnceLock::new(),
+            resume_failures: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1145,6 +1163,7 @@ impl Autoscaler {
                 );
                 self.metrics.record_cold_start(&d.spec.id, age);
                 promoted_ids.push(p.sandbox_id.clone());
+                self.resume_failures.lock().unwrap().remove(&p.sandbox_id);
                 promoted.push(Arc::new(VmBackend::new(p.sandbox_id.clone(), addr)));
                 continue;
             }
@@ -1243,6 +1262,9 @@ impl Autoscaler {
                     self.kill_or_capture(d, &id, "failed resume").await;
                     continue;
                 }
+            }
+            if origin != BootOrigin::Created && self.park_failed_resume(d, &id, true).await {
+                continue;
             }
             match self.kill_vm(d, &id).await {
                 // The kill is what makes reclamation safe: the disks below are
@@ -1519,15 +1541,20 @@ impl Autoscaler {
                         continue;
                     }
                     Err(e) => {
-                        // It is already forgotten, so it will not be resumed
-                        // again. Kill it rather than leave it stopped forever
-                        // holding a disk nothing tracks.
                         tracing::warn!(
                             deployment = %d.spec.id,
                             sandbox = %sandbox_id,
                             error = %e,
-                            "failed to resume suspended VM; destroying it and booting a fresh one",
+                            "failed to resume suspended VM",
                         );
+                        // Its disk is the deployment's state: put it back and
+                        // try again next tick rather than booting an empty
+                        // replica over it.
+                        if self.park_failed_resume(d, &sandbox_id, false).await {
+                            break;
+                        }
+                        // Given up on: kill it rather than leave it stopped
+                        // forever holding a disk nothing tracks.
                         if let Err(e) = self.kill_vm(d, &sandbox_id).await {
                             tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill VM");
                         }
@@ -1699,6 +1726,12 @@ impl Autoscaler {
             }
             if retain {
                 tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "suspending VM");
+                // `retain` promises the data disk back on resume; the stop
+                // kills the guest, so flush it first. Short, since this holds
+                // up the tick for every deployment.
+                self.vms()
+                    .sync_guest(&d.spec.id, &b.sandbox_id, RETAIN_SYNC_TIMEOUT)
+                    .await;
                 match self.vms().suspend(&b.sandbox_id).await {
                     // Recorded only on success. A sandbox we failed to stop is
                     // still running and still in the fleet list, so recording it
@@ -1801,8 +1834,8 @@ impl Autoscaler {
             tracing::info!(
                 deployment = %d.spec.id,
                 sandbox = %sandbox_id,
-                "keeping the disks of a resumed replica that failed to come up; its \
-                 /workspace is the deployment's retained state",
+                "not reclaiming the disks of a resumed replica that was given up on; the \
+                 daemon's delete already took its data disk, and the sweep handles the rest",
             );
             return;
         }
@@ -1832,6 +1865,62 @@ impl Autoscaler {
     /// the write this id exists in exactly one place: memory. The daemon drops a
     /// stopped sandbox from `GET /sandboxes`, so a crash in that window leaves a
     /// VM holding a disk that nothing knows to resume or reap.
+    /// Put a retained replica whose resume failed back among the suspended,
+    /// so the next scale-up retries it instead of destroying its disk.
+    ///
+    /// `running` says the VM got as far as booting and must be stopped first.
+    /// Returns `false` once the sandbox has failed [`MAX_RESUME_ATTEMPTS`]
+    /// times, or if it could not be stopped: the caller destroys it as before.
+    async fn park_failed_resume(
+        &self,
+        d: &Arc<Deployment>,
+        sandbox_id: &str,
+        running: bool,
+    ) -> bool {
+        let attempts = {
+            let mut failures = self.resume_failures.lock().unwrap();
+            let n = failures.entry(sandbox_id.to_string()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if attempts >= MAX_RESUME_ATTEMPTS {
+            self.resume_failures.lock().unwrap().remove(sandbox_id);
+            tracing::error!(
+                deployment = %d.spec.id,
+                sandbox = %sandbox_id,
+                attempts,
+                "a retained replica failed to resume {attempts} times in a row; destroying it \
+                 and its /workspace disk",
+            );
+            return false;
+        }
+        if running {
+            self.vms()
+                .sync_guest(&d.spec.id, sandbox_id, RETAIN_SYNC_TIMEOUT)
+                .await;
+            if let Err(e) = self.vms().suspend(sandbox_id).await {
+                tracing::warn!(
+                    deployment = %d.spec.id,
+                    sandbox = %sandbox_id,
+                    error = %e,
+                    "could not stop a retained replica that failed to come up; destroying it",
+                );
+                self.resume_failures.lock().unwrap().remove(sandbox_id);
+                return false;
+            }
+        }
+        tracing::warn!(
+            deployment = %d.spec.id,
+            sandbox = %sandbox_id,
+            attempts,
+            max_attempts = MAX_RESUME_ATTEMPTS,
+            "a retained replica failed to come up; keeping it suspended with its /workspace \
+             disk and retrying it on the next scale-up",
+        );
+        self.remember_suspended(d, vec![sandbox_id.to_string()]);
+        true
+    }
+
     fn remember_suspended(&self, d: &Arc<Deployment>, ids: Vec<String>) {
         if ids.is_empty() {
             return;
@@ -1853,6 +1942,19 @@ impl Autoscaler {
     }
 
     /// Forget a sandbox we suspended — it has been resumed, or destroyed.
+    /// Destroy a suspended sandbox and its data disk, so the next scale-up
+    /// boots a new VM from the image instead of resuming it. What
+    /// `POST …/restart {"fresh": true}` asks for.
+    pub async fn discard_suspended(
+        &self,
+        d: &Arc<Deployment>,
+        sandbox_id: &str,
+    ) -> Result<(), vm::VmError> {
+        self.kill_vm(d, sandbox_id).await?;
+        self.forget_suspended(d, sandbox_id);
+        Ok(())
+    }
+
     fn forget_suspended(&self, d: &Arc<Deployment>, sandbox_id: &str) {
         let changed = d.mutate_state(|s| s.suspended.retain(|id| id != sandbox_id));
         if changed && let Err(e) = self.registry.persist_one(&d.spec.id) {
@@ -3948,6 +4050,118 @@ mod tests {
             assert!(at_rest(&d, &fleet(60), &HashMap::new()), "a fresh replica is at rest");
             d.set_backends(vec![b("sb-1", 3700)]);
             assert!(!at_rest(&d, &fleet(3700), &HashMap::new()), "a due one needs reconcile_one");
+        }
+    }
+
+    /// `idle_action: retain` keeps a replica's data disk across a stop, and the
+    /// stop kills the guest. A customer's fresh `git clone` on /workspace was
+    /// gone after every stop/wake because nothing flushed the page cache first.
+    mod retain_durability {
+        use super::*;
+        use axum::{
+            Json, Router,
+            extract::{Path, State},
+            routing::post,
+        };
+        use std::sync::Mutex;
+
+        /// A daemon that records exec and stop calls in the order they arrive.
+        async fn daemon(
+            stop_fails: bool,
+        ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let app = Router::new()
+                .route("/sandbox/:id/exec", post(|State(log): State<Arc<Mutex<Vec<String>>>>, Path(id): Path<String>, Json(body): Json<serde_json::Value>| async move {
+                    log.lock().unwrap().push(format!("exec {id} {}", body["command"].as_str().unwrap_or("")));
+                    Json(serde_json::json!({"stdout": "", "stderr": "", "exit_code": 0, "output": ""}))
+                }))
+                .route("/sandbox/:id/stop", post(move |State(log): State<Arc<Mutex<Vec<String>>>>, Path(id): Path<String>| async move {
+                    log.lock().unwrap().push(format!("stop {id}"));
+                    if stop_fails {
+                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "no"})));
+                    }
+                    (axum::http::StatusCode::OK, Json(serde_json::json!({})))
+                }))
+                .fallback(|| async { Json(serde_json::json!({})) })
+                .with_state(log.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (url, log, server)
+        }
+
+        fn retained() -> DeploymentSpec {
+            let mut s = spec();
+            s.scaling.idle_action = IdleAction::Retain;
+            s
+        }
+
+        #[tokio::test]
+        async fn a_retained_replica_is_synced_before_it_is_stopped() {
+            let (url, log, server) = daemon(false).await;
+            let (scaler, registry) = autoscaler_against(&url, retained());
+            let d = registry.get("demo").unwrap();
+            let b = Arc::new(VmBackend::new(
+                "sb-1".into(),
+                "127.0.0.1:1".parse().unwrap(),
+            ));
+            b.set_draining(true);
+            d.set_backends(vec![b]);
+
+            scaler.reap_drained(&d).await;
+
+            let calls: Vec<String> = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with("exec sb-1") || c.starts_with("stop sb-1"))
+                .cloned()
+                .collect();
+            assert_eq!(
+                calls,
+                vec!["exec sb-1 sync".to_string(), "stop sb-1".to_string()]
+            );
+            assert_eq!(d.state().suspended, vec!["sb-1".to_string()]);
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_failed_resume_is_parked_with_its_disk_until_the_attempts_run_out() {
+            let (url, log, server) = daemon(false).await;
+            let (scaler, registry) = autoscaler_against(&url, retained());
+            let d = registry.get("demo").unwrap();
+
+            for attempt in 1..MAX_RESUME_ATTEMPTS {
+                assert!(
+                    scaler.park_failed_resume(&d, "sb-1", true).await,
+                    "attempt {attempt} parks"
+                );
+                assert_eq!(d.state().suspended, vec!["sb-1".to_string()]);
+                d.mutate_state(|s| s.suspended.clear());
+            }
+            assert!(
+                !scaler.park_failed_resume(&d, "sb-1", true).await,
+                "the last attempt gives up"
+            );
+            assert!(d.state().suspended.is_empty());
+            assert!(
+                log.lock().unwrap().iter().any(|c| c == "exec sb-1 sync"),
+                "a parked VM is synced first"
+            );
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_replica_that_cannot_be_stopped_is_not_parked() {
+            let (url, _log, server) = daemon(true).await;
+            let (scaler, registry) = autoscaler_against(&url, retained());
+            let d = registry.get("demo").unwrap();
+            assert!(!scaler.park_failed_resume(&d, "sb-1", true).await);
+            assert!(
+                d.state().suspended.is_empty(),
+                "a running VM must not be recorded as suspended"
+            );
+            server.abort();
         }
     }
 

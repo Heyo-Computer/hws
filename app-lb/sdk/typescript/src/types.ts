@@ -476,6 +476,8 @@ export interface DeploymentStatus {
   pending: number;
   total_in_flight: number;
   vms: VmStatus[];
+  /** VMs created or resumed but not yet healthy; absent when there are none. */
+  pending_vms?: PendingVmView[];
   /** Present when the spec declares `vm.workspace`. */
   workspace?: WorkspaceStatus;
   /** Present for a site: whether its root on the LB host can serve. */
@@ -549,6 +551,29 @@ export interface DeploymentMetrics {
   latency_ms: Histogram;
   cold_start_s: Histogram;
   autoscale: AutoscaleCounts;
+}
+
+/** What `POST /deployments/:id/{stop,start,restart}` answered. */
+export interface LifecycleOutcome {
+  /** `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came back before the pool settled. */
+  state: "stopped" | "stopping" | "running" | "starting";
+  /** Whether a stopped VM keeps its data disk (`idle_action: retain`). */
+  retained: boolean;
+  /** The VM now serving, once one is. */
+  sandbox_id?: string;
+  warning?: string;
+}
+
+/** `GET /capacity`: the host, and the caller's own pools. */
+export interface Capacity {
+  host: HostUsage;
+  disk_free_bytes?: number;
+  disk_total_bytes?: number;
+  deployments: number;
+  running_vms: number;
+  booting_vms: number;
+  /** Suspended under `idle_action: retain`: holding a disk, not CPU or memory. */
+  stopped_vms: number;
 }
 
 export interface HostUsage {
@@ -1003,6 +1028,8 @@ export interface JobRecord {
   commit?: string;
   dockerfile?: string;
   image?: string;
+  /** A build's inputs beyond its commit; the same image and key reuse an earlier build (`reused`). */
+  build_key?: string;
   rolled_out?: boolean;
   store?: string;
   artifact?: string;
@@ -1083,6 +1110,66 @@ export interface Transfer {
   upload_url?: string;
   /** Out: where to `GET` them, up to three times. Only in the create response. */
   download_url?: string;
+}
+
+/** A background command in a sandbox, from `/deployments/:id/operations`. */
+export interface Operation {
+  id: string;
+  deployment: string;
+  /** The VM it runs in; an operation never moves. */
+  sandbox_id: string;
+  boot_id: string;
+  /** Its directory in the guest: `cmd`, `out`, `pid`, `exit`. */
+  dir: string;
+  /** The first 200 characters of the command. */
+  command: string;
+  cwd?: string;
+  /** Names of the environment it was given; values are never recorded. */
+  env_keys?: string[];
+  created_at: number;
+  finished_at?: number;
+  max_runtime_secs: number;
+  state: "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "timed_out" | "lost";
+  exit_code?: number;
+  output_bytes: number;
+  error?: string;
+  cancel_requested_at?: number;
+  timed_out?: boolean;
+  /** A page of output, on `GET …/operations/:op`. */
+  output?: OutputPage;
+  /** The guest could not be asked just now; this is the last known record. */
+  stale?: boolean;
+}
+
+/** A page of an operation's output. */
+export interface OutputPage {
+  offset: number;
+  bytes: number;
+  next_offset: number;
+  total_bytes: number;
+  encoding: "utf-8" | "base64";
+  data: string;
+}
+
+/** `GET /deployments/:id/files`: a byte range of a file in the guest. */
+export interface FileRead {
+  sandbox_id: string;
+  path: string;
+  size: number;
+  offset: number;
+  bytes: number;
+  /** Where the next read starts; absent at the end of the file. */
+  next_offset?: number;
+  encoding: "utf-8" | "base64";
+  content: string;
+}
+
+/** `PUT /deployments/:id/files`. */
+export interface FileWritten {
+  sandbox_id: string;
+  path: string;
+  wrote: number;
+  size: number;
 }
 
 export interface ExecOutput {

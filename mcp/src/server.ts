@@ -169,7 +169,7 @@ export const INSTRUCTIONS = `Heyo: deploy apps to app-lb from git repos or publi
 
 Not sure how? Call heyo_guide with your goal (or an error message) for a step-by-step plan.
 
-Your token confines you to one namespace. Pass that namespace to repo_* tools; artifact tags you publish must start with "<namespace>/".
+Your token confines you to one namespace; repo_* tools and applb_deploy use it when you leave \`namespace\` out. Artifact tags you publish must start with "<namespace>/".
 
 Static site (HTML/JS/CSS, already built):
   1. repo_create  2. repo_write_files with the BUILT files  3. repo_deploy with kind "site" and a host.

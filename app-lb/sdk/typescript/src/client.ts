@@ -37,6 +37,11 @@ import type {
   FeedEvent,
   FeedIndexEntry,
   Transfer,
+  Operation,
+  FileRead,
+  FileWritten,
+  LifecycleOutcome,
+  Capacity,
 } from "./types.js";
 import type { Shell, ShellOptions } from "./shell.js";
 import type { WaitForJobOptions, WaitForReadyOptions } from "./wait.js";
@@ -194,6 +199,8 @@ export class Heyctl {
       body?: unknown;
       /** A plain-text body, for the few routes that take one. `body` wins. */
       text?: string;
+      /** Raw bytes, sent as `application/octet-stream`. */
+      bytes?: Uint8Array;
       kind?: string;
       name?: string;
       timeoutMs?: number;
@@ -205,6 +212,7 @@ export class Heyctl {
     if (auth) headers.authorization = auth;
     if (opts.body !== undefined) headers["content-type"] = "application/json";
     else if (opts.text !== undefined) headers["content-type"] = "text/plain";
+    else if (opts.bytes !== undefined) headers["content-type"] = "application/octet-stream";
 
     // A caller's own signal *and* our deadline: whichever fires first wins.
     const timer = new AbortController();
@@ -217,7 +225,11 @@ export class Heyctl {
       const res = await this.doFetch(`${this.server}${path}`, {
         method,
         headers,
-        body: opts.body !== undefined ? JSON.stringify(opts.body) : opts.text,
+        // A Uint8Array is a valid fetch body everywhere; the cast is for lib.dom
+        // typings that want an ArrayBuffer-backed view specifically.
+        body: opts.body !== undefined
+          ? JSON.stringify(opts.body)
+          : (opts.text ?? (opts.bytes as unknown as ArrayBuffer | undefined)),
         signal: timer.signal,
       });
       return { status: res.status, text: await res.text() };
@@ -238,6 +250,8 @@ export class Heyctl {
       body?: unknown;
       /** A plain-text body (moving an artifact tag sends the digest as text). */
       text?: string;
+      /** Raw bytes, sent as `application/octet-stream`. */
+      bytes?: Uint8Array;
       kind?: string;
       name?: string;
       timeoutMs?: number;
@@ -533,6 +547,112 @@ export class Heyctl {
       timeoutMs: patienceMs,
       signal: opts.signal,
     });
+  }
+
+  // -- background operations and files --------------------------------------
+
+  /**
+   * Start `command` detached in the deployment's VM and return at once. Follow
+   * it with {@link operation}; several can run at once on one VM.
+   */
+  startOperation(
+    id: string,
+    command: string,
+    opts: { cwd?: string; env?: Record<string, string>; maxRuntimeSecs?: number; signal?: AbortSignal } = {},
+  ): Promise<Operation> {
+    const body: Record<string, unknown> = { command };
+    if (opts.cwd) body.cwd = opts.cwd;
+    if (opts.env) body.env = opts.env;
+    if (opts.maxRuntimeSecs !== undefined) body.max_runtime_secs = opts.maxRuntimeSecs;
+    return this.request("POST", `/deployments/${seg(id)}/operations`, {
+      body,
+      kind: "deployment",
+      name: id,
+      timeoutMs: ASSUMED_COLD_START_MS + EXEC_MARGIN_MS + 30_000,
+      signal: opts.signal,
+    });
+  }
+
+  /** An operation, fresh from the guest, with up to `maxBytes` of output from `offset`. */
+  operation(id: string, op: string, opts: { offset?: number; maxBytes?: number; tail?: boolean; signal?: AbortSignal } = {}): Promise<Operation> {
+    const q = new URLSearchParams();
+    if (opts.offset !== undefined) q.set("offset", String(opts.offset));
+    if (opts.maxBytes !== undefined) q.set("max_bytes", String(opts.maxBytes));
+    if (opts.tail) q.set("tail", "true");
+    const query = q.toString() ? `?${q}` : "";
+    return this.request("GET", `/deployments/${seg(id)}/operations/${seg(op)}${query}`, {
+      kind: "operation",
+      name: op,
+      signal: opts.signal,
+    });
+  }
+
+  /** Cancel an operation: SIGTERM to its process group, SIGKILL after 10s. */
+  cancelOperation(id: string, op: string, signal?: AbortSignal): Promise<Operation> {
+    return this.request("DELETE", `/deployments/${seg(id)}/operations/${seg(op)}`, { kind: "operation", name: op, signal });
+  }
+
+  /** A byte range of a file in the guest (at most 256 KiB). */
+  readFile(id: string, path: string, opts: { offset?: number; length?: number; signal?: AbortSignal } = {}): Promise<FileRead> {
+    const q = new URLSearchParams({ path });
+    if (opts.offset !== undefined) q.set("offset", String(opts.offset));
+    if (opts.length !== undefined) q.set("length", String(opts.length));
+    return this.request("GET", `/deployments/${seg(id)}/files?${q}`, { kind: "file", name: path, signal: opts.signal });
+  }
+
+  /** Write `content` (at most 1 MiB) to a file in the guest, replacing it or appending. */
+  writeFile(id: string, path: string, content: Uint8Array | string, opts: { append?: boolean; signal?: AbortSignal } = {}): Promise<FileWritten> {
+    const q = new URLSearchParams({ path });
+    if (opts.append) q.set("append", "true");
+    return this.request("PUT", `/deployments/${seg(id)}/files?${q}`, {
+      bytes: typeof content === "string" ? new TextEncoder().encode(content) : content,
+      kind: "file",
+      name: path,
+      signal: opts.signal,
+    });
+  }
+
+  // -- stop, start, restart ------------------------------------------------
+
+  /**
+   * Drain the pool and hold it at zero. Under `idle_action: retain` the VM is
+   * synced and suspended with its data disk; nothing wakes it until
+   * {@link start}. Waits up to `waitSecs` (default 30) for the pool to settle.
+   */
+  stop(id: string, waitSecs = 30, signal?: AbortSignal): Promise<LifecycleOutcome> {
+    return this.lifecycle(id, "stop", { wait_secs: waitSecs }, waitSecs, signal);
+  }
+
+  /** Put back the policy {@link stop} replaced and wait for a VM, resuming the retained one. */
+  start(id: string, waitSecs = 30, signal?: AbortSignal): Promise<LifecycleOutcome> {
+    return this.lifecycle(id, "start", { wait_secs: waitSecs }, waitSecs, signal);
+  }
+
+  /** Stop and resume the same sandbox, or with `fresh` boot a new VM with an empty data disk. */
+  restart(id: string, opts: { fresh?: boolean; waitSecs?: number; signal?: AbortSignal } = {}): Promise<LifecycleOutcome> {
+    const waitSecs = opts.waitSecs ?? 30;
+    return this.lifecycle(id, "restart", { wait_secs: waitSecs, fresh: opts.fresh ?? false }, waitSecs * 2, opts.signal);
+  }
+
+  private lifecycle(
+    id: string,
+    verb: string,
+    body: Record<string, unknown>,
+    waitSecs: number,
+    signal?: AbortSignal,
+  ): Promise<LifecycleOutcome> {
+    return this.request("POST", `/deployments/${seg(id)}/${verb}`, {
+      body,
+      kind: "deployment",
+      name: id,
+      timeoutMs: (waitSecs + 30) * 1000,
+      signal,
+    });
+  }
+
+  /** What the host has left, and the caller's own pools. */
+  capacity(signal?: AbortSignal): Promise<Capacity> {
+    return this.request("GET", "/capacity", { kind: "server", name: "", signal });
   }
 
   // -- transfers ----------------------------------------------------------

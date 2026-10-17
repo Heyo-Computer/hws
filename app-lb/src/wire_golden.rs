@@ -525,6 +525,15 @@ fn deployment_status_is_stable() {
                 } else {
                     vec![]
                 },
+                pending_vms: if managed {
+                    vec![PendingVmView {
+                        sandbox_id: "applb-sandbox-d4e5f6".into(),
+                        age_secs: 12,
+                        status: Some(heyo_sdk::SandboxStatus::Running),
+                    }]
+                } else {
+                    vec![]
+                },
                 workspace: None,
                 // A fixed answer, not the fixture host's filesystem.
                 site: spec_site.map(|root| crate::site::RootStatus {
@@ -802,6 +811,7 @@ fn job_records_are_stable() {
         commit: None,
         dockerfile: None,
         image: None,
+        build_key: None,
         rolled_out: false,
         store: None,
         artifact_ref: None,
@@ -1069,6 +1079,106 @@ fn the_small_responses_are_stable() {
             stdout: "total 0\n".into(),
             stderr: "ls: cannot access '/nope': No such file or directory\n".into(),
             output: "total 0\nls: cannot access '/nope': No such file or directory\n".into(),
+        },
+    );
+
+    golden(
+        "operation",
+        &OperationView {
+            operation: crate::operations::Operation {
+                id: "op_0123456789abcdef".into(),
+                deployment: "sb-acme".into(),
+                sandbox_id: "applb-sandbox-a1b2c3".into(),
+                boot_id: "6a1f0c2e-1b2c-4d5e-8f90-123456789abc".into(),
+                dir: "/workspace/.heyo/ops/op_0123456789abcdef".into(),
+                command: "cd /workspace/app && npm test".into(),
+                cwd: Some("/workspace".into()),
+                env_keys: vec!["CI".into()],
+                created_at: 1_760_000_000,
+                finished_at: Some(1_760_000_420),
+                max_runtime_secs: 3600,
+                state: crate::operations::OpState::Failed,
+                exit_code: Some(1),
+                output_bytes: 2048,
+                error: None,
+                cancel_requested_at: None,
+                timed_out: false,
+            },
+            output: Some(crate::operations::OutputPage {
+                offset: 2000,
+                bytes: 48,
+                next_offset: 2048,
+                total_bytes: 2048,
+                encoding: "utf-8",
+                data: "Tests: 41 passed, 1 failed\nnpm ERR! Test failed.\n".into(),
+            }),
+            stale: false,
+        },
+    );
+
+    golden(
+        "file-read",
+        &FileRead {
+            sandbox_id: "applb-sandbox-a1b2c3".into(),
+            path: "/workspace/app/package.json".into(),
+            size: 200_000,
+            offset: 0,
+            bytes: 98_304,
+            next_offset: Some(98_304),
+            content: FileContent {
+                encoding: "utf-8",
+                content: "{\"name\": \"app\"}".into(),
+            },
+        },
+    );
+
+    golden(
+        "file-written",
+        &FileWritten {
+            sandbox_id: "applb-sandbox-a1b2c3".into(),
+            path: "/workspace/app/.env".into(),
+            wrote: 42,
+            size: 42,
+        },
+    );
+
+    golden(
+        "lifecycle-stopped",
+        &LifecycleResponse {
+            state: "stopped",
+            retained: true,
+            sandbox_id: None,
+            warning: None,
+        },
+    );
+
+    golden(
+        "lifecycle-started",
+        &LifecycleResponse {
+            state: "running",
+            retained: true,
+            sandbox_id: Some("applb-sandbox-a1b2c3".into()),
+            warning: None,
+        },
+    );
+
+    golden(
+        "capacity",
+        &CapacityResponse {
+            host: HostUsageSnapshot {
+                available: true,
+                cpu_count: 16,
+                cpu_percent: 23.5,
+                memory_total_bytes: 68_719_476_736,
+                memory_used_bytes: 21_474_836_480,
+                sampled_at_ms: 1_760_000_000_000,
+            },
+            disk_free_bytes: Some(412_316_860_416),
+            disk_total_bytes: Some(1_099_511_627_776),
+            deployments: 3,
+            running_vms: 2,
+            booting_vms: 0,
+            stopped_vms: 1,
         },
     );
 

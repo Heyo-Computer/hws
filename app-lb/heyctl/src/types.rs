@@ -45,6 +45,8 @@ pub struct DeploymentStatus {
     pub pending: usize,
     pub total_in_flight: usize,
     pub vms: Vec<VmStatus>,
+    /// VMs created or resumed but not yet healthy; absent when there are none.
+    pub pending_vms: Vec<PendingVmView>,
     /// Present when the spec declares `vm.workspace`.
     pub workspace: Option<WorkspaceStatus>,
     /// Present for a site: whether its root on the LB host can serve.
@@ -964,6 +966,9 @@ pub struct JobRecord {
     pub commit: Option<String>,
     pub dockerfile: Option<String>,
     pub image: Option<String>,
+    /// A build's inputs beyond its commit; a build with the same image and key
+    /// reuses the earlier result (and sets `reused`).
+    pub build_key: Option<String>,
     pub rolled_out: bool,
 
     // artifact-pull
@@ -1930,6 +1935,118 @@ pub struct Transfer {
     pub upload_url: Option<String>,
     /// Out: where to `GET` them, up to three times. Only in the create response.
     pub download_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A background command in a sandbox, from `/deployments/:id/operations`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Operation {
+    pub id: String,
+    pub deployment: String,
+    /// The VM it runs in; an operation never moves.
+    pub sandbox_id: String,
+    pub boot_id: String,
+    /// Its directory in the guest: `cmd`, `out`, `pid`, `exit`.
+    pub dir: String,
+    /// The first 200 characters of the command.
+    pub command: String,
+    pub cwd: Option<String>,
+    /// Names of the environment it was given; values are never recorded.
+    pub env_keys: Vec<String>,
+    pub created_at: u64,
+    pub finished_at: Option<u64>,
+    pub max_runtime_secs: u64,
+    /// `running`, `cancelling`, `succeeded`, `failed`, `cancelled`,
+    /// `timed_out` or `lost`.
+    pub state: String,
+    pub exit_code: Option<i32>,
+    pub output_bytes: u64,
+    pub error: Option<String>,
+    pub cancel_requested_at: Option<u64>,
+    pub timed_out: bool,
+    /// A page of output, on `GET …/operations/:op`.
+    pub output: Option<OutputPage>,
+    /// The guest could not be asked just now; this is the last known record.
+    pub stale: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// What `POST /deployments/:id/{stop,start,restart}` answered.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LifecycleOutcome {
+    /// `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came
+    /// back as 202 before the pool settled.
+    pub state: String,
+    /// Whether a stopped VM keeps its data disk (`idle_action: retain`).
+    pub retained: bool,
+    /// The VM now serving, once one is.
+    pub sandbox_id: Option<String>,
+    pub warning: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A page of an operation's output.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct OutputPage {
+    pub offset: u64,
+    pub bytes: u64,
+    pub next_offset: u64,
+    pub total_bytes: u64,
+    /// `utf-8` or `base64`.
+    pub encoding: String,
+    pub data: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /deployments/:id/files`: a byte range of a file in the guest.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct FileRead {
+    pub sandbox_id: String,
+    pub path: String,
+    pub size: u64,
+    pub offset: u64,
+    pub bytes: u64,
+    /// Where the next read starts; absent at the end of the file.
+    pub next_offset: Option<u64>,
+    /// `utf-8` or `base64`.
+    pub encoding: String,
+    pub content: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `PUT /deployments/:id/files`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct FileWritten {
+    pub sandbox_id: String,
+    pub path: String,
+    pub wrote: usize,
+    pub size: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /capacity`: the host, and the caller's own pools.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Capacity {
+    pub host: HostUsage,
+    pub disk_free_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub deployments: usize,
+    pub running_vms: usize,
+    pub booting_vms: usize,
+    /// Suspended under `idle_action: retain`: holding a disk, not CPU or memory.
+    pub stopped_vms: usize,
     #[serde(flatten)]
     pub extra: Extra,
 }
