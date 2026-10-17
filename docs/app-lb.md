@@ -313,7 +313,7 @@ When a base domain is configured (`APP_LB_DEPLOY_BASE_DOMAIN`, or the first `APP
 | `start_command` | | Shell command run once per replica after boot. It must return, so daemonize the workload (`setsid nohup prog </dev/null &`). Its stdout and stderr go to `/var/log/heyvm-start.log` and `.err.log` inside the guest, and from there to app-obs when the image has `socat` (see below). Don't redirect them to a file of your own: that output then never leaves the guest. |
 | `working_directory` | guest default | Directory `start_command` runs in. |
 | `size_class` | daemon default | `micro`, `mini`, `small`, `medium`, `large`, `xlarge`. This is the only CPU and memory setting. |
-| `disk_size_gb` | none | Per-sandbox data disk mounted at `/workspace`. It belongs to one sandbox: a restart, rollout or `vm` edit boots a replica with a fresh disk. |
+| `disk_size_gb` | none | Per-sandbox data disk mounted at `/workspace` (ext4, formatted on first boot by the image's init; an image with its own `/init.sh` must mount `/dev/vdb` itself). It belongs to one sandbox: a restart, rollout or `vm` edit boots a replica with a fresh disk. |
 | `env_vars` | | Plain environment variables. These are readable from `GET /deployments` and the state file. |
 | `env_from` | | Secrets exported as environment variables when a replica is created: `[{"secret": "db", "key": "url", "as": "DATABASE_URL"}]`. `key` defaults to `token`, and `as` defaults to the key upper-cased. |
 | `open_ports` | | Extra guest ports to open alongside `port`. |
@@ -548,7 +548,7 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `POST /deployments/:id/rollouts`, `GET .../rollouts/:operation` | Candidate-first rollout. |
 | `POST /deployments/:id/exec` | `{command, cwd?, env?, timeout_secs?, wake?, sandbox_id?}` returns `{sandbox_id, exit_code, stdout, stderr, output}`. |
 | `GET /deployments/:id/shell` | WebSocket PTY. `?cols=&rows=&cwd=&wake=&sandbox_id=` |
-| `POST /deployments/:id/build` | Start a build (`{"ref": ...}` for a one-off ref). Returns 202 and a job. |
+| `POST /deployments/:id/build` | Start a build (`{"ref": ...}` for a one-off ref). Returns 202 and a job. A build whose image (named for its commit) is already built from the same build inputs, and is what the pool runs, finishes at once with `reused: true` and leaves the pool alone; `{"force": true}` rebuilds anyway, e.g. for a base image that moved. |
 | `POST /deployments/:id/pull` | Start an artifact pull (`{"ref": ..., "force": true}`). |
 | `POST /deployments/:id/mounts/pull` | Start a mount pull (`{"force": true}`). |
 | `POST /deployments/:id/update` | Run `update.commands`. |

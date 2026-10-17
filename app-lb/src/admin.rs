@@ -1209,6 +1209,10 @@ struct DeploymentStatus {
     pending: usize,
     total_in_flight: usize,
     vms: Vec<VmStatus>,
+    /// VMs created or resumed but not yet past their health check, oldest
+    /// first. A VM an `exec` woke is here, not in `vms`, until it is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_vms: Vec<PendingVmView>,
     /// The deployment's workspace, when the spec declares one: which snapshot
     /// the pool runs from, whether the store has it, and what — if anything —
     /// is holding the pool at zero. See [`crate::workspace`].
@@ -1328,6 +1332,7 @@ fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> Depl
                 draining: b.is_draining(),
             })
             .collect(),
+        pending_vms: pending_vms_of(d),
     }
 }
 
@@ -6325,6 +6330,10 @@ struct BuildRequest {
     /// is left alone, so a hotfix tag doesn't quietly become the new default.
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
+    /// Build even when the image this would produce is already built from the
+    /// same commit and inputs and running — for a base image that moved.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -6390,7 +6399,7 @@ async fn start_build(
     body: Option<Json<BuildRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_build(&id, req.git_ref) {
+    match state.jobs.start_build(&id, req.git_ref, req.force) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "image build started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
