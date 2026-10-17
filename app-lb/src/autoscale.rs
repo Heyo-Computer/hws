@@ -1853,6 +1853,19 @@ impl Autoscaler {
     }
 
     /// Forget a sandbox we suspended — it has been resumed, or destroyed.
+    /// Destroy a suspended sandbox and its data disk, so the next scale-up
+    /// boots a new VM from the image instead of resuming it. What
+    /// `POST …/restart {"fresh": true}` asks for.
+    pub async fn discard_suspended(
+        &self,
+        d: &Arc<Deployment>,
+        sandbox_id: &str,
+    ) -> Result<(), vm::VmError> {
+        self.kill_vm(d, sandbox_id).await?;
+        self.forget_suspended(d, sandbox_id);
+        Ok(())
+    }
+
     fn forget_suspended(&self, d: &Arc<Deployment>, sandbox_id: &str) {
         let changed = d.mutate_state(|s| s.suspended.retain(|id| id != sandbox_id));
         if changed && let Err(e) = self.registry.persist_one(&d.spec.id) {

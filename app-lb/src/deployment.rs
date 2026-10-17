@@ -393,6 +393,10 @@ pub struct DeploymentState {
     /// the fleet list cannot be asked what we suspended.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspended: Vec<String>,
+    /// The scaling policy `POST …/stop` replaced with a zero ceiling, for
+    /// `POST …/start` to put back. Absent while the deployment is not stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_scaling: Option<crate::config::ScalingPolicy>,
     /// Static upstreams administratively removed from new-request selection.
     ///
     /// Separate from health: a failed probe may recover by itself; an operator

@@ -1904,6 +1904,38 @@ mod tests {
 // -- POST /deployments/:id/exec --------------------------------------------
 
 /// What a command did. A non-zero `exit_code` is a successful *request* — the
+/// What `POST /deployments/:id/{stop,start,restart}` answered.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LifecycleOutcome {
+    /// `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came
+    /// back as 202 before the pool settled.
+    pub state: String,
+    /// Whether a stopped VM keeps its data disk (`idle_action: retain`).
+    pub retained: bool,
+    /// The VM now serving, once one is.
+    pub sandbox_id: Option<String>,
+    pub warning: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /capacity`: the host, and the caller's own pools.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Capacity {
+    pub host: HostUsage,
+    pub disk_free_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub deployments: usize,
+    pub running_vms: usize,
+    pub booting_vms: usize,
+    /// Suspended under `idle_action: retain`: holding a disk, not CPU or memory.
+    pub stopped_vms: usize,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// command ran and failed, which is not the same as being unable to run it.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]

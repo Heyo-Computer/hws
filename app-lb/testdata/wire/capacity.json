@@ -1,0 +1,16 @@
+{
+  "host": {
+    "available": true,
+    "cpu_count": 16,
+    "cpu_percent": 23.5,
+    "memory_total_bytes": 68719476736,
+    "memory_used_bytes": 21474836480,
+    "sampled_at_ms": 1760000000000
+  },
+  "disk_free_bytes": 412316860416,
+  "disk_total_bytes": 1099511627776,
+  "deployments": 3,
+  "running_vms": 2,
+  "booting_vms": 0,
+  "stopped_vms": 1
+}

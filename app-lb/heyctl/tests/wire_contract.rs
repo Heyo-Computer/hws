@@ -16,8 +16,10 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use hws::types::{
-    ArtifactStoreInfo, AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView, PostgresDatabases,
-    UpstreamTrafficStatus, WorkflowList, WorkflowView,
+    ArtifactStoreInfo, AuthProviderView, Capacity, CreatedPostgresDatabase,
+    DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord,
+    LifecycleOutcome, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView,
+    PostgresDatabases, UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
 
@@ -753,4 +755,21 @@ fn artifact_store_info_is_understood() {
     assert!(info.extra.is_empty(), "unknown fields: {:?}", info.extra.keys().collect::<Vec<_>>());
     assert!(info.available && info.writable);
     assert_eq!((info.namespace.as_str(), info.prefix.as_str()), ("team-a", "team-a/"));
+}
+
+#[test]
+fn lifecycle_and_capacity_parse_with_nothing_left_over() {
+    for name in ["lifecycle-stopped", "lifecycle-started"] {
+        let o: LifecycleOutcome = serde_json::from_str(&fixture(name)).unwrap();
+        assert!(o.extra.is_empty(), "{name}: unread fields {:?}", o.extra);
+        assert!(o.retained);
+    }
+    let c: Capacity = serde_json::from_str(&fixture("capacity")).unwrap();
+    assert!(c.extra.is_empty(), "unread fields {:?}", c.extra);
+    assert!(
+        c.host.extra.is_empty(),
+        "unread host fields {:?}",
+        c.host.extra
+    );
+    assert_eq!(c.stopped_vms, 1);
 }

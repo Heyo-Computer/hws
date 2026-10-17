@@ -513,6 +513,7 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `GET /` | Directory: one card per routable URL, with health dots. |
 | `GET /dashboard` | Live dashboard. `?view=local` forces this gateway's local view. |
 | `GET /metrics` | JSON metrics. See [Metrics](#metrics). |
+| `GET /capacity` | Host CPU, memory and free disk, plus the caller's deployments and their running, booting and stopped VMs. |
 | `GET /security` | Security alerts, block rules and hit history. `?severity=&rule=&deployment=&limit=` |
 | `GET /siem` | Security console. |
 | `GET /disks` | Disk inventory and archive progress. |
@@ -543,6 +544,7 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `DELETE /deployments/:id/retired-record` | Archive and remove a settled, fully drained managed deployment (fleet admin, `If-Match`). |
 | `PATCH /deployments/:id/scaling` | Partial scaling update. |
 | `DELETE /deployments/:id/vms/:sandbox_id` | Evict one VM (`?force=true` to kill). |
+| `POST /deployments/:id/stop`, `/start`, `/restart` | Hold the pool at zero (a retained VM keeps its disk), bring it back, or both. `restart {"fresh": true}` boots a new VM instead. See [Pausing a sandbox](#pausing-a-sandbox). |
 | `PUT`/`DELETE /deployments/:id/upstreams/:upstream/drain` | Cordon or drain, then uncordon, a static upstream. |
 | `GET /deployments/:id/discovery-status` | Discovery version and per-upstream drain and in-flight state. |
 | `POST /deployments/:id/rollouts`, `GET .../rollouts/:operation` | Candidate-first rollout. |
@@ -614,6 +616,12 @@ heyctl plugins enable artifacts
 `GET /deployments` advertises what this binary supports, so controllers can check before relying on a feature: `x-app-lb-create-only`, `x-app-lb-discovery-source`, `x-app-lb-discovery-region`, `x-app-lb-gateway`, `x-app-lb-regional-admission` (each `1`). Unknown spec fields are ignored by older binaries, which is why you should check these headers first.
 
 The spec `ETag` is `"<hex>"`, where the hex is the lowercase SHA-256 of the compact JSON of the response's `spec` with every object's keys sorted recursively and array order preserved.
+
+### Pausing a sandbox
+
+An agent sandbox is paused between steps and resumed for the next one. `POST /deployments/:id/stop` sets the pool's ceiling to zero and remembers the policy it replaced. Under `scaling.idle_action: retain`, the VM is synced, stopped and kept with its `/workspace` disk. Under `destroy`, it and its disk are gone, and the response carries a warning saying so. Nothing wakes a stopped deployment: `exec` answers `409` at once. `POST /deployments/:id/start` restores the policy and waits for a VM, resuming the retained one. Stop and start both wait up to `wait_secs` (default 30) and answer `202` if the pool has not settled by then.
+
+`POST /deployments/:id/restart` is stop followed by start: the same sandbox with the same disk. With `{"fresh": true}` it instead evicts the VM and discards any retained one, so a new VM boots from the image with an empty disk.
 
 ### Running commands inside a VM
 
