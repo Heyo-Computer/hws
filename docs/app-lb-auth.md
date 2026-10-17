@@ -343,6 +343,8 @@ Mixing works as elsewhere: `"provider": ["google", "jwt"]` lets a person sign in
 | `view` | An app-token of tier `view` or `admin` that admits this deployment |
 | `admin` | An app-token of tier `admin` that admits this deployment |
 
+When the gated deployment is app-lb's own admin API (an `admin.<region>` host in front of `127.0.0.1:9090`), give transfers a public path, `{"path": "/transfers/", "scope": "public"}`. A transfer URL carries its own single-use token, and neither the guest fetching it nor `curl` on a caller's machine holds a sign-in.
+
 ```json
 "public_paths": [
   {"path": "/healthz", "scope": "public"},

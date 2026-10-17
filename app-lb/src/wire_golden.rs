@@ -1073,6 +1073,50 @@ fn the_small_responses_are_stable() {
     );
 
     golden(
+        "transfer-created",
+        &crate::transfers::TransferView {
+            id: "tr_0123456789abcdef".into(),
+            deployment: "sb-acme".into(),
+            direction: crate::transfers::Direction::In,
+            path: "/workspace/app".into(),
+            extract: crate::transfers::Extract::TarGz,
+            strip_components: 1,
+            state: crate::transfers::TransferState::AwaitingUpload,
+            created_at: 1_760_000_000,
+            expires_at: 1_760_003_600,
+            max_bytes: 1_073_741_824,
+            size: None,
+            sha256: None,
+            sandbox_id: None,
+            error: None,
+            upload_url: Some("https://admin.example/transfers/tok".into()),
+            download_url: None,
+        },
+    );
+
+    golden(
+        "transfer-ready",
+        &crate::transfers::TransferView {
+            id: "tr_fedcba9876543210".into(),
+            deployment: "sb-acme".into(),
+            direction: crate::transfers::Direction::Out,
+            path: "/workspace/app/dist".into(),
+            extract: crate::transfers::Extract::None,
+            strip_components: 0,
+            state: crate::transfers::TransferState::Ready,
+            created_at: 1_760_000_000,
+            expires_at: 1_760_003_600,
+            max_bytes: 1_073_741_824,
+            size: Some(5_242_880),
+            sha256: Some("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into()),
+            sandbox_id: Some("applb-sandbox-a1b2c3".into()),
+            error: None,
+            upload_url: None,
+            download_url: Some("https://admin.example/transfers/tok".into()),
+        },
+    );
+
+    golden(
         "evict-response",
         &EvictResponse {
             sandbox_id: "applb-sandbox-a1b2c3".into(),

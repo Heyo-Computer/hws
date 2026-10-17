@@ -16,7 +16,9 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use hws::types::{
-    ArtifactStoreInfo, AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, NamespacePlugin, PluginInstalls, PluginView, PostgresDatabases,
+    ArtifactStoreInfo, AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase,
+    DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse,
+    NamespacePlugin, PluginInstalls, PluginView, PostgresDatabases, Transfer,
     UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
@@ -753,4 +755,14 @@ fn artifact_store_info_is_understood() {
     assert!(info.extra.is_empty(), "unknown fields: {:?}", info.extra.keys().collect::<Vec<_>>());
     assert!(info.available && info.writable);
     assert_eq!((info.namespace.as_str(), info.prefix.as_str()), ("team-a", "team-a/"));
+}
+
+#[test]
+fn transfers_parse_with_nothing_left_over() {
+    for name in ["transfer-created", "transfer-ready"] {
+        let t: Transfer = serde_json::from_str(&fixture(name)).unwrap();
+        assert!(t.extra.is_empty(), "{name}: unread fields {:?}", t.extra);
+    }
+    let t: Transfer = serde_json::from_str(&fixture("transfer-ready")).unwrap();
+    assert_eq!((t.direction.as_str(), t.state.as_str()), ("out", "ready"));
 }

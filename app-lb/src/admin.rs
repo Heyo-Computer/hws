@@ -170,6 +170,9 @@ fn html_escape(s: &str) -> String {
 #[derive(Clone)]
 struct AdminState {
     views: Option<Arc<crate::fleet::ViewStore>>,
+    /// One-time transfer URLs for large files. Absent without
+    /// `APP_LB_TRANSFER_URL`, where the routes answer 501.
+    transfers: Option<Arc<crate::transfers::Transfers>>,
     /// The shared fleet store, in fleet mode. Mutations are refused while it
     /// cannot be written, and a write it refuses answers 409 or 503.
     fleet_store: Option<Arc<crate::fleet_sync::Fleet>>,
@@ -395,6 +398,7 @@ impl AdminApi {
             addr,
             state: AdminState {
                 views: None,
+                transfers: None,
                 fleet_store: None,
                 token_sync: Default::default(),
                 images: None,
@@ -443,6 +447,11 @@ impl AdminApi {
                 onboarding: Arc::new(crate::onboarding::Onboarding::from_env()),
             },
         }
+    }
+
+    pub fn with_transfers(mut self, transfers: Option<Arc<crate::transfers::Transfers>>) -> Self {
+        self.state.transfers = transfers;
+        self
     }
 
     pub fn with_views(mut self, views: Arc<crate::fleet::ViewStore>) -> Self {
@@ -5669,6 +5678,229 @@ fn booting_vm(d: &std::sync::Arc<crate::deployment::Deployment>) -> Option<Strin
         .map(|p| p.sandbox_id.clone())
 }
 
+// --- transfers: large files through one-time URLs ------------------------
+
+fn transfers_of(state: &AdminState) -> Result<Arc<crate::transfers::Transfers>, Response> {
+    state.transfers.clone().ok_or_else(|| {
+        err(
+            StatusCode::NOT_IMPLEMENTED,
+            crate::transfers::TransferError::NotConfigured.to_string(),
+        )
+        .into_response()
+    })
+}
+
+fn transfer_error(e: crate::transfers::TransferError) -> Response {
+    use crate::transfers::TransferError as E;
+    let status = match &e {
+        E::NotConfigured => StatusCode::NOT_IMPLEMENTED,
+        E::Invalid(_) => StatusCode::BAD_REQUEST,
+        E::TooMany(_) => StatusCode::TOO_MANY_REQUESTS,
+        E::NoSpace(_) => StatusCode::INSUFFICIENT_STORAGE,
+        E::NotFound => StatusCode::NOT_FOUND,
+        E::Conflict(_) => StatusCode::CONFLICT,
+        E::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        E::Guest(_) => StatusCode::BAD_GATEWAY,
+    };
+    err(status, e.to_string()).into_response()
+}
+
+/// Most a create waits for an outbound push before answering `202`.
+const MAX_TRANSFER_WAIT_SECS: u64 = 120;
+
+/// `POST /deployments/:id/transfers` — an inbound transfer's upload URL, or
+/// an outbound one collected from the guest with its download URL.
+async fn create_transfer(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<crate::transfers::NewTransfer>,
+) -> impl IntoResponse {
+    let transfers = match transfers_of(&state) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let Some(d) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    if !d.spec.is_managed() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("deployment {id:?} has no VM to transfer files with"),
+        )
+        .into_response();
+    }
+    let (t, mut view) = match transfers.create(&d, &req) {
+        Ok(created) => created,
+        Err(e) => return transfer_error(e),
+    };
+    if req.direction == crate::transfers::Direction::In {
+        return (StatusCode::CREATED, Json(view)).into_response();
+    }
+    // Out: collect in the background and wait a while for it.
+    let tid = t.id.clone();
+    let collector = {
+        let transfers = transfers.clone();
+        let tid = tid.clone();
+        tokio::spawn(async move { transfers.collect(&tid).await })
+    };
+    let wait =
+        std::time::Duration::from_secs(req.wait_secs.unwrap_or(50).min(MAX_TRANSFER_WAIT_SECS));
+    let url = view.download_url.take();
+    match tokio::time::timeout(wait, collector).await {
+        Ok(Ok(Ok(done))) => {
+            let mut view = done.view();
+            view.download_url = url;
+            (StatusCode::OK, Json(view)).into_response()
+        }
+        Ok(Ok(Err(e))) => transfer_error(e),
+        Ok(Err(e)) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the collector failed: {e}"),
+        )
+        .into_response(),
+        Err(_) => {
+            let mut view = transfers.get(&id, &tid).map(|t| t.view()).unwrap_or(view);
+            view.download_url = url;
+            (StatusCode::ACCEPTED, Json(view)).into_response()
+        }
+    }
+}
+
+async fn list_transfers(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match transfers_of(&state) {
+        Ok(t) => Json(serde_json::json!({ "transfers": t.list(&id) })).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn get_transfer(
+    State(state): State<AdminState>,
+    Path((id, tid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let transfers = match transfers_of(&state) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    match transfers.get(&id, &tid) {
+        Some(t) => Json(t.view()).into_response(),
+        None => transfer_error(crate::transfers::TransferError::NotFound),
+    }
+}
+
+/// `POST /deployments/:id/transfers/:tid/apply` — (re)place an uploaded blob
+/// in the guest.
+async fn apply_transfer(
+    State(state): State<AdminState>,
+    Path((id, tid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let transfers = match transfers_of(&state) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    if transfers.get(&id, &tid).is_none() {
+        return transfer_error(crate::transfers::TransferError::NotFound);
+    }
+    match transfers.apply(&tid).await {
+        Ok(t) => Json(t.view()).into_response(),
+        Err(e) => transfer_error(e),
+    }
+}
+
+async fn delete_transfer(
+    State(state): State<AdminState>,
+    Path((id, tid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let transfers = match transfers_of(&state) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    if transfers.get(&id, &tid).is_none() {
+        return transfer_error(crate::transfers::TransferError::NotFound);
+    }
+    transfers.discard(&tid);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// How long an upload with `apply_on_upload` waits for the guest before
+/// answering with `applying`.
+const APPLY_ON_UPLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `PUT /transfers/:token` — the caller's upload, or the guest's push. The
+/// token is the credential; anything that is not a live one is a 404.
+async fn transfer_put(
+    State(state): State<AdminState>,
+    Path(token): Path<String>,
+    body: axum::body::Body,
+) -> impl IntoResponse {
+    use crate::transfers::Claim;
+    let not_found = || err(StatusCode::NOT_FOUND, "no such transfer").into_response();
+    let Some(transfers) = state.transfers.clone() else {
+        return not_found();
+    };
+    let t = match transfers.claim(&token, true) {
+        Some(Claim::Upload(t)) | Some(Claim::Push(t)) => t,
+        _ => return not_found(),
+    };
+    let stored = match transfers.receive(&t, body).await {
+        Ok(stored) => stored,
+        Err(e) => return transfer_error(e),
+    };
+    if stored.direction == crate::transfers::Direction::In && stored.apply_on_upload {
+        let applier = {
+            let transfers = transfers.clone();
+            let tid = stored.id.clone();
+            tokio::spawn(async move { transfers.apply(&tid).await })
+        };
+        return match tokio::time::timeout(APPLY_ON_UPLOAD_WAIT, applier).await {
+            Ok(Ok(Ok(applied))) => Json(applied.view()).into_response(),
+            Ok(Ok(Err(e))) => transfer_error(e),
+            Ok(Err(e)) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the apply failed: {e}"),
+            )
+            .into_response(),
+            Err(_) => {
+                let view = transfers
+                    .get(&stored.deployment, &stored.id)
+                    .map(|t| t.view())
+                    .unwrap_or(stored.view());
+                (StatusCode::ACCEPTED, Json(view)).into_response()
+            }
+        };
+    }
+    Json(stored.view()).into_response()
+}
+
+/// `GET /transfers/:token` — the guest's fetch, or the caller's download.
+async fn transfer_get(
+    State(state): State<AdminState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    use crate::transfers::Claim;
+    let not_found = || err(StatusCode::NOT_FOUND, "no such transfer").into_response();
+    let Some(transfers) = state.transfers.clone() else {
+        return not_found();
+    };
+    let claim = match transfers.claim(&token, false) {
+        Some(c @ (Claim::Fetch(_) | Claim::Download(_))) => c,
+        _ => return not_found(),
+    };
+    match transfers.open_blob(&claim).await {
+        Ok((file, len)) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (header::CONTENT_LENGTH, len.to_string()),
+            ],
+            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+        )
+            .into_response(),
+        Err(_) => not_found(),
+    }
+}
+
 /// `POST /deployments/:id/exec` — run one command in the deployment's VM.
 async fn exec(
     State(state): State<AdminState>,
@@ -6901,6 +7133,18 @@ fn router(state: AdminState) -> Router {
         // CRUD-tier on purpose: running a command in a VM is at least as
         // powerful as editing the spec that boots it.
         .route("/deployments/:id/exec", post(exec))
+        .route(
+            "/deployments/:id/transfers",
+            post(create_transfer).get(list_transfers),
+        )
+        .route(
+            "/deployments/:id/transfers/:tid",
+            get(get_transfer).delete(delete_transfer),
+        )
+        .route(
+            "/deployments/:id/transfers/:tid/apply",
+            post(apply_transfer),
+        )
         .route("/deployments/:id/shell", get(shell))
         // Grouped with the CRUD routes so it inherits the `APP_LB_ADMIN_AUTH`
         // gate: it reports which hostnames app-lb holds keys for.
@@ -7108,6 +7352,15 @@ fn router(state: AdminState) -> Router {
         .route("/login/handoff", post(browser_login::handoff)
             .layer(axum::extract::DefaultBodyLimit::max(8192)))
         .route("/logout", post(browser_login::logout))
+        // One-time transfer URLs. The token in the path is the credential, so
+        // these sit outside every gate, with no body limit: the upload is
+        // capped by the transfer's own max_bytes as it streams.
+        .route(
+            "/transfers/:token",
+            get(transfer_get)
+                .put(transfer_put)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .merge(releases)
         .merge(views)
         .merge(fleet)
@@ -7171,10 +7424,19 @@ fn mutates_fleet_state(method: &axum::http::Method, path: &str) -> bool {
         "/fleet-hosts",
     ];
     const HOST: &[&str] = &["/exec", "/shell", "/regional-probe", "/regional-active-probe"];
+    // Routes that act on a VM on this host, matched by the segment after the
+    // deployment id rather than by suffix: `DELETE …/operations/op_1` ends in
+    // an id, not in `/operations`, and is no more a fleet write than its POST.
+    const HOST_SEGMENTS: &[&str] = &["exec", "shell", "operations", "files", "transfers"];
+    let host_segment = path
+        .strip_prefix("/deployments/")
+        .and_then(|rest| rest.split('/').nth(1))
+        .is_some_and(|segment| HOST_SEGMENTS.contains(&segment));
     FLEET.iter().any(|p| {
         let base = p.trim_end_matches('/');
         path == base || path.strip_prefix(base).is_some_and(|rest| rest.starts_with('/'))
     }) && !HOST.iter().any(|h| path.ends_with(h))
+        && !host_segment
         && !path.contains("/machine/")
 }
 
@@ -8152,6 +8414,263 @@ mod tests {
             Fixture { state: api.state, registry, root, mutations, inactive }
         }
 
+        /// Transfers end to end: a listening admin API, and a fake daemon
+        /// that runs each exec in a local `sh`, so the guest side really
+        /// fetches and pushes with curl.
+        mod transfers_end_to_end {
+            use super::*;
+            use axum::routing::post;
+            use serde_json::{Value, json};
+
+            fn local_daemon() -> Router {
+                Router::new().route(
+                    "/sandbox/:id/exec",
+                    post(|Json(body): Json<Value>| async move {
+                        let mut cmd = std::process::Command::new("sh");
+                        cmd.arg("-c").arg(body["command"].as_str().unwrap());
+                        if let Some(env) = body["env"].as_object() {
+                            for (k, v) in env {
+                                cmd.env(k, v.as_str().unwrap());
+                            }
+                        }
+                        let out = tokio::task::spawn_blocking(move || cmd.output().unwrap()).await.unwrap();
+                        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                        Json(json!({"stdout": stdout, "stderr": stderr, "output": format!("{stdout}{stderr}"),
+                                    "exit_code": out.status.code().unwrap_or(-1)}))
+                    }),
+                )
+            }
+
+            struct Live {
+                f: Fixture,
+                base: String,
+                http: reqwest::Client,
+            }
+
+            async fn live() -> Live {
+                let mut f = fixture_with_backend(true, local_daemon(), None).await;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let transfers = crate::transfers::Transfers::open(
+                    crate::transfers::TransferConfig {
+                        public_url: base.clone(),
+                        guest_url: base.clone(),
+                        dir: f.root.join("transfers"),
+                        max_bytes: 1 << 20,
+                        budget_bytes: 8 << 20,
+                    },
+                    f.registry.clone(),
+                    f.state.autoscaler.vms().clone(),
+                    f.state.metrics.clone(),
+                    f.state.feed.clone(),
+                )
+                .unwrap();
+                f.state.transfers = Some(transfers);
+                let vm = Arc::new(crate::deployment::VmBackend::new(
+                    "sb-1".into(),
+                    "127.0.0.1:1".parse().unwrap(),
+                ));
+                f.registry.get("obsolete").unwrap().set_backends(vec![vm]);
+                let app = router(f.state.clone())
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                Live {
+                    f,
+                    base,
+                    http: reqwest::Client::new(),
+                }
+            }
+
+            async fn post_json(l: &Live, path: &str, body: Value) -> (StatusCode, Value) {
+                let r = l
+                    .http
+                    .post(format!("{}{path}", l.base))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = StatusCode::from_u16(r.status().as_u16()).unwrap();
+                (status, r.json().await.unwrap_or(Value::Null))
+            }
+
+            fn tarball(root: &FsPath) -> Vec<u8> {
+                let src = root.join("src");
+                std::fs::create_dir_all(src.join("lib")).unwrap();
+                std::fs::write(src.join("README.md"), "hello").unwrap();
+                std::fs::write(src.join("lib").join("a.bin"), vec![0u8, 1, 2, 255]).unwrap();
+                let out = std::process::Command::new("tar")
+                    .args(["-czf", "-", "-C"])
+                    .arg(&src)
+                    .arg(".")
+                    .output()
+                    .unwrap();
+                out.stdout
+            }
+
+            #[tokio::test]
+            async fn an_archive_goes_in_and_a_directory_comes_out() {
+                if std::process::Command::new("curl")
+                    .arg("--version")
+                    .output()
+                    .is_err()
+                {
+                    eprintln!("no curl on this machine; skipping");
+                    return;
+                }
+                let l = live().await;
+                let dest = l.f.root.join("guest").join("app");
+                let (status, created) = post_json(
+                    &l,
+                    "/deployments/obsolete/transfers",
+                    json!({"direction": "in", "path": dest.display().to_string(), "extract": "auto"}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{created}");
+                let upload = created["upload_url"].as_str().unwrap().to_string();
+
+                let bytes = tarball(&l.f.root);
+                let r = l
+                    .http
+                    .put(&upload)
+                    .body(bytes.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 200);
+                let applied: Value = r.json().await.unwrap();
+                assert_eq!(applied["state"], "applied", "{applied}");
+                assert_eq!(
+                    std::fs::read_to_string(dest.join("README.md")).unwrap(),
+                    "hello"
+                );
+                assert_eq!(
+                    std::fs::read(dest.join("lib").join("a.bin")).unwrap(),
+                    vec![0u8, 1, 2, 255]
+                );
+                assert!(
+                    !dest
+                        .join(format!(
+                            ".heyo-transfer-{}",
+                            created["id"].as_str().unwrap()
+                        ))
+                        .exists()
+                );
+
+                // The upload URL was spent by the complete body.
+                assert_eq!(
+                    l.http
+                        .put(&upload)
+                        .body(bytes)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    404
+                );
+
+                let (status, out) = post_json(
+                    &l,
+                    "/deployments/obsolete/transfers",
+                    json!({"direction": "out", "path": dest.display().to_string()}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{out}");
+                assert_eq!(out["state"], "ready");
+                let download = out["download_url"].as_str().unwrap().to_string();
+                for _ in 0..3 {
+                    let r = l.http.get(&download).send().await.unwrap();
+                    assert_eq!(r.status(), 200);
+                    let tgz = r.bytes().await.unwrap();
+                    let listing = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg("tar -tzf -")
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                        .and_then(|mut c| {
+                            use std::io::Write as _;
+                            c.stdin.take().unwrap().write_all(&tgz)?;
+                            c.wait_with_output()
+                        })
+                        .unwrap();
+                    assert!(String::from_utf8_lossy(&listing.stdout).contains("lib/a.bin"));
+                }
+                assert_eq!(
+                    l.http.get(&download).send().await.unwrap().status(),
+                    404,
+                    "three downloads, then gone"
+                );
+                assert_eq!(
+                    l.http
+                        .get(format!("{}/transfers/nope", l.base))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    404
+                );
+            }
+
+            #[tokio::test]
+            async fn an_upload_past_its_cap_is_refused_and_leaves_nothing() {
+                let l = live().await;
+                let (_, created) = post_json(
+                    &l,
+                    "/deployments/obsolete/transfers",
+                    json!({"direction": "in", "path": "/workspace/big", "max_bytes": 10, "apply_on_upload": false}),
+                )
+                .await;
+                let upload = created["upload_url"].as_str().unwrap().to_string();
+                let r = l
+                    .http
+                    .put(&upload)
+                    .body(vec![0u8; 11])
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 413);
+                let r = l
+                    .http
+                    .put(&upload)
+                    .body(vec![1u8; 10])
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 200, "a refused upload leaves the token usable");
+                let stored: Value = r.json().await.unwrap();
+                assert_eq!(
+                    (stored["state"].as_str(), stored["size"].as_u64()),
+                    (Some("uploaded"), Some(10))
+                );
+                assert!(
+                    stored.get("upload_url").is_none(),
+                    "a view never repeats a URL"
+                );
+            }
+
+            #[tokio::test]
+            async fn without_a_public_url_transfers_are_off() {
+                let f = fixture(true).await;
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/deployments/obsolete/transfers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"direction": "in", "path": "/w"}).to_string(),
+                    ))
+                    .unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| {
+                    <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)
+                })
+                .await
+                .unwrap();
+                let response = app.call(req).await.unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            }
+        }
+
         /// Fleet tokens: minted only where gateways are configured, exported
         /// only to fleet-wide callers, and read-only where they are mirrored.
         mod fleet_tokens {
@@ -8986,6 +9505,10 @@ mod tests {
             for (method, path) in [
                 (Method::GET, "/deployments"),
                 (Method::POST, "/deployments/web/exec"),
+                (Method::POST, "/deployments/web/transfers"),
+                (Method::POST, "/deployments/web/transfers/tr_1/apply"),
+                (Method::DELETE, "/deployments/web/transfers/tr_1"),
+                (Method::PUT, "/transfers/abc"),
                 (Method::POST, "/deployments/web/regional-probe"),
                 (Method::POST, "/login"),
                 (Method::POST, "/disks/sweep"),
@@ -11637,6 +12160,15 @@ mod tests {
             for route in [
                 ("/deployments/:id", "/deployments/sb-1"),
                 ("/deployments/:id/exec", "/deployments/sb-1/exec"),
+                ("/deployments/:id/transfers", "/deployments/sb-1/transfers"),
+                (
+                    "/deployments/:id/transfers/:tid",
+                    "/deployments/sb-1/transfers/tr_1",
+                ),
+                (
+                    "/deployments/:id/transfers/:tid/apply",
+                    "/deployments/sb-1/transfers/tr_1/apply",
+                ),
                 ("/deployments/:id/shell", "/deployments/sb-1/shell"),
                 ("/deployments/:id/scaling", "/deployments/sb-1/scaling"),
                 ("/deployments/:id/jobs", "/deployments/sb-1/jobs"),

@@ -118,6 +118,10 @@ These are summarized here. The details are in [app-lb-auth](app-lb-auth.md).
 | `APP_LB_AUTH_CACHE_SECS` | `60` | How long a resolved federated grant is cached. |
 | `APP_LB_AUTH_TIMEOUT_SECS` | `5` | Timeout for one grant lookup. The gate fails closed. |
 | `APP_LB_HOME_URL` | unset | Front-end URL linked from `/login` and from expired namespace sessions. |
+| `APP_LB_TRANSFER_URL` | unset | Public base URL at which `/transfers/` reaches this admin API, e.g. `https://admin.us5.heyo.work`. Turns [transfers](api/exec-shell.md#transfers) on; unset, their routes answer 501. Behind a sign-in gate, the gate needs `{"path": "/transfers/", "scope": "public"}`. |
+| `APP_LB_TRANSFER_GUEST_URL` | `APP_LB_TRANSFER_URL` | The base a guest reaches the same route at, when that differs. |
+| `APP_LB_TRANSFER_MAX_BYTES` | 1 GiB | Largest single transfer. |
+| `APP_LB_TRANSFER_DISK_BUDGET` | 10 GiB | Bytes all transfers may hold or have promised at once (`507` past it). Blobs live in `<state>.transfers/` and are swept when they expire. |
 | `APP_LB_ONBOARDING_MCP_URL` | unset | Hosted MCP endpoint the dashboard's "Get started" card tells namespace users to install (e.g. `https://mcp.us2.heyo.work/mcp`). Unset leaves that step out. |
 | `APP_LB_TENANT_TOKEN_MAX_TTL_SECS` | `7776000` (90 days) | Longest lifetime a namespace admin may mint a token for; also the default when they ask for none. |
 | `APP_LB_PUBLIC_IMAGE_CATALOG_URL` | unset | Cloud base URL serving `/public-images/{name}/meta`. Used to resolve the "Get started" fastcar spec's image download and digest. |
@@ -543,6 +547,8 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `DELETE /deployments/:id/retired-record` | Archive and remove a settled, fully drained managed deployment (fleet admin, `If-Match`). |
 | `PATCH /deployments/:id/scaling` | Partial scaling update. |
 | `DELETE /deployments/:id/vms/:sandbox_id` | Evict one VM (`?force=true` to kill). |
+| `POST`/`GET /deployments/:id/transfers`, `GET`/`DELETE …/:tid`, `POST …/:tid/apply` | Large files in and out through one-time URLs. See [docs/api/exec-shell.md](api/exec-shell.md#transfers). |
+| `PUT`/`GET /transfers/:token` | The one-time URLs themselves. No credential: the token is it. |
 | `PUT`/`DELETE /deployments/:id/upstreams/:upstream/drain` | Cordon or drain, then uncordon, a static upstream. |
 | `GET /deployments/:id/discovery-status` | Discovery version and per-upstream drain and in-flight state. |
 | `POST /deployments/:id/rollouts`, `GET .../rollouts/:operation` | Candidate-first rollout. |

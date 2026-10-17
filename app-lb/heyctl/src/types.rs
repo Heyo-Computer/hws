@@ -1904,6 +1904,36 @@ mod tests {
 // -- POST /deployments/:id/exec --------------------------------------------
 
 /// What a command did. A non-zero `exit_code` is a successful *request* — the
+/// A large-file transfer, from `/deployments/:id/transfers`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Transfer {
+    pub id: String,
+    pub deployment: String,
+    /// `in` or `out`.
+    pub direction: String,
+    pub path: String,
+    /// `none`, `tar`, `tar.gz` or `auto`.
+    pub extract: String,
+    pub strip_components: u32,
+    /// `awaiting_upload`, `uploaded`, `applying`, `applied`, `collecting`,
+    /// `ready` or `failed`.
+    pub state: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub max_bytes: u64,
+    pub size: Option<u64>,
+    pub sha256: Option<String>,
+    pub sandbox_id: Option<String>,
+    pub error: Option<String>,
+    /// In: where to `PUT` the bytes. Only in the create response.
+    pub upload_url: Option<String>,
+    /// Out: where to `GET` them, up to three times. Only in the create response.
+    pub download_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// command ran and failed, which is not the same as being unable to run it.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]

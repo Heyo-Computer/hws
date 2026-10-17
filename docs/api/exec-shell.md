@@ -112,3 +112,28 @@ let exit = sh.exit().cloned();
 `Shell::write` frames stdin, `Shell::resize` sends a resize, and `Shell::next` yields output and errors until the session ends. `Shell::exit()` then returns a `ShellExit { code, error }`, and `ShellExit::is_clean()` is true only when the code is `0` and no error was reported.
 
 app-lb reports an unknown exit status as `0`, which is also what a VM dying under the session looks like, so treat an `error` before the `exit` as unclean. There is no resume: if the socket drops, the session is gone, and reconnecting opens a new shell.
+
+## Transfers
+
+Files too large for the console travel through one-time URLs instead. app-lb keeps the bytes on its own disk for a while, and the guest fetches or pushes them with `curl` (or `wget`) at network speed. A transfer needs `APP_LB_TRANSFER_URL` (otherwise `501`), and the image needs `curl` or `wget`.
+
+| Route | Does |
+| --- | --- |
+| `POST /deployments/:id/transfers` | `{direction, path, extract?, strip_components?, ttl_secs? (default 3600, max 21600), max_bytes?, apply_on_upload? (default true), sandbox_id?, wait_secs?}` |
+| `PUT /transfers/:token` | Upload. Streamed, capped at `max_bytes` (`413`), hashed. With `apply_on_upload`, the guest fetches and places the bytes before the response (up to 60 s, else `202` with `applying`). |
+| `GET /transfers/:token` | Download an outbound transfer, up to three times. |
+| `GET /deployments/:id/transfers[/:tid]` | List, or one transfer's state (`awaiting_upload`, `uploaded`, `applying`, `applied`, `collecting`, `ready`, `failed`), size, sha256 and error. URLs appear only in the create response. |
+| `POST /deployments/:id/transfers/:tid/apply` | Place an uploaded transfer again, for example after starting a stopped sandbox. |
+| `DELETE /deployments/:id/transfers/:tid` | Discard it and its bytes. |
+
+**In:** create with `direction: "in"` and get `upload_url`. `PUT` the bytes there; it takes no credential, since the URL is one. The guest downloads them into a temporary file beside `path` and checks the sha256 when it has `sha256sum`. `extract: "none"` puts the file at `path`. `tar`, `tar.gz` or `auto` (which sniffs gzip) unpacks it into the directory `path`, optionally with `strip_components`.
+
+```sh
+curl -sS -XPOST "$LB/deployments/sb-acme/transfers" -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{"direction": "in", "path": "/workspace/app", "extract": "auto"}'
+curl -sS -T repo.tar.gz "<upload_url>"
+```
+
+**Out:** create with `direction: "out"` and `path`, a file or a directory (sent as a tar.gz). The guest pushes it, and the response carries `download_url` once it is stored (`202` with `collecting` if that takes longer than `wait_secs`, default 50).
+
+Every URL is single-purpose and expires with the transfer. An upload URL is spent by one complete upload, and a download URL by three downloads. The guest's own URLs last 10 minutes and reach it through its exec environment, never its command line. Anything not a live token is `404`. Transfer paths are logged as `/transfers/<token>`. At most 8 open transfers per deployment.

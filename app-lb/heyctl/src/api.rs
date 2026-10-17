@@ -469,6 +469,28 @@ impl Client {
         .await
     }
 
+    // -- transfers ----------------------------------------------------------
+
+    /// Create a transfer. `body` is `{direction, path, extract?, …}`; see
+    /// `docs/api/exec-shell.md`. An inbound one returns its `upload_url`; an
+    /// outbound one is collected from the guest and returns its `download_url`.
+    pub async fn create_transfer(&self, id: &str, body: &Value) -> Result<Transfer> {
+        self.read(
+            Request::new(Method::Post, format!("/deployments/{}/transfers", seg(id)))
+                .json(body.clone())
+                .timeout(DEFAULT_TIMEOUT + Duration::from_secs(150)),
+            "deployment",
+            id,
+        )
+        .await
+    }
+
+    pub async fn transfer(&self, id: &str, transfer: &str) -> Result<Transfer> {
+        let path = format!("/deployments/{}/transfers/{}", seg(id), seg(transfer));
+        self.read(Request::new(Method::Get, path), "transfer", transfer)
+            .await
+    }
+
     // -- secrets ------------------------------------------------------------
 
     /// `GET /workflows` — every CI workflow object.

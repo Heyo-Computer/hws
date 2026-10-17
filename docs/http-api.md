@@ -285,6 +285,9 @@ A pool is up when `pending == 0` and the count of `vms` that are `healthy && !dr
 | `DELETE /deployments/:id` | CRUD | Drain and reap every VM, release the routes, remove the deployment. `204`. |
 | `PATCH /deployments/:id/scaling` | CRUD | Merge a partial `scaling` object. VM deployments only. Always keeps the pool. |
 | `DELETE /deployments/:id/vms/:sandbox_id` | CRUD | Recycle one VM. `?force=true` kills it now. |
+| `POST /deployments/:id/transfers` | CRUD | `{direction: "in"\|"out", path, extract?, …}`. In: returns `upload_url`. Out: the guest pushes `path`, and this returns `download_url`. See [transfers](api/exec-shell.md#transfers). |
+| `GET /deployments/:id/transfers[/:tid]`, `POST …/:tid/apply`, `DELETE …/:tid` | CRUD | List, read, re-apply or discard transfers. |
+| `PUT`/`GET /transfers/:token` | None (the token) | Upload to, or download from, a one-time URL. Anything not a live token is `404`. |
 | `PUT /deployments/:id/upstreams/:upstream/drain` | CRUD | Cordon a static upstream. |
 | `DELETE /deployments/:id/upstreams/:upstream/drain` | CRUD | Uncordon it. |
 | `GET /deployments/:id/discovery-status` | CRUD | Discovery state of a discovery-backed static deployment. |

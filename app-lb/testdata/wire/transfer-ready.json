@@ -1,0 +1,15 @@
+{
+  "id": "tr_fedcba9876543210",
+  "deployment": "sb-acme",
+  "direction": "out",
+  "path": "/workspace/app/dist",
+  "extract": "none",
+  "state": "ready",
+  "created_at": 1760000000,
+  "expires_at": 1760003600,
+  "max_bytes": 1073741824,
+  "size": 5242880,
+  "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "sandbox_id": "applb-sandbox-a1b2c3",
+  "download_url": "https://admin.example/transfers/tok"
+}
