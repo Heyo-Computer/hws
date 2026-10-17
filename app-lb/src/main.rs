@@ -1364,7 +1364,6 @@ fn main() {
         registry.clone(),
         vms.clone(),
     );
-    tokio::spawn(operations.clone().watch());
 
     // One-time transfer URLs for large files, when a public base is configured.
     let transfers = transfers::TransferConfig::from_env(
@@ -1383,9 +1382,6 @@ fn main() {
             }
         }
     });
-    if let Some(t) = &transfers {
-        tokio::spawn(t.clone().watch());
-    }
 
     let admin_svc = background_service(
         "admin",
@@ -1435,8 +1431,8 @@ fn main() {
         .with_images(image_catalog.clone())
         .with_artifact_store(store_slot.clone())
         .with_fleet_store(fleet_stores.as_ref().map(|fs| fs.fleet.clone()))
-        .with_operations(operations)
-        .with_transfers(transfers),
+        .with_operations(operations.clone())
+        .with_transfers(transfers.clone()),
     );
 
     // Fleet mode: hops between members. The peer token is fleet state; the
@@ -1530,6 +1526,12 @@ fn main() {
     // neither may hold up traffic.
     if let Some(disks) = disks {
         server.add_service(background_service("disks", disks::DiskSweeper::new(disks)));
+    }
+    // The operations watcher and the transfer sweep. Never spawned from `main`
+    // directly: there is no runtime here until the server starts one.
+    server.add_service(background_service("operations", operations::Watcher(operations)));
+    if let Some(t) = transfers {
+        server.add_service(background_service("transfers", transfers::Sweeper(t)));
     }
     // Mount-tree reclamation, on the same terms. Cheaper than the disk sweep —
     // it reads one directory and compares names against the registry — but it

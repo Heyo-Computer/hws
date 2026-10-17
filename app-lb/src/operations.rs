@@ -808,13 +808,22 @@ impl Operations {
         self.prune();
     }
 
-    /// Run [`tick`](Self::tick) forever.
-    pub async fn watch(self: Arc<Self>) {
+}
+
+/// The watcher, as a pingora background service: it runs on the server's
+/// runtime and stops with it. `main` has no runtime of its own to spawn it on.
+pub struct Watcher(pub Arc<Operations>);
+
+#[async_trait::async_trait]
+impl pingora_core::services::background::BackgroundService for Watcher {
+    async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
         let mut interval = tokio::time::interval(TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
-            self.tick().await;
+            tokio::select! {
+                _ = interval.tick() => self.0.tick().await,
+                _ = shutdown.changed() => return,
+            }
         }
     }
 }
