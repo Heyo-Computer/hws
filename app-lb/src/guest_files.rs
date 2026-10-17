@@ -15,8 +15,11 @@ pub const MAX_READ_BYTES: u64 = 256 * 1024;
 pub const DEFAULT_READ_BYTES: u64 = 96 * 1024;
 /// Most bytes one write accepts; larger goes through a transfer.
 pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
-/// Bytes per console command when writing.
-pub const WRITE_CHUNK: usize = 96 * 1024;
+/// Bytes per console command when writing. heyvmd runs a command as one
+/// argument to `env … sh -lc`, and Linux caps a single argument at 128 KiB
+/// (`MAX_ARG_STRLEN`); 96 KiB base64-encodes to exactly that and failed with
+/// "Argument list too long" on us5. 48 KiB encodes to 64 KiB.
+pub const WRITE_CHUNK: usize = 48 * 1024;
 
 /// Whether `path` can be named in a guest command: absolute, and free of what
 /// single quotes cannot carry over the serial console.
@@ -142,8 +145,13 @@ mod tests {
         assert!(scripts[2].contains("size="));
         assert!(write_scripts("/f", &[], false)[0].contains("> '/f'"));
         assert!(write_scripts("/f", b"x", true)[0].contains(">> '/f'"));
-        for s in scripts {
+        for s in &scripts {
             assert!(!s.contains('\\'), "no backslash on the serial line");
+            assert!(
+                s.len() < 100_000,
+                "a command is one argv entry, capped at 128 KiB: {}",
+                s.len()
+            );
         }
         assert_eq!(parse_written("size=42\n"), Some(42));
     }

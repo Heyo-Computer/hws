@@ -110,6 +110,17 @@ const SUSPENDED_SWEEP: Duration = Duration::from_secs(300);
 /// hold up the tick.
 const RETAIN_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Whether the daemon said the sandbox does not exist. It answers a resume of
+/// a deleted sandbox with a 500 whose message says so, not a 404, so both count.
+fn daemon_lost(e: &vm::VmError) -> bool {
+    says_sandbox_not_found(&e.to_string())
+}
+
+fn says_sandbox_not_found(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("not found") && text.contains("sandbox")
+}
+
 /// Failed resumes of one retained replica before the pool gives up on it.
 ///
 /// Destroying a retained replica destroys its `/workspace` disk, so a resume
@@ -1547,15 +1558,23 @@ impl Autoscaler {
                             error = %e,
                             "failed to resume suspended VM",
                         );
-                        // Its disk is the deployment's state: put it back and
-                        // try again next tick rather than booting an empty
-                        // replica over it.
-                        if self.park_failed_resume(d, &sandbox_id, false).await {
+                        // Gone from the daemon: nothing to resume or retry, and
+                        // nothing to kill. Forget it and boot a new one now.
+                        if daemon_lost(&e) {
+                            self.resume_failures.lock().unwrap().remove(&sandbox_id);
+                            tracing::warn!(
+                                deployment = %d.spec.id,
+                                sandbox = %sandbox_id,
+                                "the suspended VM no longer exists on the daemon; forgetting it",
+                            );
+                        } else if self.park_failed_resume(d, &sandbox_id, false).await {
+                            // Its disk is the deployment's state: put it back and
+                            // try again next tick rather than booting an empty
+                            // replica over it.
                             break;
-                        }
-                        // Given up on: kill it rather than leave it stopped
-                        // forever holding a disk nothing tracks.
-                        if let Err(e) = self.kill_vm(d, &sandbox_id).await {
+                        } else if let Err(e) = self.kill_vm(d, &sandbox_id).await {
+                            // Given up on: kill it rather than leave it stopped
+                            // forever holding a disk nothing tracks.
                             tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill VM");
                         }
                     }
@@ -2410,8 +2429,18 @@ impl Autoscaler {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill evicted VM");
                 return EvictOutcome::KillFailed(e.to_string());
             }
-            // `prune` removes the now-dead backend next tick and won't record a
-            // reap, so count it here to keep the dashboard's reaped total honest.
+            // Out of the pool now, not at the next `prune`: left in it as a
+            // draining backend, `reap_drained` retires it again, and under
+            // `retain` records the dead VM as suspended for a later resume.
+            let keep: Vec<_> = d
+                .backends()
+                .iter()
+                .filter(|b| b.sandbox_id != sandbox_id)
+                .cloned()
+                .collect();
+            d.set_backends(keep);
+            // `prune` won't record a reap for it, so count it here to keep the
+            // dashboard's reaped total honest.
             self.metrics.record_reaped(&d.spec.id, 1);
             d.scale_signal.notify_one();
             return EvictOutcome::Killed;
@@ -4149,6 +4178,43 @@ mod tests {
                 "a parked VM is synced first"
             );
             server.abort();
+        }
+
+        /// Regression: a force evict left the killed VM in the pool as a
+        /// draining backend until the next prune, and `reap_drained` then
+        /// "suspended" it, recording a VM that no longer existed for resume.
+        #[tokio::test]
+        async fn a_force_evicted_vm_leaves_the_pool_at_once() {
+            let (url, _log, server) = daemon(false).await;
+            let (scaler, registry) = autoscaler_against(&url, retained());
+            let d = registry.get("demo").unwrap();
+            let b = Arc::new(VmBackend::new(
+                "sb-1".into(),
+                "127.0.0.1:1".parse().unwrap(),
+            ));
+            d.set_backends(vec![b]);
+            assert!(matches!(
+                scaler.evict(&d, "sb-1", true).await,
+                EvictOutcome::Killed
+            ));
+            assert!(
+                d.backends().is_empty(),
+                "nothing left for reap_drained to retire again"
+            );
+            scaler.reap_drained(&d).await;
+            assert!(
+                d.state().suspended.is_empty(),
+                "a killed VM is never recorded as suspended"
+            );
+            server.abort();
+        }
+
+        #[test]
+        fn the_daemons_missing_sandbox_answer_counts_as_gone() {
+            assert!(says_sandbox_not_found(
+                "api error (500): Internal error: Sandbox not found: sb-30a3698b (calling /sandbox/sb-30a3698b/start)"
+            ));
+            assert!(!says_sandbox_not_found("api error (503): daemon busy"));
         }
 
         #[tokio::test]

@@ -52,6 +52,9 @@ pub const TICK: Duration = Duration::from_secs(15);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long after SIGTERM a cancelled operation gets before SIGKILL.
 const CANCEL_GRACE_SECS: u64 = 10;
+/// How long a VM with running operations may be missing from its pool before
+/// they are reported lost.
+const MISSING_GRACE_SECS: u64 = 45;
 /// How long a started operation may go without recording its pid before it is
 /// reported as never having started.
 const START_GRACE_SECS: u64 = 60;
@@ -464,6 +467,9 @@ pub struct Operations {
     ops: Mutex<BTreeMap<String, Operation>>,
     /// One in-flight slot per VM with a running operation, keyed by sandbox.
     holds: Mutex<HashMap<String, BackendSlot>>,
+    /// When each VM with running operations was first seen missing from its
+    /// pool. A VM is only given up on after [`MISSING_GRACE_SECS`].
+    missing_since: Mutex<HashMap<String, u64>>,
 }
 
 impl Operations {
@@ -486,6 +492,7 @@ impl Operations {
             vms,
             ops: Mutex::new(ops),
             holds: Mutex::new(HashMap::new()),
+            missing_since: Mutex::new(HashMap::new()),
         })
     }
 
@@ -605,6 +612,20 @@ impl Operations {
         offset: u64,
         max_bytes: u64,
     ) -> (Operation, Option<OutputPage>, bool) {
+        // A finished operation's record is final; only its output is read.
+        // Judging it again would rewrite why it ended.
+        if op.state.finished() {
+            let script = page_script(&op.dir, offset, max_bytes.min(MAX_PAGE_BYTES));
+            return match self.exec(&op.sandbox_id, script).await {
+                Ok(out) => {
+                    let page = parse_page(&out.stdout)
+                        .ok()
+                        .map(|(total, bytes)| output_page(offset, total, bytes));
+                    (op.clone(), page, false)
+                }
+                Err(_) => (op.clone(), None, true),
+            };
+        }
         let mut script = status_script(&[&op.dir]);
         script.push_str("; ");
         script.push_str(&page_script(&op.dir, offset, max_bytes.min(MAX_PAGE_BYTES)));
@@ -789,6 +810,7 @@ impl Operations {
                 .cloned();
             match &backend {
                 Some(b) => {
+                    self.missing_since.lock().unwrap().remove(&sandbox);
                     self.hold(&d, &sandbox);
                     // A slot held for an hour leaves `last_active` an hour old,
                     // and a drain's force-kill deadline counts from it. Keep it
@@ -800,7 +822,18 @@ impl Operations {
                 }
                 None => {
                     let booting = d.pending().iter().any(|p| p.sandbox_id == sandbox);
-                    if !booting {
+                    // Missing for a moment is not gone: across an app-lb
+                    // restart the VM is back only once the autoscaler adopts
+                    // it again.
+                    let now = now_secs();
+                    let since = *self
+                        .missing_since
+                        .lock()
+                        .unwrap()
+                        .entry(sandbox.clone())
+                        .or_insert(now);
+                    if !booting && now.saturating_sub(since) >= MISSING_GRACE_SECS {
+                        self.missing_since.lock().unwrap().remove(&sandbox);
                         for op in &ops {
                             self.update(&op.id, |o| {
                                 o.state = OpState::Lost;
@@ -836,11 +869,30 @@ impl Operations {
 
 /// The watcher, as a pingora background service: it runs on the server's
 /// runtime and stops with it. `main` has no runtime of its own to spawn it on.
-pub struct Watcher(pub Arc<Operations>);
+impl Operations {
+    /// Pretend `sandbox` went missing `secs` ago.
+    #[cfg(test)]
+    pub fn backdate_missing(&self, sandbox: &str, secs: u64) {
+        self.missing_since
+            .lock()
+            .unwrap()
+            .insert(sandbox.to_string(), now_secs().saturating_sub(secs));
+    }
+}
+
+pub struct Watcher(pub Arc<Operations>, pub tokio::sync::watch::Receiver<bool>);
 
 #[async_trait::async_trait]
 impl pingora_core::services::background::BackgroundService for Watcher {
     async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
+        // Not before the autoscaler has adopted the VMs already running: until
+        // then every pool is empty, and each running operation would look as
+        // if its VM had gone.
+        let mut adopted = self.1.clone();
+        tokio::select! {
+            _ = adopted.wait_for(|done| *done) => {}
+            _ = shutdown.changed() => return,
+        }
         let mut interval = tokio::time::interval(TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

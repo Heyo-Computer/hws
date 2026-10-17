@@ -411,11 +411,12 @@ export function sandboxTools(clients: Clients, _config: Config, deployTool?: Too
       name: "sandbox_stop",
       description:
         "Pause the sandbox: its VM stops and /workspace is kept for sandbox_start. Nothing " +
-        "wakes it until then.",
-      schema: { id: z.string(), wait_secs: num().optional() },
+        "wakes it until then. Refused while background commands run unless force: true " +
+        "(they are marked lost; their output stays on /workspace).",
+      schema: { id: z.string(), wait_secs: num().optional(), force: bool().optional() },
       handler: async (a) => {
         const wait = waitSecs(a.wait_secs, 30);
-        return json(await lifecycle("stop", a.id, { wait_secs: wait }, wait));
+        return json(await lifecycle("stop", a.id, { wait_secs: wait, force: Boolean(a.force) }, wait));
       },
     },
     {
@@ -431,10 +432,17 @@ export function sandboxTools(clients: Clients, _config: Config, deployTool?: Too
       name: "sandbox_restart",
       description:
         "Restart the sandbox keeping /workspace, or with fresh: true boot a new VM with an " +
-        "empty disk.",
-      schema: { id: z.string(), fresh: bool().optional() },
+        "empty disk. force: true as for sandbox_stop.",
+      schema: { id: z.string(), fresh: bool().optional(), force: bool().optional() },
       handler: async (a) =>
-        json(await lifecycle("restart", a.id, { wait_secs: 60, fresh: Boolean(a.fresh) }, 120)),
+        json(
+          await lifecycle(
+            "restart",
+            a.id,
+            { wait_secs: 60, fresh: Boolean(a.fresh), force: Boolean(a.force) },
+            120,
+          ),
+        ),
     },
     {
       name: "sandbox_kill",

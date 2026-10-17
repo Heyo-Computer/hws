@@ -480,7 +480,7 @@ VMs to run code in, on app-lb: create, exec (or start detached and poll), files,
 | `sandbox_info` | read-only | One sandbox: its spec, VMs and state. |
 | `sandbox_exec_cancel` |  | Cancel an operation: SIGTERM to its process group, SIGKILL 10s later. |
 | `sandbox_transfer_status` | read-only | One upload or download: its state, size, sha256 and any error. |
-| `sandbox_restart` |  | Restart the sandbox keeping /workspace, or with fresh: true boot a new VM with an empty disk. |
+| `sandbox_restart` |  | Restart the sandbox keeping /workspace, or with fresh: true boot a new VM with an empty disk. force: true as for sandbox_stop. |
 | `heyo_capacity` | read-only | What the host has left (CPU, memory, disk) and your sandboxes' VMs. |
 
 ### Git repos
