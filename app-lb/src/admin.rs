@@ -4706,6 +4706,20 @@ async fn stop_pool(
 ) -> Result<Response, Response> {
     let change = state.registry.change_guard().await;
     let previous = state.registry.get(id).map(|d| d.spec.scaling.clone());
+    // The VMs serving now. Under `retain` the stop is only done once each is
+    // recorded as suspended: a VM leaves the pool before its suspend lands,
+    // and a start in that gap boots a new VM instead of resuming this one.
+    let serving: Vec<String> = state
+        .registry
+        .get(id)
+        .map(|d| {
+            d.backends()
+                .iter()
+                .map(|b| b.sandbox_id.clone())
+                .chain(d.pending().iter().map(|p| p.sandbox_id.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     let deployment = patch_scaling(state, id, |current| {
         let mut stopped = current.clone();
         stopped.min_replicas = 0;
@@ -4728,10 +4742,12 @@ async fn stop_pool(
     drop(change);
     let retained = deployment.spec.scaling.idle_action == crate::config::IdleAction::Retain;
     let settled = wait_until(wait, || {
-        state
-            .registry
-            .get(id)
-            .is_none_or(|d| d.backends().is_empty() && d.pending().is_empty())
+        state.registry.get(id).is_none_or(|d| {
+            let state = d.state();
+            d.backends().is_empty()
+                && d.pending().is_empty()
+                && (!retained || serving.iter().all(|s| state.suspended.contains(s)))
+        })
     })
     .await;
     let body = LifecycleResponse {
@@ -9721,6 +9737,40 @@ mod tests {
                 assert_eq!(d.spec.scaling.max_replicas, 3);
                 assert_eq!(d.spec.scaling.scale_to_zero_after_secs, 600);
                 assert!(d.state().stopped_scaling.is_none());
+            }
+
+            /// Regression: stop answered "stopped" as soon as the VM left the
+            /// pool, before its suspend was recorded, so a restart's start in
+            /// that gap booted a new VM with an empty disk.
+            #[tokio::test]
+            async fn a_retained_stop_waits_for_the_suspend_to_be_recorded() {
+                let f = fixture(true).await;
+                sandbox(&f);
+                let d = f.registry.get("sb").unwrap();
+                d.set_backends(vec![Arc::new(crate::deployment::VmBackend::new(
+                    "sb-1".into(),
+                    "127.0.0.1:1".parse().unwrap(),
+                ))]);
+                let registry = f.registry.clone();
+                let started = std::time::Instant::now();
+                let reaper = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    registry.get("sb").unwrap().set_backends(vec![]);
+                    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                    registry
+                        .get("sb")
+                        .unwrap()
+                        .mutate_state(|s| s.suspended.push("sb-1".into()));
+                });
+                let (status, body) =
+                    call(&f, "POST", "/deployments/sb/stop", json!({"wait_secs": 5})).await;
+                reaper.await.unwrap();
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["state"], "stopped");
+                assert!(
+                    started.elapsed() >= std::time::Duration::from_millis(1100),
+                    "returned before the suspend landed"
+                );
             }
 
             #[tokio::test]
