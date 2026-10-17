@@ -29,6 +29,41 @@ import { checkSpec, rulesFor, suffixRoutesWithoutCerts } from "../applb/rules.js
 
 const DESTRUCTIVE = DESTRUCTIVE_PREFIX;
 
+/** The most output `applb_exec` and `applb_read_file` return in one call. */
+const GUEST_MAX_CHARS = 200_000;
+/** The most `applb_read_file` reads, and `applb_write_file` writes, per call. */
+const GUEST_FILE_CHUNK = 96 * 1024;
+
+interface GuestExec {
+  sandbox_id?: string;
+  exit_code?: number;
+  stdout?: string;
+  stderr?: string;
+  output?: string;
+}
+
+/**
+ * app-lb returns stdout, stderr *and* their interleaving, so a command with
+ * one stream spent the output cap twice on the same bytes. The interleaving
+ * says nothing new when one stream is empty.
+ */
+function compactExec(r: GuestExec): GuestExec {
+  if (!r || typeof r !== "object" || typeof r.output !== "string") return r;
+  if (!r.stdout || !r.stderr) {
+    const { output: _same, ...rest } = r;
+    return rest;
+  }
+  return r;
+}
+
+/** Single-quote for `sh`, refusing what the quoting cannot carry. */
+function guestPath(path: unknown): string {
+  const p = String(path ?? "");
+  if (!p.startsWith("/")) throw new Error(`path must be absolute: ${JSON.stringify(p)}`);
+  if (p.includes("'") || p.includes("\n")) throw new Error(`path cannot contain a quote or newline: ${JSON.stringify(p)}`);
+  return `'${p}'`;
+}
+
 /**
  * Whether a lookup of a deployment says "you cannot see one by that id".
  *
@@ -1071,22 +1106,134 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           .string()
           .optional()
           .describe("run in THIS VM of the pool rather than whichever is offered"),
+        max_chars: num()
+          .optional()
+          .describe(`default 12000, max ${GUEST_MAX_CHARS}`),
       },
-      handler: async (a) =>
-        json(
-          await clients.applb({
-            method: "POST",
-            path: `/deployments/${enc(String(a.id))}/exec`,
-            body: {
-              command: a.command,
-              ...(a.cwd === undefined ? {} : { cwd: a.cwd }),
-              ...(a.env === undefined ? {} : { env: a.env }),
-              ...(a.timeout_secs === undefined ? {} : { timeout_secs: a.timeout_secs }),
-              ...(a.wake === undefined ? {} : { wake: a.wake }),
-              ...(a.sandbox_id === undefined ? {} : { sandbox_id: a.sandbox_id }),
-            },
-          }),
-        ),
+      handler: async (a) => {
+        const out = json(
+          compactExec(
+            (await clients.applb({
+              method: "POST",
+              path: `/deployments/${enc(String(a.id))}/exec`,
+              body: {
+                command: a.command,
+                ...(a.cwd === undefined ? {} : { cwd: a.cwd }),
+                ...(a.env === undefined ? {} : { env: a.env }),
+                ...(a.timeout_secs === undefined ? {} : { timeout_secs: a.timeout_secs }),
+                ...(a.wake === undefined ? {} : { wake: a.wake }),
+                ...(a.sandbox_id === undefined ? {} : { sandbox_id: a.sandbox_id }),
+              },
+            })) as GuestExec,
+          ),
+          a.max_chars === undefined ? undefined : Math.min(Number(a.max_chars), GUEST_MAX_CHARS),
+        );
+        return out.includes("… truncated at ")
+          ? `${out}\nFor all of it: redirect the output to a file in the guest and page it with applb_read_file.`
+          : out;
+      },
+    },
+    {
+      name: "applb_read_file",
+      description:
+        "Reads up to 96 KiB of a guest file from `offset`, with its size and `next_offset` to " +
+        "page the rest; base64 for binary. Serial console, tens of KB/s: logs and small files.",
+      schema: {
+        id: z.string(),
+        path: z.string(),
+        offset: num().optional(),
+        length: num().optional(),
+        encoding: z.enum(["text", "base64"]).optional(),
+        wake: bool().optional(),
+        sandbox_id: z.string().optional(),
+      },
+      handler: async (a) => {
+        const file = guestPath(a.path);
+        const offset = Math.max(0, Math.floor(Number(a.offset ?? 0)));
+        const length = Math.min(Math.max(1, Math.floor(Number(a.length ?? GUEST_FILE_CHUNK))), GUEST_FILE_CHUNK);
+        const base64 = a.encoding === "base64";
+        // Size on the first line, then the bytes. `tail -c +N | head -c L`
+        // rather than dd, which is slow at bs=1 and busybox-dependent above it.
+        const command =
+          `wc -c < ${file} || exit 3; tail -c +${offset + 1} ${file} | head -c ${length}` +
+          (base64 ? " | base64 | tr -d '\\n'" : "");
+        const r = (await clients.applb({
+          method: "POST",
+          path: `/deployments/${enc(String(a.id))}/exec`,
+          body: {
+            command,
+            ...(a.wake === undefined ? {} : { wake: a.wake }),
+            ...(a.sandbox_id === undefined ? {} : { sandbox_id: a.sandbox_id }),
+          },
+        })) as GuestExec;
+        if (r.exit_code !== 0) return json(compactExec(r));
+        const out = r.stdout ?? "";
+        const nl = out.indexOf("\n");
+        const size = Number(out.slice(0, nl).trim());
+        const content = out.slice(nl + 1);
+        const read = base64 ? Buffer.from(content, "base64").length : Buffer.byteLength(content);
+        const next = offset + read;
+        return json(
+          {
+            sandbox_id: r.sandbox_id,
+            path: a.path,
+            size,
+            offset,
+            bytes: read,
+            next_offset: next < size ? next : null,
+            encoding: base64 ? "base64" : "text",
+            content,
+          },
+          GUEST_MAX_CHARS,
+        );
+      },
+    },
+    {
+      name: "applb_write_file",
+      description:
+        DESTRUCTIVE +
+        "Writes up to 96 KiB to a guest file (replace, or `append` for the next piece); base64 " +
+        "for binary. Serial console, tens of KB/s.",
+      schema: {
+        id: z.string(),
+        path: z.string(),
+        content: z.string(),
+        encoding: z.enum(["text", "base64"]).optional(),
+        append: bool().optional(),
+        wake: bool().optional(),
+        sandbox_id: z.string().optional(),
+      },
+      handler: async (a) => {
+        const file = guestPath(a.path);
+        const bytes =
+          a.encoding === "base64" ? Buffer.from(String(a.content), "base64") : Buffer.from(String(a.content));
+        if (bytes.length > GUEST_FILE_CHUNK) {
+          throw new Error(
+            `content is ${bytes.length} bytes; one call writes at most ${GUEST_FILE_CHUNK}. ` +
+              "Send it in pieces: the first without `append`, the rest with `append: true`.",
+          );
+        }
+        const dir = String(a.path).replace(/\/[^/]*$/, "") || "/";
+        const command =
+          `mkdir -p ${guestPath(dir)} && printf %s '${bytes.toString("base64")}' | base64 -d ` +
+          `${a.append ? ">>" : ">"} ${file} && wc -c < ${file}`;
+        const r = (await clients.applb({
+          method: "POST",
+          path: `/deployments/${enc(String(a.id))}/exec`,
+          body: {
+            command,
+            ...(a.wake === undefined ? {} : { wake: a.wake }),
+            ...(a.sandbox_id === undefined ? {} : { sandbox_id: a.sandbox_id }),
+          },
+        })) as GuestExec;
+        if (r.exit_code !== 0) return json(compactExec(r));
+        return json({
+          sandbox_id: r.sandbox_id,
+          path: a.path,
+          wrote: bytes.length,
+          size: Number((r.stdout ?? "").trim()),
+        });
+      },
     },
 
     // ---- ci reads --------------------------------------------------------
