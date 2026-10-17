@@ -1318,7 +1318,7 @@
           "type": "boolean"
         },
         "disk_size_gb": {
-          "description": "Size of the replica's persistent data disk, mounted at `/workspace`.\n\nSeparate from the rootfs, which is fixed when the image is built and\ncannot be grown afterwards — so this is not the knob for \"the image ran\nout of space\". The disk belongs to one sandbox: a rollout, a restart or\nany `vm` edit boots a replica with a fresh one, and only\n[`WorkspaceSpec`] carries contents across.",
+          "description": "Size of the replica's persistent data disk, mounted at `/workspace`.\n\nheyvmd attaches it blank at `/dev/vdb`; the guest's init formats it on\nfirst boot and mounts it. The heyo base images and the init app-lb adds\nto a Dockerfile build both do; an image that brings its own `/init.sh`\nmust do it itself.\n\nSeparate from the rootfs, which is fixed when the image is built and\ncannot be grown afterwards — so this is not the knob for \"the image ran\nout of space\". The disk belongs to one sandbox: a rollout, a restart or\nany `vm` edit boots a replica with a fresh one, and only\n[`WorkspaceSpec`] carries contents across.",
           "type": [
             "integer",
             "null"

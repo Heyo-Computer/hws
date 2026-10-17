@@ -3602,5 +3602,17 @@ pub(crate) mod guest_init {
             assert!(SCRIPT.contains("while :; do"));
             assert!(!SCRIPT.contains("bash"), "base images may have no bash");
         }
+
+        /// Regression: `disk_size_gb` is documented as mounted at /workspace,
+        /// but an image built `FROM ubuntu:24.04` got this script, which left
+        /// /dev/vdb raw. heyvmd's own guest mounts (`mount<N>`) stay heyvmd's.
+        #[test]
+        fn the_script_mounts_the_data_disk_but_not_a_heyvmd_guest_mount() {
+            assert!(SCRIPT.contains("mkfs.ext4 -q -L workspace /dev/vdb"));
+            assert!(SCRIPT.contains("mount /dev/vdb /workspace"));
+            assert!(SCRIPT.contains("mount[0-9]*) ;;"));
+            let mount = SCRIPT.find("mount /dev/vdb /workspace").unwrap();
+            assert!(mount < SCRIPT.find("echo \"HEYVM_READY\"").unwrap());
+        }
     }
 }
