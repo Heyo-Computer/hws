@@ -553,6 +553,29 @@ export interface DeploymentMetrics {
   autoscale: AutoscaleCounts;
 }
 
+/** What `POST /deployments/:id/{stop,start,restart}` answered. */
+export interface LifecycleOutcome {
+  /** `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came back before the pool settled. */
+  state: "stopped" | "stopping" | "running" | "starting";
+  /** Whether a stopped VM keeps its data disk (`idle_action: retain`). */
+  retained: boolean;
+  /** The VM now serving, once one is. */
+  sandbox_id?: string;
+  warning?: string;
+}
+
+/** `GET /capacity`: the host, and the caller's own pools. */
+export interface Capacity {
+  host: HostUsage;
+  disk_free_bytes?: number;
+  disk_total_bytes?: number;
+  deployments: number;
+  running_vms: number;
+  booting_vms: number;
+  /** Suspended under `idle_action: retain`: holding a disk, not CPU or memory. */
+  stopped_vms: number;
+}
+
 export interface HostUsage {
   available: boolean;
   cpu_count: number;
