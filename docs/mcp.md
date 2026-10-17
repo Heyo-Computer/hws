@@ -38,6 +38,8 @@ claude mcp add --transport http heyo https://mcp.heyo.work/mcp \
 
 A namespace user mints that token from the app-lb dashboard's "Get started" card (or **App-tokens → New token**). It is an `admin`-tier token confined to their namespace and expires within 90 days; see [app-lb auth](app-lb-auth.md#namespace-admins-mint-their-own-tokens). The `applb_*` tools work with it. The app-obs and ci tools do not yet, because those gates live in the `default` namespace (see [Limits and known gaps](#limits-and-known-gaps)).
 
+The `sandbox_*` tools are not listed on the hosted server: they need a Heyo cloud key, and it takes app-lb tokens. A sandbox there is an app-lb deployment with no route. Create it with `applb_deploy`, run commands with `applb_exec`, and move files with `applb_read_file` and `applb_write_file`. Your token's namespace is used wherever you leave `namespace` out.
+
 A namespace on us2 (`admin.us2.heyo.work`) uses that region's server, `https://mcp.us2.heyo.work/mcp`, the same way. [Onboarding](onboarding.md) lists each region's endpoint.
 
 ### Claude Code, local server
@@ -179,7 +181,9 @@ When a call returns 401 or 403, run `heyo_whoami`. It reports the current creden
 | `applb_drain_upstream` | destructive. Take a static upstream out of rotation. |
 | `applb_uncordon_upstream` | Put it back. |
 | `applb_evict_vm` | destructive. Destroy one pool VM. |
-| `applb_exec` | destructive. Run a command in a deployment's guest. Args `id`, `command`, `cwd`, `env`, `sandbox_id`. |
+| `applb_exec` | destructive. Run a command in a deployment's guest. Args `id`, `command`, `cwd`, `env`, `timeout_secs`, `wake`, `sandbox_id`, `max_chars` (output returned, default 12,000, max 200,000). |
+| `applb_read_file` | Read up to 96 KiB of a guest file from `offset`, with its `size` and `next_offset`; `encoding: base64` for binary. Over the serial console, so tens of KB/s. |
+| `applb_write_file` | destructive. Write up to 96 KiB to a guest file, replacing it or `append`ing the next piece; `encoding: base64` for binary. |
 | `applb_purge_disk`, `applb_purge_orphan_disks`, `applb_sweep_disks` | destructive. "Orphaned" is app-lb's inference, so review before purging. |
 
 ### Sandboxes
@@ -339,6 +343,7 @@ Pointed at the gated host, those tools fail with this explanation rather than a 
 | 503 from `sandbox_create` | Region capacity, not a fault. It is retried with backoff (3 attempts from 2 s). Try another `driver` or region. Cloud publishes no free-capacity figure, so `heyo_capacity` can't predict it. |
 | Namespace tokens and default-namespace gates | app-obs and ci gates normally live in `default`, so a token confined to another namespace gets 403 from them while app-lb tools still work. |
 | Managed mode route set | Through cloud's namespace path, fleet-wide operator tools (`applb_disks`, `applb_certs`, `applb_purge_disk`, `applb_purge_orphan_disks`, `applb_sweep_disks`) return `404 route not exposed through the namespace proxy`. |
+| Hosted calls time out at 30 s | `HEYO_MCP_TIMEOUT_MS` is the server's, not the caller's. A command that runs longer keeps running in the guest after the call returns an error, and later commands on that VM wait behind it. Start long work detached (`setsid nohup … > /workspace/step.log 2>&1 &`) and poll the log with `applb_read_file`. Commands on one VM run one at a time. |
 | Guest `start_command` failures | Written to `/var/log/heyvm-start.log` in the guest, never to app-obs. Read the file with `applb_exec`. An empty log beside an empty pool points here. |
 | Untyped fallbacks | The raw `*_request` tools bypass schema validation and read-only guarantees. |
 | No JWT re-verification | In HTTP mode the server trusts app-lb's forwarded identity headers, so it must only be reachable through app-lb. |
