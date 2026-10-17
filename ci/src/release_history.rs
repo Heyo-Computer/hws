@@ -150,6 +150,7 @@ const EFFECTIVE_STEPS: &str = "WITH RECURSIVE lineage AS (
 
 const RECEIPTS: &str =
     "SELECT DISTINCT d.id,d.request_hash,d.service_id,d.sha,d.status,d.created_at,d.updated_at,
+    d.run_id,d.job_id,m.request AS maintenance_request,
     COALESCE(s.intent->>'artifact',h.intent->'request'->>'artifact_sha256',
         u.request->'release'->>'artifactDigest',f.intent->>'artifact',
         m.request->>'archive_sha256',b.request->'artifact'->>'artifact_sha256',
@@ -164,6 +165,83 @@ const RECEIPTS: &str =
     LEFT JOIN ci_controller_rollout c ON c.id=d.id
     WHERE EXISTS(SELECT 1 FROM obligations o WHERE d.step_id=o.step_id OR d.id=o.deployment_id)
     ORDER BY d.id";
+
+/// Maintenance attests the extracted archive, while the catalog identifies its
+/// outer CI artifact. Recover that relationship from the successful publication
+/// and its frozen selectors, including for receipts written before this fix.
+async fn maintenance_artifact(
+    tx: &mut Transaction<'_, Postgres>,
+    receipt: &sqlx::postgres::PgRow,
+) -> Result<Option<String>> {
+    let digest = receipt.get("artifact");
+    let Some(request) = receipt.get::<Option<Value>, _>("maintenance_request") else {
+        return Ok(digest);
+    };
+    let promotion = sqlx::query(
+        "SELECT c.manifest,c.manifest_sha256 FROM ci_release_service_promotion p
+        JOIN ci_release_bundle c ON c.id=p.bundle_id JOIN ci_release_build b ON b.id=c.build_id
+        WHERE p.run_id=$1 AND b.status='ready'",
+    )
+    .bind(receipt.get::<&str, _>("run_id"))
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(promotion) = promotion else {
+        return Ok(digest);
+    };
+    let manifest: Value = promotion.get("manifest");
+    ensure!(
+        hex::encode(Sha256::digest(serde_json::to_vec(&manifest)?))
+            == promotion.get::<String, _>("manifest_sha256"),
+        "maintenance candidate manifest checksum mismatch"
+    );
+    ensure!(
+        manifest["revision"].as_str() == Some(receipt.get::<&str, _>("sha")),
+        "maintenance candidate revision mismatch"
+    );
+    let publications = sqlx::query(
+        "SELECT j.plan->'steps'->s.idx AS step FROM ci_service_archive a
+        JOIN ci_step s ON s.id=a.step_id JOIN ci_job j ON j.id=a.job_id
+        WHERE a.run_id=$1 AND a.sha=$2 AND a.archive_id=$3 AND a.archive_user_id=$4
+        AND a.orchestrator_url=$5 AND a.archive_sha256=$6 AND a.heyvm_sha256=$7
+        AND s.status='success' AND (a.job_id=$8 OR j.status='success')",
+    )
+    .bind(receipt.get::<&str, _>("run_id"))
+    .bind(receipt.get::<&str, _>("sha"))
+    .bind(request["body"]["artifactArchiveId"].as_str())
+    .bind(request["body"]["artifactUserId"].as_str())
+    .bind(
+        request["target"]["orchestrator_url"]
+            .as_str()
+            .map(|s| s.trim_end_matches('/')),
+    )
+    .bind(request["archive_sha256"].as_str())
+    .bind(request["body"]["sha256"].as_str())
+    .bind(receipt.get::<&str, _>("job_id"))
+    .fetch_all(&mut **tx)
+    .await?;
+    ensure!(
+        publications.len() == 1,
+        "maintenance receipt lacks unambiguous archive publication provenance"
+    );
+    let step: Value = publications[0].get("step");
+    ensure!(
+        step["uses"] == "ci/promote-service-archive",
+        "maintenance publication did not consume a candidate"
+    );
+    let input = |key: &str| {
+        step["with"][key]
+            .as_str()
+            .filter(|s| !s.is_empty() && !s.contains("${{"))
+            .ok_or_else(|| anyhow::anyhow!("maintenance publication requires literal {key}"))
+    };
+    let artifact = crate::release_environment::artifact(
+        &manifest,
+        input("workflow")?,
+        input("artifact")?,
+        step["with"]["job"].as_str(),
+    )?;
+    Ok(artifact.digest)
+}
 
 pub(crate) async fn settle(store: &Store) -> Result<()> {
     let ids: Vec<String> = sqlx::query_scalar(
@@ -303,7 +381,17 @@ async fn settle_in(mut tx: Transaction<'_, Postgres>, id: &str) -> Result<()> {
             .iter()
             .all(|r| r.get::<&str, _>("status") == "passed");
     let revisions: BTreeSet<String> = receipts.iter().map(|r| r.get("sha")).collect();
-    let artifacts: BTreeSet<String> = receipts.iter().filter_map(|r| r.get("artifact")).collect();
+    let mut artifacts = BTreeSet::new();
+    for receipt in &receipts {
+        let artifact = if success {
+            maintenance_artifact(&mut tx, receipt).await?
+        } else {
+            receipt.get("artifact")
+        };
+        if let Some(digest) = artifact {
+            artifacts.insert(digest);
+        }
+    }
     let unknown: Vec<String> = receipts
         .iter()
         .filter(|r| r.get::<Option<String>, _>("artifact").is_none())
@@ -855,10 +943,19 @@ mod tests {
         assert_eq!(final_state["current_deployment"]["run_id"], "later");
         assert_eq!(final_state["previous_deployment"]["run_id"], "earlier");
         assert_eq!(final_state["state"]["active_run"], "old");
-        let rollback_revisions: BTreeSet<_> = final_state["rollback_versions"].as_array().unwrap()
-            .iter().map(|v| v["revision"].as_str().unwrap().to_owned()).collect();
-        assert_eq!(rollback_revisions, ['a', 'b', 'c', 'd'].into_iter()
-            .map(|c| c.to_string().repeat(40)).collect());
+        let rollback_revisions: BTreeSet<_> = final_state["rollback_versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["revision"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            rollback_revisions,
+            ['a', 'b', 'c', 'd']
+                .into_iter()
+                .map(|c| c.to_string().repeat(40))
+                .collect()
+        );
 
         // Validation rejection never started deployment. Repair old false
         // failures too, but do not infer safety once a job has started.
@@ -920,6 +1017,90 @@ mod tests {
                 .unwrap();
             assert_eq!(status, "failure");
         }
+
+        // Host maintenance records the inner archive checksum, not the outer
+        // candidate artifact. Only an exact successful publication links them.
+        let revision = "9".repeat(40);
+        let outer = "8".repeat(64);
+        let inner = "7".repeat(64);
+        seed(&store, "maintenance", &revision, &inner).await;
+        sqlx::query("UPDATE ci_service_deployment SET updated_at=now()+interval '4 minutes' WHERE run_id='maintenance'")
+            .execute(store.pool()).await.unwrap();
+        let manifest = json!({"version":2,"retained":true,"repository":"repo","revision":revision,
+            "components":{"cloud":{"id":"artifact","run_id":"build","workflow":"runtime.yml",
+            "job":"linux","name":"runtime","sink":"artifacts","uri":"retained-runtime",
+            "sha256":outer,"size_bytes":73}}});
+        sqlx::query("INSERT INTO ci_release_build(id,repository,name,revision,git_ref,policy,created_by,status)
+            VALUES('runtime','repo','runtime',$1,'main','{}','test','ready')")
+            .bind(&revision).execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_release_bundle(id,repository,name,manifest,manifest_sha256,created_by,build_id)
+            VALUES('runtime','repo','runtime',$1,$2,'test','runtime')")
+            .bind(&manifest).bind(hex::encode(Sha256::digest(serde_json::to_vec(&manifest).unwrap())))
+            .execute(store.pool()).await.unwrap();
+        for job in ["west", "east"] {
+            let id = format!("maintenance.{job}");
+            sqlx::query("DELETE FROM ci_service_rollout WHERE id=$1")
+                .bind(&id)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE ci_job SET plan=$2 WHERE id=$1")
+                .bind(&id).bind(json!({"steps":[{"uses":"ci/host-heyvm-maintenance"},
+                    {"uses":"ci/promote-service-archive","with":{"workflow":"runtime.yml","artifact":"runtime","job":"linux"}}]}))
+                .execute(store.pool()).await.unwrap();
+            sqlx::query("UPDATE ci_step SET uses='ci/host-heyvm-maintenance' WHERE id=$1")
+                .bind(&id)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES($1||'.publish',$1,1,'publish','ci/promote-service-archive','success')")
+                .bind(&id).execute(store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_service_archive(step_id,job_id,run_id,archive_id,sha,orchestrator_url,archive_user_id,archive_sha256,heyvm_sha256)
+                VALUES($1||'.publish',$1,'maintenance',$1,$2,'https://orchestrator','owner',$3,'executable')")
+                .bind(&id).bind(&revision).bind(&inner).execute(store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_host_maintenance(id,runner_hd_id,request,phase,deadline) VALUES($1,$1,$2,'passed',now())")
+                .bind(&id).bind(json!({"archive_sha256":inner,"target":{"orchestrator_url":"https://orchestrator/"},
+                    "body":{"artifactArchiveId":id,"artifactUserId":"owner","sha256":"executable"}}))
+                .execute(store.pool()).await.unwrap();
+        }
+        let mut tx = store.pool().begin().await.unwrap();
+        enroll(
+            &mut tx,
+            "maintenance",
+            "repo",
+            &[cloud()],
+            "promotion",
+            Some("runtime"),
+            false,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query("INSERT INTO ci_release_service_promotion(run_id,environment,service,request_id,bundle_id,automatic,policy)
+            VALUES('maintenance','stage','cloud','maintenance','runtime',false,'{}')")
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_release_service_environment SET active_run='maintenance' WHERE name='stage' AND service='cloud'")
+            .execute(store.pool()).await.unwrap();
+        // Same revision alone is insufficient: corrupt the executable binding.
+        sqlx::query(
+            "UPDATE ci_service_archive SET heyvm_sha256='wrong' WHERE job_id='maintenance.east'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        settle(&store).await.unwrap();
+        let blocked = view(&store, "stage", "cloud").await.unwrap().unwrap();
+        assert_eq!(blocked["current_deployment"]["run_id"], "later");
+        assert_eq!(blocked["state"]["active_run"], "maintenance");
+        sqlx::query("UPDATE ci_service_archive SET heyvm_sha256='executable' WHERE job_id='maintenance.east'")
+            .execute(store.pool()).await.unwrap();
+        settle(&store).await.unwrap();
+        settle(&store).await.unwrap();
+        let maintained = view(&store, "stage", "cloud").await.unwrap().unwrap();
+        assert_eq!(maintained["current_deployment"]["run_id"], "maintenance");
+        assert_eq!(maintained["current_deployment"]["bundle_id"], "runtime");
+        assert_eq!(maintained["previous_deployment"]["run_id"], "later");
+        assert!(maintained["state"]["active_run"].is_null());
 
         store.pool().close().await;
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
