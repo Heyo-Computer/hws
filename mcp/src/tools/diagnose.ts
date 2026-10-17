@@ -59,18 +59,15 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
     {
       name: "heyo_status",
       description:
-        "Which of heyo cloud, app-lb, app-obs and ci this server can reach, whether your " +
-        "namespace's artifacts on app-lb are available, and what each says about itself. Start here when a tool fails with a " +
-        "connection or auth error — it distinguishes 'not configured' from 'configured and " +
-        "refusing'. The cloud probe doubles as an API-key check, and the app-lb one resolves " +
-        "the managed namespace, so a namespace that cannot be worked out surfaces here rather " +
-        "than inside a later call. For 'which credential am I' rather than 'what can I " +
-        "reach', use heyo_whoami.",
+        "Which of app-lb, app-obs and ci this server can reach, whether your namespace's " +
+        "artifacts on app-lb are available, and what each says about itself. Start here when " +
+        "a tool fails with a connection or auth error — it distinguishes 'not configured' from " +
+        "'configured and refusing'. For 'which credential am I', use heyo_whoami.",
       schema: {},
       handler: async () => {
         const r = await settle({
-          cloud: clients.cloud({ path: "/me/daemons" }),
-          applb: clients.applb({ path: "/metrics" }),
+          applb: clients.applb({ path: "/healthz", expectText: true }),
+          whoami: clients.applb({ path: "/whoami" }),
           obs: clients.obs({ path: "/healthz" }),
           ci: clients.ci({ path: "/healthz" }),
           // Through app-lb with the caller's credential, the same door every
@@ -91,12 +88,12 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         );
         return report(`Configured: ${configured(config).join(", ") || "nothing"}`, [
           ...faults,
+          section("app-lb /healthz", r.applb),
           section(
-            "heyo cloud /me/daemons — reachable, and the key is good",
-            r.cloud,
-            "heyo cloud /me/daemons — FAILED. This is where a bad HEYO_API_KEY shows up.",
+            "app-lb /whoami — the credential is good",
+            r.whoami,
+            "app-lb /whoami — FAILED. This is where a bad APPLB_TOKEN shows up.",
           ),
-          section("app-lb /metrics", r.applb),
           section("app-obs /healthz", r.obs),
           section("ci /healthz", r.ci),
           section(

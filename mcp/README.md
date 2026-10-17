@@ -1,10 +1,12 @@
 # heyo-mcp
 
-An MCP server over heyo: **heyo cloud** for sandboxes — boot a microVM, run a
-command in it, get files in and out — and the three services that answer
-operational questions about a fleet, [app-lb](../app-lb) (deployments and VM
-pools, and your namespace's artifacts — the bytes a deployment runs from),
-[app-obs](../app-obs) (logs and metrics) and [ci](../ci) (builds).
+An MCP server over heyo: **sandboxes** — boot a microVM, run commands in it
+(short ones, or long ones detached), get files in and out — and the services
+that answer operational questions about a fleet, [app-lb](../app-lb)
+(deployments and VM pools, and your namespace's artifacts — the bytes a
+deployment runs from), [app-obs](../app-obs) (logs and metrics) and [ci](../ci)
+(builds). Sandboxes are app-lb deployments, so app-lb serves both halves; the
+server never calls the Heyo cloud API.
 
 The sandbox half is the API an agent runs work on. The operational half exists
 because its questions span three services: "why is nothing running" is app-lb's
@@ -12,47 +14,39 @@ topology *and* app-obs's logs *and* ci's queue, and a tool per endpoint leaves
 that join to be redone by hand every time. The diagnostic tools below do the
 join and carry what it cost to learn which endpoint answers what.
 
-## Two API keys and nothing else
+## An app-lb URL and a token
 
 ```bash
-HEYO_API_KEY=heyo_api_…      # heyo cloud: sandboxes
-APPLB_TOKEN=heyo_api_…       # the managed app-lb, through cloud's namespace door
+APPLB_URL=https://admin.us5.heyo.work   # app-lb's admin API
+APPLB_TOKEN=applb_…                     # an app-lb token, from its dashboard
 ```
 
-That is a complete configuration. Cloud's base defaults to
-`https://server.heyo.computer`; app-lb defaults to the same base and discovers
-its namespace from the key on first use — one namespace is the answer, several
-is ambiguous and names them, none says how to create one. Through that door the
-app-lb credential *is* a heyo API key, so a lone `HEYO_API_KEY` configures both;
-the second variable exists for a deployment that wants them separate, and for a
-self-hosted app-lb where they genuinely differ.
-
-Everything below is for the cases that need more: a self-hosted app-lb, app-obs,
-ci, or a cloud that is not the public one.
+That is a complete configuration: every sandbox and deployment tool works with
+it. A namespace token's namespace comes from app-lb's own `/whoami`, so it is
+never asked for. Everything below is for the cases that need more: app-obs, ci,
+the git remote, or a self-hosted app-lb with Basic auth.
 
 ## Configuration
 
 | Variable | Purpose |
 |---|---|
-| `HEYO_API_KEY` | heyo cloud API key — the sandbox tools, and app-lb's default credential. Unset, the sandbox tools are not listed at all |
-| `HEYO_BASE_URL` | cloud base URL; defaults to `https://server.heyo.computer` |
-| `APPLB_URL` | app-lb base URL — its own admin listener, or heyo cloud (see managed mode). Unset means the managed door at cloud's base |
-| `APPLB_NAMESPACE` | managed mode: the namespace to reach app-lb in, through heyo cloud |
-| `APPLB_TOKEN` | bearer token (a `heyo_api_*` key in managed mode), or… |
+| `APPLB_URL` | app-lb's admin API — required for every app-lb and sandbox tool |
+| `APPLB_NAMESPACE` | the namespace tools name when the caller does not; without it, a namespace token's own (from `/whoami`) |
+| `APPLB_TOKEN` | an app-lb token (`applb_…`), or… |
 | `APPLB_BASIC` | `user:pass`, or a complete `Basic …` header |
 | `APP_OBS_URL` | app-obs base URL |
 | `APP_OBS_API_TOKEN` | bearer for its query routes (`/healthz` stays open) |
 | `CI_URL` | ci's **own** listener for the pages — see below; the read API works either way |
 | `CI_TOKEN` | a repository submit token (`git config ci.token`) — what `ci_run_status` and `ci_run_logs` present |
 | `REMOTE_URL` | the Heyo git remote (`remote/`) — the `repo_*` tools |
-| `REMOTE_TOKEN` | its credential; defaults to `APPLB_TOKEN` (the remote resolves `applb_…` tokens through app-lb), then `HEYO_API_KEY`. Over HTTP the caller's own bearer is always used |
-| `REMOTE_NAMESPACE` | the namespace repo tools default to; falls back to `APPLB_NAMESPACE`, then app-lb's discovered namespace |
+| `REMOTE_TOKEN` | its credential; defaults to `APPLB_TOKEN` (the remote resolves `applb_…` tokens through app-lb). Over HTTP the caller's own bearer is always used |
+| `REMOTE_NAMESPACE` | the namespace repo tools default to; falls back to `APPLB_NAMESPACE`, then the token's own |
 | `HEYO_MCP_TIMEOUT_MS` | per-request bound, default 30000 |
 
 Each service is independent: configure one and its tools work while the others
-report themselves unconfigured. `heyo_status` says which is which — and its
-app-lb probe is also what resolves the managed namespace, so an ambiguous one
-surfaces there rather than inside some later call.
+report themselves unconfigured. `heyo_status` says which is which. `HEYO_API_KEY`
+and `HEYO_BASE_URL` are no longer read: a configuration still carrying them is
+reported as a fault at start and by `heyo_status`, with what to set instead.
 
 A `Basic` value is passed through byte for byte, because app-lb compares it that
 way — a re-encoded-but-equivalent header is rejected.
@@ -74,13 +68,12 @@ An agent with files and no repo:
 app-lb fronts one artifact store for the fleet and serves each namespace's
 corner of it on its admin API at `/namespaces/{ns}/artifacts/…`. Every `art_*`
 tool goes there with **the caller's own app-lb credential** — the same base the
-`applb_*` tools use, including the managed `…/namespaces/{ns}/lb` door — and
+`applb_*` tools use — and
 app-lb is the single enforcement point: reads need the view tier in the
 namespace, writes need the admin tier over the whole namespace (not a token
 narrowed to particular deployments), and tags must start with `<namespace>/`.
 This server holds no store key and has no gateway of its own; the namespace
-comes from the managed door, or from app-lb's `GET /whoami` for a self-hosted
-app-lb.
+is `APPLB_NAMESPACE`, or the one app-lb's `GET /whoami` confines the token to.
 
 | Route (under `/namespaces/{ns}/artifacts`) | Tool |
 |---|---|
@@ -194,209 +187,37 @@ Read both fields.
 
 ## Sandboxes
 
-`sandbox_create` boots a microVM and returns its id; every other sandbox tool
-names that id. There is **one endpoint for every sandbox** — no per-sandbox
-connection, nothing to re-establish after a restart, and `sandbox_list` recovers
-an id that was lost. A sandbox outlives the call that made it: it is a VM with a
-TTL, not a request scope.
+A sandbox is an app-lb deployment with no route: one Firecracker VM from a hub
+image (`heyo/debian:latest` unless you name another), a data disk at
+`/workspace`, and `idle_action: retain`, so stopping it keeps that disk. It is
+reached only through these tools, with the same app-lb token as everything
+else.
 
 ```
-sandbox_create → id
-sandbox_exec / sandbox_read_file / sandbox_write_file
-sandbox_set_ttl        keep it alive across a conversation
-sandbox_stop / start   park it: disk kept, TTL clock stopped
-sandbox_kill           destroy it and its disk
+sandbox_create → id                 waits until the VM is ready
+sandbox_exec                        a short command (under ~30s)
+sandbox_exec_start → operation      a long one, detached; several at once
+sandbox_exec_status {offset}        its state and a page of output
+sandbox_read_file / write_file      small files (≤1 MiB), over the console
+sandbox_upload / download → URL     archives: curl the one-time URL
+sandbox_stop / start                pause between steps; /workspace is kept
+sandbox_kill                        delete it and its disk
 ```
 
-### The 1 MB body, and the way around it
+**Long work goes through operations.** `sandbox_exec` holds the VM's only
+console until the command ends, and the call is bounded by this server's own
+timeout (`HEYO_MCP_TIMEOUT_MS`, 30s). `sandbox_exec_start` returns at once; the
+command runs in its own session with its output in `/workspace/.heyo/ops/<id>`,
+and while it runs the sandbox is not stopped for idleness.
 
-Cloud's JSON API caps a request body at 1 MB, and file writes cross it base64,
-so ~768 KB of payload is already `413 Request Entity Too Large` — 512 KB
-succeeds, measured against the live API. MCP inherits that limit because it is
-the same API underneath; a photograph from a phone routinely exceeds it.
+**Big files never cross the console.** `sandbox_upload` returns a single-use
+URL: `curl -T repo.tar.gz '<url>'` from wherever the file is, and the guest
+fetches it, checks its sha256, and unpacks it at `path`. `sandbox_download`
+does the reverse — a file, or a directory as a tar.gz. The URL is the
+credential: keep it out of logs.
 
-The archive route is not subject to it, because the bytes never enter a JSON
-body:
-
-```
-sandbox_upload_url        → { archive_id, upload_url }
-PUT the tar.gz to upload_url   ← Content-Type: application/gzip, NO Authorization
-sandbox_finalize_upload   → the archive is now usable
-sandbox_create { archive_id }  or  sandbox_attach_archive { id, archive_id }
-```
-
-The presigned URL belongs to the object store, so its ceiling is the store's,
-not the API's — hundreds of megabytes, which is the case it exists for. The
-signature is the credential; sending a bearer alongside it is what makes some
-stores refuse. `sandbox_attach_archive` is what makes this usable
-mid-conversation: it mounts an archive onto a sandbox that is already running,
-so a large file reaches an existing sandbox without booting a new one to carry
-it.
-
-`sandbox_write_file` refuses more than 512 KiB rather than spending a round trip
-to be told 413, and the refusal names this route.
-
-### 503 is capacity, not a fault
-
-`ApiError(503): No available backend in region US supports libvirt` means no
-host in that region runs that driver with room to spare. Retrying immediately
-fails identically; retrying with backoff does not. So `sandbox_create` retries
-exactly that status — three attempts by default, doubling from 2s, `retries: 0`
-to disable — and retries nothing else, because a rejected spec only gets
-rejected again. Naming a driver the region actually runs (`firecracker`) or the
-other region often succeeds where the default did not.
-
-`heyo_capacity` is the pre-flight, and is honest about its reach: it lists the
-daemons *this key* has registered, online or not, plus every sandbox already
-running. Cloud publishes no per-region or per-driver free capacity, so for
-heyo-hosted regions a 503 on create remains the first signal.
-
-## Managed mode
-
-Heyo runs one app-lb as a platform service. Customers do not reach its admin
-listener; they reach it through heyo cloud, per namespace, at
-`/namespaces/{ns}/lb/…`, with their ordinary `heyo_api_*` key. Cloud pins every
-request to that namespace and app-lb resolves the key into a grant, so the
-same admin API answers, walled to what the key may see.
-
-This server needs no code for that — only a different base:
-
-```bash
-APPLB_URL=https://server.heyo.computer \
-APPLB_NAMESPACE=team-a \
-APPLB_TOKEN=heyo_api_… \
-node dist/index.js
-```
-
-`APPLB_NAMESPACE` turns the base into `${APPLB_URL}/namespaces/team-a/lb`;
-every tool then appends its path as before. (Spelling the full
-`…/namespaces/team-a/lb` URL out in `APPLB_URL` works too and is not rewritten
-again.) A namespace is created once, with `POST /namespaces` on cloud or the
-SDK's `Namespaces.create`, and deployments registered through this door land
-in it whether or not the spec says so.
-
-What the door exposes: `applb_list_deployments`, `applb_get_deployment`,
-`applb_deploy`, `applb_create_deployment`, `applb_update_deployment`,
-`applb_scale`, `applb_build`, `applb_pull`, `applb_pull_mounts`,
-`applb_host_update`, `applb_job`, `applb_deployment_jobs`,
-`applb_delete_deployment`, `applb_spec_schema`,
-`applb_evict_vm`, `applb_exec`, `applb_metrics` and `applb_security_events`. The fleet-wide operator
-tools — `applb_disks`, `applb_certs`, `applb_purge_disk`,
-`applb_purge_orphan_disks`, `applb_sweep_disks` — answer `404 route not exposed
-through the namespace proxy`, and `applb_request` is bounded by the same list.
-VMs a managed deployment boots are billed to the namespace's account like any
-other sandbox.
-
-A hosted instance can serve many tenants from one process: leave `APPLB_TOKEN`
-and `APPLB_BASIC` unset and, in HTTP mode, each request's own `Authorization`
-header goes upstream instead, so every caller acts under their own key and
-therefore their own namespaces. A configured token otherwise wins over a
-caller's header — an instance deployed to act as itself must not be talked into
-acting as someone else.
-
-**Behind an app-token gate, the instance's own MCP path has to be public.** A
-gate checks a token against the deployment *it* belongs to before anything
-behind it runs, and a hosted instance usually lives in `default` — so a token
-confined to any other namespace is refused at the door with a 403, however well
-it is scoped for everything else. Give the path
-`{"path": "/mcp", "scope": "public"}` and set `HEYO_MCP_REQUIRE_IDENTITY=0`.
-That is safe only because the instance holds no credential: an anonymous
-request reaches a server with nothing to act with, and every call it makes
-carries the caller's own token to be judged where it lands. Over HTTP,
-`art_publish` takes `content_base64` only. `deploy/vm.md` has the reasoning.
-
-**One credential overrides that, and must: a token app-lb minted itself.** A
-caller presenting `Authorization: Bearer applb_…` reaches app-lb with *that*
-token, whether or not this process has one of its own. An app-token carries a
-scope — an `admin` level and a `deployments` list — which app-lb enforces per
-route, so substituting the operator's fleet-wide `APPLB_TOKEN` for it would
-hand a token scoped to one deployment the reach of a credential scoped to all
-of them. The gate in front authenticated a narrow principal; acting for it with
-broad authority is a confused deputy, and this is the shape that closes it.
-
-The rule keys on the `applb_` prefix, so nothing else changes: a `heyo_api_*`
-key or a JWT means nothing to app-lb's admin API and still falls to the
-configured credential, leaving managed mode and JWT-gated deployments exactly
-as they were. Nor is preferring the caller's token an escalation the other way
-— it is a credential they already hold, and app-lb re-checks its scope whoever
-relayed it.
-
-**app-obs and ci follow the same rule when app-lb is what gates them.** Reached
-directly on loopback they authenticate themselves: `APP_OBS_API_TOKEN` and
-`CI_TOKEN` are their *own* service tokens, an `applb_…` bearer means nothing to
-either, and forwarding one would 401 every obs and ci tool on a deployment that
-was working. Reached at a hostname behind an app-lb gate the credential *is* an
-app-lb token, and then the caller's must win — a caller whose scope omits
-`app-obs` must not read app-obs on this process's ticket.
-
-What separates the two is the shape of what is configured, so there is no new
-switch: nothing at all, or another `applb_…`, both mean the gate authenticates
-and the caller's token is used; a service's own token means it does not, and is
-left alone. Configure neither and the process holds no credential for any of
-the four services — every call runs as whoever asked. That is the shape
-`deploy/vm.md` deploys.
-
-**A namespace-confined caller reads app-obs through app-lb's obs plugin, never
-directly.** app-obs's own `APP_OBS_API_TOKEN` reads every namespace, so it is
-the operator's alone. The telemetry tools (`namespace_telemetry`,
-`deployment_logs`, `diagnose_deployment`, `obs_request`) therefore decide a
-route per credential (`src/telemetry.ts`):
-
-1. a `namespace` argument, or the managed door's namespace, or a `/whoami`
-   that says `confined` → `GET /namespaces/{ns}/plugins/obs/api/…` on app-lb,
-   carrying the caller's own credential. app-lb checks reach and pins the
-   namespace before it calls app-obs; the service token never leaves app-lb.
-2. a `/whoami` that says unconfined (the operator, a fleet token) → app-obs
-   directly at `APP_OBS_URL`, as before; `deployment_logs` still checks the
-   deployment against app-lb first.
-
-`fleet_overview` is fleet-wide and refuses a confined caller, pointing it at
-`namespace_telemetry`. Because the plugin route needs only app-lb, a hosted
-instance with no `APP_OBS_URL` still lists the telemetry tools.
-
-Nothing is collected for a namespace until a namespace admin installs the
-plugin there — `heyctl plugins install obs -n <ns>`, or
-`PUT /namespaces/<ns>/plugins/obs` — and the tools answer a 409
-`plugin_not_installed` with exactly that instruction. Through cloud's managed
-door the plugin paths must also be on cloud's route allowlist
-(`lb_route_allowed` in the cloud service): `GET namespaces/{ns}/plugins`,
-`GET namespaces/{ns}/plugins/obs/api/{fleet,deployments/…,alerts}` and, for
-alert edits, `POST`/`DELETE …/plugins/obs/api/alerts[/{id}]` and
-`PUT`/`DELETE namespaces/{ns}/plugins/obs`, with `{ns}` equal to the door's own
-namespace. Until it is, those calls answer `404 route not exposed through the
-namespace proxy`.
-
-Cloud is outside this, and outside the borrow-when-empty rule too. An
-`applb_…` token is not a cloud credential — cloud has never heard of it — so it
-is never substituted for one. That leaves two honest configurations and no
-third:
-
-- **`HEYO_API_KEY` set.** The sandbox tools work, and every caller an app-token
-  gate admits shares that one cloud account. There is no per-user cloud
-  counterpart to switch to, so **treat sandbox reach as shared** and mint tokens
-  with the `deployments` scope the caller should actually have.
-- **`HEYO_API_KEY` unset.** Cloud stays unconfigured and `buildTools` lists no
-  sandbox tools at all. This is the fleet-operations shape — app-lb, app-obs, ci
-  and the feed, and nothing that needs a credential the gate cannot supply. See
-  `deploy/vm.md`.
-
-The gate is on the credential rather than a switch, so a hosted instance
-carrying no key of its own still hands the sandbox tools to a caller who
-presents a `heyo_api_*` key, per request. That is what keeps managed mode
-multi-tenant.
-
-And know what `admin` buys, because it is coarser than it sounds. `none` passes
-the gate and reaches no admin route; `view` covers `/metrics`, `/disks`,
-`/feeds`, `/security`, `/ingress` and `/storage` — which is `applb_metrics`,
-`applb_security_events`, `applb_disks` and the feed tools, and nothing else;
-`admin` is everything.
-There is **no read-only tier for deployment routes**: `GET /deployments` and
-`GET /deployments/:id` are CRUD-tier, because a spec's env vars can hold
-secrets, so `applb_list_deployments`, `applb_get_deployment` and
-`applb_deployment_jobs` all require `admin` — the same scope that deletes a
-deployment and execs in its VMs. A token that can read one can delete it. For a
-caller who needs deployment reads, the `deployments` list and `namespace` are
-the only narrowing that exists.
+**Only `/workspace` survives a stop.** The rest of the filesystem is the image
+again on start.
 
 ## Running it
 
@@ -580,7 +401,7 @@ Cross-service, shaped like the question rather than the endpoint.
 
 | Tool | | Does |
 | --- | --- | --- |
-| `heyo_status` | read-only | Which of heyo cloud, app-lb, app-obs and ci this server can reach, whether your namespace's artifacts on app-lb are available, and what each says about itself. |
+| `heyo_status` | read-only | Which of app-lb, app-obs and ci this server can reach, whether your namespace's artifacts on app-lb are available, and what each says about itself. |
 | `heyo_whoami` | read-only | What this server's credential is and what it may do: admin scope, namespace, deployment scope and expiry. |
 | `diagnose_deployment` | read-only | Everything about one deployment at once: app-lb's record and its VM pool, app-obs's bucketed series, and the most recent error-level logs. |
 | `deployment_logs` | read-only | Log lines for one deployment, newest first, with the filters app-obs supports: time window or explicit from/to, level, backend, a substring query, and a cursor for paging. |
@@ -628,8 +449,6 @@ Reads over app-lb's topology, plus the operations that move VMs and disks.
 | `applb_purge_orphan_disks` | **destructive** | Deletes every disk app-lb considers orphaned, in one call. |
 | `applb_sweep_disks` | **destructive** | Runs the disk expiry sweep now instead of waiting for the next tick, deleting every disk past its TTL. |
 | `applb_exec` | **destructive** | Runs a command inside a deployment's guest and returns its output. |
-| `applb_read_file` |  | Reads up to 96 KiB of a guest file from `offset`, with its size and `next_offset` to page the rest; base64 for binary. |
-| `applb_write_file` | **destructive** | Writes up to 96 KiB to a guest file (replace, or `append` for the next piece); base64 for binary. |
 
 ### The event feed
 
@@ -642,25 +461,27 @@ app-lb's per-namespace RSS, as data.
 
 ### Sandboxes
 
-heyo cloud. Listed only when a usable cloud API key is configured.
+VMs to run code in, on app-lb: create, exec (or start detached and poll), files, one-time upload/download URLs, stop/start, kill.
 
 | Tool | | Does |
 | --- | --- | --- |
-| `sandbox_create` |  | Boot a sandbox (a microVM) and return it once it is running. |
-| `sandbox_list` |  | Every sandbox this key can see, with status, image, uptime and bound URLs. |
-| `sandbox_info` |  | One sandbox by id: status, region, size, TTL and bound URLs. |
-| `sandbox_exec` |  | Run a command in the sandbox with `sh -c` and return stdout, stderr and exit_code. |
-| `sandbox_read_file` |  | Read a file from the sandbox. |
-| `sandbox_write_file` |  | Write a file into the sandbox. |
-| `sandbox_upload_url` |  | Reserve an archive and return a presigned URL to PUT its bytes to. |
-| `sandbox_finalize_upload` |  | Close out an upload started by sandbox_upload_url: the archive is only usable once finalized. |
-| `sandbox_attach_archive` |  | Mount a finalized archive onto a sandbox that is already running, replacing what is at `sandbox_path`. |
-| `sandbox_set_ttl` |  | Reset how long the sandbox may run unattended, from now. |
-| `sandbox_stop` |  | Stop the sandbox without destroying it. |
-| `sandbox_start` |  | Start a stopped sandbox again, with its disk as it was left. |
-| `sandbox_restart` |  | Reboot the sandbox. |
-| `sandbox_kill` | **destructive** | Permanently deletes the sandbox and its disk. |
-| `heyo_capacity` | read-only | What can be told about capacity *before* booting something. |
+| `sandbox_create` |  | Create a sandbox: a Firecracker VM from a hub image (default heyo/debian:latest) with a /workspace disk that survives sandbox_stop. |
+| `sandbox_exec` | **destructive** | Run a short command (under ~30s) in the sandbox and return its output. |
+| `sandbox_exec_start` | **destructive** | Start a command detached in the sandbox and return at once with an operation id. |
+| `sandbox_exec_status` | read-only | An operation's state (running, succeeded, failed, cancelled, timed_out, lost), exit code, and a page of its output from offset (next_offset continues it; tail for the end). |
+| `sandbox_read_file` | read-only | Read up to 256 KiB of a file in the sandbox from offset; next_offset continues it. |
+| `sandbox_write_file` | **destructive** | Write up to 1 MiB to a file in the sandbox (replace, or append); parent directories are created. |
+| `sandbox_upload` |  | Get a one-time URL to upload a file or archive into the sandbox: curl -T it there (no credential needed) and the guest places it at path, unpacking tar/tar.gz into it. |
+| `sandbox_download` |  | Get a one-time URL to download a file, or a directory as a tar.gz, from the sandbox. |
+| `sandbox_stop` |  | Pause the sandbox: its VM stops and /workspace is kept for sandbox_start. |
+| `sandbox_start` |  | Resume a stopped sandbox with its /workspace, and wait for it. |
+| `sandbox_kill` | **destructive** | Delete the sandbox, its VM and its /workspace disk. |
+| `sandbox_list` | read-only | Your sandboxes (deployments with no route), with their pool state. |
+| `sandbox_info` | read-only | One sandbox: its spec, VMs and state. |
+| `sandbox_exec_cancel` |  | Cancel an operation: SIGTERM to its process group, SIGKILL 10s later. |
+| `sandbox_transfer_status` | read-only | One upload or download: its state, size, sha256 and any error. |
+| `sandbox_restart` |  | Restart the sandbox keeping /workspace, or with fresh: true boot a new VM with an empty disk. |
+| `heyo_capacity` | read-only | What the host has left (CPU, memory, disk) and your sandboxes' VMs. |
 
 ### Git repos
 
@@ -708,12 +529,11 @@ Everything without a dedicated tool. Prefer a named tool when one exists — a r
 
 | Tool | | Does |
 | --- | --- | --- |
-| `heyo_request` |  | Raw HTTP against heyo cloud, for endpoints without a dedicated tool above. |
 | `applb_request` |  | Raw HTTP against app-lb, for endpoints without a dedicated tool above. |
 | `obs_request` |  | Raw HTTP against app-obs, for endpoints without a dedicated tool above. |
 | `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
 
-_77 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+_76 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
 
 <!-- END GENERATED CATALOGUE -->
 
@@ -725,13 +545,13 @@ be listed here, and named eight when there were eleven.
 
 Folding them into a generic request tool would hide a `DELETE` inside a
 parameter, where it is invisible in a transcript and in an approval prompt. The
-same reasoning names `sandbox_kill` rather than leaving it to `heyo_request`.
+same reasoning names `sandbox_kill` rather than leaving it to `applb_request`.
 
 The prose is the part that matters: the SDK is explicit that clients should
 never make tool-use decisions from annotations, so the sentence the model reads
 carries the warning and `destructiveHint` is derived from it.
 
-The raw `heyo_request` / `applb_request` / `obs_request` / `ci_request`
+The raw `applb_request` / `obs_request` / `ci_request`
 tools reach the rest of each API, including destructive methods. Prefer a named tool when one exists —
 the raw one's intent cannot be read without reading its arguments.
 

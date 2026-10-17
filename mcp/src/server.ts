@@ -14,7 +14,7 @@ import {
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { z } from "zod";
 
-import { cloudUsable, type Config } from "./config.js";
+import type { Config } from "./config.js";
 import { makeClients } from "./clients/index.js";
 import { registerResources } from "./resources.js";
 import { diagnosticTools, type Tool } from "./tools/diagnose.js";
@@ -29,33 +29,11 @@ import { explainFailure, guideTool } from "./tools/guide.js";
 /**
  * The tools this configuration can actually serve.
  *
- * Every group but one is unconditional: an unreachable app-lb, app-obs or ci
- * still gets its tools listed, because `bind` turns the absence into a
+ * Every group is unconditional: an unreachable app-lb, app-obs or ci still
+ * gets its tools listed, because `bind` turns the absence into a
  * `NotConfigured` error naming the variable to set, and that is a better answer
- * than a tool that silently does not exist.
- *
- * The sandbox tools are the exception, and the reason is that their absence is
- * a *deployment shape* rather than a misconfiguration. An instance behind an
- * app-token gate has no cloud credential to act with and no way to get one — the
- * gate admits `applb_…` tokens, which cloud cannot consume — so listing the
- * sandbox tools there advertises capability the caller can never reach. A
- * fleet-operations instance is a complete thing, not a broken one.
- *
- * (The count is asserted in `listing.test.ts` rather than named here. It used
- * to say "sixteen" and the real number was fifteen — a number in a comment is
- * a mirror, and mirrors drift.)
- *
- * Gated on {@link cloudUsable} rather than on a switch of its own, because that
- * is exactly the condition: `makeClients` treats an unusable cloud as absent for
- * the same reason, and the two must use the same predicate or the tools are
- * listed by one and refused by the other. "Usable" means present *and* not an
- * `applb_…` token — a credential cloud cannot accept is not a credential. And because {@link withForwardedAuth} may supply it
- * per-request, this stays correct for a hosted instance carrying no key of its
- * own — a caller presenting a `heyo_api_*` key gets the sandbox tools, and one
- * presenting an app-lb token does not.
- *
- * `heyo_status` still reports cloud either way, so "this server has no sandbox
- * tools" remains an answerable question rather than a silent gap.
+ * than a tool that silently does not exist. The sandbox tools are app-lb's
+ * like the rest, so the credential that deploys is the one that runs a sandbox.
  */
 export function buildTools(config: Config): Tool[] {
   const clients = makeClients(config);
@@ -63,7 +41,7 @@ export function buildTools(config: Config): Tool[] {
   const all = [
     guideTool(config),
     ...diagnosticTools(clients, config),
-    ...(cloudUsable(config) ? sandboxTools(clients) : []),
+    ...sandboxTools(clients, config, actions.find((t) => t.name === "applb_deploy")),
     ...feedTools(clients),
     ...actions,
     ...artifactTools(clients, config),
@@ -117,6 +95,17 @@ export const WORKFLOW_FIRST = [
   "heyo_guide",
   "heyo_status",
   "heyo_whoami",
+  "sandbox_create",
+  "sandbox_exec",
+  "sandbox_exec_start",
+  "sandbox_exec_status",
+  "sandbox_read_file",
+  "sandbox_write_file",
+  "sandbox_upload",
+  "sandbox_download",
+  "sandbox_stop",
+  "sandbox_start",
+  "sandbox_kill",
   "repo_create",
   "repo_write_files",
   "repo_deploy",
@@ -165,11 +154,13 @@ export function withHint(tool: string, text: string): string {
  * Sent to the client at `initialize`; most hosts put it in front of the model.
  * Short on purpose: the common paths, and where the details live.
  */
-export const INSTRUCTIONS = `Heyo: deploy apps to app-lb from git repos or published artifacts.
+export const INSTRUCTIONS = `Heyo: sandboxes for agents, and deploying apps to app-lb from git repos or published artifacts.
 
 Not sure how? Call heyo_guide with your goal (or an error message) for a step-by-step plan.
 
 Your token confines you to one namespace; repo_* tools and applb_deploy use it when you leave \`namespace\` out. Artifact tags you publish must start with "<namespace>/".
+
+Sandbox (a VM to run code in): sandbox_create, then sandbox_exec for short commands (under ~30s) or sandbox_exec_start + sandbox_exec_status for long ones (they run detached; several can run at once). Files: sandbox_read_file/sandbox_write_file for small ones (≤1 MiB), sandbox_upload/sandbox_download for archives (they hand back a one-time URL to curl). Keep work under /workspace: it survives sandbox_stop/sandbox_start; the rest of the disk does not. sandbox_kill deletes it.
 
 Static site (HTML/JS/CSS, already built):
   1. repo_create  2. repo_write_files with the BUILT files  3. repo_deploy with kind "site" and a host.
@@ -298,6 +289,11 @@ const READ_ONLY = new Set([
   "heyo_status",
   "heyo_whoami",
   "heyo_capacity",
+  "sandbox_list",
+  "sandbox_info",
+  "sandbox_exec_status",
+  "sandbox_read_file",
+  "sandbox_transfer_status",
   "fleet_overview",
   "diagnose_deployment",
   "diagnose_empty_pool",

@@ -37,6 +37,23 @@ const DAEMONIZE =
 
 export const GUIDES: readonly Guide[] = [
   {
+    id: "run-code-in-a-sandbox",
+    title: "Run code in a sandbox VM (an agent's workspace)",
+    keywords: ["sandbox", "vm", "run", "exec", "code", "agent", "workspace", "test", "session", "upload", "download", "pause"],
+    steps: [
+      "sandbox_create {name?, image?, disk_size_gb?} — a Firecracker VM from a hub image (default heyo/debian:latest) with a /workspace disk. It waits until the VM is ready.",
+      "Get code in: sandbox_upload {id, path: \"/workspace/app\"} returns a one-time URL; `curl -T repo.tar.gz '<url>'` and it is unpacked there. Small files: sandbox_write_file.",
+      "Short commands: sandbox_exec {id, command: \"cd /workspace/app && npm ci\"}. Anything over ~30s: sandbox_exec_start, then sandbox_exec_status {id, operation, offset} until it finishes; several can run at once.",
+      "Get results out: sandbox_read_file for small files, sandbox_download {id, path} for a file or a directory (as tar.gz), then curl the URL.",
+      "Between steps: sandbox_stop keeps /workspace and frees the VM; sandbox_start brings it back. Done: sandbox_kill.",
+    ],
+    pitfalls: [
+      "Only /workspace survives sandbox_stop; the rest of the filesystem is the image again on start.",
+      "Each sandbox_exec starts in / with a fresh shell: cd in the same command, and pass variables in env.",
+      "A sandbox stops itself after idle_secs (default 600) with nothing running; an operation started with sandbox_exec_start keeps it up while it runs.",
+    ],
+  },
+  {
     id: "deploy-static-site",
     title: "Deploy a static site from files you have",
     keywords: ["static", "site", "html", "css", "frontend", "spa", "react", "vite", "dist", "build", "website", "page"],

@@ -47,8 +47,8 @@ function everyTool() {
   return toolListing(
     buildTools(
       loadConfig({
-        HEYO_API_KEY: "heyo_api_x",
-        APPLB_TOKEN: "heyo_api_lb",
+        APPLB_URL: "http://127.0.0.1:9090",
+        APPLB_TOKEN: "applb_1_x",
         APP_OBS_URL: "http://app-obs",
         CI_URL: "http://ci",
       }),
@@ -113,7 +113,7 @@ const GROUPS = [
   },
   {
     title: "Sandboxes",
-    blurb: "heyo cloud. Listed only when a usable cloud API key is configured.",
+    blurb: "VMs to run code in, on app-lb: create, exec (or start detached and poll), files, one-time upload/download URLs, stop/start, kill.",
     match: (n) => n.startsWith("sandbox_") || n === "heyo_capacity",
   },
   {

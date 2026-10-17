@@ -198,9 +198,9 @@ export function noVmFinding(error: string, pool?: BackoffState): Finding | undef
  * health check to get there — out of whatever `/metrics` returned.
  *
  * The caller passes the `/metrics` it read with its own credential, which
- * app-lb narrows to the deployments that credential may view (and the
- * managed door pins to its namespace), so this never names a deployment the
- * caller could not already see. It deliberately takes no wider view.
+ * app-lb narrows to the deployments that credential may view, so this never
+ * names a deployment the caller could not already see. It deliberately takes
+ * no wider view.
  */
 export function healthyPeers(metrics: unknown, exceptId: string): string[] {
   const deps = (metrics as { deployments?: Array<Record<string, unknown>> } | undefined)?.deployments ?? [];

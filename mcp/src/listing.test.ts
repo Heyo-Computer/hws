@@ -24,12 +24,9 @@ import { loadConfig } from "./config.js";
 import { buildTools, toolListing } from "./server.js";
 import type { Tool } from "./tools/diagnose.js";
 
-/** The full surface: cloud configured, so the sandbox tools are listed too. */
+/** The full surface over stdio: app-lb configured, every tool listed. */
 const everything = (): Tool[] =>
-  buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" }));
-
-/** The fleet-operations shape: no cloud credential, so no sandbox tools. */
-const fleetOnly = (): Tool[] => buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:9090" }));
+  buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:9090", APPLB_TOKEN: "applb_1_x" }));
 
 /**
  * Every prefix a tool name may carry, and the two that carry none.
@@ -66,24 +63,14 @@ test("tool names are unique", () => {
   assert.deepEqual(duplicated, [], "a duplicate name shadows a tool in the byName map");
 });
 
-test("the sandbox tools are gated on a cloud credential", () => {
-  const withCloud = toolListing(everything()).map((t) => t.name);
-  const without = toolListing(fleetOnly()).map((t) => t.name);
-
-  // Asserted rather than named in a comment. The doc comment on `buildTools`
-  // used to say "sixteen" when the real number was fifteen.
-  const gated = withCloud.filter((n) => !without.includes(n));
-  assert.equal(gated.length, 16, `expected 16 gated tools, got ${gated.length}: ${gated.join(", ")}`);
-  assert.ok(gated.includes("sandbox_create"));
-  assert.ok(
-    gated.includes("heyo_capacity"),
-    "heyo_capacity hits cloud despite its name and must be gated with the sandbox tools",
-  );
-  assert.ok(
-    gated.includes("heyo_request"),
-    "heyo_request targets cloud and must be gated with the tools that share its credential",
-  );
-  assert.ok(without.includes("applb_list_deployments"), "app-lb tools survive without cloud");
+test("the sandbox tools need nothing but app-lb, and none of them is the cloud's", () => {
+  const names = toolListing(everything()).map((t) => t.name);
+  assert.ok(names.includes("sandbox_create"));
+  assert.ok(names.includes("heyo_capacity"));
+  assert.ok(!names.includes("heyo_request"), "nothing reaches the Heyo cloud API");
+  for (const gone of ["sandbox_set_ttl", "sandbox_upload_url", "sandbox_finalize_upload", "sandbox_attach_archive"]) {
+    assert.ok(!names.includes(gone), `${gone} was a cloud-only concept`);
+  }
 });
 
 // The destructive set moved to `annotations.test.ts`, which names it rather than
@@ -118,7 +105,14 @@ test("a tool that advertises its own schema still agrees with the one that valid
 });
 
 test("the listing stays within its size budget", () => {
-  // Measured 2026-10-17 (latest): 69,505 bytes across 77 tools, up from 68,211
+  // Measured 2026-10-17 (latest): 63,992 bytes across 76 tools, down from
+  // 69,505 across 77. The sandbox tools moved from the Heyo cloud to app-lb:
+  // the cloud-only tools (heyo_request, sandbox_set_ttl and the three archive
+  // tools) and their 1 MB-body and capacity prose went, applb_read_file and
+  // applb_write_file folded into sandbox_read_file/write_file, and the
+  // operations, upload/download, stop/start and transfer tools came in short.
+  //
+  // Earlier, 2026-10-17: 69,505 bytes across 77 tools, up from 68,211
   // across 75. The +1,294 is `applb_read_file` and `applb_write_file`, the only
   // way to move a file in or out of a deployment's guest without a cloud key
   // (a customer's agent had no way to get an artifact out past applb_exec's
@@ -168,7 +162,7 @@ test("the listing stays within its size budget", () => {
   // NOT enough to bring the nested spec tree back: applb_deploy advertises
   // top-level fields only (measured 65,628 bytes after that cut, from 76,926),
   // and applb_spec_schema serves any block on demand.
-  const BUDGET = 70_300;
+  const BUDGET = 65_000;
   const bytes = JSON.stringify(toolListing(everything())).length;
   assert.ok(
     bytes <= BUDGET,

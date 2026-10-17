@@ -214,38 +214,3 @@ test("applb_exec drops the interleaved copy when only one stream has output", as
     stub.restore();
   }
 });
-
-test("applb_read_file pages a guest file and reports where the next page starts", async () => {
-  const stub = stubFetch({ sandbox_id: "sb-1", exit_code: 0, stdout: "11\nhello", stderr: "", output: "" });
-  try {
-    const out = JSON.parse(await tool("applb_read_file").handler({ id: "web", path: "/workspace/a.txt", length: 5 }));
-    assert.equal(out.size, 11);
-    assert.equal(out.content, "hello");
-    assert.equal(out.next_offset, 5);
-    const command = (stub.calls[0]?.body as { command: string }).command;
-    assert.match(command, /tail -c \+1 '\/workspace\/a.txt' \| head -c 5/);
-    await assert.rejects(tool("applb_read_file").handler({ id: "web", path: "/a'b" }));
-  } finally {
-    stub.restore();
-  }
-});
-
-test("applb_write_file sends the bytes base64'd and refuses more than one call carries", async () => {
-  const stub = stubFetch({ sandbox_id: "sb-1", exit_code: 0, stdout: "5\n", stderr: "", output: "" });
-  try {
-    const out = JSON.parse(
-      await tool("applb_write_file").handler({ id: "web", path: "/workspace/d/a.txt", content: "hello", append: true }),
-    );
-    assert.equal(out.wrote, 5);
-    const command = (stub.calls[0]?.body as { command: string }).command;
-    assert.ok(command.includes(Buffer.from("hello").toString("base64")), command);
-    assert.match(command, /mkdir -p '\/workspace\/d'/);
-    assert.match(command, />> '\/workspace\/d\/a.txt'/);
-    await assert.rejects(
-      tool("applb_write_file").handler({ id: "web", path: "/a", content: "x".repeat(200 * 1024) }),
-      /at most/,
-    );
-  } finally {
-    stub.restore();
-  }
-});

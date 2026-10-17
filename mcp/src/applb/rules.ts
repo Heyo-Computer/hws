@@ -97,8 +97,8 @@ export const SPEC_RULES: readonly SpecRule[] = [
     blocks: ["WorkspaceSpec", "VmSpec"],
     rule:
       "`vm.workspace` and `vm.workspace_archive` are mutually exclusive — both own " +
-      "`/workspace`. `workspace_archive` is filled in by cloud; a hand-written one with " +
-      "only `archive_id` is refused (UnresolvedWorkspaceArchive).",
+      "`/workspace`. `workspace_archive` needs the Heyo cloud to resolve its archive, which " +
+      "this server does not use: create the deployment, then sandbox_upload the archive.",
   },
   {
     blocks: ["IngressSpec", "VmSpec"],
@@ -270,6 +270,12 @@ export function checkSpec(spec: unknown, opts: CheckOptions = {}): string[] {
   if (vm) {
     if (vm.workspace !== undefined && vm.workspace_archive !== undefined) {
       problems.push("`vm.workspace` and `vm.workspace_archive` both own /workspace; set one.");
+    }
+    const archive = vm.workspace_archive as Record<string, unknown> | undefined;
+    if (archive && typeof archive === "object" && !archive.s3_key) {
+      problems.push(
+        "`vm.workspace_archive` needs the Heyo cloud to resolve; use sandbox_upload after create.",
+      );
     }
     if (vm.workspace !== undefined) {
       const scaling = (s.scaling ?? {}) as Record<string, unknown>;

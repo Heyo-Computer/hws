@@ -36,15 +36,13 @@ import { json, report } from "../format.js";
 import type { Tool } from "./diagnose.js";
 
 /**
- * Reached through cloud's managed door, `/feeds` is outside the route set that
- * door exposes; a 404 there is the door, not a missing feed. Said once, here.
+ * Where else a feed can be read, said once here: outside the admin API, a feed
+ * is served only where a deployment's spec carries `feed.expose`.
  */
 const MANAGED_DOOR_NOTE =
-  "If this answers 404 through the managed service, that is cloud's namespace " +
-  "door — it exposes the deployment routes, not the fleet-wide ones. A feed is " +
-  "reachable from outside the admin listener only where a deployment's spec " +
-  "carries `feed.expose`, which serves it on that deployment's own routes " +
-  "behind that deployment's own auth gate.";
+  "A feed is reachable from outside the admin API only where a deployment's spec " +
+  "carries `feed.expose`, which serves it on that deployment's own routes behind " +
+  "that deployment's own auth gate.";
 
 interface FeedEvent {
   id?: number;

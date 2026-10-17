@@ -1,23 +1,18 @@
 /**
- * The configuration that is present, well-formed, and cannot work.
+ * Configuration left over from when this server called the Heyo cloud.
  *
- * A customer was handed a namespace-scoped app-lb token and put it in
- * `HEYO_API_KEY`. Everything they tried answered
- * `heyo cloud 401 on /namespaces: {"error":"Unauthorized"}` — a cloud path, for
- * questions they had asked app-lb, with no indication that the variable was the
- * problem. The server could already tell: `isApplbToken` existed and was applied
- * only to credentials arriving from callers, never to the one it was configured
- * with, on a transport (stdio) where that check never ran at all.
- *
- * These tests pin the whole path: what is detected, who is told, what is *not*
- * advertised, and what is no longer attempted over the network.
+ * `HEYO_API_KEY` used to be the whole configuration: it reached cloud for
+ * sandboxes and app-lb through cloud's per-namespace door. Both are gone, and
+ * sandboxes are app-lb's. These tests pin what such a configuration now gets:
+ * a fault that says what to set instead, app-lb tools that name `APPLB_URL`,
+ * and not a single request to the cloud host.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { cloudUsable, credentialFaults, faultBanner, loadConfig } from "./config.js";
-import { buildTools, toolListing } from "./server.js";
+import { credentialFaults, faultBanner, loadConfig } from "./config.js";
+import { buildTools } from "./server.js";
 import type { Tool } from "./tools/diagnose.js";
 
 interface Call {
@@ -46,137 +41,54 @@ function tool(tools: Tool[], name: string): Tool {
   return found;
 }
 
-/** Exactly what the customer had: one variable, holding the wrong kind of token. */
-const theirConfig = () => loadConfig({ HEYO_API_KEY: "applb_dep_secret" });
-const goodConfig = () => loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" });
+const legacy = () => loadConfig({ HEYO_API_KEY: "heyo_api_x" });
+const good = () => loadConfig({ APPLB_URL: "https://admin.us5.heyo.work", APPLB_TOKEN: "applb_1_x" });
 
-test("an app-lb token in HEYO_API_KEY is two faults, not a mystery", () => {
-  const faults = credentialFaults(theirConfig());
-  assert.equal(faults.length, 2, "both the cloud key and the door it opens are wrong");
-
-  const [cloud, applb] = faults;
-  assert.equal(cloud?.service, "heyo cloud");
-  assert.equal(applb?.service, "app-lb");
-
-  // Each names the variable and the configuration that works.
-  for (const f of faults) {
-    assert.match(f.detail, /APPLB_TOKEN/, `${f.service} does not say where the token belongs`);
-    assert.match(f.detail, /APPLB_URL/, `${f.service} does not name the working shape`);
-  }
-  assert.match(cloud!.detail, /HEYO_API_KEY/);
-  assert.match(cloud!.detail, /heyo_api_/, "does not say what cloud actually wants");
+test("a leftover HEYO_API_KEY is a fault that says what to set instead", () => {
+  const [fault] = credentialFaults(legacy());
+  assert.equal(fault?.service, "app-lb");
+  assert.match(fault!.detail, /APPLB_URL/);
+  assert.match(fault!.detail, /APPLB_TOKEN/);
+  assert.ok(!fault!.detail.includes("heyo_api_x"), "a fault never prints a credential");
+  assert.match(faultBanner(legacy()), /CREDENTIAL FAULT/);
 });
 
-test("a fault never prints the token it is complaining about", () => {
-  const banner = faultBanner(loadConfig({ HEYO_API_KEY: "applb_dep_HUNTER2SECRET" }));
-  assert.ok(banner.length > 0, "no banner at all");
-  assert.doesNotMatch(banner, /HUNTER2SECRET/, "the secret leaked into a log line");
-  assert.match(banner, /applb_dep_…/, "not recognisable enough to match against the environment");
+test("a working configuration produces no faults and no banner", () => {
+  assert.deepEqual(credentialFaults(good()), []);
+  assert.equal(faultBanner(good()), "");
 });
 
-test("a correct configuration produces no faults and no banner", () => {
-  assert.deepEqual(credentialFaults(goodConfig()), []);
-  assert.equal(faultBanner(goodConfig()), "");
-  assert.equal(cloudUsable(goodConfig()), true);
-  assert.equal(cloudUsable(theirConfig()), false);
-});
-
-test("an unusable cloud key withholds the sandbox tools rather than listing them to fail", () => {
-  const theirs = toolListing(buildTools(theirConfig())).map((t) => t.name);
-  const good = toolListing(buildTools(goodConfig())).map((t) => t.name);
-
-  assert.ok(!theirs.some((n) => n.startsWith("sandbox_")), "sandbox tools listed but unreachable");
-  assert.ok(!theirs.includes("heyo_capacity"), "heyo_capacity hits cloud and must be withheld too");
-  assert.ok(!theirs.includes("heyo_request"), "heyo_request targets cloud and must be withheld too");
-  assert.equal(good.length - theirs.length, 16, "the gated set changed size unexpectedly");
-
-  // The app-lb half of the server is still a complete, useful thing.
-  assert.ok(theirs.includes("applb_list_deployments"));
-  assert.ok(theirs.includes("heyo_status"), "the tool that explains this must always be present");
-});
-
-test("an app-lb call names the variables instead of a cloud path nobody asked about", async () => {
-  const stub = stubFetch(() => ({ status: 401, body: { error: "Unauthorized" } }));
+test("without APPLB_URL every sandbox and app-lb tool names it, and nothing is fetched", async () => {
+  const stub = stubFetch(() => ({}));
   try {
-    const tools = buildTools(theirConfig());
-    await assert.rejects(
-      () => tool(tools, "applb_list_deployments").handler({}),
-      (e: Error) => {
-        assert.match(e.message, /HEYO_API_KEY/, "does not name the variable that is wrong");
-        assert.match(e.message, /APPLB_TOKEN/, "does not name where the token belongs");
-        assert.doesNotMatch(e.message, /401 on \/namespaces/, "still leads with the cloud path");
-        return true;
-      },
-    );
-    // And it never went to the network: the fault is knowable from config alone.
-    assert.equal(stub.calls.length, 0, `sent ${stub.calls.length} requests it already knew would fail`);
-  } finally {
-    stub.restore();
-  }
-});
-
-test("a refused namespace lookup is attempted once, not once per tool call", async () => {
-  // A well-formed cloud key that cloud rejects. No config-level fault applies,
-  // so this exercises the memoization split rather than the pre-flight: nothing
-  // about the next call differs, so nothing should be re-sent.
-  const stub = stubFetch(() => ({ status: 401, body: { error: "Unauthorized" } }));
-  try {
-    const tools = buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_rejected" }));
-    for (const name of ["applb_list_deployments", "applb_metrics", "applb_certs"]) {
-      await assert.rejects(() => tool(tools, name).handler({}));
+    const tools = buildTools(legacy());
+    for (const name of ["sandbox_list", "sandbox_exec", "applb_list_deployments"]) {
+      await assert.rejects(tool(tools, name).handler({ id: "sb", command: "true" }), /APPLB_URL/, name);
     }
-    const lookups = stub.calls.filter((c) => c.url.endsWith("/namespaces"));
-    assert.equal(lookups.length, 1, `re-asked cloud ${lookups.length} times for the same refusal`);
+    assert.deepEqual(stub.calls, [], "no request goes anywhere, least of all the cloud");
   } finally {
     stub.restore();
   }
 });
 
-test("a lookup that found nothing is retried, because a namespace can be created", async () => {
-  // The case the original always-retry rule was written for, and the reason the
-  // split is by permanence rather than by "did it fail".
-  let created = false;
-  const stub = stubFetch((c) =>
-    c.url.endsWith("/namespaces")
-      ? { body: { namespaces: created ? [{ name: "team-a" }] : [] } }
-      : { body: [] },
-  );
+test("heyo_status asks app-lb, never the cloud", async () => {
+  const stub = stubFetch(() => ({ body: { kind: "app", namespace: "team-a" } }));
   try {
-    const tools = buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x" }));
-    await assert.rejects(() => tool(tools, "applb_list_deployments").handler({}), /reaches no app-lb namespace/);
-    created = true;
-    await tool(tools, "applb_list_deployments").handler({});
-    assert.equal(stub.calls.filter((c) => c.url.endsWith("/namespaces")).length, 2);
+    const out = await tool(buildTools(good()), "heyo_status").handler({});
+    assert.match(out, /app-lb \/whoami — the credential is good/);
+    assert.ok(stub.calls.every((c) => c.url.startsWith("https://admin.us5.heyo.work/")), JSON.stringify(stub.calls));
+    assert.ok(stub.calls.some((c) => c.url.endsWith("/whoami")));
   } finally {
     stub.restore();
   }
 });
 
-test("heyo_status leads with the fault and withdraws its own claim", async () => {
-  const stub = stubFetch(() => ({ status: 401, body: { error: "Unauthorized" } }));
+test("heyo_status leads with a leftover-configuration fault", async () => {
+  const stub = stubFetch(() => ({}));
   try {
-    const out = await tool(buildTools(theirConfig()), "heyo_status").handler({});
-
-    assert.match(out, /CREDENTIAL FAULT/, "the cause is not stated");
-    assert.ok(
-      out.indexOf("CREDENTIAL FAULT") < out.indexOf("/me/daemons"),
-      "the fault must come before the probes it explains",
-    );
-    // The bug: a static heading asserting the opposite of the body under it.
-    assert.doesNotMatch(out, /reachable, and the key is good/);
-    assert.match(out, /FAILED\. This is where a bad HEYO_API_KEY shows up/);
-    assert.match(out, /NO usable key/, "the Configured line still calls cloud healthy");
-  } finally {
-    stub.restore();
-  }
-});
-
-test("a working cloud key still gets the affirmative heading", async () => {
-  const stub = stubFetch(() => ({ body: { daemons: [] } }));
-  try {
-    const out = await tool(buildTools(goodConfig()), "heyo_status").handler({});
-    assert.match(out, /reachable, and the key is good/, "the claim is useful when it is true");
-    assert.doesNotMatch(out, /CREDENTIAL FAULT/);
+    const out = await tool(buildTools(legacy()), "heyo_status").handler({});
+    assert.ok(out.indexOf("CREDENTIAL FAULT") < out.indexOf("app-lb /healthz"), out);
+    assert.deepEqual(stub.calls, []);
   } finally {
     stub.restore();
   }

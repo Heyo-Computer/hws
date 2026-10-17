@@ -69,8 +69,7 @@ function confinedNamespace(body: unknown): string | null {
  *
  * 1. A namespace the caller named goes through app-lb. app-lb, not this
  *    server, decides whether they reach it.
- * 2. The managed door already knows its namespace (configured or discovered),
- *    and every caller of it is confined by construction.
+ * 2. A namespace configured with APPLB_NAMESPACE.
  * 3. Otherwise app-lb is asked who this credential is. Confined → app-lb.
  *    Unconfined → app-obs directly when it is configured; with no app-obs
  *    configured there is no fleet-wide door, so the caller has to name a
