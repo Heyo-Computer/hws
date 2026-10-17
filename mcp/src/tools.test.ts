@@ -120,9 +120,10 @@ test("each sandbox tool makes the app-lb request it names", async () => {
     ["sandbox_download", { id: "sb", path: "/workspace/dist" }, "POST", "/deployments/sb/transfers",
       { direction: "out", path: "/workspace/dist", wait_secs: 50 }],
     ["sandbox_transfer_status", { id: "sb", transfer: "tr_1" }, "GET", "/deployments/sb/transfers/tr_1"],
-    ["sandbox_stop", { id: "sb" }, "POST", "/deployments/sb/stop", { wait_secs: 30 }],
+    ["sandbox_stop", { id: "sb" }, "POST", "/deployments/sb/stop", { wait_secs: 30, force: false }],
+    ["sandbox_stop", { id: "sb", force: true }, "POST", "/deployments/sb/stop", { wait_secs: 30, force: true }],
     ["sandbox_start", { id: "sb" }, "POST", "/deployments/sb/start", { wait_secs: 60 }],
-    ["sandbox_restart", { id: "sb", fresh: true }, "POST", "/deployments/sb/restart", { wait_secs: 60, fresh: true }],
+    ["sandbox_restart", { id: "sb", fresh: true }, "POST", "/deployments/sb/restart", { wait_secs: 60, fresh: true, force: false }],
     ["sandbox_kill", { id: "sb" }, "DELETE", "/deployments/sb"],
     ["heyo_capacity", {}, "GET", "/capacity"],
   ];

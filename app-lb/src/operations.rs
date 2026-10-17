@@ -605,6 +605,20 @@ impl Operations {
         offset: u64,
         max_bytes: u64,
     ) -> (Operation, Option<OutputPage>, bool) {
+        // A finished operation's record is final; only its output is read.
+        // Judging it again would rewrite why it ended.
+        if op.state.finished() {
+            let script = page_script(&op.dir, offset, max_bytes.min(MAX_PAGE_BYTES));
+            return match self.exec(&op.sandbox_id, script).await {
+                Ok(out) => {
+                    let page = parse_page(&out.stdout)
+                        .ok()
+                        .map(|(total, bytes)| output_page(offset, total, bytes));
+                    (op.clone(), page, false)
+                }
+                Err(_) => (op.clone(), None, true),
+            };
+        }
         let mut script = status_script(&[&op.dir]);
         script.push_str("; ");
         script.push_str(&page_script(&op.dir, offset, max_bytes.min(MAX_PAGE_BYTES)));
