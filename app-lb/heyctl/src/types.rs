@@ -966,6 +966,9 @@ pub struct JobRecord {
     pub commit: Option<String>,
     pub dockerfile: Option<String>,
     pub image: Option<String>,
+    /// A build's inputs beyond its commit; a build with the same image and key
+    /// reuses the earlier result (and sets `reused`).
+    pub build_key: Option<String>,
     pub rolled_out: bool,
 
     // artifact-pull

@@ -1005,6 +1005,8 @@ export interface JobRecord {
   commit?: string;
   dockerfile?: string;
   image?: string;
+  /** A build's inputs beyond its commit; the same image and key reuse an earlier build (`reused`). */
+  build_key?: string;
   rolled_out?: boolean;
   store?: string;
   artifact?: string;

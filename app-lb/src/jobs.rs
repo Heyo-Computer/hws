@@ -202,6 +202,11 @@ pub struct JobRecord {
     pub dockerfile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// A build's inputs beyond the commit already in `image`: the build spec
+    /// and the guest init app-lb adds. A later build with the same image and
+    /// key reuses this one's result. See [`build_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_key: Option<String>,
     /// Whether `vm.image` was updated and the pool told to roll. Set by both
     /// image sources — it describes the roll-out, not how the image was made.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -322,6 +327,7 @@ impl JobRecord {
             commit: None,
             dockerfile: None,
             image: None,
+            build_key: None,
             rolled_out: false,
             store: None,
             artifact_ref: None,
@@ -475,6 +481,13 @@ fn short(digest: &str) -> String {
 
 fn is_sha256_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What a build depends on beyond its commit (which `image_for` already puts
+/// in the image name): the build spec, and the guest init app-lb adds to a
+/// Dockerfile that has none, which changes when app-lb does.
+fn build_key(spec: &BuildSpec) -> String {
+    fingerprint(&serde_json::json!({ "spec": spec, "guest_init": guest_init::SCRIPT }))
 }
 
 fn fingerprint(value: &impl Serialize) -> String {
@@ -749,6 +762,7 @@ impl Jobs {
         self: &Arc<Self>,
         deployment_id: &str,
         ref_override: Option<String>,
+        force: bool,
     ) -> Result<JobRecord, StartError> {
         let deployment = self.claimable(deployment_id, JobKind::ImageBuild)?;
         let Some(mut spec) = deployment.spec.build.clone() else {
@@ -791,7 +805,7 @@ impl Jobs {
                 }
             }
         }, move |jobs, job_id, deployment_id| async move {
-            jobs.run_build(&job_id, &deployment_id, &spec).await
+            jobs.run_build(&job_id, &deployment_id, &spec, force).await
         })
     }
 
@@ -1245,6 +1259,7 @@ impl Jobs {
         job_id: &str,
         deployment_id: &str,
         spec: &BuildSpec,
+        force: bool,
     ) -> Result<String, String> {
         if let Some(site) = self.registry.get(deployment_id).and_then(|d| d.spec.site.clone()) {
             return self.run_site_build(job_id, deployment_id, spec, &site).await;
@@ -1265,7 +1280,29 @@ impl Jobs {
         };
 
         let image = spec.image_for(deployment_id, &prepared.version);
-        self.update_record(job_id, |r| r.image = Some(image.clone()));
+        let key = build_key(spec);
+        self.update_record(job_id, |r| {
+            r.image = Some(image.clone());
+            r.build_key = Some(key.clone());
+        });
+
+        // The image name carries the commit, so the same name built with the
+        // same key is the same image. Rebuilding it took minutes and then
+        // recycled a pool already running it: a customer editing only
+        // start_command paid a 2.2 GB rebuild and a second VM replacement on
+        // every deploy. `force` is for a base image that moved upstream.
+        if !force && self.built_and_running(job_id, deployment_id, &image, &key) {
+            self.log(
+                job_id,
+                format!(
+                    "{image} is already built from this commit with the same build inputs, and \
+                     the pool runs it: nothing to build or roll out (POST …/build {{\"force\": \
+                     true}} rebuilds anyway)"
+                ),
+            );
+            self.update_record(job_id, |r| r.reused = true);
+            return Ok(image);
+        }
 
         // An application image rarely brings the PID 1 a Firecracker guest
         // boots (`init=/init.sh`); without one every VM panics and the pool
@@ -1345,6 +1382,44 @@ impl Jobs {
         // -- roll out --------------------------------------------------------
         self.roll_out(job_id, deployment_id, &image).await?;
         Ok(image)
+    }
+
+    /// Whether a build of `image` with `key` can be skipped: the deployment
+    /// runs `image`, a build that succeeded made it from the same inputs, and
+    /// the daemon still has it. An image this host cannot vouch for (no
+    /// inventory) is rebuilt.
+    fn built_and_running(&self, job_id: &str, deployment_id: &str, image: &str, key: &str) -> bool {
+        let running = self
+            .registry
+            .get(deployment_id)
+            .and_then(|d| d.spec.vm.as_ref().and_then(|vm| vm.image.clone()))
+            .is_some_and(|current| current == image);
+        if !running {
+            return false;
+        }
+        let history = self.history.lock().expect("job history mutex poisoned");
+        // A rollout operation's build proves its own readiness; never skip one.
+        if history
+            .iter()
+            .any(|r| r.id == job_id && r.operation_id.is_some())
+        {
+            return false;
+        }
+        let built = history.iter().any(|r| {
+            r.deployment == deployment_id
+                && r.kind == JobKind::ImageBuild
+                && r.status == JobStatus::Succeeded
+                && r.image.as_deref() == Some(image)
+                && r.build_key.as_deref() == Some(key)
+        });
+        drop(history);
+        built
+            && self.images.get().is_some_and(|catalog| {
+                catalog
+                    .store()
+                    .get(image)
+                    .is_some_and(|r| r.tier == crate::images::Tier::Local)
+            })
     }
 
     /// Where app-lb keeps the site roots it manages, if anywhere.
@@ -2833,6 +2908,76 @@ mod tests {
         }, registry, autoscaler, secrets, None))
     }
 
+    /// Regression: a deploy that changed only `start_command` rebuilt a 2.2 GB
+    /// image from an unchanged commit and Dockerfile, then recycled the pool a
+    /// second time. The same image built from the same inputs, running and
+    /// still on this host, is reused.
+    #[tokio::test]
+    async fn a_build_with_unchanged_inputs_is_reused_only_while_it_is_running_here() {
+        let dir = scratch("build-reuse");
+        let jobs = jobs_at(&dir);
+        let mut spec = deployment_spec();
+        spec.vm.as_mut().unwrap().image = Some("web-abc123".into());
+        jobs.registry.upsert(spec);
+        let key = build_key(&build_spec());
+        let mut done = JobRecord::new("job-1".into(), "web".into(), JobKind::ImageBuild);
+        done.status = JobStatus::Succeeded;
+        done.image = Some("web-abc123".into());
+        done.build_key = Some(key.clone());
+        jobs.history.lock().unwrap().push_back(done);
+        jobs.history.lock().unwrap().push_back(JobRecord::new(
+            "job-2".into(),
+            "web".into(),
+            JobKind::ImageBuild,
+        ));
+
+        assert!(
+            !jobs.built_and_running("job-2", "web", "web-abc123", &key),
+            "no image inventory: nothing vouches for the image being here"
+        );
+
+        let vms = crate::vm::VmManager::new(
+            Some("http://127.0.0.1:1".into()),
+            None,
+            crate::mounts::MountStore::new(dir.join("mounts"), 0),
+        )
+        .unwrap();
+        let catalog = crate::images::ImageCatalog::new(
+            crate::images::ImagesConfig::default(),
+            crate::images::ImageStore::new(dir.join("images.d")),
+            vms.clone(),
+            jobs.registry.clone(),
+            jobs.secrets.clone(),
+            crate::artifact::Puller::new("art".into(), dir.join("scratch"), None, vms),
+        );
+        catalog.note_built("web-abc123", 1);
+        jobs.set_images(catalog);
+
+        assert!(jobs.built_and_running("job-2", "web", "web-abc123", &key));
+        assert!(!jobs.built_and_running("job-2", "web", "web-abc123", "other-inputs"));
+        assert!(
+            !jobs.built_and_running("job-2", "web", "web-def456", &key),
+            "a new commit builds"
+        );
+
+        let mut spec = deployment_spec();
+        spec.vm.as_mut().unwrap().image = Some("web-older".into());
+        jobs.registry.upsert(spec);
+        assert!(
+            !jobs.built_and_running("job-2", "web", "web-abc123", &key),
+            "an image the pool is not running is rolled out, so it is not skipped"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_build_key_changes_with_the_build_spec() {
+        let mut other = build_spec();
+        other.dockerfile = Some("Dockerfile.prod".into());
+        assert_eq!(build_key(&build_spec()), build_key(&build_spec()));
+        assert_ne!(build_key(&build_spec()), build_key(&other));
+    }
+
     /// A site built from a repo: the checkout's `context` lands in the root
     /// (created, because it is under the managed sites dir), `.git` does not,
     /// a rebuild replaces it, and a checkout without the index is refused while
@@ -2870,7 +3015,7 @@ mod tests {
         jobs.registry.upsert(spec.clone());
         let build = spec.build.clone().unwrap();
 
-        let out = jobs.run_build("job", "docs", &build).await.unwrap();
+        let out = jobs.run_build("job", "docs", &build, false).await.unwrap();
         assert!(out.starts_with("2 files"), "{out}");
         assert_eq!(std::fs::read_to_string(root.join("index.html")).unwrap(), "v1");
         assert!(root.join("css/app.css").is_file());
@@ -2878,12 +3023,15 @@ mod tests {
 
         std::fs::write(src.join("dist/index.html"), "v2").unwrap();
         git(&["commit", "-qam", "v2"]);
-        jobs.run_build("job", "docs", &build).await.unwrap();
+        jobs.run_build("job", "docs", &build, false).await.unwrap();
         assert_eq!(std::fs::read_to_string(root.join("index.html")).unwrap(), "v2");
 
         std::fs::remove_file(src.join("dist/index.html")).unwrap();
         git(&["commit", "-qam", "drop index"]);
-        let err = jobs.run_build("job", "docs", &build).await.unwrap_err();
+        let err = jobs
+            .run_build("job", "docs", &build, false)
+            .await
+            .unwrap_err();
         assert!(err.contains("build.context"), "{err}");
         assert_eq!(std::fs::read_to_string(root.join("index.html")).unwrap(), "v2", "old tree still serving");
         std::fs::remove_dir_all(dir).unwrap();

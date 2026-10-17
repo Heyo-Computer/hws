@@ -548,7 +548,7 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `POST /deployments/:id/rollouts`, `GET .../rollouts/:operation` | Candidate-first rollout. |
 | `POST /deployments/:id/exec` | `{command, cwd?, env?, timeout_secs?, wake?, sandbox_id?}` returns `{sandbox_id, exit_code, stdout, stderr, output}`. |
 | `GET /deployments/:id/shell` | WebSocket PTY. `?cols=&rows=&cwd=&wake=&sandbox_id=` |
-| `POST /deployments/:id/build` | Start a build (`{"ref": ...}` for a one-off ref). Returns 202 and a job. |
+| `POST /deployments/:id/build` | Start a build (`{"ref": ...}` for a one-off ref). Returns 202 and a job. A build whose image (named for its commit) is already built from the same build inputs, and is what the pool runs, finishes at once with `reused: true` and leaves the pool alone; `{"force": true}` rebuilds anyway, e.g. for a base image that moved. |
 | `POST /deployments/:id/pull` | Start an artifact pull (`{"ref": ..., "force": true}`). |
 | `POST /deployments/:id/mounts/pull` | Start a mount pull (`{"force": true}`). |
 | `POST /deployments/:id/update` | Run `update.commands`. |

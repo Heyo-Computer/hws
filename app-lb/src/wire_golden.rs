@@ -811,6 +811,7 @@ fn job_records_are_stable() {
         commit: None,
         dockerfile: None,
         image: None,
+        build_key: None,
         rolled_out: false,
         store: None,
         artifact_ref: None,

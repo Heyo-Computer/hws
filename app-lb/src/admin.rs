@@ -6295,6 +6295,10 @@ struct BuildRequest {
     /// is left alone, so a hotfix tag doesn't quietly become the new default.
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
+    /// Build even when the image this would produce is already built from the
+    /// same commit and inputs and running — for a base image that moved.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -6360,7 +6364,7 @@ async fn start_build(
     body: Option<Json<BuildRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_build(&id, req.git_ref) {
+    match state.jobs.start_build(&id, req.git_ref, req.force) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "image build started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
