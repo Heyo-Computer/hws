@@ -4631,6 +4631,35 @@ struct LifecycleRequest {
     /// fresh data disk, instead of stopping and resuming the same sandbox.
     #[serde(default)]
     fresh: bool,
+    /// Stop (or restart) even while background operations run: they are
+    /// marked `lost`, and their output stays in the guest.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Refuse to take a VM away from running operations unless `force`; with it,
+/// mark them lost first so their slots stop holding the VM up.
+fn yield_operations(state: &AdminState, id: &str, force: bool) -> Result<(), Response> {
+    let Some(ops) = &state.operations else {
+        return Ok(());
+    };
+    let running = ops.running(id);
+    if running == 0 {
+        return Ok(());
+    }
+    if !force {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!(
+                "deployment {id:?} has {running} running operation(s); wait for them, cancel \
+                 them, or pass {{\"force\": true}} to stop anyway (they are marked lost)"
+            ),
+        )
+        .into_response());
+    }
+    let n = ops.abandon(id, "the sandbox was stopped while the operation ran");
+    tracing::info!(deployment = %id, operations = n, "stop forced past running operations");
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -4661,6 +4690,9 @@ async fn stop_deployment(
     body: Option<Json<LifecycleRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
+    if let Err(response) = yield_operations(&state, &id, req.force) {
+        return response;
+    }
     match stop_pool(&state, &id, lifecycle_wait(&req)).await {
         Ok(response) => response,
         Err(response) => response,
@@ -4798,6 +4830,9 @@ async fn restart_deployment(
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
     let wait = lifecycle_wait(&req);
+    if let Err(response) = yield_operations(&state, &id, req.force) {
+        return response;
+    }
     if req.fresh {
         let Some(d) = state.registry.get(&id) else {
             return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
@@ -9440,6 +9475,61 @@ mod tests {
             }
 
             #[tokio::test]
+            async fn stop_refuses_running_operations_unless_forced() {
+                let (f, _vm, ops, _guest) = fixture_with_vm().await;
+                let (_, started) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/operations",
+                    json_body(json!({"command": "sleep 300"})),
+                )
+                .await;
+                let id = started["id"].as_str().unwrap().to_string();
+                let (status, refused) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/stop",
+                    json_body(json!({"wait_secs": 0})),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+                assert!(
+                    refused["error"].as_str().unwrap().contains("force"),
+                    "{refused}"
+                );
+                assert_eq!(
+                    f.registry
+                        .get("obsolete")
+                        .unwrap()
+                        .spec
+                        .scaling
+                        .max_replicas,
+                    5,
+                    "nothing changed"
+                );
+
+                let (status, stopped) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/stop",
+                    json_body(json!({"wait_secs": 0, "force": true})),
+                )
+                .await;
+                assert!(status.is_success(), "{stopped}");
+                let op = ops.get("obsolete", &id).unwrap();
+                assert_eq!(op.state, crate::operations::OpState::Lost);
+                assert!(op.error.unwrap().contains("stopped"));
+                let pid: i32 = std::fs::read_to_string(format!("{}/pid", op.dir))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let _ = std::process::Command::new("kill")
+                    .args(["-s", "KILL", "--", &format!("-{pid}")])
+                    .status();
+            }
+
+            #[tokio::test]
             async fn a_cancelled_operation_and_its_children_stop() {
                 let (f, _vm, ops, _guest) = fixture_with_vm().await;
                 let (_, started) = call(
@@ -9677,11 +9767,20 @@ mod tests {
             use serde_json::{Value, json};
 
             fn local_daemon() -> Router {
+                local_daemon_with_path(None)
+            }
+
+            /// With `path`, the guest's PATH is that directory alone: a guest
+            /// image without curl or wget.
+            fn local_daemon_with_path(path: Option<PathBuf>) -> Router {
                 Router::new().route(
                     "/sandbox/:id/exec",
-                    post(|Json(body): Json<Value>| async move {
-                        let mut cmd = std::process::Command::new("sh");
+                    post(move |Json(body): Json<Value>| async move {
+                        let mut cmd = std::process::Command::new("/bin/sh");
                         cmd.arg("-c").arg(body["command"].as_str().unwrap());
+                        if let Some(path) = &path {
+                            cmd.env("PATH", path);
+                        }
                         if let Some(env) = body["env"].as_object() {
                             for (k, v) in env {
                                 cmd.env(k, v.as_str().unwrap());
@@ -9703,7 +9802,11 @@ mod tests {
             }
 
             async fn live() -> Live {
-                let mut f = fixture_with_backend(true, local_daemon(), None).await;
+                live_with(local_daemon()).await
+            }
+
+            async fn live_with(daemon: Router) -> Live {
+                let mut f = fixture_with_backend(true, daemon, None).await;
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let base = format!("http://{}", listener.local_addr().unwrap());
                 let transfers = crate::transfers::Transfers::open(
@@ -9760,6 +9863,103 @@ mod tests {
                     .output()
                     .unwrap();
                 out.stdout
+            }
+
+            /// A bin directory with what the guest scripts need, and no curl or wget.
+            fn bare_bin(root: &FsPath) -> PathBuf {
+                let bin = root.join("bare-bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                for tool in [
+                    "sh",
+                    "tar",
+                    "gzip",
+                    "base64",
+                    "wc",
+                    "tr",
+                    "head",
+                    "tail",
+                    "mkdir",
+                    "mv",
+                    "rm",
+                    "od",
+                    "cut",
+                    "sha256sum",
+                    "dirname",
+                    "cat",
+                    "touch",
+                ] {
+                    if let Ok(found) = which(tool) {
+                        let _ = std::os::unix::fs::symlink(found, bin.join(tool));
+                    }
+                }
+                bin
+            }
+
+            fn which(tool: &str) -> Result<PathBuf, ()> {
+                for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
+                    let p = FsPath::new(dir).join(tool);
+                    if p.exists() {
+                        return Ok(p);
+                    }
+                }
+                Err(())
+            }
+
+            #[tokio::test]
+            async fn without_curl_or_wget_small_transfers_go_over_the_console() {
+                let scratch = std::env::temp_dir().join(format!(
+                    "app-lb-bare-{}-{}",
+                    std::process::id(),
+                    FIXTURE.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir_all(&scratch).unwrap();
+                let bin = bare_bin(&scratch);
+                let l = live_with(local_daemon_with_path(Some(bin))).await;
+                let dest = l.f.root.join("guest").join("app");
+                let (status, created) = post_json(
+                    &l,
+                    "/deployments/obsolete/transfers",
+                    json!({"direction": "in", "path": dest.display().to_string(), "extract": "tar.gz"}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{created}");
+                let upload = created["upload_url"].as_str().unwrap().to_string();
+                let r = l
+                    .http
+                    .put(&upload)
+                    .body(tarball(&l.f.root))
+                    .send()
+                    .await
+                    .unwrap();
+                let applied: Value = r.json().await.unwrap();
+                assert_eq!(applied["state"], "applied", "{applied}");
+                assert_eq!(
+                    std::fs::read(dest.join("lib").join("a.bin")).unwrap(),
+                    vec![0u8, 1, 2, 255]
+                );
+
+                let (status, out) = post_json(
+                    &l,
+                    "/deployments/obsolete/transfers",
+                    json!({"direction": "out", "path": dest.display().to_string()}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{out}");
+                assert_eq!(out["state"], "ready");
+                let r = l
+                    .http
+                    .get(out["download_url"].as_str().unwrap())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 200);
+                let tgz = r.bytes().await.unwrap();
+                assert_eq!(
+                    &tgz[..2],
+                    &[0x1f, 0x8b],
+                    "a directory comes out as a tar.gz"
+                );
+                let _ = std::fs::remove_dir_all(scratch);
             }
 
             #[tokio::test]
