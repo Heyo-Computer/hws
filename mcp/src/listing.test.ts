@@ -105,7 +105,14 @@ test("a tool that advertises its own schema still agrees with the one that valid
 });
 
 test("the listing stays within its size budget", () => {
-  // Measured 2026-10-17 (latest): 69,505 bytes across 77 tools, up from 68,211
+  // Measured 2026-10-17 (latest): 63,992 bytes across 76 tools, down from
+  // 69,505 across 77. The sandbox tools moved from the Heyo cloud to app-lb:
+  // the cloud-only tools (heyo_request, sandbox_set_ttl and the three archive
+  // tools) and their 1 MB-body and capacity prose went, applb_read_file and
+  // applb_write_file folded into sandbox_read_file/write_file, and the
+  // operations, upload/download, stop/start and transfer tools came in short.
+  //
+  // Earlier, 2026-10-17: 69,505 bytes across 77 tools, up from 68,211
   // across 75. The +1,294 is `applb_read_file` and `applb_write_file`, the only
   // way to move a file in or out of a deployment's guest without a cloud key
   // (a customer's agent had no way to get an artifact out past applb_exec's
@@ -155,7 +162,7 @@ test("the listing stays within its size budget", () => {
   // NOT enough to bring the nested spec tree back: applb_deploy advertises
   // top-level fields only (measured 65,628 bytes after that cut, from 76,926),
   // and applb_spec_schema serves any block on demand.
-  const BUDGET = 70_300;
+  const BUDGET = 65_000;
   const bytes = JSON.stringify(toolListing(everything())).length;
   assert.ok(
     bytes <= BUDGET,
