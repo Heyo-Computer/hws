@@ -83,7 +83,34 @@ test("sandbox_create registers a route-less hub VM, create-only, then waits for 
     const start = stub.calls.find((c) => c.url === `${LB}/deployments/sb-1/start`);
     assert.deepEqual(start?.body, { wait_secs: 5 });
     assert.match(out, /applb-sb-1-a/);
+    assert.match(out, /is running/);
+    // A sandbox that came up gets a summary, not applb_deploy's report: it
+    // used to say "the pool never becomes ready" about a running sandbox.
+    assert.doesNotMatch(out, /start_command/);
+    assert.ok(out.length < 1500, `output is ${out.length} characters`);
     assert.ok(stub.calls.every((c) => c.url.startsWith(LB)), "app-lb only");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("sandbox_create keeps the full report when the sandbox did not come up", async () => {
+  let registered = false;
+  const stub = stubFetch((c) => {
+    if (c.method === "POST" && c.url === `${LB}/deployments`) registered = true;
+    if (c.method === "GET" && c.url === `${LB}/deployments/sb-2` && !registered) {
+      return { status: 404, body: { error: "no" } };
+    }
+    if (c.url.endsWith("/whoami")) return { body: { namespace: "team-a" } };
+    if (c.url.endsWith("/pull")) return { body: { id: "job-1", status: "succeeded" } };
+    if (c.url.includes("/jobs")) return { body: { id: "job-1", status: "succeeded" } };
+    if (c.url.endsWith("/start")) return { status: 202, body: { state: "starting" } };
+    return { body: { spec: { id: "sb-2" } } };
+  });
+  try {
+    const out = await tool(teamA(), "sandbox_create").handler({ name: "sb-2", wait_seconds: 5 });
+    assert.match(out, /not running yet/);
+    assert.match(out, /## Created/, "the deploy report is there to diagnose with");
   } finally {
     stub.restore();
   }

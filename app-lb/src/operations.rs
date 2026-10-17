@@ -260,22 +260,33 @@ pub fn parse_status(stdout: &str) -> (Option<String>, HashMap<String, Probe>) {
     (boot, probes)
 }
 
-/// `len` bytes of `<dir>/out` from `offset`, base64, after its total size.
-pub fn page_script(dir: &str, offset: u64, len: u64) -> String {
+/// `len` bytes of `<dir>/out` from `from`, base64, after its total size and
+/// where the page starts. `None` pages the last `len` bytes, measured in the
+/// guest at the moment of reading: an offset worked out from the last known
+/// size would lag whatever was written since.
+pub fn page_script(dir: &str, from: Option<u64>, len: u64) -> String {
+    let start = match from {
+        Some(offset) => offset.to_string(),
+        None => format!("$(( s > {len} ? s - {len} : 0 ))"),
+    };
     format!(
-        "D={d}; s=$({{ wc -c < \"$D/out\"; }} 2>/dev/null | tr -d ' '); echo \"size=${{s:-0}}\"; printf 'data='; \
-         tail -c +{start} \"$D/out\" 2>/dev/null | head -c {len} | base64 | tr -d '[:space:]'; echo",
+        "D={d}; s=$({{ wc -c < \"$D/out\"; }} 2>/dev/null | tr -d ' '); s=${{s:-0}}; o={start}; \
+         echo \"size=$s\"; echo \"from=$o\"; printf 'data='; \
+         tail -c +$((o + 1)) \"$D/out\" 2>/dev/null | head -c {len} | base64 | tr -d '[:space:]'; echo",
         d = quote(dir),
-        start = offset + 1,
     )
 }
 
-/// The total size and the decoded bytes [`page_script`] printed.
-pub fn parse_page(stdout: &str) -> Result<(u64, Vec<u8>), String> {
+/// The total size, where the page starts and the decoded bytes
+/// [`page_script`] printed.
+pub fn parse_page(stdout: &str) -> Result<(u64, u64, Vec<u8>), String> {
     let mut size = None;
+    let mut from = 0;
     let mut data = None;
     for line in stdout.lines().map(str::trim) {
-        if let Some(s) = line.strip_prefix("size=") {
+        if let Some(f) = line.strip_prefix("from=") {
+            from = f.parse().unwrap_or(0);
+        } else if let Some(s) = line.strip_prefix("size=") {
             size = s.parse().ok();
         } else if let Some(d) = line.strip_prefix("data=") {
             data = Some(d.to_string());
@@ -290,7 +301,7 @@ pub fn parse_page(stdout: &str) -> Result<(u64, Vec<u8>), String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.unwrap_or_default())
         .map_err(|e| format!("the guest's output page was not valid base64: {e}"))?;
-    Ok((size, bytes))
+    Ok((size, from, bytes))
 }
 
 /// Mark `dir` cancelled and send `signal` to its process group (or, where the
@@ -609,18 +620,18 @@ impl Operations {
     pub async fn read(
         &self,
         op: &Operation,
-        offset: u64,
+        from: Option<u64>,
         max_bytes: u64,
     ) -> (Operation, Option<OutputPage>, bool) {
         // A finished operation's record is final; only its output is read.
         // Judging it again would rewrite why it ended.
         if op.state.finished() {
-            let script = page_script(&op.dir, offset, max_bytes.min(MAX_PAGE_BYTES));
+            let script = page_script(&op.dir, from, max_bytes.min(MAX_PAGE_BYTES));
             return match self.exec(&op.sandbox_id, script).await {
                 Ok(out) => {
                     let page = parse_page(&out.stdout)
                         .ok()
-                        .map(|(total, bytes)| output_page(offset, total, bytes));
+                        .map(|(total, start, bytes)| output_page(start, total, bytes));
                     (op.clone(), page, false)
                 }
                 Err(_) => (op.clone(), None, true),
@@ -628,7 +639,7 @@ impl Operations {
         }
         let mut script = status_script(&[&op.dir]);
         script.push_str("; ");
-        script.push_str(&page_script(&op.dir, offset, max_bytes.min(MAX_PAGE_BYTES)));
+        script.push_str(&page_script(&op.dir, from, max_bytes.min(MAX_PAGE_BYTES)));
         let out = match self.exec(&op.sandbox_id, script).await {
             Ok(out) => out,
             Err(e) => {
@@ -640,7 +651,7 @@ impl Operations {
         let updated = self.apply(op, boot.as_deref(), probes.get(&op.dir)).await;
         let page = parse_page(&out.stdout)
             .ok()
-            .map(|(total, bytes)| output_page(offset, total, bytes));
+            .map(|(total, start, bytes)| output_page(start, total, bytes));
         (updated, page, false)
     }
 
@@ -1066,9 +1077,10 @@ mod tests {
 
     #[test]
     fn pages_decode_and_text_stays_text() {
-        let (size, bytes) = parse_page("size=11\ndata=aGVsbG8=\n").unwrap();
+        let (size, from, bytes) = parse_page("size=11\nfrom=6\ndata=aGVsbG8=\n").unwrap();
+        assert_eq!(from, 6);
         assert_eq!((size, bytes.as_slice()), (11, b"hello".as_slice()));
-        let page = output_page(6, size, bytes);
+        let page = output_page(from, size, bytes);
         assert_eq!(
             (
                 page.encoding,
@@ -1092,7 +1104,8 @@ mod tests {
             ),
             status_script(&["/workspace/.heyo/ops/op_1"]),
             cancel_script("/workspace/.heyo/ops/op_1", "TERM"),
-            page_script("/workspace/.heyo/ops/op_1", 0, 100),
+            page_script("/workspace/.heyo/ops/op_1", Some(0), 100),
+            page_script("/workspace/.heyo/ops/op_1", None, 100),
             purge_script("/workspace/.heyo/ops/op_1"),
         ] {
             assert!(!script.contains('\\'), "{script}");

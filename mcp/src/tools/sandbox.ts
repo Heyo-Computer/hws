@@ -130,28 +130,52 @@ export function sandboxTools(clients: Clients, _config: Config, deployTool?: Too
           return `Sandbox ${id} already exists; use it (sandbox_info) or pick another name.`;
         }
         const wait = waitSecs(a.wait_seconds, 120);
+        const spec = sandboxSpec(a, id);
         // The hub images start what a sandbox needs (sshd) from their own init.
         const deployed = await deployTool.handler({
-          spec: sandboxSpec(a, id),
+          spec,
           wait_seconds: wait,
           ...(a.start_command ? {} : { no_start_command: true }),
         });
-        const registered = await clients
+        const registered = (await clients
           .applb({ path: dep(id) })
-          .then(() => true)
-          .catch(() => false);
+          .catch(() => undefined)) as { spec?: { namespace?: string } } | undefined;
+        // applb_deploy's full report is for when something went wrong; a
+        // sandbox that came up needs only what it is and what to do next.
         if (!registered) return deployed;
-        if (wait === 0) return `${deployed}\n\nNot waited for: sandbox_start ${id} waits for its VM.`;
-        const started = await lifecycle("start", id, { wait_secs: wait }, wait);
-        return report(`Sandbox ${id}`, [
-          { title: "State", body: started },
-          { title: "Created", body: deployed },
-          {
-            title: "Next",
-            body:
-              "sandbox_exec for short commands, sandbox_exec_start for long ones; keep work " +
-              "under /workspace. sandbox_stop pauses it, sandbox_kill deletes it.",
-          },
+        const vm = spec.vm as Record<string, unknown>;
+        const summary = {
+          id,
+          namespace: registered.spec?.namespace,
+          image: (spec.artifact as { ref: string }).ref,
+          size_class: vm.size_class,
+          workspace_disk_gb: vm.disk_size_gb,
+          stops_after_idle_secs: (spec.scaling as Record<string, unknown>).scale_to_zero_after_secs,
+        };
+        const next =
+          "sandbox_exec for short commands, sandbox_exec_start for anything over ~30 s; keep " +
+          "work under /workspace (it survives sandbox_stop, the rest of the disk does not). " +
+          "sandbox_kill deletes it.";
+        if (wait === 0) {
+          return report(`Sandbox ${id} created`, [
+            { title: "Sandbox", body: summary },
+            { title: "Next", body: `Not waited for: sandbox_start ${id} waits for its VM. ${next}` },
+          ]);
+        }
+        const started = (await lifecycle("start", id, { wait_secs: wait }, wait)) as {
+          state?: string;
+          sandbox_id?: string;
+        };
+        if (started?.state !== "running") {
+          return report(`Sandbox ${id} is not running yet`, [
+            { title: "State", body: started },
+            { title: "Created", body: deployed },
+            { title: "Next", body: `sandbox_info ${id} shows it booting; sandbox_start ${id} waits again.` },
+          ]);
+        }
+        return report(`Sandbox ${id} is running`, [
+          { title: "Sandbox", body: { ...summary, vm: started.sandbox_id } },
+          { title: "Next", body: next },
         ]);
       },
     },
