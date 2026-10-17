@@ -289,7 +289,7 @@ A pool is up when `pending == 0` and the count of `vms` that are `healthy && !dr
 | `GET /deployments/:id/operations[/:op]` | CRUD | List operations, or one refreshed from the guest with a page of its output. |
 | `DELETE /deployments/:id/operations/:op` | CRUD | Cancel an operation, or `?purge=true` to forget a finished one. |
 | `GET`/`PUT /deployments/:id/files?path=` | CRUD | Read a byte range of, or write (at most 1 MiB to), a file in the running guest. |
-| `POST /deployments/:id/stop` | CRUD | Drain the pool and hold it at zero (`{wait_secs?}`, default 30). Under `idle_action: retain` the VM is synced and suspended with its data disk. Nothing wakes it, and `exec` answers `409`, until start. `200 {state:"stopped", retained}`, or `202` `stopping`. |
+| `POST /deployments/:id/stop` | CRUD | Drain the pool and hold it at zero (`{wait_secs?, force?}`, default 30 s). `409` while background operations run, unless `force`, which marks them `lost`. Under `idle_action: retain` the VM is synced and suspended with its data disk. Nothing wakes it, and `exec` answers `409`, until start. `200 {state:"stopped", retained}`, or `202` `stopping`. |
 | `POST /deployments/:id/start` | CRUD | Restore the scaling policy stop replaced and wait for a VM, resuming the retained one. `200 {state:"running", sandbox_id}`, or `202` `starting`. |
 | `POST /deployments/:id/restart` | CRUD | Stop and start the same sandbox, keeping its disk. `{"fresh": true}` instead boots a new VM from the image with an empty disk. |
 | `POST /deployments/:id/transfers` | CRUD | `{direction: "in"\|"out", path, extract?, …}`. In: returns `upload_url`. Out: the guest pushes `path`, and this returns `download_url`. See [transfers](api/exec-shell.md#transfers). |

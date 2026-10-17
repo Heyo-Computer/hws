@@ -683,6 +683,30 @@ impl Operations {
         Ok(())
     }
 
+    /// Mark a deployment's running operations lost and release their VMs:
+    /// `stop {"force": true}` is about to take the VM away from under them.
+    /// Their output stays in the guest (on `/workspace` when there is a data
+    /// disk). Returns how many there were.
+    pub fn abandon(&self, deployment: &str, why: &str) -> usize {
+        let ids: Vec<String> = self
+            .ops
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|o| o.deployment == deployment && !o.state.finished())
+            .map(|o| o.id.clone())
+            .collect();
+        for id in &ids {
+            self.update(id, |o| {
+                o.state = OpState::Lost;
+                o.error = Some(why.to_string());
+                o.finished_at = Some(now_secs());
+            });
+        }
+        self.release_idle();
+        ids.len()
+    }
+
     /// Drop the slot on every VM with no running operation left.
     fn release_idle(&self) {
         let busy: std::collections::HashSet<String> = self

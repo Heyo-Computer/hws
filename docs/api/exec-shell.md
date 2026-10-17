@@ -143,7 +143,7 @@ app-lb reports an unknown exit status as `0`, which is also what a VM dying unde
 
 ## Transfers
 
-Files too large for the console travel through one-time URLs instead. app-lb keeps the bytes on its own disk for a while, and the guest fetches or pushes them with `curl` (or `wget`) at network speed. A transfer needs `APP_LB_TRANSFER_URL` (otherwise `501`), and the image needs `curl` or `wget`.
+Files too large for the console travel through one-time URLs instead. app-lb keeps the bytes on its own disk for a while, and the guest fetches or pushes them with `curl` (or `wget`) at network speed. A transfer needs `APP_LB_TRANSFER_URL` (otherwise `501`). An image with neither `curl` nor `wget` still works up to 8 MiB: app-lb then moves the bytes over the console instead, which takes minutes rather than seconds.
 
 | Route | Does |
 | --- | --- |

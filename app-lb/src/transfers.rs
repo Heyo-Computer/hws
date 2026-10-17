@@ -49,6 +49,16 @@ const MAX_DOWNLOADS: u32 = 3;
 pub const MAX_OPEN_PER_DEPLOYMENT: usize = 8;
 /// How long the guest side of an apply or push may take.
 const GUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Largest transfer moved over the console when the guest has no curl or wget.
+/// The console carries tens of KB/s, so this is minutes at most.
+pub const CONSOLE_FALLBACK_BYTES: u64 = 8 * 1024 * 1024;
+/// Bound on each console chunk command.
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What a guest without a fetch tool, or without curl to push with, reports.
+const NO_FETCH_TOOL: &str = "the guest has neither curl nor wget to fetch with";
+const NO_CURL_PUSH: &str = "the guest has no curl to push with";
+
 /// How often expired transfers are swept.
 pub const SWEEP: Duration = Duration::from_secs(60);
 
@@ -349,6 +359,30 @@ pub fn valid_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Where [`apply_script`] keeps the blob before placing it: inside the
+/// destination when unpacking, beside it otherwise.
+pub fn staged_path(id: &str, path: &str, extract: Extract) -> String {
+    if extract != Extract::None {
+        return format!("{}/.heyo-transfer-{id}", path.trim_end_matches('/'));
+    }
+    let dir = match path.rfind('/') {
+        Some(0) | None => "",
+        Some(i) => &path[..i],
+    };
+    format!("{dir}/.heyo-transfer-{id}")
+}
+
+/// Stage `path` for a console read: a file as it is, a directory as a tarball
+/// beside the other staged files. Prints `staged=<file>` and `size=<bytes>`.
+pub fn stage_out_script(id: &str, path: &str) -> String {
+    format!(
+        "P='{path}'; if [ -d \"$P\" ]; then F=/tmp/.heyo-transfer-{id}.tgz; tar -czf \"$F\" -C \"$P\" . || \
+         {{ echo 'error=could not pack the directory'; exit 1; }}; elif [ -f \"$P\" ]; then F=\"$P\"; \
+         else echo 'error=no such file or directory'; exit 2; fi; \
+         echo \"staged=$F\"; echo \"size=$(wc -c < \"$F\" | tr -d ' ')\""
+    )
+}
+
 /// Fetch the blob from `$HEYO_TRANSFER_URL`, check it, and place or unpack it.
 ///
 /// The temporary file sits beside the destination (inside it, when
@@ -379,7 +413,8 @@ pub fn apply_script(id: &str, path: &str, extract: Extract, strip: u32, sha256: 
     };
     format!(
         "I={id}; P='{path}'; S={sha256}; {dir_setup}; \
-         if command -v curl >/dev/null 2>&1; then \
+         if [ -z \"$HEYO_TRANSFER_URL\" ]; then [ -f \"$T\" ] || {{ echo 'error=nothing was staged'; exit 1; }}; \
+         elif command -v curl >/dev/null 2>&1; then \
          curl -fsS --retry 3 --connect-timeout 15 --max-time 540 -o \"$T\" \"$HEYO_TRANSFER_URL\" \
          || {{ r=$?; rm -f \"$T\"; echo \"error=download failed (curl exit $r)\"; exit 1; }}; \
          elif command -v wget >/dev/null 2>&1; then \
@@ -395,7 +430,7 @@ pub fn apply_script(id: &str, path: &str, extract: Extract, strip: u32, sha256: 
 /// `$HEYO_TRANSFER_URL`. Prints `pushed` or `error=…`.
 pub fn push_script(path: &str) -> String {
     format!(
-        "P='{path}'; command -v curl >/dev/null 2>&1 || {{ echo 'error=the guest has no curl to push with'; exit 127; }}; \
+        "P='{path}'; command -v curl >/dev/null 2>&1 || {{ echo 'error={NO_CURL_PUSH}'; exit 127; }}; \
          if [ -d \"$P\" ]; then tar -czf - -C \"$P\" . | curl -fsS --connect-timeout 15 --max-time 540 -X PUT \
          -H 'Content-Type: application/octet-stream' -T - \"$HEYO_TRANSFER_URL\"; r=$?; \
          elif [ -f \"$P\" ]; then curl -fsS --connect-timeout 15 --max-time 540 -X PUT \
@@ -792,9 +827,7 @@ impl Transfers {
             })?;
         if let Some(e) = guest_error(&out.stdout) {
             return Err(TransferError::Guest(if e == "no-fetch-tool" {
-                "the guest has neither curl nor wget to fetch with; add one to the image, or write \
-                 small files with PUT /deployments/:id/files"
-                    .into()
+                NO_FETCH_TOOL.into()
             } else {
                 e
             }));
@@ -837,7 +870,12 @@ impl Transfers {
         });
         let url = self.guest_url(id).ok_or(TransferError::NotFound)?;
         let script = apply_script(&t.id, &t.path, t.extract, t.strip_components, &sha);
-        let result = self.run_guest(&backend.sandbox_id, &script, url).await;
+        let mut result = self.run_guest(&backend.sandbox_id, &script, url).await;
+        if matches!(&result, Err(TransferError::Guest(m)) if m.starts_with(NO_FETCH_TOOL)) {
+            result = self
+                .apply_over_console(&t, &backend.sandbox_id, &script)
+                .await;
+        }
         let updated = self.update(id, |r| {
             r.guest_token = None;
             match &result {
@@ -850,6 +888,125 @@ impl Transfers {
         });
         result?;
         Ok(updated.unwrap_or(t))
+    }
+
+    /// The inbound fallback for a guest with no curl or wget: write the blob to
+    /// its staged path over the console, then run the same apply with nothing
+    /// to fetch. Only up to [`CONSOLE_FALLBACK_BYTES`].
+    async fn apply_over_console(
+        &self,
+        t: &Transfer,
+        sandbox_id: &str,
+        script: &str,
+    ) -> Result<String, TransferError> {
+        let size = t.size.unwrap_or(0);
+        if size > CONSOLE_FALLBACK_BYTES {
+            return Err(TransferError::Guest(format!(
+                "{NO_FETCH_TOOL}, and {size} bytes is too much for the console (at most \
+                 {CONSOLE_FALLBACK_BYTES}); add curl or wget to the image"
+            )));
+        }
+        let bytes = tokio::fs::read(self.blob(&t.id))
+            .await
+            .map_err(|e| TransferError::Guest(format!("could not read the stored upload: {e}")))?;
+        let staged = staged_path(&t.id, &t.path, t.extract);
+        for chunk in crate::guest_files::write_scripts(&staged, &bytes, false) {
+            self.console(sandbox_id, &chunk).await?;
+        }
+        self.run_guest(sandbox_id, script, String::new()).await
+    }
+
+    /// One short console command, its stdout, or why it failed.
+    async fn console(&self, sandbox_id: &str, script: &str) -> Result<String, TransferError> {
+        let out = self
+            .vms
+            .exec(
+                sandbox_id,
+                script,
+                heyo_sdk::CommandRunOptions {
+                    cwd: None,
+                    env: None,
+                    timeout: Some(CHUNK_TIMEOUT),
+                },
+            )
+            .await
+            .map_err(|e| {
+                TransferError::Guest(format!("console transfer to {sandbox_id} failed: {e}"))
+            })?;
+        if let Some(e) = guest_error(&out.stdout) {
+            return Err(TransferError::Guest(e));
+        }
+        if out.exit_code != 0 {
+            return Err(TransferError::Guest(format!(
+                "console transfer step failed (exit {}): {}",
+                out.exit_code,
+                out.output.trim()
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    /// The outbound fallback for a guest with no curl: stage the path, read it
+    /// back over the console, and store it as the transfer's blob.
+    async fn collect_over_console(
+        &self,
+        t: &Transfer,
+        sandbox_id: &str,
+    ) -> Result<(), TransferError> {
+        let out = self
+            .console(sandbox_id, &stage_out_script(&t.id, &t.path))
+            .await?;
+        let field = |k: &str| {
+            out.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix(k)
+                    .and_then(|v| v.strip_prefix('='))
+                    .map(str::to_string)
+            })
+        };
+        let staged = field("staged")
+            .ok_or_else(|| TransferError::Guest("the guest did not stage the path".into()))?;
+        let size: u64 = field("size").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let packed = staged.starts_with("/tmp/.heyo-transfer-");
+        let rm = packed.then(|| format!("rm -f '{staged}'"));
+        if size > CONSOLE_FALLBACK_BYTES.min(t.max_bytes) {
+            if let Some(rm) = &rm {
+                let _ = self.console(sandbox_id, rm).await;
+            }
+            return Err(TransferError::Guest(format!(
+                "{NO_CURL_PUSH}, and {size} bytes is too much for the console (at most \
+                 {CONSOLE_FALLBACK_BYTES}); add curl to the image"
+            )));
+        }
+        let mut bytes: Vec<u8> = Vec::with_capacity(size as usize);
+        while (bytes.len() as u64) < size {
+            let script = crate::guest_files::read_script(
+                &staged,
+                bytes.len() as u64,
+                crate::guest_files::MAX_READ_BYTES,
+            );
+            let page = self.console(sandbox_id, &script).await?;
+            let (_, chunk) = crate::guest_files::parse_read(&page).map_err(TransferError::Guest)?;
+            if chunk.is_empty() {
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if let Some(rm) = &rm {
+            let _ = self.console(sandbox_id, rm).await;
+        }
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        tokio::fs::write(self.blob(&t.id), &bytes)
+            .await
+            .map_err(|e| TransferError::Guest(format!("could not store the download: {e}")))?;
+        let n = bytes.len() as u64;
+        self.update(&t.id, |r| {
+            r.size = Some(n);
+            r.sha256 = Some(digest);
+            r.guest_token = None;
+            r.state = TransferState::Ready;
+        });
+        Ok(())
     }
 
     /// Have the guest push an outbound transfer's path.
@@ -865,9 +1022,15 @@ impl Transfers {
         let _slot = backend.try_hold();
         self.update(id, |r| r.sandbox_id = Some(backend.sandbox_id.clone()));
         let url = self.guest_url(id).ok_or(TransferError::NotFound)?;
-        let result = self
+        let mut result = self
             .run_guest(&backend.sandbox_id, &push_script(&t.path), url)
             .await;
+        if matches!(&result, Err(TransferError::Guest(m)) if m.starts_with(NO_CURL_PUSH)) {
+            result = self
+                .collect_over_console(&t, &backend.sandbox_id)
+                .await
+                .map(|()| String::new());
+        }
         if let Err(e) = &result {
             self.update(id, |r| {
                 r.state = TransferState::Failed;
