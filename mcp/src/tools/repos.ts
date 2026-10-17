@@ -68,16 +68,20 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
       body: { namespace: ns, repos: repo ? [repo] : [], access, ttl_secs: ttl, name },
     })) as { token: string; id: string; expires_at?: number | null };
 
-  const pushRecipe = (cloneUrl: string, token: string, branch: string) => ({
-    // extraHeader rather than a token in the URL, so nothing lands in
-    // .git/config.
-    push: `git -c http.extraHeader="Authorization: Bearer ${token}" push ${cloneUrl} HEAD:${branch}`,
-    clone: `git -c http.extraHeader="Authorization: Bearer ${token}" clone ${cloneUrl}`,
+  // The token is returned once, in `token`, and the commands name it as
+  // $HEYO_GIT_TOKEN: agents echo command strings into logs and transcripts,
+  // and a literal token in four of them is four leaks. extraHeader rather than
+  // a token in the URL, so nothing lands in .git/config either.
+  const auth = '-c http.extraHeader="Authorization: Bearer $HEYO_GIT_TOKEN"';
+  const pushRecipe = (cloneUrl: string, branch: string) => ({
+    set_token: "export HEYO_GIT_TOKEN=<token>   # the `token` field above",
+    push: `git ${auth} push ${cloneUrl} HEAD:${branch}`,
+    clone: `git ${auth} clone ${cloneUrl}`,
     from_scratch: [
       "git init -b " + branch,
       "git add -A",
       'git commit -m "initial commit"',
-      `git -c http.extraHeader="Authorization: Bearer ${token}" push ${cloneUrl} HEAD:${branch}`,
+      `git ${auth} push ${cloneUrl} HEAD:${branch}`,
     ],
   });
 
@@ -122,7 +126,7 @@ export function repoTools(clients: Clients, config: Config, deployTool?: Tool): 
           default_branch: branch,
           token: tok.token,
           token_expires_at: tok.expires_at ?? null,
-          ...pushRecipe(String(repo.clone_url), tok.token, branch),
+          ...pushRecipe(String(repo.clone_url), branch),
           next:
             "repo_deploy once something is pushed (or applb_deploy with this clone URL as " +
             "`build.repo`); repo_write_files if git is not available.",

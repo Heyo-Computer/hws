@@ -87,7 +87,10 @@ test("repo_create reuses an existing repo and hands back a scoped write token", 
     const out = parse(await tool(tools(), "repo_create").handler({ name: "site.git" }));
     assert.equal(out.created, false);
     assert.equal(out.token, "hrm_ab_cd");
-    assert.match(String(out.push), /extraHeader="Authorization: Bearer hrm_ab_cd" push http:\/\/remote:9700\/team-a\/site.git HEAD:main/);
+    assert.match(String(out.push), /extraHeader="Authorization: Bearer \$HEYO_GIT_TOKEN" push http:\/\/remote:9700\/team-a\/site.git HEAD:main/);
+    // The token is in `token` and nowhere else: command strings get echoed.
+    const { token: _token, ...rest } = out;
+    assert.ok(!JSON.stringify(rest).includes("hrm_ab_cd"), JSON.stringify(rest));
     const mint = stub.calls.find((c) => c.url.endsWith("/api/tokens"))!;
     assert.deepEqual(JSON.parse(mint.body!), {
       namespace: "team-a",
