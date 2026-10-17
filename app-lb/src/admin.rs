@@ -9490,6 +9490,54 @@ mod tests {
                 assert_eq!(list["operations"].as_array().unwrap().len(), 1);
             }
 
+            /// Regression: across an app-lb restart the watcher's first tick
+            /// ran before the autoscaler re-adopted the VMs, saw an empty pool,
+            /// and reported every running operation lost.
+            #[tokio::test]
+            async fn a_vm_briefly_missing_from_its_pool_does_not_lose_its_operations() {
+                let (f, vm, ops, _guest) = fixture_with_vm().await;
+                let (_, started) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/operations",
+                    json_body(json!({"command": "sleep 300"})),
+                )
+                .await;
+                let id = started["id"].as_str().unwrap().to_string();
+                f.registry.get("obsolete").unwrap().set_backends(vec![]);
+                ops.tick().await;
+                assert_eq!(
+                    ops.get("obsolete", &id).unwrap().state,
+                    crate::operations::OpState::Running
+                );
+
+                // Back in the pool (re-adopted): still running, and held again.
+                f.registry
+                    .get("obsolete")
+                    .unwrap()
+                    .set_backends(vec![vm.clone()]);
+                ops.tick().await;
+                assert_eq!(
+                    ops.get("obsolete", &id).unwrap().state,
+                    crate::operations::OpState::Running
+                );
+
+                // Gone for longer than the grace: lost.
+                f.registry.get("obsolete").unwrap().set_backends(vec![]);
+                ops.backdate_missing("sb-1", 120);
+                ops.tick().await;
+                let op = ops.get("obsolete", &id).unwrap();
+                assert_eq!(op.state, crate::operations::OpState::Lost);
+                let pid: i32 = std::fs::read_to_string(format!("{}/pid", op.dir))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let _ = std::process::Command::new("kill")
+                    .args(["-s", "KILL", "--", &format!("-{pid}")])
+                    .status();
+            }
+
             #[tokio::test]
             async fn stop_refuses_running_operations_unless_forced() {
                 let (f, _vm, ops, _guest) = fixture_with_vm().await;

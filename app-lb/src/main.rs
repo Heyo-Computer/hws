@@ -1194,6 +1194,8 @@ fn main() {
         ),
     );
     let autoscaler = autoscaler_svc.task();
+    // The operations watcher starts only once existing VMs are adopted.
+    let operations_adopted = autoscaler.adopted();
     let adopted = autoscaler.adopted();
     // A spread deployment another host removed is out of routing once the
     // registry applies the change; its VMs on this host's daemon go here.
@@ -1529,7 +1531,7 @@ fn main() {
     }
     // The operations watcher and the transfer sweep. Never spawned from `main`
     // directly: there is no runtime here until the server starts one.
-    server.add_service(background_service("operations", operations::Watcher(operations)));
+    server.add_service(background_service("operations", operations::Watcher(operations, operations_adopted)));
     if let Some(t) = transfers {
         server.add_service(background_service("transfers", transfers::Sweeper(t)));
     }
