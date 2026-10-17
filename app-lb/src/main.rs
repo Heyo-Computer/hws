@@ -69,6 +69,7 @@ mod site;
 mod store_gateway;
 mod tls;
 mod tokens;
+mod transfers;
 mod unpack;
 mod vm;
 mod worker;
@@ -1365,6 +1366,27 @@ fn main() {
     );
     tokio::spawn(operations.clone().watch());
 
+    // One-time transfer URLs for large files, when a public base is configured.
+    let transfers = transfers::TransferConfig::from_env(
+        std::path::Path::new(&cfg.state_path).with_extension("transfers"),
+    )
+    .and_then(|tcfg| {
+        let url = tcfg.public_url.clone();
+        match transfers::Transfers::open(tcfg, registry.clone(), vms.clone(), metrics.clone(), event_feed.clone()) {
+            Ok(t) => {
+                tracing::info!(url = %url, "transfers enabled");
+                Some(t)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "transfers disabled: cannot use their directory");
+                None
+            }
+        }
+    });
+    if let Some(t) = &transfers {
+        tokio::spawn(t.clone().watch());
+    }
+
     let admin_svc = background_service(
         "admin",
         AdminApi::new(
@@ -1413,7 +1435,8 @@ fn main() {
         .with_images(image_catalog.clone())
         .with_artifact_store(store_slot.clone())
         .with_fleet_store(fleet_stores.as_ref().map(|fs| fs.fleet.clone()))
-        .with_operations(operations),
+        .with_operations(operations)
+        .with_transfers(transfers),
     );
 
     // Fleet mode: hops between members. The peer token is fleet state; the

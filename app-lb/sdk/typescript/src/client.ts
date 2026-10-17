@@ -36,6 +36,7 @@ import type {
   TokenSummary,
   FeedEvent,
   FeedIndexEntry,
+  Transfer,
   Operation,
   FileRead,
   FileWritten,
@@ -652,6 +653,45 @@ export class Heyctl {
   /** What the host has left, and the caller's own pools. */
   capacity(signal?: AbortSignal): Promise<Capacity> {
     return this.request("GET", "/capacity", { kind: "server", name: "", signal });
+  }
+
+  // -- transfers ----------------------------------------------------------
+
+  /**
+   * Create a transfer. Inbound: returns `upload_url`; `PUT` the bytes there
+   * (no credential) and the guest fetches and places them. Outbound: the guest
+   * pushes `path` (a directory as a tar.gz) and this returns `download_url`.
+   */
+  createTransfer(
+    id: string,
+    req: {
+      direction: "in" | "out";
+      path: string;
+      extract?: "none" | "tar" | "tar.gz" | "auto";
+      strip_components?: number;
+      ttl_secs?: number;
+      max_bytes?: number;
+      apply_on_upload?: boolean;
+      sandbox_id?: string;
+      wait_secs?: number;
+    },
+    signal?: AbortSignal,
+  ): Promise<Transfer> {
+    return this.request("POST", `/deployments/${seg(id)}/transfers`, {
+      body: req,
+      kind: "deployment",
+      name: id,
+      timeoutMs: 180_000,
+      signal,
+    });
+  }
+
+  transfer(id: string, transfer: string, signal?: AbortSignal): Promise<Transfer> {
+    return this.request("GET", `/deployments/${seg(id)}/transfers/${seg(transfer)}`, {
+      kind: "transfer",
+      name: transfer,
+      signal,
+    });
   }
 
   // -- workflows ------------------------------------------------------------

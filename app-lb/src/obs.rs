@@ -471,7 +471,11 @@ impl Access<'_> {
     /// `lb_deployment` attributes a request that matched nothing; see
     /// [`LogSink::send_access`], which supplies it.
     pub fn into_record(self, lb_deployment: &str) -> Record {
-        let path = truncate(self.path.to_string(), MAX_PATH);
+        // A transfer URL's path is its credential; never log it.
+        let path = truncate(
+            crate::transfers::redact(self.path).into_owned(),
+            MAX_PATH,
+        );
         let ms = self.duration.as_secs_f64() * 1000.0;
         let status = self.status;
         let message = match status {

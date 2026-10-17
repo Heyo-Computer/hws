@@ -1,0 +1,13 @@
+{
+  "id": "tr_0123456789abcdef",
+  "deployment": "sb-acme",
+  "direction": "in",
+  "path": "/workspace/app",
+  "extract": "tar.gz",
+  "strip_components": 1,
+  "state": "awaiting_upload",
+  "created_at": 1760000000,
+  "expires_at": 1760003600,
+  "max_bytes": 1073741824,
+  "upload_url": "https://admin.example/transfers/tok"
+}

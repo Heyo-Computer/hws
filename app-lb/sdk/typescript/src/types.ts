@@ -1090,6 +1090,28 @@ export interface CertStatus {
   needs_renewal: boolean;
 }
 
+/** A large-file transfer, from `/deployments/:id/transfers`. */
+export interface Transfer {
+  id: string;
+  deployment: string;
+  direction: "in" | "out";
+  path: string;
+  extract: "none" | "tar" | "tar.gz" | "auto";
+  strip_components?: number;
+  state: "awaiting_upload" | "uploaded" | "applying" | "applied" | "collecting" | "ready" | "failed";
+  created_at: number;
+  expires_at: number;
+  max_bytes: number;
+  size?: number;
+  sha256?: string;
+  sandbox_id?: string;
+  error?: string;
+  /** In: where to `PUT` the bytes. Only in the create response. */
+  upload_url?: string;
+  /** Out: where to `GET` them, up to three times. Only in the create response. */
+  download_url?: string;
+}
+
 /** A background command in a sandbox, from `/deployments/:id/operations`. */
 export interface Operation {
   id: string;

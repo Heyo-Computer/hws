@@ -292,6 +292,9 @@ A pool is up when `pending == 0` and the count of `vms` that are `healthy && !dr
 | `POST /deployments/:id/stop` | CRUD | Drain the pool and hold it at zero (`{wait_secs?}`, default 30). Under `idle_action: retain` the VM is synced and suspended with its data disk. Nothing wakes it, and `exec` answers `409`, until start. `200 {state:"stopped", retained}`, or `202` `stopping`. |
 | `POST /deployments/:id/start` | CRUD | Restore the scaling policy stop replaced and wait for a VM, resuming the retained one. `200 {state:"running", sandbox_id}`, or `202` `starting`. |
 | `POST /deployments/:id/restart` | CRUD | Stop and start the same sandbox, keeping its disk. `{"fresh": true}` instead boots a new VM from the image with an empty disk. |
+| `POST /deployments/:id/transfers` | CRUD | `{direction: "in"\|"out", path, extract?, …}`. In: returns `upload_url`. Out: the guest pushes `path`, and this returns `download_url`. See [transfers](api/exec-shell.md#transfers). |
+| `GET /deployments/:id/transfers[/:tid]`, `POST …/:tid/apply`, `DELETE …/:tid` | CRUD | List, read, re-apply or discard transfers. |
+| `PUT`/`GET /transfers/:token` | None (the token) | Upload to, or download from, a one-time URL. Anything not a live token is `404`. |
 | `PUT /deployments/:id/upstreams/:upstream/drain` | CRUD | Cordon a static upstream. |
 | `DELETE /deployments/:id/upstreams/:upstream/drain` | CRUD | Uncordon it. |
 | `GET /deployments/:id/discovery-status` | CRUD | Discovery state of a discovery-backed static deployment. |
