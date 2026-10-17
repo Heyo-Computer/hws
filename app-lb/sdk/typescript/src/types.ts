@@ -476,6 +476,8 @@ export interface DeploymentStatus {
   pending: number;
   total_in_flight: number;
   vms: VmStatus[];
+  /** VMs created or resumed but not yet healthy; absent when there are none. */
+  pending_vms?: PendingVmView[];
   /** Present when the spec declares `vm.workspace`. */
   workspace?: WorkspaceStatus;
   /** Present for a site: whether its root on the LB host can serve. */

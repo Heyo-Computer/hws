@@ -24,7 +24,7 @@ const WIRE = join(here, "..", "..", "..", "testdata", "wire");
  */
 const KNOWN = {
   common: {
-    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "workspace", "site"],
+    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "pending_vms", "workspace", "site"],
     SiteRootStatus: ["root", "status", "index_present", "hint"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
     DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed"],

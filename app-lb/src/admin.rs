@@ -1209,6 +1209,10 @@ struct DeploymentStatus {
     pending: usize,
     total_in_flight: usize,
     vms: Vec<VmStatus>,
+    /// VMs created or resumed but not yet past their health check, oldest
+    /// first. A VM an `exec` woke is here, not in `vms`, until it is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_vms: Vec<PendingVmView>,
     /// The deployment's workspace, when the spec declares one: which snapshot
     /// the pool runs from, whether the store has it, and what — if anything —
     /// is holding the pool at zero. See [`crate::workspace`].
@@ -1328,6 +1332,7 @@ fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> Depl
                 draining: b.is_draining(),
             })
             .collect(),
+        pending_vms: pending_vms_of(d),
     }
 }
 

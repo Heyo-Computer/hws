@@ -525,6 +525,15 @@ fn deployment_status_is_stable() {
                 } else {
                     vec![]
                 },
+                pending_vms: if managed {
+                    vec![PendingVmView {
+                        sandbox_id: "applb-sandbox-d4e5f6".into(),
+                        age_secs: 12,
+                        status: Some(heyo_sdk::SandboxStatus::Running),
+                    }]
+                } else {
+                    vec![]
+                },
                 workspace: None,
                 // A fixed answer, not the fixture host's filesystem.
                 site: spec_site.map(|root| crate::site::RootStatus {
