@@ -24,7 +24,7 @@ listener stays on 127.0.0.1:9090, untouched.
 
 ## The credential posture, which is the point
 
-**This deployment holds no credentials.** No `APPLB_TOKEN`, no `HEYO_API_KEY`,
+**This deployment holds no credentials.** No `APPLB_TOKEN`,
 no service tokens for app-obs or ci — `env_vars` is three URLs and four
 switches, and there is no `env_from` at all. Every call it makes runs as the
 caller who asked for it.
@@ -164,27 +164,18 @@ Three things follow:
 An anonymous caller gets the tool list, the deployment schema and examples, and
 `heyo_status`'s view of which services answer — documentation, not capability.
 
-## This deployment has no sandbox tools, on purpose
+## Sandboxes, with the caller's own token
 
-An app-token gate admits `applb_…` and nothing else, and cloud has never heard
-of that credential. So there is no cloud key here and no way for a caller to
-supply one — which makes the fourteen `sandbox_*` tools plus `heyo_capacity`
-unreachable by construction, not by misconfiguration.
+The `sandbox_*` tools are app-lb's like everything else: a sandbox is an app-lb
+deployment with no route, driven through its exec, operations, files and
+transfer routes. So a caller's `applb_…` token, forwarded as for every other
+app-lb tool, is all a sandbox needs, and this deployment — which holds no
+credential of its own — serves them to every namespace token the gate admits,
+each confined to its own namespace by app-lb.
 
-`buildTools` (`src/server.ts`) therefore omits them when no cloud credential is
-present, and `withForwardedAuth` refuses to substitute an app-lb token for one:
-borrowing it would have produced a tool list that is complete, advertised, and
-401s on every call. `heyo_status` still probes cloud and reports it as not
-configured, so the absence stays an answerable question.
-
-The gate is on the *credential*, not on a deployment-wide switch, so the same
-build still serves the multi-tenant shape: an instance carrying no key of its
-own gives the sandbox tools to a caller who presents a `heyo_api_*` key, per
-request. That is a different deployment — no app-lb gate, since the gate would
-reject a cloud key at the door — and it is the natural home for customer
-sandbox access if it is ever wanted.
-
-What is left here is the fleet: app-lb, app-obs, ci, and the feed.
+Nothing here calls the Heyo cloud API. Transfers hand the caller a one-time URL
+on the admin host (`/transfers/<token>`), which the admin deployment's gate must
+leave public; see `docs/app-lb-auth.md`.
 
 ## The 0.0.0.0 bind, and the rule that replaces the loopback one
 
