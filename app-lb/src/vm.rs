@@ -928,6 +928,44 @@ impl VmManager {
         Ok(sandbox.commands().run(command, options).await?)
     }
 
+    /// Flush the guest's page cache ahead of a stop.
+    ///
+    /// heyvmd stops a guest by killing it, not shutting it down, so whatever
+    /// the workload wrote but the kernel had not written back is lost unless
+    /// it is flushed first. Best effort: a guest that cannot run `sync` within
+    /// `within` is logged and stopped anyway.
+    pub async fn sync_guest(
+        &self,
+        deployment: &str,
+        sandbox_id: &str,
+        within: std::time::Duration,
+    ) {
+        let sync = tokio::time::timeout(
+            within,
+            self.exec(
+                sandbox_id,
+                "sync",
+                CommandRunOptions {
+                    cwd: None,
+                    env: None,
+                    timeout: Some(within),
+                },
+            ),
+        )
+        .await;
+        match sync {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(
+                deployment = %deployment, sandbox = %sandbox_id, error = %e,
+                "could not sync the guest before stopping it; the last few seconds of writes may be lost",
+            ),
+            Err(_) => tracing::warn!(
+                deployment = %deployment, sandbox = %sandbox_id,
+                "the guest did not answer `sync` in time; stopping it anyway",
+            ),
+        }
+    }
+
     /// Open an interactive PTY on a VM.
     ///
     /// Returns once the daemon has answered the session handshake, so a failure
