@@ -1,0 +1,26 @@
+{
+  "id": "op_0123456789abcdef",
+  "deployment": "sb-acme",
+  "sandbox_id": "applb-sandbox-a1b2c3",
+  "boot_id": "6a1f0c2e-1b2c-4d5e-8f90-123456789abc",
+  "dir": "/workspace/.heyo/ops/op_0123456789abcdef",
+  "command": "cd /workspace/app && npm test",
+  "cwd": "/workspace",
+  "env_keys": [
+    "CI"
+  ],
+  "created_at": 1760000000,
+  "finished_at": 1760000420,
+  "max_runtime_secs": 3600,
+  "state": "failed",
+  "exit_code": 1,
+  "output_bytes": 2048,
+  "output": {
+    "offset": 2000,
+    "bytes": 48,
+    "next_offset": 2048,
+    "total_bytes": 2048,
+    "encoding": "utf-8",
+    "data": "Tests: 41 passed, 1 failed\nnpm ERR! Test failed.\n"
+  }
+}

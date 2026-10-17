@@ -551,6 +551,8 @@ A deployment- or namespace-scoped token sees a narrowed view of list and metrics
 | `DELETE /deployments/:id/retired-record` | Archive and remove a settled, fully drained managed deployment (fleet admin, `If-Match`). |
 | `PATCH /deployments/:id/scaling` | Partial scaling update. |
 | `DELETE /deployments/:id/vms/:sandbox_id` | Evict one VM (`?force=true` to kill). |
+| `POST`/`GET /deployments/:id/operations`, `GET`/`DELETE …/operations/:op` | Background commands: start detached, page output, cancel. See [docs/api/exec-shell.md](api/exec-shell.md#background-operations). |
+| `GET`/`PUT /deployments/:id/files?path=` | Read or write a file in the running guest (256 KiB per read, 1 MiB per write). |
 | `POST /deployments/:id/stop`, `/start`, `/restart` | Hold the pool at zero (a retained VM keeps its disk), bring it back, or both. `restart {"fresh": true}` boots a new VM instead. See [Pausing a sandbox](#pausing-a-sandbox). |
 | `PUT`/`DELETE /deployments/:id/upstreams/:upstream/drain` | Cordon or drain, then uncordon, a static upstream. |
 | `GET /deployments/:id/discovery-status` | Discovery version and per-upstream drain and in-flight state. |
@@ -645,6 +647,8 @@ Without `sandbox_id`, the pool picks a VM. With it, you get that VM, a 404 (not 
 Commands on one VM run one at a time: they share the guest's serial console, so concurrent `exec` calls queue, and their wall time adds up. `timeout_secs` defaults to 60 and is capped at 3600. A command still running when its timeout expires is interrupted. On a guest whose console shell has no controlling terminal (the init app-lb adds is one), the interrupt cannot reach it, and later commands on that VM wait behind it. Run long work detached (`setsid nohup … > /workspace/step.log 2>&1 &`) and poll the log instead. Callers with their own HTTP timeout, like the hosted MCP server at 30 seconds, should do the same for anything that takes longer.
 
 A VM an `exec` woke appears in `GET /deployments/:id` under `pending_vms` until it passes its health check, then under `vms`. `sandbox_id` in the response says which VM ran the command; after a stop and resume it is the same sandbox, and after a `vm` edit or rollout it is a new one.
+
+Commands on one VM go through its single serial console, one at a time. For anything that runs longer than about 30 seconds, start a [background operation](api/exec-shell.md#background-operations) instead: it returns at once, runs detached, can be paged and cancelled, and several can run side by side. Small files can be read and written with `GET`/`PUT /deployments/:id/files`.
 
 ## Dashboards
 

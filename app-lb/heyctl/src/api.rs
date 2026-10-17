@@ -21,6 +21,7 @@ use crate::transport::{Auth, HttpTransport, Method, Request, Response, Transport
 use crate::types::*;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -516,6 +517,83 @@ impl Client {
             id,
         )
         .await
+    }
+
+    // -- background operations and files -------------------------------------
+
+    /// Start `command` detached in the deployment's VM and return at once.
+    /// Follow it with [`operation`](Self::operation); several can run at once.
+    pub async fn start_operation(
+        &self,
+        id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        env: Option<&BTreeMap<String, String>>,
+        max_runtime_secs: Option<u64>,
+    ) -> Result<Operation> {
+        if command.trim().is_empty() {
+            return Err(Error::Invalid("a command must not be blank".into()));
+        }
+        let mut body = json!({ "command": command });
+        if let Some(cwd) = cwd {
+            body["cwd"] = json!(cwd);
+        }
+        if let Some(env) = env {
+            body["env"] = json!(env);
+        }
+        if let Some(t) = max_runtime_secs {
+            body["max_runtime_secs"] = json!(t);
+        }
+        self.read(
+            Request::new(Method::Post, format!("/deployments/{}/operations", seg(id)))
+                .json(body)
+                .timeout(DEFAULT_TIMEOUT + Duration::from_secs(150)),
+            "deployment",
+            id,
+        )
+        .await
+    }
+
+    /// An operation, fresh from the guest, with up to `max_bytes` of output
+    /// from `offset`.
+    pub async fn operation(
+        &self,
+        id: &str,
+        op: &str,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<Operation> {
+        let path = format!(
+            "/deployments/{}/operations/{}?offset={offset}&max_bytes={max_bytes}",
+            seg(id),
+            seg(op)
+        );
+        self.read(Request::new(Method::Get, path), "operation", op)
+            .await
+    }
+
+    /// Cancel an operation: SIGTERM to its process group, SIGKILL after 10s.
+    pub async fn cancel_operation(&self, id: &str, op: &str) -> Result<Operation> {
+        let path = format!("/deployments/{}/operations/{}", seg(id), seg(op));
+        self.read(Request::new(Method::Delete, path), "operation", op)
+            .await
+    }
+
+    /// A byte range of a file in the guest (at most 256 KiB).
+    pub async fn read_file(
+        &self,
+        id: &str,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<FileRead> {
+        let url = format!(
+            "/deployments/{}/files?path={}&offset={offset}&length={length}",
+            seg(id),
+            seg(path)
+        );
+        self.read(Request::new(Method::Get, url), "file", path)
+            .await
     }
 
     // -- secrets ------------------------------------------------------------

@@ -65,6 +65,34 @@ A command that fails is still `200`, and the crate returns it as `Ok`. Output is
 
 The crate sets its own deadline on an `exec` request so that it never gives up before app-lb does. `ExecRequest::patience()` is `timeout_secs` (default 60, clamped to 1–3600), plus 120 seconds when `wake` is set (app-lb's default `cold_start_timeout_secs`), plus a 15-second margin. A deployment configured with a longer cold start needs `.patient_for(d)`.
 
+## Background operations
+
+`exec` holds the request, and the guest's only console, until the command ends. For anything longer than about 30 seconds, start it as an operation instead: it runs detached in its own session, and you look at it with short requests while it runs. Several operations can run on one VM at once.
+
+| Route | Does |
+| --- | --- |
+| `POST /deployments/:id/operations` | `{command, cwd?, env?, max_runtime_secs? (default 3600, max 21600), wake?, sandbox_id?}`. Starts the command and returns `201` with the record (`id: "op_…"`, `state: "running"`, `sandbox_id`). At most 16 running per deployment (`429` past that). |
+| `GET /deployments/:id/operations` | `{operations: [...]}`, newest first, without output. |
+| `GET /deployments/:id/operations/:op?offset=&max_bytes=&tail=` | The record, refreshed from the guest, plus `output: {offset, bytes, next_offset, total_bytes, encoding, data}`. Pages are 64 KiB by default, at most 256 KiB; `tail=true` pages the last `max_bytes`. `encoding` is `utf-8`, or `base64` when the bytes are not text. `stale: true` means the guest could not be asked (its console was busy) and this is the last known record. |
+| `DELETE /deployments/:id/operations/:op` | Cancel it: SIGTERM to its process group, SIGKILL 10 s later. `202` with `state: "cancelling"`. `?purge=true` instead forgets a finished operation and removes its directory. |
+
+`state` is `running`, `cancelling`, `succeeded`, `failed` (non-zero `exit_code`), `cancelled`, `timed_out` (ran past `max_runtime_secs`), or `lost`. An operation is lost when its VM was restarted, replaced or stopped under it, or when its process ended without recording an exit code.
+
+Each operation lives in one guest directory: `/workspace/.heyo/ops/<id>` when the VM has a data disk, otherwise `/var/tmp/heyo-ops/<id>`. It holds the command (`cmd`), output (`out`, stdout and stderr together), `pid` and `exit`. On `/workspace`, the output survives a stop and can be read again after a start.
+
+While an operation runs, app-lb holds an in-flight slot on its VM. That stops the pool from scaling the VM to zero or reaping it, and the idle clock starts when the last operation ends. A watcher looks at every running operation every 15 seconds and records state changes, so a finished operation shows its final state even if nobody asks. Records persist across an app-lb restart.
+
+## Files
+
+The console is also the only way to a file inside a running guest. heyvmd's own file routes act on host directories the guest never sees.
+
+| Route | Does |
+| --- | --- |
+| `GET /deployments/:id/files?path=&offset=&length=` | Up to 256 KiB (default 96 KiB) of the file from `offset`: `{sandbox_id, path, size, offset, bytes, next_offset?, encoding, content}`. `404` for a missing file. |
+| `PUT /deployments/:id/files?path=&append=` | Write the raw request body (at most 1 MiB) to the file, replacing it or with `append=true` adding to it. Parent directories are created. `{sandbox_id, path, wrote, size}`. |
+
+`path` must be absolute and free of quotes, backslashes and newlines. Both take `wake` and `sandbox_id` like `exec`. The console moves tens of KB/s, which suits configuration, logs and small artifacts; move anything larger with a transfer.
+
 ## Shell
 
 `GET /deployments/:id/shell` (WebSocket upgrade)

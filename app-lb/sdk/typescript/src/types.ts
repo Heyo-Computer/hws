@@ -1090,6 +1090,66 @@ export interface CertStatus {
   needs_renewal: boolean;
 }
 
+/** A background command in a sandbox, from `/deployments/:id/operations`. */
+export interface Operation {
+  id: string;
+  deployment: string;
+  /** The VM it runs in; an operation never moves. */
+  sandbox_id: string;
+  boot_id: string;
+  /** Its directory in the guest: `cmd`, `out`, `pid`, `exit`. */
+  dir: string;
+  /** The first 200 characters of the command. */
+  command: string;
+  cwd?: string;
+  /** Names of the environment it was given; values are never recorded. */
+  env_keys?: string[];
+  created_at: number;
+  finished_at?: number;
+  max_runtime_secs: number;
+  state: "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "timed_out" | "lost";
+  exit_code?: number;
+  output_bytes: number;
+  error?: string;
+  cancel_requested_at?: number;
+  timed_out?: boolean;
+  /** A page of output, on `GET …/operations/:op`. */
+  output?: OutputPage;
+  /** The guest could not be asked just now; this is the last known record. */
+  stale?: boolean;
+}
+
+/** A page of an operation's output. */
+export interface OutputPage {
+  offset: number;
+  bytes: number;
+  next_offset: number;
+  total_bytes: number;
+  encoding: "utf-8" | "base64";
+  data: string;
+}
+
+/** `GET /deployments/:id/files`: a byte range of a file in the guest. */
+export interface FileRead {
+  sandbox_id: string;
+  path: string;
+  size: number;
+  offset: number;
+  bytes: number;
+  /** Where the next read starts; absent at the end of the file. */
+  next_offset?: number;
+  encoding: "utf-8" | "base64";
+  content: string;
+}
+
+/** `PUT /deployments/:id/files`. */
+export interface FileWritten {
+  sandbox_id: string;
+  path: string;
+  wrote: number;
+  size: number;
+}
+
 export interface ExecOutput {
   sandbox_id: string;
   exit_code: number;
