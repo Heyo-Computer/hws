@@ -87,7 +87,10 @@ test("repo_create reuses an existing repo and hands back a scoped write token", 
     const out = parse(await tool(tools(), "repo_create").handler({ name: "site.git" }));
     assert.equal(out.created, false);
     assert.equal(out.token, "hrm_ab_cd");
-    assert.match(String(out.push), /extraHeader="Authorization: Bearer hrm_ab_cd" push http:\/\/remote:9700\/team-a\/site.git HEAD:main/);
+    assert.match(String(out.push), /extraHeader="Authorization: Bearer \$HEYO_GIT_TOKEN" push http:\/\/remote:9700\/team-a\/site.git HEAD:main/);
+    // The token is in `token` and nowhere else: command strings get echoed.
+    const { token: _token, ...rest } = out;
+    assert.ok(!JSON.stringify(rest).includes("hrm_ab_cd"), JSON.stringify(rest));
     const mint = stub.calls.find((c) => c.url.endsWith("/api/tokens"))!;
     assert.deepEqual(JSON.parse(mint.body!), {
       namespace: "team-a",
@@ -254,4 +257,20 @@ test("the remote is reached as the caller, whatever kind of credential they hold
     assert.equal(withForwardedAuth(base, { authorization: header }).remote?.auth, header);
   }
   assert.equal(withForwardedAuth(base, {}).remote?.auth, "Bearer hrm_operator_x");
+});
+
+test("repo_create takes a namespace token's namespace from /whoami when none is named", async () => {
+  const stub = stubFetch((c) => {
+    if (c.url === "http://lb:9090/whoami") return { body: { kind: "app", namespace: "team-b" } };
+    if (c.method === "POST" && c.url.endsWith("/api/repos/team-b"))
+      return { status: 201, body: { clone_url: "http://remote:9700/team-b/site.git", default_branch: "main" } };
+    if (c.url.endsWith("/api/tokens")) return { status: 201, body: { token: "hrm_x", id: "x" } };
+    return { status: 404, body: { error: "unexpected" } };
+  });
+  try {
+    const out = parse(await tool(tools({ REMOTE_NAMESPACE: "" }), "repo_create").handler({ name: "site" }));
+    assert.equal(out.repo, "team-b/site");
+  } finally {
+    stub.restore();
+  }
 });

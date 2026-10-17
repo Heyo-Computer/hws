@@ -1597,7 +1597,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       ]
     },
     "Placement": {
-      "description": "Where a deployment runs when several app-lb hosts share one fleet store\n(`docs/design/fleet-shared-state.md` § 4).\n\nOnly `pinned` is accepted today: every replica runs on `home`, and every\nother host keeps the spec but runs, routes and certifies nothing for it.\n`spread`, which lets replicas run on any listed host, arrives with the\nplacement controller that decides how many go where.\n\nA single-server app-lb accepts the field and ignores it: there is no other\nhost for a deployment to be placed on.",
+      "description": "Where a deployment runs when several app-lb hosts share one fleet store\n(`docs/design/fleet-shared-state.md` § 4).\n\n- `pinned`: every replica runs on `home`, and every other host keeps the\n  spec but runs, routes and certifies nothing for it.\n- `spread`: replicas run on any live listed host, as many on each as the\n  fleet's placement controller (`fleet_placement`) decides. Only for a\n  VM pool with no host-bound state; [`DeploymentSpec::validate`] refuses\n  the rest.\n\nA single-server app-lb accepts the field and ignores it: there is no other\nhost for a deployment to be placed on.",
       "type": "object",
       "properties": {
         "home": {

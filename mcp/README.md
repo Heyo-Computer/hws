@@ -628,6 +628,8 @@ Reads over app-lb's topology, plus the operations that move VMs and disks.
 | `applb_purge_orphan_disks` | **destructive** | Deletes every disk app-lb considers orphaned, in one call. |
 | `applb_sweep_disks` | **destructive** | Runs the disk expiry sweep now instead of waiting for the next tick, deleting every disk past its TTL. |
 | `applb_exec` | **destructive** | Runs a command inside a deployment's guest and returns its output. |
+| `applb_read_file` |  | Reads up to 96 KiB of a guest file from `offset`, with its size and `next_offset` to page the rest; base64 for binary. |
+| `applb_write_file` | **destructive** | Writes up to 96 KiB to a guest file (replace, or `append` for the next piece); base64 for binary. |
 
 ### The event feed
 
@@ -711,7 +713,7 @@ Everything without a dedicated tool. Prefer a named tool when one exists — a r
 | `obs_request` |  | Raw HTTP against app-obs, for endpoints without a dedicated tool above. |
 | `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
 
-_75 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+_77 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
 
 <!-- END GENERATED CATALOGUE -->
 

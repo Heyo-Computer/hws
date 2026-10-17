@@ -170,6 +170,7 @@ test("the destructive set is the one app-lb's own routes imply", () => {
     "applb_purge_disk",
     "applb_purge_orphan_disks",
     "applb_sweep_disks",
+    "applb_write_file",
     // A tag's removal strands every deployment that pulls it.
     "art_delete_tag",
     "ci_cancel_run",
