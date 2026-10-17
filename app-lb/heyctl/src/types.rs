@@ -45,6 +45,8 @@ pub struct DeploymentStatus {
     pub pending: usize,
     pub total_in_flight: usize,
     pub vms: Vec<VmStatus>,
+    /// VMs created or resumed but not yet healthy; absent when there are none.
+    pub pending_vms: Vec<PendingVmView>,
     /// Present when the spec declares `vm.workspace`.
     pub workspace: Option<WorkspaceStatus>,
     /// Present for a site: whether its root on the LB host can serve.
@@ -964,6 +966,9 @@ pub struct JobRecord {
     pub commit: Option<String>,
     pub dockerfile: Option<String>,
     pub image: Option<String>,
+    /// A build's inputs beyond its commit; a build with the same image and key
+    /// reuses the earlier result (and sets `reused`).
+    pub build_key: Option<String>,
     pub rolled_out: bool,
 
     // artifact-pull

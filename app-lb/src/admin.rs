@@ -1209,6 +1209,10 @@ struct DeploymentStatus {
     pending: usize,
     total_in_flight: usize,
     vms: Vec<VmStatus>,
+    /// VMs created or resumed but not yet past their health check, oldest
+    /// first. A VM an `exec` woke is here, not in `vms`, until it is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_vms: Vec<PendingVmView>,
     /// The deployment's workspace, when the spec declares one: which snapshot
     /// the pool runs from, whether the store has it, and what — if anything —
     /// is holding the pool at zero. See [`crate::workspace`].
@@ -1328,6 +1332,7 @@ fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> Depl
                 draining: b.is_draining(),
             })
             .collect(),
+        pending_vms: pending_vms_of(d),
     }
 }
 
@@ -5511,14 +5516,49 @@ struct ShellQuery {
 enum VmTarget {
     Ready(crate::deployment::BackendSlot),
     /// A VM the daemon reports `Running` that has not passed its health check.
-    Booting(String),
+    Booting(BootingHold),
 }
 
 impl VmTarget {
     fn sandbox_id(&self) -> &str {
         match self {
             Self::Ready(slot) => slot.sandbox_id(),
-            Self::Booting(id) => id,
+            Self::Booting(hold) => &hold.sandbox_id,
+        }
+    }
+}
+
+/// What a command running in a still-booting VM holds instead of a slot.
+///
+/// A pending VM has no backend to take a slot on, so the command counts as a
+/// waiter: demand that keeps the pool from scaling to zero while it runs, even
+/// if the VM is promoted meanwhile. When it ends, the VM's activity clock is
+/// reset as a released slot would reset it, so the idle window starts then.
+struct BootingHold {
+    sandbox_id: String,
+    deployment: std::sync::Arc<crate::deployment::Deployment>,
+    _waiter: crate::deployment::WaiterGuard,
+}
+
+impl BootingHold {
+    fn new(d: &std::sync::Arc<crate::deployment::Deployment>, sandbox_id: String) -> Self {
+        Self {
+            sandbox_id,
+            deployment: d.clone(),
+            _waiter: d.track_waiter(),
+        }
+    }
+}
+
+impl Drop for BootingHold {
+    fn drop(&mut self) {
+        if let Some(b) = self
+            .deployment
+            .backends()
+            .iter()
+            .find(|b| b.sandbox_id == self.sandbox_id)
+        {
+            b.touch();
         }
     }
 }
@@ -5575,7 +5615,7 @@ async fn hold_a_vm(
             sandbox = %sandbox_id,
             "no VM has passed its health check; running in one that is still booting",
         );
-        return Ok(VmTarget::Booting(sandbox_id));
+        return Ok(VmTarget::Booting(BootingHold::new(&d, sandbox_id)));
     }
     if !wake {
         return Err(err(
@@ -5598,7 +5638,7 @@ async fn hold_a_vm(
         // still something to run a command in, and answering 503 here would send
         // the caller away from the VM their own request had just started.
         None => match booting_vm(&d) {
-            Some(sandbox_id) => Ok(VmTarget::Booting(sandbox_id)),
+            Some(sandbox_id) => Ok(VmTarget::Booting(BootingHold::new(&d, sandbox_id))),
             None => Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
@@ -5636,7 +5676,7 @@ fn hold_this_vm(
     }
     match d.pending().iter().find(|p| p.sandbox_id == want) {
         Some(p) if p.status == Some(heyo_sdk::SandboxStatus::Running) => {
-            Ok(VmTarget::Booting(want.to_string()))
+            Ok(VmTarget::Booting(BootingHold::new(d, want.to_string())))
         }
         Some(_) => Err(err(
             StatusCode::CONFLICT,
@@ -6290,6 +6330,10 @@ struct BuildRequest {
     /// is left alone, so a hotfix tag doesn't quietly become the new default.
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
+    /// Build even when the image this would produce is already built from the
+    /// same commit and inputs and running — for a base image that moved.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -6355,7 +6399,7 @@ async fn start_build(
     body: Option<Json<BuildRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_build(&id, req.git_ref) {
+    match state.jobs.start_build(&id, req.git_ref, req.force) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "image build started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
@@ -9817,6 +9861,31 @@ mod tests {
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-cold")), Err(StatusCode::CONFLICT));
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-unknown")), Err(StatusCode::CONFLICT));
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-nope")), Err(StatusCode::NOT_FOUND));
+        }
+
+        /// Regression: a command in a booting VM held nothing, so it was no
+        /// demand, and a scale-to-zero pool could drain the VM under it once
+        /// it was promoted.
+        #[test]
+        fn a_command_in_a_booting_vm_is_demand_until_it_ends() {
+            let d = deployment();
+            d.set_pending(vec![pending("sb-boot", 100, Some(SandboxStatus::Running))]);
+            let Ok(held) = hold_this_vm(&d, "demo", "sb-boot") else {
+                panic!("a booting VM is a target");
+            };
+            assert_eq!(d.demand(), 1);
+
+            // Promoted while the command runs: ending the command releases the
+            // demand and leaves the promoted VM freshly active.
+            let b = std::sync::Arc::new(crate::deployment::VmBackend::new(
+                "sb-boot".into(),
+                "127.0.0.1:1".parse().unwrap(),
+            ));
+            d.set_pending(vec![]);
+            d.set_backends(vec![b.clone()]);
+            drop(held);
+            assert_eq!(d.demand(), 0);
+            assert!(crate::deployment::now_secs() - b.last_active() <= 1);
         }
     }
 

@@ -926,6 +926,11 @@ pub struct VmSpec {
     pub size_class: Option<SandboxSize>,
     /// Size of the replica's persistent data disk, mounted at `/workspace`.
     ///
+    /// heyvmd attaches it blank at `/dev/vdb`; the guest's init formats it on
+    /// first boot and mounts it. The heyo base images and the init app-lb adds
+    /// to a Dockerfile build both do; an image that brings its own `/init.sh`
+    /// must do it itself.
+    ///
     /// Separate from the rootfs, which is fixed when the image is built and
     /// cannot be grown afterwards — so this is not the knob for "the image ran
     /// out of space". The disk belongs to one sandbox: a rollout, a restart or

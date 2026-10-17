@@ -24,7 +24,7 @@ const WIRE = join(here, "..", "..", "..", "testdata", "wire");
  */
 const KNOWN = {
   common: {
-    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "workspace", "site"],
+    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "pending_vms", "workspace", "site"],
     SiteRootStatus: ["root", "status", "index_present", "hint"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
     DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed"],
@@ -83,7 +83,7 @@ const KNOWN = {
     SiemStats: ["observed", "dropped", "analyzed", "raised", "suppressed", "tracked_clients", "clients_at_capacity"],
     WorkflowSpec: ["id", "repo", "ref", "path", "network", "auth", "secrets_prefix", "enabled"],
     WorkflowList: ["workflows"],
-    JobRecord: ["id", "deployment", "kind", "status", "started_at", "finished_at", "error", "log", "repo", "ref", "commit", "dockerfile", "image", "rolled_out", "store", "artifact", "digest", "bytes", "reused", "site_root", "files", "working_dir", "commands_total", "commands_run", "verified", "mounts"],
+    JobRecord: ["id", "deployment", "kind", "status", "started_at", "finished_at", "error", "log", "repo", "ref", "commit", "dockerfile", "image", "build_key", "rolled_out", "store", "artifact", "digest", "bytes", "reused", "site_root", "files", "working_dir", "commands_total", "commands_run", "verified", "mounts"],
     MountOutcome: ["path", "store", "ref", "digest", "tree", "files", "bytes", "unpacked", "reused", "changed"],
     SecretSummary: ["id", "namespace", "description", "keys", "updated_at", "encrypted_at_rest"],
     CertStatus: ["host", "not_after", "issuer", "needs_renewal"],
