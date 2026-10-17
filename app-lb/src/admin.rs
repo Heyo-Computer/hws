@@ -6305,12 +6305,14 @@ async fn get_operation(
         .max_bytes
         .unwrap_or(crate::operations::DEFAULT_PAGE_BYTES)
         .min(crate::operations::MAX_PAGE_BYTES);
-    let offset = if q.tail {
-        op.output_bytes.saturating_sub(max)
+    // A tail is measured in the guest when it is read, not from the last
+    // known size, which lags whatever was written since.
+    let from = if q.tail {
+        None
     } else {
-        q.offset.unwrap_or(0)
+        Some(q.offset.unwrap_or(0))
     };
-    let (operation, output, stale) = ops.read(&op, offset, max).await;
+    let (operation, output, stale) = ops.read(&op, from, max).await;
     Json(OperationView {
         operation,
         output,
@@ -6713,8 +6715,12 @@ async fn delete_transfer(
 }
 
 /// How long an upload with `apply_on_upload` waits for the guest before
-/// answering with `applying`.
-const APPLY_ON_UPLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// answering with `applying`. Long enough for the slowest apply there is, a
+/// console fallback of 8 MiB at tens of KB/s (about ten minutes), so the
+/// caller's PUT normally ends with the file in place; `202` is for an apply
+/// that is stuck. Nothing between the caller and app-lb times out an idle
+/// response sooner.
+const APPLY_ON_UPLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// `PUT /transfers/:token` — the caller's upload, or the guest's push. The
 /// token is the credential; anything that is not a live one is a 404.
@@ -9484,6 +9490,18 @@ mod tests {
                 .await;
                 assert_eq!(page["output"]["data"], "hello");
                 assert_eq!(page["output"]["next_offset"], 8);
+
+                // A tail is the last bytes as the guest has them now.
+                let (_, tail) = call(
+                    &f,
+                    "GET",
+                    &format!("/deployments/obsolete/operations/{id}?tail=true&max_bytes=4"),
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(tail["output"]["data"], "bye\n");
+                assert_eq!(tail["output"]["offset"], 15);
+                assert_eq!(tail["output"]["next_offset"], tail["output"]["total_bytes"]);
 
                 let (_, list) =
                     call(&f, "GET", "/deployments/obsolete/operations", Body::empty()).await;

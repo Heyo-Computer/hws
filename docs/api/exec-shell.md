@@ -148,7 +148,7 @@ Files too large for the console travel through one-time URLs instead. app-lb kee
 | Route | Does |
 | --- | --- |
 | `POST /deployments/:id/transfers` | `{direction, path, extract?, strip_components?, ttl_secs? (default 3600, max 21600), max_bytes?, apply_on_upload? (default true), sandbox_id?, wait_secs?}` |
-| `PUT /transfers/:token` | Upload. Streamed, capped at `max_bytes` (`413`), hashed. With `apply_on_upload`, the guest fetches and places the bytes before the response (up to 60 s, else `202` with `applying`). |
+| `PUT /transfers/:token` | Upload. Streamed, capped at `max_bytes` (`413`), hashed. With `apply_on_upload`, the guest fetches and places the bytes before the response, which waits for them. That takes seconds with curl or wget and up to about ten minutes for 8 MiB over the console. `202` with `applying` means it is still going after 15 minutes. |
 | `GET /transfers/:token` | Download an outbound transfer, up to three times. |
 | `GET /deployments/:id/transfers[/:tid]` | List, or one transfer's state (`awaiting_upload`, `uploaded`, `applying`, `applied`, `collecting`, `ready`, `failed`), size, sha256 and error. URLs appear only in the create response. |
 | `POST /deployments/:id/transfers/:tid/apply` | Place an uploaded transfer again, for example after starting a stopped sandbox. |
