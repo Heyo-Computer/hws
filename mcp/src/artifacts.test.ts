@@ -70,13 +70,13 @@ function tool(tools: Tool[], name: string): Tool {
   return found;
 }
 
-/** The managed app-lb door for namespace `acme`, as `loadConfig` builds it. */
-const LB = "https://server.heyo.computer/namespaces/acme/lb";
+/** app-lb's admin API, with `acme` configured as the namespace. */
+const LB = "https://admin.us5.heyo.work";
 /** Where `acme`'s artifacts live on that app-lb. */
 const ART = `${LB}/namespaces/acme/artifacts`;
 
 const withArt = () =>
-  buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_NAMESPACE: "acme" }));
+  buildTools(loadConfig({ APPLB_URL: LB, APPLB_TOKEN: "applb_1_x", APPLB_NAMESPACE: "acme" }));
 
 /** app-lb answering a manifest PUT the way it does. */
 const storeResponder = (manifestDigest = "m".repeat(64)) =>
@@ -145,7 +145,7 @@ test("every artifact request carries the caller's own app-lb bearer and no store
     await tool(buildTools(cfg), "art_list_tags").handler({});
     assert.equal(stub.calls.length, 4);
     for (const call of stub.calls) {
-      assert.ok(call.url.startsWith("https://lb.example/namespaces/acme/lb/namespaces/acme/artifacts/"), call.url);
+      assert.ok(call.url.startsWith("https://lb.example/namespaces/acme/artifacts/"), call.url);
       assert.equal(call.headers.authorization, "Bearer applb_2_caller", call.url);
       assert.equal(call.headers["x-api-key"], undefined, call.url);
     }
@@ -282,7 +282,7 @@ test("no tool, instruction or guide text points an agent at the artifact store",
   const banned = [/ART_API_KEY/, /ART_URL/, /ART_GATE_TOKEN/, /art\.us\d/, /artifact\.store/, /\/art\b(?!ifact)/, /x-api-key/i, /art_request|art_usage|art_list_blobs|art_list_manifests/];
   for (const http of [false, true]) {
     const tools = buildTools(
-      loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_NAMESPACE: "acme", ...(http ? { HEYO_MCP_HTTP_PORT: "8090" } : {}) }),
+      loadConfig({ APPLB_URL: LB, APPLB_TOKEN: "applb_1_x", APPLB_NAMESPACE: "acme", ...(http ? { HEYO_MCP_HTTP_PORT: "8090" } : {}) }),
     );
     for (const t of tools) {
       const schemaText = JSON.stringify(

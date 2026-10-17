@@ -1,511 +1,455 @@
 /**
- * heyo cloud: the sandbox control plane.
+ * Sandboxes: VMs an agent creates, runs code in, moves files through, pauses
+ * between steps and deletes — all on app-lb.
  *
- * One endpoint, many sandboxes. Every tool here names the sandbox it acts on,
- * so a client holds one connection for its whole life and no per-sandbox
- * session exists to lose on a restart. A sandbox outlives the call that made
- * it — it is a VM with a TTL, not a request scope — which is what lets an agent
- * hold a conversation across replies instead of rebuilding its world each time.
+ * A sandbox is an app-lb deployment with no route: one Firecracker VM from a
+ * hub image, a data disk at `/workspace`, `idle_action: retain` so a stop keeps
+ * that disk, and reached only through these tools. Nothing here calls the Heyo
+ * cloud API, so the app-lb token that deploys apps is the only credential a
+ * sandbox needs — which is what lets the hosted server offer them at all.
  *
- * # The 1 MB body, and the way around it
+ * # Which tool for what
  *
- * Cloud's JSON API caps a request body at 1 MB, and file writes travel through
- * it base64-encoded, so ~768 KB of payload is already `413 Request Entity Too
- * Large`. That ceiling is real and it is not MCP's — it is the same limit the
- * SDK meets. What gets past it is the archive path, and its shape matters:
- * {@link uploadUrlTool} hands back a **presigned object-store URL** that the
- * caller PUTs the bytes to directly. Those bytes never enter a JSON body, never
- * pass through this server, and are bounded by the object store rather than by
- * the API — which is why a phone video works and an inline write of the same
- * file cannot. `sandbox_write_file` refuses oversized content rather than
- * spending a round trip to be told 413, and says which tool to use instead.
+ * - **Short commands** (under ~30 s): `sandbox_exec`. It holds the VM's only
+ *   console until the command ends, and the call times out with the server.
+ * - **Long ones** (a test suite, a coding session): `sandbox_exec_start`, then
+ *   `sandbox_exec_status` to page the output. They run detached, several at
+ *   once, and keep the VM up while they run.
+ * - **Small files** (≤1 MiB): `sandbox_read_file` / `sandbox_write_file`, over
+ *   the console.
+ * - **Archives**: `sandbox_upload` / `sandbox_download` hand back a one-time URL
+ *   the caller `curl`s; the guest fetches or pushes the bytes over the network.
  *
  * # What is destructive
  *
- * `sandbox_kill` destroys the VM and its disk. `sandbox_stop` does not: a
- * stopped sandbox keeps its disk and starts again with its files, which is the
- * cheap way to park a conversation that may resume. TTL expiry reaps only a
- * *running* sandbox, so parking one is also how you stop the clock.
- *
- * # Why `heyo_capacity` is in this module
- *
- * It is the one tool here whose name does not begin `sandbox_`, because it
- * answers a question about the fleet rather than about a sandbox: which daemons
- * are online and what they have room for. It lives here anyway because it hits
- * *cloud*, and `buildTools` gates this whole group on a usable cloud credential.
- * Listing it beside the app-lb tools would advertise it on a fleet-operations
- * instance that has no cloud key and could never answer it.
+ * `sandbox_kill` deletes the sandbox and its disk. `sandbox_stop` does not: the
+ * disk under `/workspace` comes back on `sandbox_start` (the rest of the
+ * filesystem is the image again).
  */
 
 import { z } from "zod";
-import { num , DESTRUCTIVE_PREFIX } from "./schema.js";
+import { bool, num, DESTRUCTIVE_PREFIX } from "./schema.js";
 import type { Clients } from "../clients/index.js";
-import { settle } from "../clients/index.js";
-import { json, report, section } from "../format.js";
+import type { Config } from "../config.js";
+import { json, report } from "../format.js";
 import { ServiceError } from "../http.js";
 import type { Tool } from "./diagnose.js";
+import { compactExec, GUEST_MAX_CHARS, type GuestExec } from "./actions.js";
 
 const DESTRUCTIVE = DESTRUCTIVE_PREFIX;
 
-/**
- * The most content a write may carry inline, in bytes before encoding.
- *
- * Measured against the live API rather than derived: 512 KB succeeds, 768 KB
- * returns 413, which brackets a 1 MB body with base64's 4/3 expansion —
- * 768 KB × 4/3 is exactly 1024 KB. 512 KiB encodes to ~683 KB and leaves room
- * for the rest of the envelope.
- */
-export const INLINE_WRITE_LIMIT = 512 * 1024;
+/** Where a sandbox's image comes from unless the caller names another. */
+export const HUB_STORE = "https://hub.heyo.work";
+export const DEFAULT_IMAGE = "heyo/debian:latest";
 
-/** Cloud reports these and stops changing; anything else is still moving. */
-const TERMINAL = new Set(["running", "failed", "stopped", "paused", "cold-stored"]);
+/** Seconds a lifecycle call may wait on app-lb, plus this, is its deadline. */
+const WAIT_MARGIN_MS = 15_000;
 
-const READY_POLL_MS = 2_000;
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-function statusOf(info: unknown): string {
-  const s = (info as { status?: unknown })?.status;
-  return typeof s === "string" ? s : "unknown";
+function sandboxId(): string {
+  const hex = Array.from({ length: 4 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, "0"));
+  return `sbx-${hex.join("")}`;
 }
 
-/** A 503 from cloud is capacity, and capacity is the one failure worth waiting on. */
-function isCapacity(e: unknown): boolean {
-  return e instanceof ServiceError && e.status === 503;
+/** The deployment spec a sandbox is. Exported for tests. */
+export function sandboxSpec(a: Record<string, unknown>, id: string): Record<string, unknown> {
+  const vm: Record<string, unknown> = {
+    driver: "firecracker",
+    // Health is a TCP connect to sshd, which the hub images run; the sandbox
+    // takes no traffic on it.
+    port: 22,
+    size_class: a.size_class ?? "small",
+    disk_size_gb: a.disk_size_gb ?? 10,
+  };
+  if (a.start_command) vm.start_command = a.start_command;
+  if (a.working_directory) vm.working_directory = a.working_directory;
+  if (a.env_vars) vm.env_vars = a.env_vars;
+  return {
+    id,
+    ...(a.namespace ? { namespace: a.namespace } : {}),
+    routes: [],
+    artifact: { store: HUB_STORE, ref: a.image ?? DEFAULT_IMAGE },
+    vm,
+    health: { path: null },
+    scaling: {
+      min_replicas: 0,
+      max_replicas: 1,
+      idle_action: "retain",
+      scale_to_zero_after_secs: a.idle_secs ?? 600,
+    },
+  };
 }
 
-export function sandboxTools(clients: Clients): Tool[] {
+function isSandbox(d: unknown): boolean {
+  const spec = (d as { spec?: { routes?: unknown[]; vm?: unknown } })?.spec;
+  return Boolean(spec?.vm) && Array.isArray(spec?.routes) && spec!.routes!.length === 0;
+}
+
+export function sandboxTools(clients: Clients, _config: Config, deployTool?: Tool): Tool[] {
   const enc = encodeURIComponent;
-  const sandboxPath = (id: unknown, suffix = "") => `/deployed-sandboxes/${enc(String(id))}${suffix}`;
+  const dep = (id: unknown, suffix = "") => `/deployments/${enc(String(id))}${suffix}`;
+  const waitSecs = (v: unknown, fallback: number) => Math.max(0, Math.min(Number(v ?? fallback), 300));
 
-  const info = (id: unknown) => clients.cloud({ path: sandboxPath(id) });
-
-  /**
-   * Poll until the sandbox stops being `provisioning`, or the budget runs out.
-   *
-   * A 404 inside the budget is tolerated, not fatal: a sandbox can be created
-   * and not yet resolvable by id for a moment, and failing there would report a
-   * VM that is booting fine as one that does not exist.
-   */
-  async function waitForReady(id: string, seconds: number): Promise<unknown> {
-    const deadline = Date.now() + seconds * 1000;
-    for (;;) {
-      let current: unknown;
-      try {
-        current = await info(id);
-      } catch (e) {
-        if (!(e instanceof ServiceError && e.status === 404) || Date.now() >= deadline) throw e;
-        await sleep(READY_POLL_MS);
-        continue;
-      }
-      if (TERMINAL.has(statusOf(current))) return current;
-      if (Date.now() >= deadline) return current;
-      await sleep(READY_POLL_MS);
-    }
-  }
+  const lifecycle = (verb: string, id: unknown, body: Record<string, unknown>, wait: number) =>
+    clients.applb({
+      method: "POST",
+      path: dep(id, `/${verb}`),
+      body,
+      timeoutMs: wait * 1000 + WAIT_MARGIN_MS,
+    });
 
   return [
     {
       name: "sandbox_create",
       description:
-        "Boot a sandbox (a microVM) and return it once it is running. The id it " +
-        "returns is the only handle any other tool needs — sandboxes are addressed by " +
-        "id on this one endpoint, not by a per-sandbox connection.\n\n" +
-        "It outlives this call. `ttl_seconds` is how long a *running* sandbox survives " +
-        "unattended (default is the account's); sandbox_set_ttl renews it at any point, " +
-        "and sandbox_stop parks it — disk kept, clock stopped — for a later " +
-        "sandbox_start. So a conversation can keep one sandbox rather than rebuilding " +
-        "its world per reply.\n\n" +
-        "`archive_id` seeds /workspace from an already-uploaded archive: that is how " +
-        "content too large for a JSON body gets in. See sandbox_upload_url.\n\n" +
-        "A 503 here is region capacity, not a fault. `retries` retries exactly that, " +
-        "with exponential backoff; everything else fails immediately, because retrying " +
-        "a rejected spec only rejects it again.",
+        "Create a sandbox: a Firecracker VM from a hub image (default heyo/debian:latest) with " +
+        "a /workspace disk that survives sandbox_stop. Waits for it to be ready unless " +
+        "wait_seconds is 0. Then use sandbox_exec / sandbox_exec_start.",
       schema: {
-        image: z.string().optional().describe("default 'ubuntu:24.04'"),
-        size_class: z
-          .enum(["micro", "mini", "small", "medium", "large", "xlarge"])
-          .optional()
-          .describe("default 'small'"),
-        region: z.enum(["US", "EU"]).optional().describe("default 'US'"),
-        driver: z
-          .enum(["firecracker", "libvirt", "kvm", "firecracker_containerd"])
-          .optional()
-          .describe(
-            "leave unset to let cloud place it; naming one the region does not run is " +
-              "the usual cause of a 503",
-          ),
-        name: z.string().optional(),
-        archive_id: z.string().optional().describe("seed /workspace from this archive"),
+        name: z.string().optional().describe("sandbox id; default sbx-<random>"),
+        image: z.string().optional().describe("hub image, e.g. heyo/ubuntu:latest"),
+        size_class: z.enum(["micro", "mini", "small", "medium", "large", "xlarge"]).optional(),
+        disk_size_gb: num().optional().describe("/workspace disk; default 10"),
         start_command: z.string().optional(),
         working_directory: z.string().optional(),
         env_vars: z.record(z.string()).optional(),
-        open_ports: z.array(num()).optional(),
-        setup_hooks: z.array(z.string()).optional(),
-        ttl_seconds: num().optional().describe("0 means unlimited, if the plan allows"),
-        disk_size_gb: num().optional(),
-        wait_seconds: z
-          .number()
-          .optional()
-          .describe("how long to wait for it to leave 'provisioning'; default 120, 0 returns at once"),
-        retries: num().optional().describe("capacity (503) retries; default 3, 0 disables"),
+        idle_secs: num().optional().describe("idle seconds before it stops itself; default 600"),
+        namespace: z.string().optional().describe("defaults to your token's"),
+        wait_seconds: num().optional().describe("default 120; 0 returns at once"),
       },
       handler: async (a) => {
-        // The SDK fills these in before it posts, and a tool that did not would
-        // boot something subtly different from what the same call boots in code.
-        const body: Record<string, unknown> = {
-          region: a.region ?? "US",
-          image: a.image ?? "ubuntu:24.04",
-          size_class: a.size_class ?? "small",
-          open_ports: a.open_ports ?? [],
-        };
-        for (const k of [
-          "name",
-          "archive_id",
-          "driver",
-          "start_command",
-          "working_directory",
-          "env_vars",
-          "setup_hooks",
-          "ttl_seconds",
-          "disk_size_gb",
-        ] as const) {
-          if (a[k] !== undefined) body[k] = a[k];
+        if (!deployTool) throw new Error("sandbox_create needs applb_deploy, which this server lacks");
+        const id = typeof a.name === "string" && a.name.trim() ? a.name.trim() : sandboxId();
+        const exists = await clients
+          .applb({ path: dep(id) })
+          .then(() => true)
+          .catch((e) => {
+            if (e instanceof ServiceError && (e.status === 404 || e.status === 403)) return false;
+            throw e;
+          });
+        if (exists) {
+          return `Sandbox ${id} already exists; use it (sandbox_info) or pick another name.`;
         }
-
-        const retries = Math.max(0, Number(a.retries ?? 3));
-        let created: unknown;
-        for (let attempt = 0; ; attempt++) {
-          try {
-            created = await clients.cloud({ method: "POST", path: "/sandbox-deploy", body });
-            break;
-          } catch (e) {
-            if (!isCapacity(e) || attempt >= retries) throw e;
-            await sleep(2_000 * 2 ** attempt);
-          }
-        }
-
-        const id = (created as { id?: unknown })?.id;
-        const wait = Number(a.wait_seconds ?? 120);
-        if (!id || wait <= 0) return json(created);
-        const settled = await waitForReady(String(id), wait);
-        const status = statusOf(settled);
-        return report(`Sandbox ${id} — ${status}`, [
-          { title: "Created", body: created },
+        const wait = waitSecs(a.wait_seconds, 120);
+        // The hub images start what a sandbox needs (sshd) from their own init.
+        const deployed = await deployTool.handler({
+          spec: sandboxSpec(a, id),
+          wait_seconds: wait,
+          ...(a.start_command ? {} : { no_start_command: true }),
+        });
+        const registered = await clients
+          .applb({ path: dep(id) })
+          .then(() => true)
+          .catch(() => false);
+        if (!registered) return deployed;
+        if (wait === 0) return `${deployed}\n\nNot waited for: sandbox_start ${id} waits for its VM.`;
+        const started = await lifecycle("start", id, { wait_secs: wait }, wait);
+        return report(`Sandbox ${id}`, [
+          { title: "State", body: started },
+          { title: "Created", body: deployed },
           {
-            title:
-              status === "provisioning"
-                ? `Still provisioning after ${wait}s — poll sandbox_info`
-                : "Current state",
-            body: settled,
+            title: "Next",
+            body:
+              "sandbox_exec for short commands, sandbox_exec_start for long ones; keep work " +
+              "under /workspace. sandbox_stop pauses it, sandbox_kill deletes it.",
           },
         ]);
       },
     },
-
     {
       name: "sandbox_list",
-      description:
-        "Every sandbox this key can see, with status, image, uptime and bound URLs. " +
-        "The way to find a sandbox again after a restart — the id is the state worth " +
-        "keeping, and this recovers it if that was lost.",
-      schema: { name: z.string().optional().describe("exact display-name filter") },
-      handler: async (a) =>
-        json(
-          await clients.cloud({
-            path: "/deployed-sandboxes",
-            query: { name: a.name as string | undefined },
+      description: "Your sandboxes (deployments with no route), with their pool state.",
+      schema: {},
+      handler: async () => {
+        const all = (await clients.applb({ path: "/deployments" })) as unknown;
+        const list = Array.isArray(all) ? all.filter(isSandbox) : [];
+        return json(
+          list.map((d) => {
+            const r = d as Record<string, unknown>;
+            const spec = r.spec as Record<string, unknown>;
+            return {
+              id: spec.id,
+              namespace: spec.namespace,
+              ready: r.ready,
+              pending: r.pending,
+              stopped: (spec.scaling as Record<string, unknown> | undefined)?.max_replicas === 0,
+              vms: r.vms,
+            };
           }),
-        ),
+        );
+      },
     },
-
     {
       name: "sandbox_info",
-      description:
-        "One sandbox by id: status, region, size, TTL and bound URLs. Resolves even " +
-        "for a stopped sandbox, which can be transiently missing from sandbox_list " +
-        "right after it stops. This is the readiness poll after a create that did not " +
-        "wait — 'provisioning' is still moving, 'failed' carries the reason.",
+      description: "One sandbox: its spec, VMs and state.",
       schema: { id: z.string() },
-      handler: async (a) => json(await info(a.id)),
+      handler: async (a) => json(await clients.applb({ path: dep(a.id) })),
     },
-
     {
       name: "sandbox_exec",
       description:
-        "Run a command in the sandbox with `sh -c` and return stdout, stderr and " +
-        "exit_code. A non-zero exit is a successful call with a non-zero code in it, " +
-        "not an error — read exit_code.\n\n" +
-        "There is no streaming and no cancellation: output is buffered until the " +
-        "command exits, and a command that outlives this server's request timeout " +
-        "keeps running in the guest while the call fails. Long work wants nohup and a " +
-        "log file the next exec reads.",
+        DESTRUCTIVE +
+        "Run a short command (under ~30s) in the sandbox and return its output. Anything " +
+        "longer: sandbox_exec_start. Each call starts in / with a fresh shell: cd first.",
       schema: {
         id: z.string(),
         command: z.string(),
         cwd: z.string().optional(),
         env: z.record(z.string()).optional(),
+        timeout_secs: num().optional(),
+        max_chars: num().optional().describe(`default 12000, max ${GUEST_MAX_CHARS}`),
+      },
+      handler: async (a) => {
+        const out = json(
+          compactExec(
+            (await clients.applb({
+              method: "POST",
+              path: dep(a.id, "/exec"),
+              body: {
+                command: a.command,
+                ...(a.cwd === undefined ? {} : { cwd: a.cwd }),
+                ...(a.env === undefined ? {} : { env: a.env }),
+                ...(a.timeout_secs === undefined ? {} : { timeout_secs: a.timeout_secs }),
+              },
+            })) as GuestExec,
+          ),
+          a.max_chars === undefined ? undefined : Math.min(Number(a.max_chars), GUEST_MAX_CHARS),
+        );
+        return out.includes("… truncated at ")
+          ? `${out}\nFor all of it: run it with sandbox_exec_start and page sandbox_exec_status.`
+          : out;
+      },
+    },
+    {
+      name: "sandbox_exec_start",
+      description:
+        DESTRUCTIVE +
+        "Start a command detached in the sandbox and return at once with an operation id. For " +
+        "anything over ~30s; several can run at once. Follow with sandbox_exec_status.",
+      schema: {
+        id: z.string(),
+        command: z.string(),
+        cwd: z.string().optional(),
+        env: z.record(z.string()).optional(),
+        max_runtime_secs: num().optional().describe("default 3600, max 21600"),
       },
       handler: async (a) =>
         json(
-          await clients.cloud({
+          await clients.applb({
             method: "POST",
-            path: `/sandbox/${enc(String(a.id))}/exec`,
-            body: { command: a.command, cwd: a.cwd, env: a.env },
+            path: dep(a.id, "/operations"),
+            body: {
+              command: a.command,
+              ...(a.cwd === undefined ? {} : { cwd: a.cwd }),
+              ...(a.env === undefined ? {} : { env: a.env }),
+              ...(a.max_runtime_secs === undefined ? {} : { max_runtime_secs: a.max_runtime_secs }),
+            },
+            timeoutMs: 150_000,
           }),
         ),
     },
-
+    {
+      name: "sandbox_exec_status",
+      description:
+        "An operation's state (running, succeeded, failed, cancelled, timed_out, lost), exit " +
+        "code, and a page of its output from offset (next_offset continues it; tail for the end).",
+      schema: {
+        id: z.string(),
+        operation: z.string(),
+        offset: num().optional(),
+        max_bytes: num().optional().describe("default 65536, max 262144"),
+        tail: bool().optional(),
+      },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            path: dep(a.id, `/operations/${enc(String(a.operation))}`),
+            query: {
+              offset: a.offset as number | undefined,
+              max_bytes: (a.max_bytes as number | undefined) ?? 65_536,
+              tail: a.tail ? "true" : undefined,
+            },
+          }),
+        ),
+    },
+    {
+      name: "sandbox_exec_cancel",
+      description: "Cancel an operation: SIGTERM to its process group, SIGKILL 10s later.",
+      schema: { id: z.string(), operation: z.string() },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            method: "DELETE",
+            path: dep(a.id, `/operations/${enc(String(a.operation))}`),
+          }),
+        ),
+    },
     {
       name: "sandbox_read_file",
       description:
-        "Read a file from the sandbox. The content crosses as base64 inside a JSON " +
-        "body, so cloud's 1 MB body limit applies to the *response* too — a large file " +
-        "is better tarred and served over a bound port, or summarised in the guest " +
-        "with sandbox_exec.",
+        "Read up to 256 KiB of a file in the sandbox from offset; next_offset continues it. " +
+        "Binary comes back base64. Larger: sandbox_download.",
       schema: {
         id: z.string(),
-        file_path: z.string(),
-        mount_path: z.string().optional().describe("default '/workspace'"),
-        encoding: z
-          .enum(["text", "base64"])
-          .optional()
-          .describe("'text' decodes UTF-8; 'base64' returns the wire value. Default 'text'."),
+        path: z.string().describe("absolute path"),
+        offset: num().optional(),
+        length: num().optional(),
       },
-      handler: async (a) => {
-        const out = await clients.cloud({
-          method: "POST",
-          path: `/sandbox/${enc(String(a.id))}/read-file`,
-          body: { file_path: a.file_path, mount_path: a.mount_path ?? "/workspace" },
-        });
-        const content = (out as { content?: unknown })?.content;
-        if ((a.encoding ?? "text") !== "text" || typeof content !== "string") return json(out);
-        return json(Buffer.from(content, "base64").toString("utf8"));
-      },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            path: dep(a.id, "/files"),
+            query: {
+              path: String(a.path),
+              offset: a.offset as number | undefined,
+              length: a.length as number | undefined,
+            },
+          }),
+        ),
     },
-
     {
       name: "sandbox_write_file",
       description:
-        "Write a file into the sandbox. Content travels base64 in a JSON body, so this " +
-        `is capped at ${INLINE_WRITE_LIMIT / 1024} KiB — measured, not guessed: 512 KB ` +
-        "succeeds and 768 KB returns 413 against cloud's 1 MB body limit. Anything " +
-        "larger is refused here rather than sent to be rejected, and the refusal names " +
-        "the route that has no such limit: sandbox_upload_url → PUT → " +
-        "sandbox_finalize_upload → sandbox_attach_archive.",
+        DESTRUCTIVE +
+        "Write up to 1 MiB to a file in the sandbox (replace, or append); parent directories " +
+        "are created. Larger: sandbox_upload.",
       schema: {
         id: z.string(),
-        file_path: z.string(),
-        content: z.string().optional().describe("UTF-8 text"),
-        content_base64: z.string().optional().describe("binary, base64-encoded"),
-        mount_path: z.string().optional().describe("default '/workspace'"),
+        path: z.string().describe("absolute path"),
+        content: z.string(),
+        encoding: z.enum(["text", "base64"]).optional(),
+        append: bool().optional(),
       },
       handler: async (a) => {
         const bytes =
-          typeof a.content_base64 === "string"
-            ? Buffer.from(a.content_base64, "base64")
-            : Buffer.from(String(a.content ?? ""), "utf8");
-        if (bytes.byteLength > INLINE_WRITE_LIMIT) {
-          throw new Error(
-            `${bytes.byteLength} bytes is past the ${INLINE_WRITE_LIMIT}-byte inline ` +
-              "write limit — base64 of that would exceed cloud's 1 MB body limit and " +
-              "come back 413. Use the archive route instead: sandbox_upload_url returns " +
-              "a presigned URL to PUT the bytes to directly (no JSON body, no 1 MB " +
-              "ceiling), then sandbox_finalize_upload and sandbox_attach_archive put " +
-              "them in the sandbox.",
-          );
-        }
+          a.encoding === "base64" ? Buffer.from(String(a.content), "base64") : Buffer.from(String(a.content));
         return json(
-          await clients.cloud({
-            method: "POST",
-            path: `/sandbox/${enc(String(a.id))}/write-file`,
-            body: {
-              file_path: a.file_path,
-              mount_path: a.mount_path ?? "/workspace",
-              content: bytes.toString("base64"),
-            },
+          await clients.applb({
+            method: "PUT",
+            path: dep(a.id, "/files"),
+            query: { path: String(a.path), append: a.append ? "true" : undefined },
+            rawBody: new Uint8Array(bytes),
           }),
         );
       },
     },
-
     {
-      name: "sandbox_upload_url",
+      name: "sandbox_upload",
       description:
-        "Reserve an archive and return a presigned URL to PUT its bytes to. **This is " +
-        "the way past the 1 MB body limit.** The URL belongs to the object store, not " +
-        "to cloud: PUT the bytes straight to it with `Content-Type: application/gzip` " +
-        "and *no* Authorization header — the signature is the credential, and a bearer " +
-        "alongside it is what makes some stores refuse. The bytes never touch this " +
-        "server or any JSON body, so the ceiling is the object store's, not the API's: " +
-        "hundreds of MB — phone video — is the case this exists for.\n\n" +
-        "The archive is a **tar.gz** whose contents become a mount; a single photo is " +
-        "a one-entry tarball. Then call sandbox_finalize_upload with the archive_id, " +
-        "and either pass that id to sandbox_create or sandbox_attach_archive it onto a " +
-        "sandbox already running.",
-      schema: {},
-      handler: async () => {
-        const out = await clients.cloud({ method: "POST", path: "/sandbox-archives/presign" });
-        return report("Presigned archive upload", [
-          { title: "Reservation", body: out },
-          {
-            title: "Next",
-            body: [
-              "PUT the tar.gz to upload_url with Content-Type: application/gzip and no Authorization header",
-              "sandbox_finalize_upload { archive_id }",
-              "sandbox_create { archive_id } — or sandbox_attach_archive { id, archive_id } for a running sandbox",
-            ],
+        "Get a one-time URL to upload a file or archive into the sandbox: curl -T it there " +
+        "(no credential needed) and the guest places it at path, unpacking tar/tar.gz into it.",
+      schema: {
+        id: z.string(),
+        path: z.string().describe("destination: a file, or the directory to unpack into"),
+        extract: z.enum(["none", "tar", "tar.gz", "auto"]).optional().describe("default auto"),
+        strip_components: num().optional(),
+        ttl_secs: num().optional(),
+        max_bytes: num().optional(),
+      },
+      handler: async (a) => {
+        const t = (await clients.applb({
+          method: "POST",
+          path: dep(a.id, "/transfers"),
+          body: {
+            direction: "in",
+            path: a.path,
+            extract: a.extract ?? "auto",
+            ...(a.strip_components === undefined ? {} : { strip_components: a.strip_components }),
+            ...(a.ttl_secs === undefined ? {} : { ttl_secs: a.ttl_secs }),
+            ...(a.max_bytes === undefined ? {} : { max_bytes: a.max_bytes }),
           },
+        })) as { upload_url?: string; id?: string };
+        return report(`Upload ${t.id ?? ""} ready`, [
+          { title: "Upload with", body: `curl -sS -T <file> '${t.upload_url}'` },
+          {
+            title: "Notes",
+            body:
+              "Single-use and expiring; the URL is the credential, so keep it out of logs. The " +
+              "response to the upload says when the guest has placed it; sandbox_transfer_status " +
+              "shows it later.",
+          },
+          { title: "Transfer", body: t },
         ]);
       },
     },
-
     {
-      name: "sandbox_finalize_upload",
-      description:
-        "Close out an upload started by sandbox_upload_url: the archive is only usable " +
-        "once finalized. Returns its id and size — a size of zero means the PUT did not " +
-        "land, which is worth checking before wondering why a mount is empty.",
-      schema: {
-        archive_id: z.string(),
-        name: z.string().optional().describe("display name"),
-        sandbox_id: z
-          .string()
-          .optional()
-          .describe(
-            "a label stored with the archive, not a sandbox to attach it to — the SDK " +
-              "passes the source directory's name. Attaching is sandbox_attach_archive.",
-          ),
-      },
-      handler: async (a) =>
-        json(
-          await clients.cloud({
-            method: "POST",
-            path: `/sandbox-archives/${enc(String(a.archive_id))}/finalize`,
-            body: { sandbox_id: a.sandbox_id ?? String(a.name ?? a.archive_id), name: a.name },
-          }),
-        ),
-    },
-
-    {
-      name: "sandbox_attach_archive",
-      description:
-        "Mount a finalized archive onto a sandbox that is already running, replacing " +
-        "what is at `sandbox_path`. This is what makes the archive route usable " +
-        "mid-conversation: a large file can reach a sandbox that already exists, " +
-        "without booting a new one to carry it.\n\n" +
-        "It *replaces* the mount — anything at that path and not in the archive is " +
-        "gone. Mount somewhere of its own if the sandbox's existing /workspace matters.",
+      name: "sandbox_download",
+      description: "Get a one-time URL to download a file, or a directory as a tar.gz, from the sandbox.",
       schema: {
         id: z.string(),
-        archive_id: z.string(),
-        sandbox_path: z.string().optional().describe("default '/workspace'"),
+        path: z.string().describe("a file, or a directory (sent as tar.gz)"),
+        wait_secs: num().optional().describe("how long to wait for the guest's push; default 50"),
       },
-      handler: async (a) =>
-        json(
-          await clients.cloud({
-            method: "POST",
-            path: sandboxPath(a.id, "/replace-mount"),
-            body: { archive_id: a.archive_id, sandbox_path: a.sandbox_path ?? "/workspace" },
-          }),
-        ),
+      handler: async (a) => {
+        const wait = waitSecs(a.wait_secs, 50);
+        const t = (await clients.applb({
+          method: "POST",
+          path: dep(a.id, "/transfers"),
+          body: { direction: "out", path: a.path, wait_secs: wait },
+          timeoutMs: wait * 1000 + WAIT_MARGIN_MS,
+        })) as { download_url?: string; state?: string; id?: string };
+        const ready = t.state === "ready";
+        return report(ready ? `Download ${t.id} ready` : `Download ${t.id} still collecting`, [
+          {
+            title: "Download with",
+            body:
+              `curl -sS -o <out> '${t.download_url}'` +
+              (ready ? "" : "\n(works once sandbox_transfer_status says ready)"),
+          },
+          { title: "Notes", body: "Up to three downloads, then the URL stops working; it is the credential." },
+          { title: "Transfer", body: t },
+        ]);
+      },
     },
-
     {
-      name: "sandbox_set_ttl",
-      description:
-        "Reset how long the sandbox may run unattended, from now. This is the keepalive " +
-        "for a sandbox that has to survive between replies: call it whenever the " +
-        "conversation touches the sandbox and it never ages out mid-thread. `0` is " +
-        "unlimited where the plan allows it.\n\n" +
-        "Only a *running* sandbox is reaped, so a stopped one is not on this clock at " +
-        "all — sandbox_stop is the other way to keep one indefinitely.",
-      schema: { id: z.string(), ttl_seconds: num() },
+      name: "sandbox_transfer_status",
+      description: "One upload or download: its state, size, sha256 and any error.",
+      schema: { id: z.string(), transfer: z.string() },
       handler: async (a) =>
-        json(
-          await clients.cloud({
-            method: "POST",
-            path: sandboxPath(a.id, "/ttl"),
-            body: { ttl_seconds: a.ttl_seconds },
-          }),
-        ),
+        json(await clients.applb({ path: dep(a.id, `/transfers/${enc(String(a.transfer))}`) })),
     },
-
     {
       name: "sandbox_stop",
       description:
-        "Stop the sandbox without destroying it. The disk survives, so sandbox_start " +
-        "brings back the same files; it costs disk and no memory, and a stopped sandbox " +
-        "is off the TTL reaper. The way to park a conversation that may resume.",
-      schema: { id: z.string() },
-      handler: async (a) =>
-        json(await clients.cloud({ method: "POST", path: `/sandbox/${enc(String(a.id))}/stop` })),
+        "Pause the sandbox: its VM stops and /workspace is kept for sandbox_start. Nothing " +
+        "wakes it until then.",
+      schema: { id: z.string(), wait_secs: num().optional() },
+      handler: async (a) => {
+        const wait = waitSecs(a.wait_secs, 30);
+        return json(await lifecycle("stop", a.id, { wait_secs: wait }, wait));
+      },
     },
-
     {
       name: "sandbox_start",
-      description: "Start a stopped sandbox again, with its disk as it was left.",
-      schema: { id: z.string() },
-      handler: async (a) =>
-        json(await clients.cloud({ method: "POST", path: `/sandbox/${enc(String(a.id))}/start` })),
+      description: "Resume a stopped sandbox with its /workspace, and wait for it.",
+      schema: { id: z.string(), wait_secs: num().optional() },
+      handler: async (a) => {
+        const wait = waitSecs(a.wait_secs, 60);
+        return json(await lifecycle("start", a.id, { wait_secs: wait }, wait));
+      },
     },
-
     {
       name: "sandbox_restart",
       description:
-        "Reboot the sandbox. The disk survives; anything held only in memory, and any " +
-        "process not started by the image, does not.",
-      schema: { id: z.string() },
-      handler: async (a) => json(await clients.cloud({ method: "POST", path: sandboxPath(a.id, "/restart") })),
+        "Restart the sandbox keeping /workspace, or with fresh: true boot a new VM with an " +
+        "empty disk.",
+      schema: { id: z.string(), fresh: bool().optional() },
+      handler: async (a) =>
+        json(await lifecycle("restart", a.id, { wait_secs: 60, fresh: Boolean(a.fresh) }, 120)),
     },
-
     {
       name: "sandbox_kill",
-      description:
-        DESTRUCTIVE +
-        "Permanently deletes the sandbox and its disk. Everything written in it is " +
-        "gone and the id stops resolving. Use sandbox_stop if it might be wanted again.",
+      description: DESTRUCTIVE + "Delete the sandbox, its VM and its /workspace disk. No undo.",
       schema: { id: z.string() },
-      handler: async (a) => json(await clients.cloud({ method: "DELETE", path: sandboxPath(a.id) })),
+      handler: async (a) => {
+        await clients.applb({ method: "DELETE", path: dep(a.id) });
+        return `Sandbox ${a.id} deleted.`;
+      },
     },
-
     {
       name: "heyo_capacity",
-      description:
-        "What can be told about capacity *before* booting something.\n\n" +
-        "Be clear about what this does and does not answer. It lists the daemons this " +
-        "key has registered — your own hosts — with online/stale/offline, and every " +
-        "sandbox already running against it. If your work lands on your own hosts, an " +
-        "offline daemon here is the whole explanation for a failed boot. For " +
-        "heyo-hosted regions there is no public capacity endpoint: cloud does not " +
-        "publish free capacity per region or driver, so a 503 from sandbox_create is " +
-        "the first and only signal, and this call cannot pre-empt it. Treat that 503 " +
-        "as capacity, back off exponentially, and try another driver or region.",
+      description: "What the host has left (CPU, memory, disk) and your sandboxes' VMs.",
       schema: {},
-      handler: async () => {
-        const r = await settle({
-          daemons: clients.cloud({ path: "/me/daemons" }),
-          sandboxes: clients.cloud({ path: "/deployed-sandboxes" }),
-        });
-        const counts = r.sandboxes.ok && Array.isArray(r.sandboxes.value)
-          ? (r.sandboxes.value as unknown[]).reduce<Record<string, number>>((acc, s) => {
-              const k = statusOf(s);
-              acc[k] = (acc[k] ?? 0) + 1;
-              return acc;
-            }, {})
-          : null;
-        return report("Capacity, as far as it is knowable", [
-          section("Your registered daemons (online / stale / offline)", r.daemons),
-          { title: "Sandboxes by status", body: counts },
-          {
-            title: "Not covered",
-            body:
-              "heyo-hosted region capacity. Cloud publishes no per-region or per-driver " +
-              "free capacity, so a 503 on create is the only signal that a region is " +
-              "full — retry with backoff rather than pre-flighting.",
-          },
-        ]);
-      },
+      handler: async () => json(await clients.applb({ path: "/capacity" })),
     },
   ];
 }

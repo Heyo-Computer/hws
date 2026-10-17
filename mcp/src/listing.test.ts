@@ -24,12 +24,9 @@ import { loadConfig } from "./config.js";
 import { buildTools, toolListing } from "./server.js";
 import type { Tool } from "./tools/diagnose.js";
 
-/** The full surface: cloud configured, so the sandbox tools are listed too. */
+/** The full surface over stdio: app-lb configured, every tool listed. */
 const everything = (): Tool[] =>
-  buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" }));
-
-/** The fleet-operations shape: no cloud credential, so no sandbox tools. */
-const fleetOnly = (): Tool[] => buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:9090" }));
+  buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:9090", APPLB_TOKEN: "applb_1_x" }));
 
 /**
  * Every prefix a tool name may carry, and the two that carry none.
@@ -66,24 +63,14 @@ test("tool names are unique", () => {
   assert.deepEqual(duplicated, [], "a duplicate name shadows a tool in the byName map");
 });
 
-test("the sandbox tools are gated on a cloud credential", () => {
-  const withCloud = toolListing(everything()).map((t) => t.name);
-  const without = toolListing(fleetOnly()).map((t) => t.name);
-
-  // Asserted rather than named in a comment. The doc comment on `buildTools`
-  // used to say "sixteen" when the real number was fifteen.
-  const gated = withCloud.filter((n) => !without.includes(n));
-  assert.equal(gated.length, 16, `expected 16 gated tools, got ${gated.length}: ${gated.join(", ")}`);
-  assert.ok(gated.includes("sandbox_create"));
-  assert.ok(
-    gated.includes("heyo_capacity"),
-    "heyo_capacity hits cloud despite its name and must be gated with the sandbox tools",
-  );
-  assert.ok(
-    gated.includes("heyo_request"),
-    "heyo_request targets cloud and must be gated with the tools that share its credential",
-  );
-  assert.ok(without.includes("applb_list_deployments"), "app-lb tools survive without cloud");
+test("the sandbox tools need nothing but app-lb, and none of them is the cloud's", () => {
+  const names = toolListing(everything()).map((t) => t.name);
+  assert.ok(names.includes("sandbox_create"));
+  assert.ok(names.includes("heyo_capacity"));
+  assert.ok(!names.includes("heyo_request"), "nothing reaches the Heyo cloud API");
+  for (const gone of ["sandbox_set_ttl", "sandbox_upload_url", "sandbox_finalize_upload", "sandbox_attach_archive"]) {
+    assert.ok(!names.includes(gone), `${gone} was a cloud-only concept`);
+  }
 });
 
 // The destructive set moved to `annotations.test.ts`, which names it rather than

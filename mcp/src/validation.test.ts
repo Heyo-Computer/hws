@@ -49,7 +49,7 @@ function stubFetch(responder: (c: Call) => { status?: number; body?: unknown } =
 const tools = () =>
   buildTools(
     loadConfig({
-      HEYO_API_KEY: "heyo_api_x",
+      APPLB_URL: "http://127.0.0.1:9090",
       APPLB_NAMESPACE: "team-a",
       CI_URL: "http://127.0.0.1:9555",
       CI_TOKEN: "t",
@@ -202,14 +202,14 @@ test("a valid spec is passed through untouched, unknown fields and all", async (
 test("a raw request takes the method in any case, and defaults to GET", async () => {
   const stub = stubFetch(() => ({ body: {} }));
   try {
-    await tool("heyo_request").handler({ path: "/me", method: "get" });
-    await tool("heyo_request").handler({ path: "/me" });
+    await tool("applb_request").handler({ path: "/whoami", method: "get" });
+    await tool("applb_request").handler({ path: "/whoami" });
     assert.deepEqual(
       stub.calls.map((c) => c.method),
       ["GET", "GET"],
       "case or the default was lost when the enum began to be enforced",
     );
-    await assert.rejects(() => tool("heyo_request").handler({ path: "/me", method: "TRACE" }));
+    await assert.rejects(() => tool("applb_request").handler({ path: "/whoami", method: "TRACE" }));
   } finally {
     stub.restore();
   }

@@ -1,11 +1,11 @@
 /**
- * The behaviour that is not obvious from a route table: what the server infers
- * when it was told two API keys and nothing else, what it refuses to send, and
- * what it makes of a feed cursor that has outlived the feed.
+ * The behaviour that is not obvious from a route table: the requests the
+ * sandbox tools make of app-lb, what the server refuses to send, and what it
+ * makes of a feed cursor that has outlived the feed.
  *
- * `fetch` is stubbed rather than a live cloud reached, so these assert the
+ * `fetch` is stubbed rather than a live app-lb reached, so these assert the
  * shapes this server produces — the request it builds and the text it hands
- * back — not that cloud agrees with them.
+ * back — not that app-lb agrees with them.
  */
 
 import { test } from "node:test";
@@ -19,6 +19,8 @@ interface Call {
   url: string;
   method: string;
   body?: unknown;
+  headers?: Record<string, string>;
+  raw?: string;
 }
 
 type Reply = { status?: number; body?: unknown };
@@ -32,6 +34,8 @@ function stubFetch(responder: (call: Call) => Reply): { calls: Call[]; restore: 
       url: String(input),
       method: init?.method ?? "GET",
       body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+      headers: (init?.headers ?? {}) as Record<string, string>,
+      raw: init?.body instanceof Uint8Array ? Buffer.from(init.body).toString("utf8") : undefined,
     };
     calls.push(call);
     const { status = 200, body = {} } = responder(call);
@@ -49,123 +53,109 @@ function tool(tools: Tool[], name: string): Tool {
   return found;
 }
 
-const twoKeys = () => buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" }));
+const LB = "https://admin.us5.heyo.work";
+const teamA = () =>
+  buildTools(loadConfig({ APPLB_URL: LB, APPLB_TOKEN: "applb_1_x", APPLB_NAMESPACE: "team-a" }));
 
-test("the managed namespace is discovered from the key, once, and reused", async () => {
-  const stub = stubFetch((c) =>
-    c.url.endsWith("/namespaces")
-      ? { body: { namespaces: [{ name: "team-a", scope: "admin" }] } }
-      : { body: [{ id: "web" }] },
-  );
-  try {
-    const tools = twoKeys();
-    await tool(tools, "applb_list_deployments").handler({});
-    await tool(tools, "applb_list_deployments").handler({});
-
-    assert.deepEqual(
-      stub.calls.map((c) => c.url),
-      [
-        "https://server.heyo.computer/namespaces",
-        "https://server.heyo.computer/namespaces/team-a/lb/deployments",
-        "https://server.heyo.computer/namespaces/team-a/lb/deployments",
-      ],
-    );
-  } finally {
-    stub.restore();
-  }
-});
-
-test("several namespaces are named in the error rather than guessed between", async () => {
-  const stub = stubFetch(() => ({ body: { namespaces: [{ name: "team-a" }, { name: "team-b" }] } }));
-  try {
-    await assert.rejects(
-      () => tool(twoKeys(), "applb_list_deployments").handler({}),
-      /team-a, team-b.*APPLB_NAMESPACE/s,
-    );
-  } finally {
-    stub.restore();
-  }
-});
-
-test("sandbox_write_file refuses what the 1 MB body limit would reject", async () => {
-  const stub = stubFetch(() => ({ body: {} }));
-  try {
-    const write = tool(twoKeys(), "sandbox_write_file");
-    // 512 KiB is the measured ceiling: it encodes to ~683 KB and lands.
-    await write.handler({ id: "sb-1", file_path: "a.bin", content: "x".repeat(512 * 1024) });
-    assert.equal(stub.calls.length, 1);
-
-    // One byte more and the round trip is spent to be told 413, so it is not
-    // spent — the refusal names the route that has no such limit.
-    await assert.rejects(
-      () => write.handler({ id: "sb-1", file_path: "a.bin", content: "x".repeat(512 * 1024 + 1) }),
-      /sandbox_upload_url/,
-    );
-    assert.equal(stub.calls.length, 1, "nothing was sent");
-  } finally {
-    stub.restore();
-  }
-});
-
-test("sandbox_create sends the SDK's own defaults", async () => {
-  const stub = stubFetch((c) =>
-    c.url.endsWith("/sandbox-deploy") ? { body: { id: "sb-9" } } : { body: { id: "sb-9", status: "running" } },
-  );
-  try {
-    await tool(twoKeys(), "sandbox_create").handler({ ttl_seconds: 900 });
-    assert.deepEqual(stub.calls[0]?.body, {
-      region: "US",
-      image: "ubuntu:24.04",
-      size_class: "small",
-      open_ports: [],
-      ttl_seconds: 900,
-    });
-    // Then it polls the sandbox rather than returning something still provisioning.
-    assert.equal(stub.calls[1]?.url, "https://server.heyo.computer/deployed-sandboxes/sb-9");
-  } finally {
-    stub.restore();
-  }
-});
-
-test("a 503 is retried as capacity; a rejected spec is not retried at all", async () => {
-  let creates = 0;
+test("sandbox_create registers a route-less hub VM, create-only, then waits for it", async () => {
+  let registered = false;
   const stub = stubFetch((c) => {
-    if (!c.url.endsWith("/sandbox-deploy")) return { body: { id: "sb-9", status: "running" } };
-    creates += 1;
-    return creates === 1
-      ? { status: 503, body: { error: "No available backend in region US supports libvirt" } }
-      : { body: { id: "sb-9" } };
+    if (c.method === "POST" && c.url === `${LB}/deployments`) registered = true;
+    if (c.method === "GET" && c.url === `${LB}/deployments/sb-1` && !registered) {
+      return { status: 404, body: { error: "no" } };
+    }
+    if (c.url.endsWith("/whoami")) return { body: { namespace: "team-a" } };
+    if (c.url.endsWith("/pull")) return { body: { id: "job-1", status: "succeeded" } };
+    if (c.url.includes("/jobs")) return { body: { id: "job-1", status: "succeeded" } };
+    if (c.url.endsWith("/start")) return { body: { state: "running", sandbox_id: "applb-sb-1-a" } };
+    return { body: { spec: { id: "sb-1" } } };
   });
   try {
-    const create = tool(twoKeys(), "sandbox_create");
-    await create.handler({ retries: 1, wait_seconds: 0 });
-    assert.equal(creates, 2, "capacity was waited out");
-
-    creates = 0;
-    stub.restore();
+    const out = await tool(teamA(), "sandbox_create").handler({ name: "sb-1", wait_seconds: 5 });
+    const register = stub.calls.find((c) => c.method === "POST" && c.url === `${LB}/deployments`);
+    const spec = register?.body as Record<string, any>;
+    assert.equal(spec.id, "sb-1");
+    assert.deepEqual(spec.routes, []);
+    assert.equal(spec.namespace, "team-a", "the token's namespace is filled in");
+    assert.deepEqual(spec.artifact, { store: "https://hub.heyo.work", ref: "heyo/debian:latest" });
+    assert.equal(spec.scaling.idle_action, "retain");
+    assert.equal(spec.vm.disk_size_gb, 10);
+    const start = stub.calls.find((c) => c.url === `${LB}/deployments/sb-1/start`);
+    assert.deepEqual(start?.body, { wait_secs: 5 });
+    assert.match(out, /applb-sb-1-a/);
+    assert.ok(stub.calls.every((c) => c.url.startsWith(LB)), "app-lb only");
   } finally {
     stub.restore();
-  }
-
-  const rejected = stubFetch(() => ({ status: 422, body: { error: "unknown size_class" } }));
-  try {
-    await assert.rejects(
-      () => tool(twoKeys(), "sandbox_create").handler({ retries: 3, size_class: "small" }),
-      /422/,
-    );
-    assert.equal(rejected.calls.length, 1, "a bad spec is only rejected once");
-  } finally {
-    rejected.restore();
   }
 });
 
-test("a 503 from cloud arrives carrying what it means", async () => {
-  const stub = stubFetch(() => ({ status: 503, body: { error: "No available backend in region US" } }));
+test("sandbox_create never overwrites an existing deployment", async () => {
+  const stub = stubFetch(() => ({ body: { spec: { id: "sb-1" } } }));
   try {
-    await assert.rejects(
-      () => tool(twoKeys(), "sandbox_create").handler({ retries: 0 }),
-      /region capacity, not a fault[\s\S]*heyo_capacity/,
-    );
+    const out = await tool(teamA(), "sandbox_create").handler({ name: "sb-1" });
+    assert.match(out, /already exists/);
+    assert.ok(stub.calls.every((c) => c.method === "GET"));
+  } finally {
+    stub.restore();
+  }
+});
+
+test("each sandbox tool makes the app-lb request it names", async () => {
+  const stub = stubFetch(() => ({ body: { ok: true, state: "ready", upload_url: "u", download_url: "d" } }));
+  const tools = teamA();
+  const cases: [string, Record<string, unknown>, string, string, unknown?][] = [
+    ["sandbox_list", {}, "GET", "/deployments"],
+    ["sandbox_info", { id: "sb" }, "GET", "/deployments/sb"],
+    ["sandbox_exec", { id: "sb", command: "ls" }, "POST", "/deployments/sb/exec", { command: "ls" }],
+    ["sandbox_exec_start", { id: "sb", command: "npm test", max_runtime_secs: 60 }, "POST", "/deployments/sb/operations",
+      { command: "npm test", max_runtime_secs: 60 }],
+    ["sandbox_exec_status", { id: "sb", operation: "op_1", offset: 10 }, "GET",
+      "/deployments/sb/operations/op_1?offset=10&max_bytes=65536"],
+    ["sandbox_exec_cancel", { id: "sb", operation: "op_1" }, "DELETE", "/deployments/sb/operations/op_1"],
+    ["sandbox_read_file", { id: "sb", path: "/workspace/a b" }, "GET", "/deployments/sb/files?path=%2Fworkspace%2Fa+b"],
+    ["sandbox_write_file", { id: "sb", path: "/w/f", content: "hi", append: true }, "PUT",
+      "/deployments/sb/files?path=%2Fw%2Ff&append=true"],
+    ["sandbox_upload", { id: "sb", path: "/workspace/app" }, "POST", "/deployments/sb/transfers",
+      { direction: "in", path: "/workspace/app", extract: "auto" }],
+    ["sandbox_download", { id: "sb", path: "/workspace/dist" }, "POST", "/deployments/sb/transfers",
+      { direction: "out", path: "/workspace/dist", wait_secs: 50 }],
+    ["sandbox_transfer_status", { id: "sb", transfer: "tr_1" }, "GET", "/deployments/sb/transfers/tr_1"],
+    ["sandbox_stop", { id: "sb" }, "POST", "/deployments/sb/stop", { wait_secs: 30 }],
+    ["sandbox_start", { id: "sb" }, "POST", "/deployments/sb/start", { wait_secs: 60 }],
+    ["sandbox_restart", { id: "sb", fresh: true }, "POST", "/deployments/sb/restart", { wait_secs: 60, fresh: true }],
+    ["sandbox_kill", { id: "sb" }, "DELETE", "/deployments/sb"],
+    ["heyo_capacity", {}, "GET", "/capacity"],
+  ];
+  try {
+    for (const [name, args, method, path, body] of cases) {
+      stub.calls.length = 0;
+      await tool(tools, name).handler(args);
+      const call = stub.calls[0];
+      assert.equal(call?.method, method, name);
+      assert.equal(call?.url, `${LB}${path}`, name);
+      if (body !== undefined) assert.deepEqual(call?.body, body, name);
+    }
+  } finally {
+    stub.restore();
+  }
+});
+
+test("sandbox_write_file sends the bytes, not JSON, and decodes base64 first", async () => {
+  const stub = stubFetch(() => ({ body: { wrote: 2 } }));
+  try {
+    await tool(teamA(), "sandbox_write_file").handler({ id: "sb", path: "/f", content: "aGk=", encoding: "base64" });
+    assert.equal(stub.calls[0]?.raw, "hi");
+    assert.equal(stub.calls[0]?.headers?.["content-type"], "application/octet-stream");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("sandbox_upload hands back a curl line for the one-time URL", async () => {
+  const stub = stubFetch(() => ({ body: { id: "tr_1", upload_url: `${LB}/transfers/tok` } }));
+  try {
+    const out = await tool(teamA(), "sandbox_upload").handler({ id: "sb", path: "/workspace/app" });
+    assert.match(out, /curl -sS -T <file> 'https:\/\/admin\.us5\.heyo\.work\/transfers\/tok'/);
   } finally {
     stub.restore();
   }
@@ -180,15 +170,15 @@ test("the feed cursor is the caller's, and one from before a restart reads as a 
     c.url.endsWith("/namespaces") ? { body: { namespaces: [{ name: "team-a" }] } } : { body: events },
   );
   try {
-    const feed = tool(twoKeys(), "applb_feed");
+    const feed = tool(teamA(), "applb_feed");
 
     const fresh = await feed.handler({});
     assert.match(fresh, /latest_id 7/);
     // The namespace came from the discovery app-lb already did — the feed is
     // served at /feeds/:namespace, so it has to be named, not merely reached.
     assert.equal(
-      stub.calls[1]?.url,
-      "https://server.heyo.computer/namespaces/team-a/lb/feeds/team-a?format=json",
+      stub.calls[0]?.url,
+      `${LB}/feeds/team-a?format=json`,
     );
 
     const incremental = await feed.handler({ since_id: 6 });
@@ -205,39 +195,20 @@ test("the feed cursor is the caller's, and one from before a restart reads as a 
   }
 });
 
-test("a fleet-operations instance lists no sandbox tools at all", () => {
-  // Behind an app-token gate there is no cloud credential and no way to acquire
-  // one, so the sandbox tools are not missing — they are not part of this
-  // deployment. Listing them would advertise a set of operations whose only
-  // possible outcome is an auth error.
-  const withCloud = buildTools(
-    loadConfig({ APPLB_URL: "http://127.0.0.1:8080", HEYO_API_KEY: "heyo_api_x" }),
-  );
-  const fleetOps = buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:8080" }));
-
-  const names = (tools: Tool[]) => tools.map((t) => t.name);
-  assert.ok(names(withCloud).includes("sandbox_create"));
-  assert.ok(!names(fleetOps).includes("sandbox_create"));
-  assert.ok(!names(fleetOps).includes("heyo_capacity"));
-  assert.equal(names(fleetOps).filter((n) => n.startsWith("sandbox_")).length, 0);
-
-  // Everything else survives, including the app-lb tools this instance exists
-  // for and `heyo_status` — which is what keeps "why are there no sandbox
-  // tools" an answerable question rather than a silent gap.
-  assert.ok(names(fleetOps).includes("applb_list_deployments"));
-  assert.ok(names(fleetOps).includes("heyo_status"));
-  const dropped = names(withCloud).filter((n) => !names(fleetOps).includes(n));
-  assert.equal(dropped.length, withCloud.length - fleetOps.length);
-  assert.ok(dropped.length > 0, "the cloud-keyed set must be the larger one");
-
-  // A caller's own cloud key restores them per request, which is what keeps this
-  // gate on the credential rather than on a deployment-wide switch.
-  const hosted = loadConfig({ APPLB_URL: "http://127.0.0.1:8080" });
-  const asCaller = withForwardedAuth(hosted, { authorization: "Bearer heyo_api_caller" });
-  assert.ok(names(buildTools(asCaller)).includes("sandbox_create"));
-  // But an app-lb token does not conjure them: cloud cannot consume it.
-  const asToken = withForwardedAuth(hosted, { authorization: "Bearer applb_abc123_secret" });
-  assert.ok(!names(buildTools(asToken)).includes("sandbox_create"));
+test("an app-lb URL alone lists the sandbox tools, and no tool or config points at the cloud", () => {
+  const tools = buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:8080" }));
+  const names = tools.map((t) => t.name);
+  for (const n of ["sandbox_create", "sandbox_exec", "sandbox_exec_start", "sandbox_upload", "heyo_capacity"]) {
+    assert.ok(names.includes(n), n);
+  }
+  assert.ok(!names.includes("heyo_request"), "the raw cloud tool is gone");
+  // Hosted, as the caller: an app-lb token is all a sandbox needs.
+  const hosted = withForwardedAuth(loadConfig({ APPLB_URL: "http://127.0.0.1:8080", HEYO_MCP_HTTP_PORT: "8090" }), {
+    authorization: "Bearer applb_abc123_secret",
+  });
+  assert.ok(buildTools(hosted).some((t) => t.name === "sandbox_create"));
+  const text = JSON.stringify(tools.map((t) => [t.name, t.description]));
+  assert.ok(!text.includes("server.heyo.computer"), "no tool mentions the cloud host");
 });
 
 /**
@@ -246,7 +217,7 @@ test("a fleet-operations instance lists no sandbox tools at all", () => {
  * for its namespace, with its own credential — app-lb decides reach, and pins
  * the namespace before app-obs is asked.
  */
-test("a managed-door caller reads logs through its namespace's obs plugin, never app-obs's token", async () => {
+test("a namespace-configured caller reads logs through its namespace's obs plugin, never app-obs's token", async () => {
   const stub = stubFetch((c) => {
     if (c.url.endsWith("/namespaces")) {
       return { body: { namespaces: [{ name: "team-a", scope: "admin" }] } };
@@ -256,8 +227,9 @@ test("a managed-door caller reads logs through its namespace's obs plugin, never
   try {
     const tools = buildTools(
       loadConfig({
-        HEYO_API_KEY: "heyo_api_x",
-        APPLB_TOKEN: "heyo_api_lb",
+        APPLB_URL: LB,
+        APPLB_NAMESPACE: "team-a",
+        APPLB_TOKEN: "applb_1_x",
         APP_OBS_URL: "https://obs.example.com",
         APP_OBS_API_TOKEN: "applb_obs",
       }),
@@ -268,7 +240,7 @@ test("a managed-door caller reads logs through its namespace's obs plugin, never
     assert.ok(
       urls.some((u) =>
         u.startsWith(
-          "https://server.heyo.computer/namespaces/team-a/lb/namespaces/team-a/plugins/obs/api/deployments/web/logs?",
+          `${LB}/namespaces/team-a/plugins/obs/api/deployments/web/logs?`,
         ),
       ),
       `not read through the plugin: ${urls.join(", ")}`,
@@ -293,8 +265,9 @@ test("deployment_logs refuses a deployment app-lb will not show this credential"
   try {
     const tools = buildTools(
       loadConfig({
-        HEYO_API_KEY: "heyo_api_x",
-        APPLB_TOKEN: "heyo_api_lb",
+        APPLB_URL: LB,
+        APPLB_NAMESPACE: "team-a",
+        APPLB_TOKEN: "applb_1_x",
         APP_OBS_URL: "https://obs.example.com",
         APP_OBS_API_TOKEN: "applb_obs",
       }),
@@ -420,10 +393,10 @@ test("a namespace without the obs plugin is told how to install it", async () =>
   });
   try {
     await assert.rejects(
-      tool(twoKeys(), "deployment_logs").handler({ id: "web" }),
+      tool(teamA(), "deployment_logs").handler({ id: "web" }),
       /heyctl plugins install obs -n team-a/,
     );
-    const out = await tool(twoKeys(), "namespace_telemetry").handler({});
+    const out = await tool(teamA(), "namespace_telemetry").handler({});
     assert.match(out, /heyctl plugins install obs -n team-a/);
   } finally {
     stub.restore();
@@ -439,8 +412,9 @@ test("fleet_overview turns a confined caller away before app-obs is asked", asyn
   try {
     const tools = buildTools(
       loadConfig({
-        HEYO_API_KEY: "heyo_api_x",
-        APPLB_TOKEN: "heyo_api_lb",
+        APPLB_URL: LB,
+        APPLB_NAMESPACE: "team-a",
+        APPLB_TOKEN: "applb_1_x",
         APP_OBS_URL: "https://obs.example.com",
         APP_OBS_API_TOKEN: "t",
       }),
@@ -464,7 +438,7 @@ test("applb_security_events passes the /security query filters through unchanged
       : { body: { enabled: true, alerts: [], totals: {}, rules: [], guard: {} } },
   );
   try {
-    const out = await tool(twoKeys(), "applb_security_events").handler({
+    const out = await tool(teamA(), "applb_security_events").handler({
       severity: "high",
       rule: "auth.brute-force",
       deployment: "web",
@@ -472,9 +446,9 @@ test("applb_security_events passes the /security query filters through unchanged
       limit: 20,
     });
     assert.match(out, /"enabled": true/);
-    assert.equal(stub.calls.length, 2, "namespace discovery then /security");
-    const security = stub.calls[1]!.url;
-    assert.ok(security.includes("/lb/security"), `hit /security: ${security}`);
+    assert.equal(stub.calls.length, 1, "only /security");
+    const security = stub.calls[0]!.url;
+    assert.ok(security.startsWith(`${LB}/security?`), `hit /security: ${security}`);
     assert.ok(security.includes("severity=high"));
     assert.ok(security.includes("rule=auth.brute-force"));
     // 'auth.brute-force' has a '+', not a literal '-' in URLSearchParams.
@@ -487,11 +461,10 @@ test("applb_security_events passes the /security query filters through unchanged
 });
 
 test("applb_security_events sends nothing when no filter is given", async () => {
-  // An empty call must not synthesize a `namespace=` query param: through the
-  // managed door the response is narrowed server-side, and a self-hosted app-lb
-  // returns everything. Adding a default here would silently widen or narrow
-  // what the caller asked for. A self-hosted config (APPLB_URL) skips namespace
-  // discovery, so the only request is the one to /security.
+  // An empty call must not synthesize a `namespace=` query param: app-lb
+  // narrows a confined credential's answer itself, and an operator's returns
+  // everything. Adding a default here would silently widen or narrow what the
+  // caller asked for.
   const stub = stubFetch(() => ({ body: { enabled: false, alerts: [], rules: [] } }));
   try {
     const tools = buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:8090" }));

@@ -16,7 +16,7 @@
  */
 
 import type { Config, ServiceConfig } from "./config.js";
-import { CI_GATE_HINT, CLOUD_CAPACITY_HINT, CLOUD_KEY_HINT, isApplbToken } from "./config.js";
+import { CI_GATE_HINT } from "./config.js";
 
 export class ServiceError extends Error {
   constructor(
@@ -60,6 +60,14 @@ export interface RequestOptions {
   rawBody?: Uint8Array | string;
   /** Content type for `rawBody`. Ignored when `body` is used, which is JSON. */
   contentType?: string;
+  /** Extra request headers, such as `If-None-Match: *` for a create-only write. */
+  headers?: Record<string, string>;
+  /**
+   * This call's deadline, when it is meant to outlast the default: a call that
+   * waits on the server (a sandbox start waiting for its VM) is given its
+   * server-side wait plus a margin.
+   */
+  timeoutMs?: number;
   /**
    * Return the response body as text rather than parsing it.
    *
@@ -77,10 +85,8 @@ export interface RequestOptions {
    * A sentence attached to any error from this call, on top of whatever the
    * status alone implies.
    *
-   * For a call the *user* did not make. Namespace discovery is the case: it
-   * runs inside the first app-lb tool of the process, against cloud, on a path
-   * nobody asked for, so its failures need to say what they were for before
-   * they say what went wrong.
+   * For a call the *user* did not make, whose failure needs to say what it was
+   * for before it says what went wrong.
    */
   hint?: string;
 }
@@ -108,13 +114,15 @@ export async function request(
   // cannot have it silently dropped, and after `authorization`, which is the
   // one header a service config never puts here. See `ServiceConfig.headers`.
   Object.assign(headers, cfg.headers ?? {});
+  Object.assign(headers, opts.headers ?? {});
   if (opts.body !== undefined) headers["content-type"] = "application/json";
   if (opts.rawBody !== undefined) {
     headers["content-type"] = opts.contentType ?? "application/octet-stream";
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const deadline = opts.timeoutMs ?? timeoutMs;
+  const timer = setTimeout(() => controller.abort(), deadline);
   let res: Response;
   try {
     res = await fetch(`${cfg.baseUrl}${path}`, {
@@ -130,7 +138,7 @@ export async function request(
     });
   } catch (e) {
     const reason = e instanceof Error && e.name === "AbortError"
-      ? `no response within ${timeoutMs}ms — the service accepted the connection and did not answer`
+      ? `no response within ${deadline}ms — the service accepted the connection and did not answer`
       : e instanceof Error
         ? e.message
         : String(e);
@@ -142,27 +150,10 @@ export async function request(
   const raw = new Uint8Array(await res.arrayBuffer());
   const text = opts.expectBytes && res.ok ? "" : new TextDecoder().decode(raw);
   if (!res.ok) {
-    // Two statuses mean something more specific than they look, and both are
-    // read wrong by default: a 401 from ci is the documented gate behaviour far
-    // more often than it is a bad token, and a 503 from cloud is region
-    // capacity rather than a fault. Attaching the sentence here means every
-    // call site carries it, including the ones that only pass a body through.
-    const status =
-      service === "ci" && res.status === 401
-        ? CI_GATE_HINT
-        : service === "heyo cloud" && res.status === 503
-          ? CLOUD_CAPACITY_HINT
-          : // A cloud 401 or 403 with an app-lb token is not a bad password, it
-            // is the wrong *kind* of credential, and the difference decides
-            // whether retrying is pointless. Checked here rather than only at
-            // config load because a hosted instance holds no key of its own and
-            // takes the caller's — see `withForwardedAuth`, which can install
-            // this credential long after `credentialFaults` has run.
-            (res.status === 401 || res.status === 403) &&
-              service === "heyo cloud" &&
-              isApplbToken(cfg.auth ?? "")
-            ? CLOUD_KEY_HINT
-            : undefined;
+    // A 401 from ci is the documented gate behaviour far more often than it is
+    // a bad token. Attaching the sentence here means every call site carries
+    // it, including the ones that only pass a body through.
+    const status = service === "ci" && res.status === 401 ? CI_GATE_HINT : undefined;
     const hint = [opts.hint, status].filter(Boolean).join("\n\n") || undefined;
     throw new ServiceError(service, res.status, path, text, hint);
   }

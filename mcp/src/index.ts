@@ -29,8 +29,8 @@ if (Number.isFinite(port) && port > 0) {
     `heyo-mcp ready — ${tools.length} tools; configured: ${configured(config).join(", ") || "nothing"}`,
   );
   // After the ready line so it is the last thing on the screen, and never
-  // fatal: an instance whose cloud key is wrong still serves every app-lb, ci
-  // and artifact tool, and refusing to start would take those away too.
+  // fatal: a leftover setting is worth reporting, and refusing to start would
+  // take away every tool that does work.
   const faults = faultBanner(config);
   if (faults) console.error(`\n${faults}`);
 }

@@ -23,18 +23,16 @@ import { json, report, type Section } from "../format.js";
 import { remoteRepoOf, storeBuildCredential } from "./remote-auth.js";
 import { ServiceError } from "../http.js";
 import type { Tool } from "./diagnose.js";
-import { cloudUsable, type Config } from "../config.js";
+import type { Config } from "../config.js";
 import { DEPLOYMENT_SPEC_FULL, DEPLOYMENT_SPEC_SCHEMA } from "../applb/spec.schema.js";
 import { checkSpec, rulesFor, suffixRoutesWithoutCerts } from "../applb/rules.js";
 
 const DESTRUCTIVE = DESTRUCTIVE_PREFIX;
 
-/** The most output `applb_exec` and `applb_read_file` return in one call. */
-const GUEST_MAX_CHARS = 200_000;
-/** The most `applb_read_file` reads, and `applb_write_file` writes, per call. */
-const GUEST_FILE_CHUNK = 96 * 1024;
+/** The most output `applb_exec` and `sandbox_exec` return in one call. */
+export const GUEST_MAX_CHARS = 200_000;
 
-interface GuestExec {
+export interface GuestExec {
   sandbox_id?: string;
   exit_code?: number;
   stdout?: string;
@@ -47,21 +45,13 @@ interface GuestExec {
  * one stream spent the output cap twice on the same bytes. The interleaving
  * says nothing new when one stream is empty.
  */
-function compactExec(r: GuestExec): GuestExec {
+export function compactExec(r: GuestExec): GuestExec {
   if (!r || typeof r !== "object" || typeof r.output !== "string") return r;
   if (!r.stdout || !r.stderr) {
     const { output: _same, ...rest } = r;
     return rest;
   }
   return r;
-}
-
-/** Single-quote for `sh`, refusing what the quoting cannot carry. */
-function guestPath(path: unknown): string {
-  const p = String(path ?? "");
-  if (!p.startsWith("/")) throw new Error(`path must be absolute: ${JSON.stringify(p)}`);
-  if (p.includes("'") || p.includes("\n")) throw new Error(`path cannot contain a quote or newline: ${JSON.stringify(p)}`);
-  return `'${p}'`;
 }
 
 /**
@@ -193,6 +183,8 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
   const artifactWarning = (spec: Record<string, unknown> | undefined, ownNs?: string): Section | undefined => {
     const art = spec?.artifact as Record<string, unknown> | undefined;
     if (!art || typeof art !== "object") return undefined;
+    // The public hub: its images are meant to be pulled anonymously by anyone.
+    if (art.store === "https://hub.heyo.work") return undefined;
     const notes: string[] = [];
     if (typeof art.store === "string" && art.store.trim() && !art.auth) {
       notes.push(
@@ -370,8 +362,8 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           .string()
           .optional()
           .describe(
-            "only alerts for deployments in this namespace; defaults to the configured " +
-              "namespace in managed mode",
+            "only alerts for deployments in this namespace; app-lb narrows a confined " +
+              "credential's answer itself",
           ),
         limit: num().optional().describe("most recent N alerts after filtering"),
       },
@@ -1129,113 +1121,10 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           a.max_chars === undefined ? undefined : Math.min(Number(a.max_chars), GUEST_MAX_CHARS),
         );
         return out.includes("… truncated at ")
-          ? `${out}\nFor all of it: redirect the output to a file in the guest and page it with applb_read_file.`
+          ? `${out}\nFor all of it: redirect the output to a file in the guest and page it with sandbox_read_file.`
           : out;
       },
     },
-    {
-      name: "applb_read_file",
-      description:
-        "Reads up to 96 KiB of a guest file from `offset`, with its size and `next_offset` to " +
-        "page the rest; base64 for binary. Serial console, tens of KB/s: logs and small files.",
-      schema: {
-        id: z.string(),
-        path: z.string(),
-        offset: num().optional(),
-        length: num().optional(),
-        encoding: z.enum(["text", "base64"]).optional(),
-        wake: bool().optional(),
-        sandbox_id: z.string().optional(),
-      },
-      handler: async (a) => {
-        const file = guestPath(a.path);
-        const offset = Math.max(0, Math.floor(Number(a.offset ?? 0)));
-        const length = Math.min(Math.max(1, Math.floor(Number(a.length ?? GUEST_FILE_CHUNK))), GUEST_FILE_CHUNK);
-        const base64 = a.encoding === "base64";
-        // Size on the first line, then the bytes. `tail -c +N | head -c L`
-        // rather than dd, which is slow at bs=1 and busybox-dependent above it.
-        const command =
-          `wc -c < ${file} || exit 3; tail -c +${offset + 1} ${file} | head -c ${length}` +
-          (base64 ? " | base64 | tr -d '\\n'" : "");
-        const r = (await clients.applb({
-          method: "POST",
-          path: `/deployments/${enc(String(a.id))}/exec`,
-          body: {
-            command,
-            ...(a.wake === undefined ? {} : { wake: a.wake }),
-            ...(a.sandbox_id === undefined ? {} : { sandbox_id: a.sandbox_id }),
-          },
-        })) as GuestExec;
-        if (r.exit_code !== 0) return json(compactExec(r));
-        const out = r.stdout ?? "";
-        const nl = out.indexOf("\n");
-        const size = Number(out.slice(0, nl).trim());
-        const content = out.slice(nl + 1);
-        const read = base64 ? Buffer.from(content, "base64").length : Buffer.byteLength(content);
-        const next = offset + read;
-        return json(
-          {
-            sandbox_id: r.sandbox_id,
-            path: a.path,
-            size,
-            offset,
-            bytes: read,
-            next_offset: next < size ? next : null,
-            encoding: base64 ? "base64" : "text",
-            content,
-          },
-          GUEST_MAX_CHARS,
-        );
-      },
-    },
-    {
-      name: "applb_write_file",
-      description:
-        DESTRUCTIVE +
-        "Writes up to 96 KiB to a guest file (replace, or `append` for the next piece); base64 " +
-        "for binary. Serial console, tens of KB/s.",
-      schema: {
-        id: z.string(),
-        path: z.string(),
-        content: z.string(),
-        encoding: z.enum(["text", "base64"]).optional(),
-        append: bool().optional(),
-        wake: bool().optional(),
-        sandbox_id: z.string().optional(),
-      },
-      handler: async (a) => {
-        const file = guestPath(a.path);
-        const bytes =
-          a.encoding === "base64" ? Buffer.from(String(a.content), "base64") : Buffer.from(String(a.content));
-        if (bytes.length > GUEST_FILE_CHUNK) {
-          throw new Error(
-            `content is ${bytes.length} bytes; one call writes at most ${GUEST_FILE_CHUNK}. ` +
-              "Send it in pieces: the first without `append`, the rest with `append: true`.",
-          );
-        }
-        const dir = String(a.path).replace(/\/[^/]*$/, "") || "/";
-        const command =
-          `mkdir -p ${guestPath(dir)} && printf %s '${bytes.toString("base64")}' | base64 -d ` +
-          `${a.append ? ">>" : ">"} ${file} && wc -c < ${file}`;
-        const r = (await clients.applb({
-          method: "POST",
-          path: `/deployments/${enc(String(a.id))}/exec`,
-          body: {
-            command,
-            ...(a.wake === undefined ? {} : { wake: a.wake }),
-            ...(a.sandbox_id === undefined ? {} : { sandbox_id: a.sandbox_id }),
-          },
-        })) as GuestExec;
-        if (r.exit_code !== 0) return json(compactExec(r));
-        return json({
-          sandbox_id: r.sandbox_id,
-          path: a.path,
-          wrote: bytes.length,
-          size: Number((r.stdout ?? "").trim()),
-        });
-      },
-    },
-
     // ---- ci reads --------------------------------------------------------
     {
       name: "ci_run_status",
@@ -1318,14 +1207,6 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
     // ---- raw, for everything not named above ---------------------------
     ...(
       [
-        // Gated with the sandbox tools it shares a credential with. It was
-        // listed unconditionally while targeting cloud, so on a
-        // fleet-operations instance it advertised a door that could only ever
-        // answer `NotConfigured` — the same thing `buildTools` withholds the
-        // sandbox tools to avoid.
-        ...(cloudUsable(config)
-          ? ([{ key: "cloud", tool: "heyo_request", label: "heyo cloud" }] as const)
-          : []),
         { key: "applb", tool: "applb_request", label: "app-lb" },
         { key: "obs", tool: "obs_request", label: "app-obs" },
         { key: "ci", tool: "ci_request", label: "ci" },

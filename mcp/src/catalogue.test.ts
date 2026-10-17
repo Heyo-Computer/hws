@@ -80,8 +80,8 @@ test("every tool appears in the catalogue exactly once", { skip }, async () => {
   const text = await block();
   const tools = buildTools(
     loadConfig({
-      HEYO_API_KEY: "heyo_api_x",
-      APPLB_TOKEN: "heyo_api_lb",
+      APPLB_URL: "http://127.0.0.1:9090",
+      APPLB_TOKEN: "applb_1_x",
       APP_OBS_URL: "http://o",
       CI_URL: "http://c",
     }),
@@ -103,7 +103,7 @@ test("the catalogue marks exactly the tools that call themselves destructive", {
       .filter((n): n is string => !!n),
   );
   const destructive = new Set(
-    toolListing(buildTools(loadConfig({ HEYO_API_KEY: "heyo_api_x", APPLB_TOKEN: "heyo_api_lb" })))
+    toolListing(buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:9090", APPLB_TOKEN: "applb_1_x" })))
       .filter((t) => t.description.startsWith(DESTRUCTIVE_PREFIX))
       .map((t) => t.name),
   );

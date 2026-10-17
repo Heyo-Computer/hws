@@ -22,7 +22,8 @@ import { buildTools, toolListing } from "./server.js";
 import { DESTRUCTIVE_PREFIX } from "./tools/schema.js";
 
 const CONFIG = {
-  HEYO_API_KEY: "heyo_api_x",
+  APPLB_URL: "http://127.0.0.1:9090",
+  APPLB_TOKEN: "applb_x",
   APPLB_NAMESPACE: "team-a",
   APP_OBS_URL: "http://127.0.0.1:9600",
   APP_OBS_API_TOKEN: "t",
@@ -38,8 +39,8 @@ const OFFLINE = new Set(["applb_spec_schema", "heyo_guide"]);
 
 /**
  * Read-only tools that refuse CONFIG's credential before sending anything.
- * `fleet_overview` is the whole fleet and CONFIG is the managed door, which is
- * confined to `team-a` by construction — so it is turned away locally. It is
+ * `fleet_overview` is the whole fleet and CONFIG names namespace `team-a`, so
+ * it is turned away locally. It is
  * driven under an unconfined credential below instead, so it is still checked.
  */
 const REFUSED_HERE = new Set(["fleet_overview"]);
@@ -75,6 +76,10 @@ const ARGS: Record<string, Record<string, unknown>> = {
   repo_get: { repo: "site" },
   applb_spec_schema: { block: "VmSpec" },
   applb_security_events: { severity: "high", limit: 20 },
+  sandbox_info: { id: "sb" },
+  sandbox_exec_status: { id: "sb", operation: "op_1" },
+  sandbox_read_file: { id: "sb", path: "/workspace/a" },
+  sandbox_transfer_status: { id: "sb", transfer: "tr_1" },
 };
 
 test("every tool is annotated, and destructiveness matches its own prose", () => {
@@ -170,13 +175,16 @@ test("the destructive set is the one app-lb's own routes imply", () => {
     "applb_purge_disk",
     "applb_purge_orphan_disks",
     "applb_sweep_disks",
-    "applb_write_file",
     // A tag's removal strands every deployment that pulls it.
     "art_delete_tag",
     "ci_cancel_run",
     "ci_cleanup_failed_vms",
     "ci_destroy_vm",
+    // Arbitrary code in the sandbox, like applb_exec.
+    "sandbox_exec",
+    "sandbox_exec_start",
     "sandbox_kill",
+    "sandbox_write_file",
   ]);
 });
 
