@@ -918,11 +918,21 @@ impl Transfers {
         }
     }
 
-    pub async fn watch(self: Arc<Self>) {
+}
+
+/// The expiry sweep, as a pingora background service (see
+/// [`crate::operations::Watcher`]).
+pub struct Sweeper(pub Arc<Transfers>);
+
+#[async_trait::async_trait]
+impl pingora_core::services::background::BackgroundService for Sweeper {
+    async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
         let mut interval = tokio::time::interval(SWEEP);
         loop {
-            interval.tick().await;
-            self.sweep();
+            tokio::select! {
+                _ = interval.tick() => self.0.sweep(),
+                _ = shutdown.changed() => return,
+            }
         }
     }
 }
