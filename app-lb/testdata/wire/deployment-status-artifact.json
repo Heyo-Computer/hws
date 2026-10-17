@@ -88,5 +88,12 @@
       "healthy": true,
       "draining": false
     }
+  ],
+  "pending_vms": [
+    {
+      "sandbox_id": "applb-sandbox-d4e5f6",
+      "age_secs": 12,
+      "status": "running"
+    }
   ]
 }

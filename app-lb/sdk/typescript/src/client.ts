@@ -39,6 +39,8 @@ import type {
   Operation,
   FileRead,
   FileWritten,
+  LifecycleOutcome,
+  Capacity,
 } from "./types.js";
 import type { Shell, ShellOptions } from "./shell.js";
 import type { WaitForJobOptions, WaitForReadyOptions } from "./wait.js";
@@ -607,6 +609,49 @@ export class Heyctl {
       name: path,
       signal: opts.signal,
     });
+  }
+
+  // -- stop, start, restart ------------------------------------------------
+
+  /**
+   * Drain the pool and hold it at zero. Under `idle_action: retain` the VM is
+   * synced and suspended with its data disk; nothing wakes it until
+   * {@link start}. Waits up to `waitSecs` (default 30) for the pool to settle.
+   */
+  stop(id: string, waitSecs = 30, signal?: AbortSignal): Promise<LifecycleOutcome> {
+    return this.lifecycle(id, "stop", { wait_secs: waitSecs }, waitSecs, signal);
+  }
+
+  /** Put back the policy {@link stop} replaced and wait for a VM, resuming the retained one. */
+  start(id: string, waitSecs = 30, signal?: AbortSignal): Promise<LifecycleOutcome> {
+    return this.lifecycle(id, "start", { wait_secs: waitSecs }, waitSecs, signal);
+  }
+
+  /** Stop and resume the same sandbox, or with `fresh` boot a new VM with an empty data disk. */
+  restart(id: string, opts: { fresh?: boolean; waitSecs?: number; signal?: AbortSignal } = {}): Promise<LifecycleOutcome> {
+    const waitSecs = opts.waitSecs ?? 30;
+    return this.lifecycle(id, "restart", { wait_secs: waitSecs, fresh: opts.fresh ?? false }, waitSecs * 2, opts.signal);
+  }
+
+  private lifecycle(
+    id: string,
+    verb: string,
+    body: Record<string, unknown>,
+    waitSecs: number,
+    signal?: AbortSignal,
+  ): Promise<LifecycleOutcome> {
+    return this.request("POST", `/deployments/${seg(id)}/${verb}`, {
+      body,
+      kind: "deployment",
+      name: id,
+      timeoutMs: (waitSecs + 30) * 1000,
+      signal,
+    });
+  }
+
+  /** What the host has left, and the caller's own pools. */
+  capacity(signal?: AbortSignal): Promise<Capacity> {
+    return this.request("GET", "/capacity", { kind: "server", name: "", signal });
   }
 
   // -- workflows ------------------------------------------------------------

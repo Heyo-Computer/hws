@@ -433,6 +433,55 @@ impl Client {
         self.read(Request::new(Method::Get, path), "deployment", id).await
     }
 
+    // -- stop, start, restart ------------------------------------------------
+
+    /// `POST /deployments/:id/stop`: drain the pool and hold it at zero. Under
+    /// `idle_action: retain` the VM is synced and suspended with its data disk;
+    /// nothing wakes it until [`start`](Self::start). Waits up to `wait_secs`
+    /// for the pool to settle (`state: "stopping"` if it has not).
+    pub async fn stop(&self, id: &str, wait_secs: u64) -> Result<LifecycleOutcome> {
+        self.lifecycle(id, "stop", json!({ "wait_secs": wait_secs }), wait_secs)
+            .await
+    }
+
+    /// `POST /deployments/:id/start`: put back the policy stop replaced and
+    /// wait up to `wait_secs` for a VM, resuming the retained one.
+    pub async fn start(&self, id: &str, wait_secs: u64) -> Result<LifecycleOutcome> {
+        self.lifecycle(id, "start", json!({ "wait_secs": wait_secs }), wait_secs)
+            .await
+    }
+
+    /// `POST /deployments/:id/restart`: stop and resume the same sandbox, or
+    /// with `fresh` boot a new VM from the image with an empty data disk.
+    pub async fn restart(&self, id: &str, fresh: bool, wait_secs: u64) -> Result<LifecycleOutcome> {
+        let body = json!({ "wait_secs": wait_secs, "fresh": fresh });
+        self.lifecycle(id, "restart", body, wait_secs.saturating_mul(2))
+            .await
+    }
+
+    async fn lifecycle(
+        &self,
+        id: &str,
+        verb: &str,
+        body: Value,
+        wait_secs: u64,
+    ) -> Result<LifecycleOutcome> {
+        self.read(
+            Request::new(Method::Post, format!("/deployments/{}/{verb}", seg(id)))
+                .json(body)
+                .timeout(DEFAULT_TIMEOUT + Duration::from_secs(wait_secs)),
+            "deployment",
+            id,
+        )
+        .await
+    }
+
+    /// `GET /capacity`: what the host has left, and the caller's own pools.
+    pub async fn capacity(&self) -> Result<Capacity> {
+        self.read(Request::new(Method::Get, "/capacity"), "server", "")
+            .await
+    }
+
     // -- running things inside a VM ----------------------------------------
 
     /// Run a command in the deployment's VM and wait for it to finish.

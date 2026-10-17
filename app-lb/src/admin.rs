@@ -703,6 +703,7 @@ fn narrows_itself(matched: &str) -> bool {
     matches!(
         matched,
         "/" | "/metrics"
+            | "/capacity"
             | "/dashboard"
             | "/security"
             | "/siem"
@@ -1218,6 +1219,10 @@ struct DeploymentStatus {
     pending: usize,
     total_in_flight: usize,
     vms: Vec<VmStatus>,
+    /// VMs created or resumed but not yet past their health check, oldest
+    /// first. A VM an `exec` woke is here, not in `vms`, until it is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_vms: Vec<PendingVmView>,
     /// The deployment's workspace, when the spec declares one: which snapshot
     /// the pool runs from, whether the store has it, and what — if anything —
     /// is holding the pool at zero. See [`crate::workspace`].
@@ -1337,6 +1342,7 @@ fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> Depl
                 draining: b.is_draining(),
             })
             .collect(),
+        pending_vms: pending_vms_of(d),
     }
 }
 
@@ -4492,18 +4498,76 @@ async fn scale(
     Path(id): Path<String>,
     Json(patch): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _change = state.registry.change_guard().await;
-    let Some(old) = state.registry.get(&id) else {
-        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    let Some(patch) = patch.as_object().cloned() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "scaling patch must be a JSON object",
+        )
+        .into_response();
+    };
+    let change = state.registry.change_guard().await;
+    let deployment = match patch_scaling(&state, &id, |current| {
+        // Merge the patch onto the current policy, then re-parse so unknown/typed
+        // fields are validated by serde.
+        let mut merged = match serde_json::to_value(current) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not read scaling policy",
+                )
+                .into_response());
+            }
+        };
+        for (k, v) in patch {
+            merged.insert(k, v);
+        }
+        serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid scaling policy: {e}"),
+            )
+            .into_response()
+        })
+    }) {
+        Ok(d) => d,
+        Err(response) => return response,
+    };
+    drop(change);
+    tracing::info!(deployment = %id, "scaled");
+    Json(status_of(&state, &deployment)).into_response()
+}
+
+/// Replace a managed deployment's scaling policy with what `f` makes of it.
+///
+/// The one path every scaling change takes — `PATCH …/scaling`, stop and start
+/// — so the refusals (rollout, workspace recovery, a deployment with no pool)
+/// and the validation are the same for all of them. The caller holds the
+/// registry's change guard.
+fn patch_scaling(
+    state: &AdminState,
+    id: &str,
+    f: impl FnOnce(&crate::config::ScalingPolicy) -> Result<crate::config::ScalingPolicy, Response>,
+) -> Result<Arc<crate::deployment::Deployment>, Response> {
+    let Some(old) = state.registry.get(id) else {
+        return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
     };
     if crate::rollout::reserved(&old) {
-        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+        return Err(err(
+            StatusCode::CONFLICT,
+            "candidate rollout reserves this deployment",
+        )
+        .into_response());
     }
 
     // Only a managed deployment is autoscaled; for the others the scaling policy
     // is inert, so a scale request is a mistake rather than a no-op.
-    if state.autoscaler.workspaces().recovery_active(&id) {
-        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    if state.autoscaler.workspaces().recovery_active(id) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "workspace recovery reserves this deployment",
+        )
+        .into_response());
     }
     if !old.spec.is_managed() {
         let fix = if old.spec.is_site() {
@@ -4511,48 +4575,322 @@ async fn scale(
         } else {
             "edit its `upstreams` via PUT instead"
         };
-        return err(
+        return Err(err(
             StatusCode::BAD_REQUEST,
             format!("deployment {id:?} has no VM pool and cannot be scaled; {fix}"),
         )
-        .into_response();
+        .into_response());
     }
-
-    let Some(patch) = patch.as_object() else {
-        return err(StatusCode::BAD_REQUEST, "scaling patch must be a JSON object").into_response();
-    };
-
-    // Merge the patch onto the current policy, then re-parse so unknown/typed
-    // fields are validated by serde.
-    let mut merged = match serde_json::to_value(&old.spec.scaling) {
-        Ok(serde_json::Value::Object(m)) => m,
-        _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "could not read scaling policy").into_response(),
-    };
-    for (k, v) in patch {
-        merged.insert(k.clone(), v.clone());
-    }
-    let scaling: crate::config::ScalingPolicy = match serde_json::from_value(serde_json::Value::Object(merged)) {
-        Ok(s) => s,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid scaling policy: {e}")).into_response(),
-    };
 
     let mut spec = old.spec.clone();
-    spec.scaling = scaling;
+    spec.scaling = f(&old.spec.scaling)?;
     // Catches min > max, zero target_concurrency, etc.
     if let Err(e) = spec.validate() {
-        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        return Err(err(StatusCode::BAD_REQUEST, e.to_string()).into_response());
     }
 
     let Some(deployment) = state.registry.update(spec) else {
-        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+        return Err(err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response());
     };
-    if let Err(e) = state.registry.persist_one(&id) {
+    if let Err(e) = state.registry.persist_one(id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
     }
-    tracing::info!(deployment = %id, "scaled");
     deployment.scale_signal.notify_one();
+    Ok(deployment)
+}
 
-    Json(status_of(&state, &deployment)).into_response()
+// --- stop, start, restart -------------------------------------------------
+//
+// A sandbox is paused between an agent's steps and resumed for the next one.
+// Scaling already does both: a pool whose ceiling is 0 drains its VMs (and,
+// under `idle_action: retain`, syncs and suspends them with their data disk),
+// and nothing — not a request, not an exec — can wake it. Stop is that ceiling,
+// start puts the old policy back. No second notion of "stopped" exists to
+// disagree with the scaling policy.
+
+/// Default and ceiling for how long stop, start and restart wait to report a
+/// settled state before answering `202` with where things stand.
+const LIFECYCLE_WAIT_SECS: u64 = 30;
+const MAX_LIFECYCLE_WAIT_SECS: u64 = 300;
+
+#[derive(Deserialize, Default)]
+struct LifecycleRequest {
+    /// Seconds to wait for the pool to settle. `0` answers at once.
+    #[serde(default)]
+    wait_secs: Option<u64>,
+    /// `restart` only: evict the VM so a new one boots from the image, with a
+    /// fresh data disk, instead of stopping and resuming the same sandbox.
+    #[serde(default)]
+    fresh: bool,
+}
+
+#[derive(Serialize)]
+struct LifecycleResponse {
+    /// `stopped`/`stopping` or `running`/`starting`.
+    state: &'static str,
+    /// Whether the stopped VM keeps its data disk (`idle_action: retain`).
+    retained: bool,
+    /// The VM now serving, once one is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+fn lifecycle_wait(req: &LifecycleRequest) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        req.wait_secs
+            .unwrap_or(LIFECYCLE_WAIT_SECS)
+            .min(MAX_LIFECYCLE_WAIT_SECS),
+    )
+}
+
+/// `POST /deployments/:id/stop` — drain the pool and keep it at zero.
+async fn stop_deployment(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<LifecycleRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match stop_pool(&state, &id, lifecycle_wait(&req)).await {
+        Ok(response) => response,
+        Err(response) => response,
+    }
+}
+
+async fn stop_pool(
+    state: &AdminState,
+    id: &str,
+    wait: std::time::Duration,
+) -> Result<Response, Response> {
+    let change = state.registry.change_guard().await;
+    let previous = state.registry.get(id).map(|d| d.spec.scaling.clone());
+    let deployment = patch_scaling(state, id, |current| {
+        let mut stopped = current.clone();
+        stopped.min_replicas = 0;
+        stopped.max_replicas = 0;
+        stopped.warm_pool = 0;
+        Ok(stopped)
+    })?;
+    // The policy to put back on start. Kept from the first stop: stopping a
+    // stopped pool must not record the zero ceiling as the thing to restore.
+    if let Some(previous) = previous.filter(|p| p.max_replicas > 0) {
+        deployment.mutate_state(|s| {
+            if s.stopped_scaling.is_none() {
+                s.stopped_scaling = Some(previous);
+            }
+        });
+        if let Err(e) = state.registry.persist_one(id) {
+            tracing::error!(deployment = %id, error = %e, "failed to persist state");
+        }
+    }
+    drop(change);
+    let retained = deployment.spec.scaling.idle_action == crate::config::IdleAction::Retain;
+    let settled = wait_until(wait, || {
+        state
+            .registry
+            .get(id)
+            .is_none_or(|d| d.backends().is_empty() && d.pending().is_empty())
+    })
+    .await;
+    let body = LifecycleResponse {
+        state: if settled { "stopped" } else { "stopping" },
+        retained,
+        sandbox_id: None,
+        warning: (!retained).then(|| {
+            "idle_action is destroy: the stopped VM and its /workspace disk are gone; set \
+             scaling.idle_action to retain to keep them across a stop"
+                .to_string()
+        }),
+    };
+    let status = if settled {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(body)).into_response())
+}
+
+/// `POST /deployments/:id/start` — restore the policy stop replaced and wait
+/// for a VM, resuming the retained one if there is one.
+async fn start_deployment(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<LifecycleRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match start_pool(&state, &id, lifecycle_wait(&req)).await {
+        Ok(response) => response,
+        Err(response) => response,
+    }
+}
+
+async fn start_pool(
+    state: &AdminState,
+    id: &str,
+    wait: std::time::Duration,
+) -> Result<Response, Response> {
+    let change = state.registry.change_guard().await;
+    let restore = state
+        .registry
+        .get(id)
+        .and_then(|d| d.state().stopped_scaling.clone());
+    let deployment = patch_scaling(state, id, |current| {
+        Ok(match restore {
+            Some(previous) => previous,
+            // Stopped by a scaling edit rather than by stop: a ceiling of one
+            // is the least that can serve.
+            None if current.max_replicas == 0 => {
+                let mut started = current.clone();
+                started.max_replicas = 1;
+                started
+            }
+            None => current.clone(),
+        })
+    })?;
+    deployment.mutate_state(|s| s.stopped_scaling = None);
+    if let Err(e) = state.registry.persist_one(id) {
+        tracing::error!(deployment = %id, error = %e, "failed to persist state");
+    }
+    drop(change);
+
+    let retained = deployment.spec.scaling.idle_action == crate::config::IdleAction::Retain;
+    let ready = tokio::time::timeout(
+        wait,
+        crate::request_control::wait_for_capacity(&deployment, &[], &state.metrics, &state.feed),
+    )
+    .await
+    .ok()
+    .flatten();
+    let body = LifecycleResponse {
+        state: if ready.is_some() {
+            "running"
+        } else {
+            "starting"
+        },
+        retained,
+        sandbox_id: ready.map(|b| b.sandbox_id.clone()),
+        warning: None,
+    };
+    let status = if body.sandbox_id.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(body)).into_response())
+}
+
+/// `POST /deployments/:id/restart` — the same sandbox, stopped and resumed
+/// with its data disk; or, with `fresh`, a new VM from the image.
+async fn restart_deployment(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<LifecycleRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let wait = lifecycle_wait(&req);
+    if req.fresh {
+        let Some(d) = state.registry.get(&id) else {
+            return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+        };
+        if !d.spec.is_managed() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("deployment {id:?} has no VM to restart"),
+            )
+            .into_response();
+        }
+        for b in d.backends().iter() {
+            if let EvictOutcome::KillFailed(e) =
+                state.autoscaler.evict(&d, &b.sandbox_id, true).await
+            {
+                return err(StatusCode::BAD_GATEWAY, format!("failed to evict VM: {e}"))
+                    .into_response();
+            }
+        }
+        // A suspended sandbox would be resumed in preference to a new one, and
+        // resuming it is the opposite of fresh.
+        for sandbox_id in d.state().suspended.clone() {
+            if let Err(e) = state.autoscaler.discard_suspended(&d, &sandbox_id).await {
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to discard {sandbox_id}: {e}"),
+                )
+                .into_response();
+            }
+        }
+        return match start_pool(&state, &id, wait).await {
+            Ok(r) | Err(r) => r,
+        };
+    }
+    if let Err(response) = stop_pool(&state, &id, wait).await {
+        return response;
+    }
+    match start_pool(&state, &id, wait).await {
+        Ok(r) | Err(r) => r,
+    }
+}
+
+/// `GET /capacity`: what the host has left, and what the caller's
+/// deployments hold of it. Narrowed to the caller's own deployments.
+#[derive(Serialize)]
+struct CapacityResponse {
+    host: HostUsageSnapshot,
+    /// The daemon's data filesystem, where VM disks live. Absent when the
+    /// daemon did not answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_total_bytes: Option<u64>,
+    /// The caller's managed deployments and their VMs.
+    deployments: usize,
+    running_vms: usize,
+    booting_vms: usize,
+    /// Suspended under `idle_action: retain`: holding a disk, not CPU or memory.
+    stopped_vms: usize,
+}
+
+async fn capacity(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let scope = visible_ids(&state, caller.as_ref().map(|c| &c.0));
+    let deployments = state.registry.deployments();
+    let mine: Vec<_> = deployments
+        .values()
+        .filter(|d| d.spec.is_managed())
+        .filter(|d| scope.as_deref().is_none_or(|ids| ids.contains(&d.spec.id)))
+        .collect();
+    let storage = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.autoscaler.vms().storage(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    Json(CapacityResponse {
+        host: state.metrics.host_snapshot(),
+        disk_free_bytes: storage.as_ref().map(|s| s.free_bytes),
+        disk_total_bytes: storage.as_ref().map(|s| s.total_bytes),
+        deployments: mine.len(),
+        running_vms: mine.iter().map(|d| d.backends().len()).sum(),
+        booting_vms: mine.iter().map(|d| d.pending().len()).sum(),
+        stopped_vms: mine.iter().map(|d| d.state().suspended.len()).sum(),
+    })
+}
+
+/// Poll `done` until it holds or `wait` passes. Whether it held.
+async fn wait_until(wait: std::time::Duration, done: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if done() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -5520,14 +5858,49 @@ struct ShellQuery {
 enum VmTarget {
     Ready(crate::deployment::BackendSlot),
     /// A VM the daemon reports `Running` that has not passed its health check.
-    Booting(String),
+    Booting(BootingHold),
 }
 
 impl VmTarget {
     fn sandbox_id(&self) -> &str {
         match self {
             Self::Ready(slot) => slot.sandbox_id(),
-            Self::Booting(id) => id,
+            Self::Booting(hold) => &hold.sandbox_id,
+        }
+    }
+}
+
+/// What a command running in a still-booting VM holds instead of a slot.
+///
+/// A pending VM has no backend to take a slot on, so the command counts as a
+/// waiter: demand that keeps the pool from scaling to zero while it runs, even
+/// if the VM is promoted meanwhile. When it ends, the VM's activity clock is
+/// reset as a released slot would reset it, so the idle window starts then.
+struct BootingHold {
+    sandbox_id: String,
+    deployment: std::sync::Arc<crate::deployment::Deployment>,
+    _waiter: crate::deployment::WaiterGuard,
+}
+
+impl BootingHold {
+    fn new(d: &std::sync::Arc<crate::deployment::Deployment>, sandbox_id: String) -> Self {
+        Self {
+            sandbox_id,
+            deployment: d.clone(),
+            _waiter: d.track_waiter(),
+        }
+    }
+}
+
+impl Drop for BootingHold {
+    fn drop(&mut self) {
+        if let Some(b) = self
+            .deployment
+            .backends()
+            .iter()
+            .find(|b| b.sandbox_id == self.sandbox_id)
+        {
+            b.touch();
         }
     }
 }
@@ -5574,6 +5947,15 @@ async fn hold_a_vm(
     if let Some(want) = sandbox_id {
         return hold_this_vm(&d, id, want);
     }
+    // A ceiling of zero is a stopped deployment: nothing can wake it, so say so
+    // now rather than after waiting out the cold-start timeout.
+    if d.spec.scaling.max_replicas == 0 && d.backends().is_empty() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("deployment {id:?} is stopped; POST /deployments/{id}/start first"),
+        )
+        .into_response());
+    }
 
     if let Some(slot) = d.select(&[]).and_then(|backend| backend.try_hold()) {
         return Ok(VmTarget::Ready(slot));
@@ -5584,7 +5966,7 @@ async fn hold_a_vm(
             sandbox = %sandbox_id,
             "no VM has passed its health check; running in one that is still booting",
         );
-        return Ok(VmTarget::Booting(sandbox_id));
+        return Ok(VmTarget::Booting(BootingHold::new(&d, sandbox_id)));
     }
     if !wake {
         return Err(err(
@@ -5607,7 +5989,7 @@ async fn hold_a_vm(
         // still something to run a command in, and answering 503 here would send
         // the caller away from the VM their own request had just started.
         None => match booting_vm(&d) {
-            Some(sandbox_id) => Ok(VmTarget::Booting(sandbox_id)),
+            Some(sandbox_id) => Ok(VmTarget::Booting(BootingHold::new(&d, sandbox_id))),
             None => Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
@@ -5645,7 +6027,7 @@ fn hold_this_vm(
     }
     match d.pending().iter().find(|p| p.sandbox_id == want) {
         Some(p) if p.status == Some(heyo_sdk::SandboxStatus::Running) => {
-            Ok(VmTarget::Booting(want.to_string()))
+            Ok(VmTarget::Booting(BootingHold::new(d, want.to_string())))
         }
         Some(_) => Err(err(
             StatusCode::CONFLICT,
@@ -6745,6 +7127,10 @@ struct BuildRequest {
     /// is left alone, so a hotfix tag doesn't quietly become the new default.
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
+    /// Build even when the image this would produce is already built from the
+    /// same commit and inputs and running — for a base image that moved.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -6810,7 +7196,7 @@ async fn start_build(
     body: Option<Json<BuildRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_build(&id, req.git_ref) {
+    match state.jobs.start_build(&id, req.git_ref, req.force) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "image build started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
@@ -7267,6 +7653,7 @@ fn router(state: AdminState) -> Router {
         // this app-lb routes, which is the same inventory `/metrics` exposes.
         .route("/", get(directory))
         .route("/metrics", get(metrics_snapshot))
+        .route("/capacity", get(capacity))
         .route("/dashboard", get(dashboard))
         // View tier, not CRUD: the dashboard is its consumer, so the browser's
         // cached view credentials have to work. It must never be ungated — it
@@ -7348,6 +7735,9 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/retired-record", axum::routing::delete(deregister_retired_record))
         .route("/deployments/:id/discovery-status", get(discovery_status))
         .route("/deployments/:id/scaling", patch(scale))
+        .route("/deployments/:id/stop", post(stop_deployment))
+        .route("/deployments/:id/start", post(start_deployment))
+        .route("/deployments/:id/restart", post(restart_deployment))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
         .route(
             "/deployments/:id/upstreams/:upstream/drain",
@@ -8900,6 +9290,128 @@ mod tests {
                 )
                 .await;
                 assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+        }
+
+        /// Stop, start and capacity: the lifecycle an agent drives a sandbox
+        /// through between steps.
+        mod sandbox_lifecycle {
+            use super::*;
+            use serde_json::{Value, json};
+
+            async fn call(
+                f: &Fixture,
+                method: &str,
+                path: &str,
+                body: Value,
+            ) -> (StatusCode, Value) {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| {
+                    <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)
+                })
+                .await
+                .unwrap();
+                let response = app.call(req).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                )
+            }
+
+            fn sandbox(f: &Fixture) {
+                f.registry.upsert(
+                    serde_json::from_value(json!({
+                        "id": "sb", "routes": [],
+                        "vm": {"driver": "firecracker", "port": 8080, "disk_size_gb": 4},
+                        "scaling": {"min_replicas": 0, "max_replicas": 3, "idle_action": "retain",
+                                    "scale_to_zero_after_secs": 600}
+                    }))
+                    .unwrap(),
+                );
+            }
+
+            #[tokio::test]
+            async fn stop_holds_the_pool_at_zero_and_start_puts_the_policy_back() {
+                let f = fixture(true).await;
+                sandbox(&f);
+
+                let (status, body) =
+                    call(&f, "POST", "/deployments/sb/stop", json!({"wait_secs": 0})).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["state"], "stopped");
+                assert_eq!(body["retained"], true);
+                let d = f.registry.get("sb").unwrap();
+                assert_eq!(d.spec.scaling.max_replicas, 0);
+                assert_eq!(d.state().stopped_scaling.as_ref().unwrap().max_replicas, 3);
+
+                // A second stop must not record the zero ceiling as the policy.
+                call(&f, "POST", "/deployments/sb/stop", json!({"wait_secs": 0})).await;
+                let d = f.registry.get("sb").unwrap();
+                assert_eq!(d.state().stopped_scaling.as_ref().unwrap().max_replicas, 3);
+
+                // Nothing wakes a stopped sandbox, and exec says so at once.
+                let (status, body) = call(
+                    &f,
+                    "POST",
+                    "/deployments/sb/exec",
+                    json!({"command": "true"}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert!(body["error"].as_str().unwrap().contains("/start"), "{body}");
+
+                let (status, body) =
+                    call(&f, "POST", "/deployments/sb/start", json!({"wait_secs": 0})).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "no VM can boot here: {body}");
+                assert_eq!(body["state"], "starting");
+                let d = f.registry.get("sb").unwrap();
+                assert_eq!(d.spec.scaling.max_replicas, 3);
+                assert_eq!(d.spec.scaling.scale_to_zero_after_secs, 600);
+                assert!(d.state().stopped_scaling.is_none());
+            }
+
+            #[tokio::test]
+            async fn a_stop_that_destroys_the_disk_says_so() {
+                let f = fixture(true).await;
+                let (status, body) = call(
+                    &f,
+                    "POST",
+                    "/deployments/obsolete/stop",
+                    json!({"wait_secs": 0}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["retained"], false);
+                assert!(
+                    body["warning"].as_str().unwrap().contains("retain"),
+                    "{body}"
+                );
+            }
+
+            #[tokio::test]
+            async fn capacity_reports_the_host_and_the_callers_pools() {
+                let f = fixture(true).await;
+                sandbox(&f);
+                f.registry
+                    .get("sb")
+                    .unwrap()
+                    .mutate_state(|s| s.suspended.push("sb-old".into()));
+                let (status, body) = call(&f, "GET", "/capacity", Value::Null).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["deployments"], 2);
+                assert_eq!(body["stopped_vms"], 1);
+                assert_eq!(body["disk_free_bytes"], 10);
+                assert!(body["host"].is_object());
             }
         }
 
@@ -10572,6 +11084,31 @@ mod tests {
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-cold")), Err(StatusCode::CONFLICT));
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-unknown")), Err(StatusCode::CONFLICT));
             assert_eq!(status_of(hold_this_vm(&d, "demo", "sb-nope")), Err(StatusCode::NOT_FOUND));
+        }
+
+        /// Regression: a command in a booting VM held nothing, so it was no
+        /// demand, and a scale-to-zero pool could drain the VM under it once
+        /// it was promoted.
+        #[test]
+        fn a_command_in_a_booting_vm_is_demand_until_it_ends() {
+            let d = deployment();
+            d.set_pending(vec![pending("sb-boot", 100, Some(SandboxStatus::Running))]);
+            let Ok(held) = hold_this_vm(&d, "demo", "sb-boot") else {
+                panic!("a booting VM is a target");
+            };
+            assert_eq!(d.demand(), 1);
+
+            // Promoted while the command runs: ending the command releases the
+            // demand and leaves the promoted VM freshly active.
+            let b = std::sync::Arc::new(crate::deployment::VmBackend::new(
+                "sb-boot".into(),
+                "127.0.0.1:1".parse().unwrap(),
+            ));
+            d.set_pending(vec![]);
+            d.set_backends(vec![b.clone()]);
+            drop(held);
+            assert_eq!(d.demand(), 0);
+            assert!(crate::deployment::now_secs() - b.last_active() <= 1);
         }
     }
 
@@ -12403,6 +12940,9 @@ mod tests {
                 ("/deployments/:id/files", "/deployments/sb-1/files"),
                 ("/deployments/:id/shell", "/deployments/sb-1/shell"),
                 ("/deployments/:id/scaling", "/deployments/sb-1/scaling"),
+                ("/deployments/:id/stop", "/deployments/sb-1/stop"),
+                ("/deployments/:id/start", "/deployments/sb-1/start"),
+                ("/deployments/:id/restart", "/deployments/sb-1/restart"),
                 ("/deployments/:id/jobs", "/deployments/sb-1/jobs"),
                 (
                     "/deployments/:id/vms/:sandbox_id",

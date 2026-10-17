@@ -80,7 +80,9 @@ test("a spec that breaks a rule is never sent, and the rule is named", async () 
       spec: { id: "web", routes: [], vm: { driver: "firecracker", port: 8080, start_command: "setsid nohup app </dev/null &" }, upstreams: ["a:1"] },
     });
     assert.match(out, /Two backends/, `did not name the rule: ${out.slice(0, 200)}`);
-    assert.equal(stub.calls.length, 0, "a spec known to be invalid still went to app-lb");
+    // Asking /whoami which namespace the token is in is a read, not the spec.
+    const sent = stub.calls.filter((c) => !c.url.endsWith("/whoami"));
+    assert.equal(sent.length, 0, "a spec known to be invalid still went to app-lb");
   } finally {
     stub.restore();
   }

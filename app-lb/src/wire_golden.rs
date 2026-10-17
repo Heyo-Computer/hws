@@ -525,6 +525,15 @@ fn deployment_status_is_stable() {
                 } else {
                     vec![]
                 },
+                pending_vms: if managed {
+                    vec![PendingVmView {
+                        sandbox_id: "applb-sandbox-d4e5f6".into(),
+                        age_secs: 12,
+                        status: Some(heyo_sdk::SandboxStatus::Running),
+                    }]
+                } else {
+                    vec![]
+                },
                 workspace: None,
                 // A fixed answer, not the fixture host's filesystem.
                 site: spec_site.map(|root| crate::site::RootStatus {
@@ -802,6 +811,7 @@ fn job_records_are_stable() {
         commit: None,
         dockerfile: None,
         image: None,
+        build_key: None,
         rolled_out: false,
         store: None,
         artifact_ref: None,
@@ -1129,6 +1139,46 @@ fn the_small_responses_are_stable() {
             path: "/workspace/app/.env".into(),
             wrote: 42,
             size: 42,
+        },
+    );
+
+    golden(
+        "lifecycle-stopped",
+        &LifecycleResponse {
+            state: "stopped",
+            retained: true,
+            sandbox_id: None,
+            warning: None,
+        },
+    );
+
+    golden(
+        "lifecycle-started",
+        &LifecycleResponse {
+            state: "running",
+            retained: true,
+            sandbox_id: Some("applb-sandbox-a1b2c3".into()),
+            warning: None,
+        },
+    );
+
+    golden(
+        "capacity",
+        &CapacityResponse {
+            host: HostUsageSnapshot {
+                available: true,
+                cpu_count: 16,
+                cpu_percent: 23.5,
+                memory_total_bytes: 68_719_476_736,
+                memory_used_bytes: 21_474_836_480,
+                sampled_at_ms: 1_760_000_000_000,
+            },
+            disk_free_bytes: Some(412_316_860_416),
+            disk_total_bytes: Some(1_099_511_627_776),
+            deployments: 3,
+            running_vms: 2,
+            booting_vms: 0,
+            stopped_vms: 1,
         },
     );
 

@@ -24,7 +24,7 @@ const WIRE = join(here, "..", "..", "..", "testdata", "wire");
  */
 const KNOWN = {
   common: {
-    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "workspace", "site"],
+    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "pending_vms", "workspace", "site"],
     SiteRootStatus: ["root", "status", "index_present", "hint"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
     DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed"],
@@ -83,7 +83,7 @@ const KNOWN = {
     SiemStats: ["observed", "dropped", "analyzed", "raised", "suppressed", "tracked_clients", "clients_at_capacity"],
     WorkflowSpec: ["id", "repo", "ref", "path", "network", "auth", "secrets_prefix", "enabled"],
     WorkflowList: ["workflows"],
-    JobRecord: ["id", "deployment", "kind", "status", "started_at", "finished_at", "error", "log", "repo", "ref", "commit", "dockerfile", "image", "rolled_out", "store", "artifact", "digest", "bytes", "reused", "site_root", "files", "working_dir", "commands_total", "commands_run", "verified", "mounts"],
+    JobRecord: ["id", "deployment", "kind", "status", "started_at", "finished_at", "error", "log", "repo", "ref", "commit", "dockerfile", "image", "build_key", "rolled_out", "store", "artifact", "digest", "bytes", "reused", "site_root", "files", "working_dir", "commands_total", "commands_run", "verified", "mounts"],
     MountOutcome: ["path", "store", "ref", "digest", "tree", "files", "bytes", "unpacked", "reused", "changed"],
     SecretSummary: ["id", "namespace", "description", "keys", "updated_at", "encrypted_at_rest"],
     CertStatus: ["host", "not_after", "issuer", "needs_renewal"],
@@ -92,6 +92,8 @@ const KNOWN = {
     OutputPage: ["offset", "bytes", "next_offset", "total_bytes", "encoding", "data"],
     FileRead: ["sandbox_id", "path", "size", "offset", "bytes", "next_offset", "encoding", "content"],
     FileWritten: ["sandbox_id", "path", "wrote", "size"],
+    LifecycleOutcome: ["state", "retained", "sandbox_id", "warning"],
+    Capacity: ["host", "disk_free_bytes", "disk_total_bytes", "deployments", "running_vms", "booting_vms", "stopped_vms"],
     EvictOutcome: ["sandbox_id", "outcome"],
     TokenSummary: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at", "fleet", "mirrored_from"],
     MintedToken: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at", "token"],
@@ -139,6 +141,9 @@ const FIXTURES = {
   operation: "Operation",
   "file-read": "FileRead",
   "file-written": "FileWritten",
+  "lifecycle-stopped": "LifecycleOutcome",
+  "lifecycle-started": "LifecycleOutcome",
+  capacity: "Capacity",
   "evict-response": "EvictOutcome",
   "api-error": "ApiError",
   "token-summary": "TokenSummary",

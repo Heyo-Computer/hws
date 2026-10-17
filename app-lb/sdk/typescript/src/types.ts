@@ -476,6 +476,8 @@ export interface DeploymentStatus {
   pending: number;
   total_in_flight: number;
   vms: VmStatus[];
+  /** VMs created or resumed but not yet healthy; absent when there are none. */
+  pending_vms?: PendingVmView[];
   /** Present when the spec declares `vm.workspace`. */
   workspace?: WorkspaceStatus;
   /** Present for a site: whether its root on the LB host can serve. */
@@ -549,6 +551,29 @@ export interface DeploymentMetrics {
   latency_ms: Histogram;
   cold_start_s: Histogram;
   autoscale: AutoscaleCounts;
+}
+
+/** What `POST /deployments/:id/{stop,start,restart}` answered. */
+export interface LifecycleOutcome {
+  /** `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came back before the pool settled. */
+  state: "stopped" | "stopping" | "running" | "starting";
+  /** Whether a stopped VM keeps its data disk (`idle_action: retain`). */
+  retained: boolean;
+  /** The VM now serving, once one is. */
+  sandbox_id?: string;
+  warning?: string;
+}
+
+/** `GET /capacity`: the host, and the caller's own pools. */
+export interface Capacity {
+  host: HostUsage;
+  disk_free_bytes?: number;
+  disk_total_bytes?: number;
+  deployments: number;
+  running_vms: number;
+  booting_vms: number;
+  /** Suspended under `idle_action: retain`: holding a disk, not CPU or memory. */
+  stopped_vms: number;
 }
 
 export interface HostUsage {
@@ -1003,6 +1028,8 @@ export interface JobRecord {
   commit?: string;
   dockerfile?: string;
   image?: string;
+  /** A build's inputs beyond its commit; the same image and key reuse an earlier build (`reused`). */
+  build_key?: string;
   rolled_out?: boolean;
   store?: string;
   artifact?: string;

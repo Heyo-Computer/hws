@@ -49,6 +49,35 @@ if command -v ip >/dev/null 2>&1; then
     fi
 fi
 
+# The `disk_size_gb` data disk. heyvmd attaches it blank at /dev/vdb and
+# leaves it to the guest: format it on first boot, mount it at /workspace on
+# every boot. A disk labelled `mount<N>` is a heyvmd guest mount (`vm.workspace`,
+# `mounts[]`) that heyvmd mounts itself after HEYVM_READY, so it is left alone.
+# Read from the superblock with dd/od, since the image may have no blkid.
+if [ -b /dev/vdb ]; then
+    magic="$(od -An -tx1 -j1080 -N2 /dev/vdb 2>/dev/null | tr -d ' \n')"
+    if [ "$magic" = "53ef" ]; then
+        label="$(dd if=/dev/vdb bs=1 skip=1144 count=16 2>/dev/null | tr -d '\000')"
+    else
+        label=""
+        if [ -z "$(od -An -N4096 /dev/vdb 2>/dev/null | tr -d ' 0*\n')" ]; then
+            if command -v mkfs.ext4 >/dev/null 2>&1; then
+                echo "init: formatting blank data disk /dev/vdb" > /dev/kmsg 2>/dev/null
+                mkfs.ext4 -q -L workspace /dev/vdb >/dev/null 2>&1
+            else
+                echo "init: /dev/vdb is blank and the image has no mkfs.ext4 (install e2fsprogs); /workspace is on the rootfs" > /dev/kmsg 2>/dev/null
+            fi
+        fi
+    fi
+    case "$label" in
+        mount[0-9]*) ;;
+        *)
+            mkdir -p /workspace 2>/dev/null
+            mount /dev/vdb /workspace 2>/dev/null
+            ;;
+    esac
+fi
+
 # sshd, when the image has one, for `heyvm exec` / `heyvm sh`. Never log to
 # the serial console: it carries heyvmd's command protocol.
 if [ -x /usr/sbin/sshd ]; then

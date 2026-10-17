@@ -45,6 +45,8 @@ pub struct DeploymentStatus {
     pub pending: usize,
     pub total_in_flight: usize,
     pub vms: Vec<VmStatus>,
+    /// VMs created or resumed but not yet healthy; absent when there are none.
+    pub pending_vms: Vec<PendingVmView>,
     /// Present when the spec declares `vm.workspace`.
     pub workspace: Option<WorkspaceStatus>,
     /// Present for a site: whether its root on the LB host can serve.
@@ -964,6 +966,9 @@ pub struct JobRecord {
     pub commit: Option<String>,
     pub dockerfile: Option<String>,
     pub image: Option<String>,
+    /// A build's inputs beyond its commit; a build with the same image and key
+    /// reuses the earlier result (and sets `reused`).
+    pub build_key: Option<String>,
     pub rolled_out: bool,
 
     // artifact-pull
@@ -1939,6 +1944,22 @@ pub struct Operation {
     pub extra: Extra,
 }
 
+/// What `POST /deployments/:id/{stop,start,restart}` answered.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LifecycleOutcome {
+    /// `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came
+    /// back as 202 before the pool settled.
+    pub state: String,
+    /// Whether a stopped VM keeps its data disk (`idle_action: retain`).
+    pub retained: bool,
+    /// The VM now serving, once one is.
+    pub sandbox_id: Option<String>,
+    pub warning: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// A page of an operation's output.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -1980,6 +2001,22 @@ pub struct FileWritten {
     pub path: String,
     pub wrote: usize,
     pub size: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /capacity`: the host, and the caller's own pools.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Capacity {
+    pub host: HostUsage,
+    pub disk_free_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub deployments: usize,
+    pub running_vms: usize,
+    pub booting_vms: usize,
+    /// Suspended under `idle_action: retain`: holding a disk, not CPU or memory.
+    pub stopped_vms: usize,
     #[serde(flatten)]
     pub extra: Extra,
 }

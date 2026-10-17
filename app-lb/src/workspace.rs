@@ -754,32 +754,7 @@ impl Workspaces {
         if self.is_pending(&id, sandbox_id) {
             return Ok(());
         }
-        // A guest stopped by heyvmd is killed, not shut down. Whatever the
-        // workload had not flushed is lost unless it is flushed first.
-        let sync = tokio::time::timeout(
-            SYNC_TIMEOUT,
-            self.vms.exec(
-                sandbox_id,
-                "sync",
-                heyo_sdk::CommandRunOptions {
-                    cwd: None,
-                    env: None,
-                    timeout: Some(SYNC_TIMEOUT),
-                },
-            ),
-        )
-        .await;
-        match sync {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(
-                deployment = %id, sandbox = %sandbox_id, error = %e,
-                "could not sync the guest before stopping it; the last few seconds of writes may be lost",
-            ),
-            Err(_) => tracing::warn!(
-                deployment = %id, sandbox = %sandbox_id,
-                "the guest did not answer `sync` in time; stopping it anyway",
-            ),
-        }
+        self.vms.sync_guest(&id, sandbox_id, SYNC_TIMEOUT).await;
         self.vms
             .suspend(sandbox_id)
             .await

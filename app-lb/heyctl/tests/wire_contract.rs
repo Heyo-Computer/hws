@@ -16,10 +16,11 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use hws::types::{
-    ArtifactStoreInfo, AuthProviderView, CreatedPostgresDatabase, DeletedPostgresDatabase,
-    DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, FileRead, FileWritten, JobRecord,
-    MetricsResponse, NamespacePlugin, Operation, PluginInstalls, PluginView, PostgresDatabases,
-    UpstreamTrafficStatus, WorkflowList, WorkflowView,
+    ArtifactStoreInfo, AuthProviderView, Capacity, CreatedPostgresDatabase,
+    DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, FileRead,
+    FileWritten, JobRecord, LifecycleOutcome, MetricsResponse, NamespacePlugin, Operation,
+    PluginInstalls, PluginView, PostgresDatabases, UpstreamTrafficStatus, WorkflowList,
+    WorkflowView,
 };
 use std::path::PathBuf;
 
@@ -55,7 +56,10 @@ fn workflow_view_understands_every_field() {
     assert_eq!(w.git_ref, "main", "`ref` on the wire, `git_ref` in Rust");
     assert_eq!(w.path, ".ci/workflows/*.yml");
     assert_eq!(w.network, "prod-runners");
-    assert!(w.auth.is_some(), "a SecretRef must survive as an opaque value");
+    assert!(
+        w.auth.is_some(),
+        "a SecretRef must survive as an opaque value"
+    );
     assert_eq!(w.secrets_prefix.as_deref(), Some("ci/app"));
     assert!(w.enabled);
 }
@@ -81,7 +85,11 @@ fn workflow_list_understands_every_field() {
 #[test]
 fn a_minimal_workflow_arrives_with_its_defaults_filled() {
     let w: WorkflowView = serde_json::from_str(&fixture("workflow-minimal")).expect("parses");
-    assert!(w.extra.is_empty(), "{:?}", w.extra.keys().collect::<Vec<_>>());
+    assert!(
+        w.extra.is_empty(),
+        "{:?}",
+        w.extra.keys().collect::<Vec<_>>()
+    );
     assert_eq!(w.git_ref, "main");
     assert_eq!(w.path, ".ci/workflows/*.yml");
     assert!(w.enabled);
@@ -152,7 +160,10 @@ fn disk_inventory_understands_every_field() {
     // The orphan clock is the policy that matters here, and it must survive the
     // wire: an orphan is the disk of a VM that never created, and retaining a
     // copy of that on the seven-day TTL is the leak this separates out.
-    assert!(inv.orphan_ttl_secs > 0, "the orphan TTL must survive the wire");
+    assert!(
+        inv.orphan_ttl_secs > 0,
+        "the orphan TTL must survive the wire"
+    );
     assert!(
         inv.orphan_ttl_secs < inv.ttl_secs,
         "an orphan must expire sooner than a recoverable disk, not later",
@@ -190,7 +201,10 @@ fn disk_inventory_understands_every_field() {
     assert!(running.claimed);
     assert_eq!(running.bytes, 1_073_741_824);
     assert_eq!(running.apparent_bytes, 8_589_934_592);
-    assert_eq!(running.held_by.as_deref(), Some("in use by a running sandbox"));
+    assert_eq!(
+        running.held_by.as_deref(),
+        Some("in use by a running sandbox")
+    );
     assert_eq!(running.parts.len(), 2);
     assert_eq!(running.roots, vec!["run/sb-1a2b3c4d".to_string()]);
 
@@ -206,7 +220,10 @@ fn disk_inventory_understands_every_field() {
     let pinned = &inv.disks[2];
     assert_eq!(pinned.state, DiskState::Stopped);
     assert!(pinned.retain);
-    assert_eq!(pinned.note.as_deref(), Some("keeping for the incident postmortem"));
+    assert_eq!(
+        pinned.note.as_deref(),
+        Some("keeping for the incident postmortem")
+    );
     assert_eq!(pinned.expires_at, None);
 }
 
@@ -219,7 +236,11 @@ fn an_unknown_disk_state_degrades_to_unknown() {
 
     let inv: DiskInventory = serde_json::from_value(value).expect("a newer server still parses");
     assert_eq!(inv.disks[0].state, DiskState::Unknown);
-    assert_eq!(inv.disks[1].state, DiskState::Orphan, "the other rows are unaffected");
+    assert_eq!(
+        inv.disks[1].state,
+        DiskState::Orphan,
+        "the other rows are unaffected"
+    );
 }
 
 /// `GET /metrics`, which had no contract test at all until now.
@@ -255,9 +276,15 @@ fn metrics_response_understands_every_field() {
         "unknown daemon fields: {:?}",
         m.daemon.extra.keys().collect::<Vec<_>>()
     );
-    assert!(!m.daemon.reachable, "the fixture records an unreachable daemon");
     assert!(
-        m.daemon.last_error.as_deref().is_some_and(|e| e.contains("deployed-sandboxes")),
+        !m.daemon.reachable,
+        "the fixture records an unreachable daemon"
+    );
+    assert!(
+        m.daemon
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("deployed-sandboxes")),
         "the reason must survive the wire, not just the boolean",
     );
 
@@ -306,7 +333,10 @@ fn guest_mounts_survive_the_wire() {
     assert_eq!(m.artifact_ref, "corpus-2026-08", "`ref` on the wire");
     assert_eq!(m.strip_components, Some(1));
     assert!(m.read_only, "the fixture's mount is read-only");
-    assert!(m.auth.is_some(), "a SecretRef must survive as an opaque value");
+    assert!(
+        m.auth.is_some(),
+        "a SecretRef must survive as an opaque value"
+    );
     assert!(
         m.digest.as_deref().is_some_and(|d| d.len() == 64),
         "the resolved digest is what says which bytes the guests hold",
@@ -324,7 +354,11 @@ fn placement_survives_the_wire() {
     let placement = d.spec.placement.expect("the owned fixture is pinned");
     assert_eq!(placement.mode, "pinned");
     assert_eq!(placement.home.as_deref(), Some("us5"));
-    assert!(placement.extra.is_empty(), "every placement field is modelled: {:?}", placement.extra);
+    assert!(
+        placement.extra.is_empty(),
+        "every placement field is modelled: {:?}",
+        placement.extra
+    );
     assert_eq!(placement.summary(), "pinned to us5");
 
     let single: DeploymentStatus =
@@ -339,7 +373,10 @@ fn placement_survives_the_wire() {
 fn a_mount_pull_reports_every_mount() {
     let j: JobRecord = serde_json::from_str(&fixture("job-mount-pull")).expect("fixture parses");
 
-    assert!(j.is_mount_pull(), "kind is `mount-pull`, not `artifact-pull`");
+    assert!(
+        j.is_mount_pull(),
+        "kind is `mount-pull`, not `artifact-pull`"
+    );
     assert_eq!(j.mounts.len(), 2);
 
     let fetched = &j.mounts[0];
@@ -357,7 +394,10 @@ fn a_mount_pull_reports_every_mount() {
     assert!(reused.reused);
     assert!(!reused.changed);
     assert_eq!(reused.bytes, Some(0));
-    assert_eq!(reused.files, None, "nothing was unpacked, which is not zero files");
+    assert_eq!(
+        reused.files, None,
+        "nothing was unpacked, which is not zero files"
+    );
 
     assert_eq!(j.result_summary(), "1/2 updated");
     assert_eq!(j.target_summary(), "/data/corpus,/opt/models");
@@ -378,21 +418,33 @@ fn a_jwt_gate_survives_the_wire() {
         "the fixture is the mixed gate: a person signs in, a program presents a token",
     );
 
-    let jwt = gate.jwt.expect("the verification policy must not be dropped");
+    let jwt = gate
+        .jwt
+        .expect("the verification policy must not be dropped");
     assert_eq!(jwt.issuer, "auth-service");
     assert_eq!(jwt.audience.as_deref(), Some("heyo-app"));
     assert_eq!(jwt.algorithms, vec!["HS256"]);
-    assert_eq!(jwt.subject_claim, "userId", "the Heyo auth API's subject is not `sub`");
+    assert_eq!(
+        jwt.subject_claim, "userId",
+        "the Heyo auth API's subject is not `sub`"
+    );
     assert_eq!(jwt.cookie.as_deref(), Some("heyo_access_token"));
     assert_eq!(jwt.leeway_secs, Some(30));
-    assert!(jwt.secret.is_some(), "a SecretRef must survive as an opaque value");
+    assert!(
+        jwt.secret.is_some(),
+        "a SecretRef must survive as an opaque value"
+    );
 
     // The claim map is the gate's allow-list, and it renders as one.
     assert_eq!(jwt.require.len(), 2);
     let summary = jwt.require_summary();
     assert!(summary.contains("role=user|admin"), "{summary}");
     assert!(summary.contains("accountId=acct_7f3c"), "{summary}");
-    assert!(jwt.key_summary().contains("heyo-auth"), "{}", jwt.key_summary());
+    assert!(
+        jwt.key_summary().contains("heyo-auth"),
+        "{}",
+        jwt.key_summary()
+    );
 }
 
 /// The auth provider object, in both shapes app-lb serialises it in.
@@ -409,9 +461,15 @@ fn auth_provider_view_understands_every_field() {
     assert_eq!(heyo.name, "heyo");
     assert_eq!(heyo.namespace, "team-a");
     assert_eq!(heyo.providers(), vec!["jwt".to_string()]);
-    let jwt = heyo.jwt.as_ref().expect("a jwt provider carries its policy");
+    let jwt = heyo
+        .jwt
+        .as_ref()
+        .expect("a jwt provider carries its policy");
     assert_eq!(jwt.issuer, "auth-service");
-    assert_eq!(jwt.subject_claim, "userId", "the Heyo auth API's subject is not `sub`");
+    assert_eq!(
+        jwt.subject_claim, "userId",
+        "the Heyo auth API's subject is not `sub`"
+    );
     assert_eq!(heyo.admits(), "role=user|admin");
     assert_eq!(heyo.trust_summary(), "auth-service");
 
@@ -423,7 +481,10 @@ fn auth_provider_view_understands_every_field() {
         google.extra.keys().collect::<Vec<_>>()
     );
     assert_eq!(google.providers(), vec!["google".to_string()]);
-    assert!(google.client_secret.is_some(), "a SecretRef must survive as a reference");
+    assert!(
+        google.client_secret.is_some(),
+        "a SecretRef must survive as a reference"
+    );
     assert_eq!(google.admits(), "@example.com");
     assert_eq!(google.cookie_domain.as_deref(), Some(".example.com"));
 }
@@ -437,14 +498,22 @@ fn an_inherited_gate_names_the_provider_it_came_from() {
         serde_json::from_str(&fixture("deployment-inherited-gate")).expect("fixture parses");
     let gate = spec.auth.as_ref().expect("the fixture has a gate");
     assert_eq!(gate.provider_ref.as_deref(), Some("corp-google"));
-    assert_eq!(spec.namespace(), "team-a", "the provider is looked up in this namespace");
-    assert!(gate.client_id.is_none(), "an inheriting gate carries no identity of its own");
+    assert_eq!(
+        spec.namespace(),
+        "team-a",
+        "the provider is looked up in this namespace"
+    );
+    assert!(
+        gate.client_id.is_none(),
+        "an inheriting gate carries no identity of its own"
+    );
 }
 
 /// The plugin list `heyctl plugins` renders.
 #[test]
 fn plugin_view_understands_every_field() {
-    let plugins: Vec<PluginView> = serde_json::from_str(&fixture("plugins")).expect("fixture parses");
+    let plugins: Vec<PluginView> =
+        serde_json::from_str(&fixture("plugins")).expect("fixture parses");
     for p in &plugins {
         assert!(
             p.extra.is_empty(),
@@ -456,7 +525,11 @@ fn plugin_view_understands_every_field() {
     let on = &plugins[0];
     assert_eq!(on.id, "example");
     assert!(on.enabled);
-    assert_eq!(on.last_error.as_deref(), Some("connection refused"), "enabled and failing is a state");
+    assert_eq!(
+        on.last_error.as_deref(),
+        Some("connection refused"),
+        "enabled and failing is a state"
+    );
     assert_eq!(on.config["url"], "http://127.0.0.1:34199");
     assert!(on.per_namespace);
     assert_eq!(on.installed_in, ["team-a"]);
@@ -495,15 +568,29 @@ fn namespace_plugin_understands_every_field() {
 fn plugin_installs_understands_every_field() {
     let i: PluginInstalls =
         serde_json::from_str(&fixture("plugin-installs")).expect("fixture parses");
-    assert!(i.extra.is_empty(), "{:?}", i.extra.keys().collect::<Vec<_>>());
+    assert!(
+        i.extra.is_empty(),
+        "{:?}",
+        i.extra.keys().collect::<Vec<_>>()
+    );
     assert_eq!(i.plugin, "obs");
     assert!(i.enabled);
     assert_eq!(i.namespaces, ["team-a", "team-b"]);
     for (ns, install) in &i.installs {
-        assert!(install.extra.is_empty(), "{ns}: {:?}", install.extra.keys().collect::<Vec<_>>());
+        assert!(
+            install.extra.is_empty(),
+            "{ns}: {:?}",
+            install.extra.keys().collect::<Vec<_>>()
+        );
     }
-    assert_eq!(i.installs["team-a"].installed_by.as_deref(), Some("user:u_123"));
-    assert!(i.installs["team-b"].installed_by.is_none(), "the operator installs unattributed");
+    assert_eq!(
+        i.installs["team-a"].installed_by.as_deref(),
+        Some("user:u_123")
+    );
+    assert!(
+        i.installs["team-b"].installed_by.is_none(),
+        "the operator installs unattributed"
+    );
 }
 
 /// The request half of the contract for the workload routes: what this crate
@@ -514,24 +601,49 @@ fn plugin_installs_understands_every_field() {
 fn the_image_inventory_reads_every_field() {
     use hws::{ImageInventory, ImageSweep};
     let inv: ImageInventory = serde_json::from_str(&fixture("images")).expect("fixture parses");
-    assert!(inv.extra.is_empty(), "unmodelled: {:?}", inv.extra.keys().collect::<Vec<_>>());
+    assert!(
+        inv.extra.is_empty(),
+        "unmodelled: {:?}",
+        inv.extra.keys().collect::<Vec<_>>()
+    );
     assert!(inv.complete);
     assert_eq!(inv.delete_supported, Some(true));
-    assert_eq!((inv.cache_bytes, inv.cache_budget_bytes), (Some(0), Some(21_474_836_480)));
+    assert_eq!(
+        (inv.cache_bytes, inv.cache_budget_bytes),
+        (Some(0), Some(21_474_836_480))
+    );
     assert_eq!((inv.cache_hits, inv.cache_misses), (4, 1));
     for i in &inv.images {
-        assert!(i.extra.is_empty(), "{}: unmodelled {:?}", i.name, i.extra.keys().collect::<Vec<_>>());
+        assert!(
+            i.extra.is_empty(),
+            "{}: unmodelled {:?}",
+            i.name,
+            i.extra.keys().collect::<Vec<_>>()
+        );
     }
-    let pulled = inv.images.iter().find(|i| i.name == "img-c74abee2ce8409f1").unwrap();
+    let pulled = inv
+        .images
+        .iter()
+        .find(|i| i.name == "img-c74abee2ce8409f1")
+        .unwrap();
     assert_eq!(pulled.source, "pull");
     assert_eq!(pulled.artifact_ref.as_deref(), Some("heyo/alpine:3.24"));
     assert_eq!(
-        pulled.references.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        pulled
+            .references
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
         vec!["deployment/web", "rollout of web", "job job-1 of api"]
     );
     let gone = inv.images.iter().find(|i| i.tier == "offloaded").unwrap();
     assert!(!gone.present);
-    assert!(gone.offloaded_to.as_deref().unwrap().contains("app-lb-offload:"));
+    assert!(
+        gone.offloaded_to
+            .as_deref()
+            .unwrap()
+            .contains("app-lb-offload:")
+    );
 
     let sweep: ImageSweep = serde_json::from_str(&fixture("images-sweep")).expect("fixture parses");
     assert_eq!(sweep.offloaded, vec!["img-0000000000000000"]);
@@ -593,7 +705,11 @@ mod requests {
                  "started_at": 1, "finished_at": null, "log": ["pulling"]}
             ])
         };
-        let (c, stub) = client(Stub::new().json(200, rec("running")).json(200, rec("succeeded")));
+        let (c, stub) = client(
+            Stub::new()
+                .json(200, rec("running"))
+                .json(200, rec("succeeded")),
+        );
         let done = c
             .wait_for_job("job-1")
             .in_deployment("web")
@@ -601,11 +717,22 @@ mod requests {
             .await
             .unwrap();
         assert_eq!(done.status, "succeeded");
-        let paths: Vec<_> = stub.calls().into_iter().map(|c| (c.method, c.path)).collect();
-        assert_eq!(paths, vec![(Method::Get, "/deployments/web/jobs".to_string()); 2]);
+        let paths: Vec<_> = stub
+            .calls()
+            .into_iter()
+            .map(|c| (c.method, c.path))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![(Method::Get, "/deployments/web/jobs".to_string()); 2]
+        );
 
         let (c, _) = client(Stub::new().json(200, json!([])));
-        let gone = c.wait_for_job("job-9").in_deployment("web").await.unwrap_err();
+        let gone = c
+            .wait_for_job("job-9")
+            .in_deployment("web")
+            .await
+            .unwrap_err();
         assert!(matches!(gone, hws::Error::NotFound { .. }), "{gone:?}");
     }
 
@@ -629,11 +756,23 @@ mod requests {
                 .json(200, json!({"caller": "operator", "admin_scope": "admin", "fleet": true, "confined": false})),
         );
         let me = c.whoami().await.unwrap();
-        assert!(me.extra.is_empty(), "{:?}", me.extra.keys().collect::<Vec<_>>());
+        assert!(
+            me.extra.is_empty(),
+            "{:?}",
+            me.extra.keys().collect::<Vec<_>>()
+        );
         assert_eq!(me.sole_namespace(), Some("team-a"));
         assert_eq!(me.token.unwrap().name, "ci");
-        assert_eq!(c.whoami().await.unwrap().sole_namespace(), None, "two namespaces, none assumed");
-        assert_eq!(c.whoami().await.unwrap().sole_namespace(), None, "the operator is everywhere");
+        assert_eq!(
+            c.whoami().await.unwrap().sole_namespace(),
+            None,
+            "two namespaces, none assumed"
+        );
+        assert_eq!(
+            c.whoami().await.unwrap().sole_namespace(),
+            None,
+            "the operator is everywhere"
+        );
         assert_eq!(stub.calls()[0].path, "/whoami");
     }
 
@@ -648,7 +787,11 @@ mod requests {
         let (c, stub) = client(Stub::new().json(202, op).json(200, done));
         let spec = json!({"id": "web", "vm": {"image": "x"}});
         let started = c.start_rollout("web", "op-1", "r1", &spec).await.unwrap();
-        assert!(started.extra.is_empty(), "{:?}", started.extra.keys().collect::<Vec<_>>());
+        assert!(
+            started.extra.is_empty(),
+            "{:?}",
+            started.extra.keys().collect::<Vec<_>>()
+        );
         assert!(!started.is_finished());
         assert!(c.rollout("web", "op-1").await.unwrap().is_finished());
 
@@ -664,15 +807,25 @@ mod requests {
 
     #[tokio::test]
     async fn discovery_status_is_camel_case_on_the_wire() {
-        let (c, stub) = client(Stub::new().json(200, json!({
-            "serviceId": "web", "version": 3,
-            "upstreams": [{"peer": "10.0.0.2:8080", "draining": false, "inFlight": 2}]
-        })));
+        let (c, stub) = client(Stub::new().json(
+            200,
+            json!({
+                "serviceId": "web", "version": 3,
+                "upstreams": [{"peer": "10.0.0.2:8080", "draining": false, "inFlight": 2}]
+            }),
+        ));
         let s = c.discovery_status("web", true).await.unwrap();
-        assert!(s.extra.is_empty(), "{:?}", s.extra.keys().collect::<Vec<_>>());
+        assert!(
+            s.extra.is_empty(),
+            "{:?}",
+            s.extra.keys().collect::<Vec<_>>()
+        );
         assert_eq!(s.service_id, "web");
         assert_eq!(s.upstreams[0].in_flight, 2);
-        assert_eq!(stub.calls()[0].path, "/deployments/web/discovery-status?staged=true");
+        assert_eq!(
+            stub.calls()[0].path,
+            "/deployments/web/discovery-status?staged=true"
+        );
     }
 }
 
@@ -752,9 +905,16 @@ fn postgres_plugin_answers_are_understood() {
 fn artifact_store_info_is_understood() {
     let info: ArtifactStoreInfo =
         serde_json::from_str(&fixture("artifact-store-info")).expect("fixture parses");
-    assert!(info.extra.is_empty(), "unknown fields: {:?}", info.extra.keys().collect::<Vec<_>>());
+    assert!(
+        info.extra.is_empty(),
+        "unknown fields: {:?}",
+        info.extra.keys().collect::<Vec<_>>()
+    );
     assert!(info.available && info.writable);
-    assert_eq!((info.namespace.as_str(), info.prefix.as_str()), ("team-a", "team-a/"));
+    assert_eq!(
+        (info.namespace.as_str(), info.prefix.as_str()),
+        ("team-a", "team-a/")
+    );
 }
 
 #[test]
@@ -769,4 +929,21 @@ fn operations_and_files_parse_with_nothing_left_over() {
     assert_eq!(read.next_offset, Some(98_304));
     let wrote: FileWritten = serde_json::from_str(&fixture("file-written")).unwrap();
     assert!(wrote.extra.is_empty(), "unread fields {:?}", wrote.extra);
+}
+
+#[test]
+fn lifecycle_and_capacity_parse_with_nothing_left_over() {
+    for name in ["lifecycle-stopped", "lifecycle-started"] {
+        let o: LifecycleOutcome = serde_json::from_str(&fixture(name)).unwrap();
+        assert!(o.extra.is_empty(), "{name}: unread fields {:?}", o.extra);
+        assert!(o.retained);
+    }
+    let c: Capacity = serde_json::from_str(&fixture("capacity")).unwrap();
+    assert!(c.extra.is_empty(), "unread fields {:?}", c.extra);
+    assert!(
+        c.host.extra.is_empty(),
+        "unread host fields {:?}",
+        c.host.extra
+    );
+    assert_eq!(c.stopped_vms, 1);
 }
