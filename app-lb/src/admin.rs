@@ -4812,13 +4812,22 @@ async fn start_pool(
     drop(change);
 
     let retained = deployment.spec.scaling.idle_action == crate::config::IdleAction::Retain;
-    let ready = tokio::time::timeout(
-        wait,
-        crate::request_control::wait_for_capacity(&deployment, &[], &state.metrics, &state.feed),
-    )
-    .await
-    .ok()
-    .flatten();
+    // The waiter is the demand that wakes a scale-to-zero pool, so it must
+    // outlive this response: dropped when `wait` ran out, it took the demand
+    // with it and nothing booted. Detached, it holds on until a VM is ready
+    // or the cold-start timeout.
+    let boot = tokio::spawn({
+        let (deployment, metrics, feed) =
+            (deployment.clone(), state.metrics.clone(), state.feed.clone());
+        async move {
+            crate::request_control::wait_for_capacity(&deployment, &[], &metrics, &feed).await
+        }
+    });
+    let ready = tokio::time::timeout(wait, boot)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
     let body = LifecycleResponse {
         state: if ready.is_some() {
             "running"
@@ -4883,7 +4892,10 @@ async fn restart_deployment(
             Ok(r) | Err(r) => r,
         };
     }
-    if let Err(response) = stop_pool(&state, &id, wait).await {
+    // The stop must settle whatever `wait_secs` says: a start before the
+    // suspend lands boots a new VM with an empty disk.
+    let stop_wait = wait.max(std::time::Duration::from_secs(LIFECYCLE_WAIT_SECS));
+    if let Err(response) = stop_pool(&state, &id, stop_wait).await {
         return response;
     }
     match start_pool(&state, &id, wait).await {
@@ -9803,6 +9815,11 @@ mod tests {
                 assert_eq!(d.spec.scaling.max_replicas, 3);
                 assert_eq!(d.spec.scaling.scale_to_zero_after_secs, 600);
                 assert!(d.state().stopped_scaling.is_none());
+                // Regression: the waiter died with the response, so the pool
+                // saw no demand and a scale-to-zero sandbox never booted.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert_eq!(d.waiters(), 1, "the start's demand must outlive the response");
+                assert_eq!(d.desired_replicas(), 1);
             }
 
             /// Regression: stop answered "stopped" as soon as the VM left the
