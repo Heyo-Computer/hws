@@ -26,7 +26,6 @@ the VM.
 | **Queue** | A read-only dashboard over a NATS JetStream server, plus recipes for running NATS itself as a managed microVM. | [Queue](queue.md) |
 | **ci** | Plans GitHub-Actions-shaped workflow files into jobs, queues them on NATS JetStream with Postgres as the source of truth, and runs each job in a fresh microVM on your runner hosts. Code arrives through `git submit`. | [ci](ci.md) |
 | **MCP server** | `heyo-mcp` gives coding agents tools for sandboxes, deployments, logs, metrics, CI runs and artifacts, over stdio or hosted behind app-lb. | [MCP server](mcp.md) |
-| **Developer tools** | `printer` (a spec-driven code factory), `codegraph` (tree-sitter code index and patching) and `computer` (Linux desktop automation), with plugins and agent skills. | [Developer tools](developer-tools.md) |
 
 ## How the pieces fit
 

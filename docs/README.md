@@ -33,7 +33,6 @@ Heyo Web Services documentation. These pages are also published at
 
 ## Development
 
-- [Developer tools](developer-tools.md) — printer, codegraph, computer, plugins and skills
 - [Contributing](contributing.md) — repository layout, building, testing and releasing
 
 ## Design records

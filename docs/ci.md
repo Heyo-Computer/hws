@@ -731,7 +731,6 @@ Each installable component has one workflow file in [`.ci/workflows/`](../.ci/wo
 | `queue.yml` | `queue` | `queue`, `queue.conf`, a deployment template |
 | `heyosecret.yml` | `heyosecret` | `heyosecret`, `heyosecret.conf`, `migrations/` |
 | `pg-fc.yml` | `pg-fc` | `pg-vm-pool` |
-| `codegraph.yml` | `codegraph` | `codegraph` |
 | `orchestrator.yml` | `orchestrator-linux` | Orchestrator release bundle |
 
 Every artifact also carries `REVISION` or `BUILD-INFO` and a `SHA256SUMS` file. Each workflow's `paths:` filter lists its crate, its path dependencies, its own workflow file and its image directory under `.ci/image/`, so a commit only rebuilds what it touches. `regional-release.yml` is the `on: release` coordinator that merges and then rolls validated artifacts out to us3, then eu1, then replaces the ci controller.

@@ -23,8 +23,7 @@ Documentation: **[docs/](docs/README.md)** · [heyo.computer/docs](https://heyo.
 | [`queue/`](queue/) | Dashboard for a NATS JetStream server |
 | [`mcp/`](mcp/) | MCP server exposing deployments, logs, builds and artifacts to agents |
 | [`ui/`](ui/) | Shared dashboard kit every service serves |
-| [`printer/`](printer/), [`codegraph/`](codegraph/), [`computer/`](computer/) | Agent developer tools: spec-driven code factory, code graph, desktop automation |
-| [`plugins/`](plugins/), [`skills/`](skills/) | printer plugins and reusable agent skills |
+| [`skills/`](skills/) | Reusable agent skills |
 
 ## Install
 
@@ -46,7 +45,6 @@ Each service is its own Cargo workspace:
 ```sh
 cargo build --locked --manifest-path app-lb/Cargo.toml
 cargo test  --locked --manifest-path app-lb/Cargo.toml
-make install   # printer, codegraph and computer into ~/.local/bin
 ```
 
 See [Contributing](docs/contributing.md) for the rest.
