@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VM recovery · Heyo control panel</title>
+    <link rel="stylesheet" href="/__ui/heyo.css" />
+    <script src="/__ui/theme.js" defer></script>
+    <style>
+      main {
+        max-width: 1100px;
+        margin: 28px auto;
+        padding: 0 24px 50px;
+      }
+      .topbar {
+        position: static;
+      }
+      h1 {
+        font-size: 28px;
+        margin: 30px 0 8px;
+      }
+      h2 {
+        font-size: 17px;
+        margin: 0 0 16px;
+      }
+      .muted {
+        color: var(--text-secondary);
+      }
+      .notice {
+        border-left: 3px solid var(--warning);
+        padding: 12px 16px;
+        background: var(--bg-panel);
+        margin: 22px 0;
+      }
+      .row {
+        display: flex;
+        gap: 12px;
+        align-items: end;
+        flex-wrap: wrap;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+        margin-top: 20px;
+      }
+      .panel {
+        padding: 22px;
+        border: 1px solid var(--border-color);
+        border-radius: 10px;
+        background: var(--bg-panel);
+        min-width: 0;
+      }
+      label {
+        display: block;
+        font-size: 13px;
+        margin: 12px 0 6px;
+      }
+      input:not([type="checkbox"]),
+      select,
+      textarea {
+        display: block;
+        box-sizing: border-box;
+        width: 100%;
+        background: var(--bg-dark);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        padding: 10px;
+        font: inherit;
+      }
+      textarea {
+        min-height: 90px;
+        resize: vertical;
+      }
+      #lookup label {
+        margin: 0;
+        flex: 1;
+      }
+      button {
+        cursor: pointer;
+        padding: 10px 14px;
+      }
+      button:disabled {
+        opacity: 0.7;
+        cursor: not-allowed;
+      }
+      #start {
+        margin-top: 18px;
+      }
+      .check {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        margin-top: 20px;
+        line-height: 1.5;
+      }
+      .check input {
+        margin-top: 4px;
+      }
+      #message {
+        white-space: pre-wrap;
+        min-height: 20px;
+        color: var(--warning);
+        margin: 16px 0;
+      }
+      #history {
+        margin-top: 20px;
+      }
+      .operation {
+        border-top: 1px solid var(--border-color);
+        padding: 16px 0;
+        overflow-wrap: anywhere;
+      }
+      .operation:first-of-type {
+        border-top: 0;
+      }
+      .operation p {
+        margin: 6px 0;
+      }
+      .phase {
+        font-weight: 600;
+        color: var(--accent);
+      }
+      code {
+        overflow-wrap: anywhere;
+      }
+      #destination-reasons {
+        font-size: 12px;
+        white-space: pre-wrap;
+        line-height: 1.5;
+      }
+      #intent {
+        margin-top: 18px;
+        overflow-wrap: anywhere;
+      }
+      #intent[hidden] {
+        display: none;
+      }
+      .sub {
+        display: block;
+        font-size: 12px;
+        color: var(--text-secondary);
+        margin-top: 6px;
+      }
+      a:focus-visible,
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible,
+      textarea:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 3px;
+      }
+      @media (max-width: 700px) {
+        main {
+          padding: 0 14px 32px;
+        }
+        .grid {
+          grid-template-columns: 1fr;
+        }
+        .topbar {
+          height: auto;
+          flex-wrap: wrap;
+          gap: 12px;
+          padding: 12px;
+        }
+        .topbar-nav {
+          display: flex;
+          position: static;
+          width: auto;
+          flex-wrap: wrap;
+        }
+        .panel {
+          padding: 16px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header class="topbar">
+        <a class="topbar-brand" href="/dashboard">heyo · control panel</a>
+        <nav class="topbar-nav">
+          <a href="/dashboard">Dashboard</a><a href="/releases">Releases</a
+          ><a href="/vm-recovery" aria-current="page">VM recovery</a>
+        </nav>
+        <div class="topbar-right"><span>{{WHO}}</span></div>
+      </header>
+      <h1>Recover a VM</h1>
+      <p class="muted">
+        Restore a retained disk checkpoint on another server. Keep the same
+        Cloud VM identity.
+      </p>
+      <div class="notice">
+        <strong>Cold recovery, not live migration.</strong> Changes after the
+        checkpoint and running memory are lost. Power off or isolate the source
+        and prevent it restarting before recovery. A timeout is not fencing
+        proof. App-lb-managed deployments and source-bound SDN services must use
+        their owning controller.
+      </div>
+      <form id="lookup" class="row">
+        <label
+          >Cloud VM ID<input
+            id="vm"
+            placeholder="dep-…"
+            required
+            pattern="[A-Za-z0-9_-]+"
+            maxlength="128" /></label
+        ><button id="load" type="submit">Load checkpoints</button>
+      </form>
+      <div id="message" role="status" aria-live="polite"></div>
+      <form id="recover">
+        <div class="grid">
+          <section class="panel">
+            <h2>1. Choose a restore point</h2>
+            <label for="checkpoint">Retained checkpoint</label
+            ><select id="checkpoint" disabled>
+              <option value="">Load a VM first</option>
+            </select>
+            <p id="checkpoint-detail" class="muted">
+              Checkpoint timestamps and age appear here.
+            </p>
+            <label for="destination">Destination server</label
+            ><select id="destination" disabled>
+              <option value="">Load a VM first</option>
+            </select>
+            <p class="sub">
+              Cloud checks eligibility now and again when admitting recovery.
+              This does not reserve capacity.
+            </p>
+            <p id="destination-reasons" class="muted"></p>
+          </section>
+          <section class="panel">
+            <h2>2. Confirm source fencing</h2>
+            <p id="source" class="muted">Source server: —</p>
+            <label class="check"
+              ><input id="fenced" type="checkbox" />I have externally fenced the
+              old source and prevented it restarting.</label
+            ><label for="evidence">Fencing evidence</label
+            ><textarea
+              id="evidence"
+              maxlength="2000"
+              placeholder="Power-off confirmation, isolation procedure, or source-runtime reclamation receipt. Do not paste secrets."
+            ></textarea
+            ><button id="start" type="submit" disabled>Start recovery</button>
+            <p class="sub">This action does not fence the source for you.</p>
+          </section>
+        </div>
+      </form>
+      <section id="intent" class="panel" hidden>
+        <h2>Current request</h2>
+        <p id="intent-summary"></p>
+        <p class="sub">
+          The operation ID is saved in this tab before sending. If interrupted,
+          inspect status and retry this same request—do not create another ID.
+        </p>
+        <div class="row">
+          <button id="inspect">Check status</button
+          ><button id="retry">Retry identical request</button>
+        </div>
+      </section>
+      <section id="history" class="panel">
+        <div class="row">
+          <h2>Recovery history</h2>
+          <button id="refresh" disabled>Refresh progress</button>
+        </div>
+        <p id="history-message" class="muted">
+          Load a Cloud VM to see its durable recovery operations.
+        </p>
+        <div id="operations"></div>
+      </section>
+      <script>
+        const $ = (id) => document.getElementById(id);
+        let vm = "",
+          generation = 0,
+          checkpoints = [],
+          operations = [],
+          intent = null,
+          busy = false,
+          ready = false,
+          historyReady = false,
+          timer;
+        const terminal = (op) => op.phase === "completed";
+        const key = (id) => "heyo-recovery:" + id;
+        function message(text) {
+          $("message").textContent = text;
+        }
+        function date(text) {
+          const d = new Date(text);
+          return text && !Number.isNaN(+d)
+            ? d.toLocaleString()
+            : "Unknown time";
+        }
+        function age(text) {
+          const n = Math.max(0, Date.now() - Date.parse(text));
+          return Number.isFinite(n)
+            ? (n < 3600000
+                ? Math.floor(n / 60000) + "m"
+                : Math.floor(n / 3600000) + "h") + " ago"
+            : "unknown age";
+        }
+        async function api(id, path, body) {
+          const response = await fetch(
+            "/api/vm-recovery/" + encodeURIComponent(id) + "/" + path,
+            {
+              method: body ? "POST" : "GET",
+              headers: body ? { "Content-Type": "application/json" } : {},
+              body: body ? JSON.stringify(body) : undefined,
+              cache: "no-store",
+            },
+          );
+          let data;
+          try {
+            data = await response.json();
+          } catch {
+            throw Error(
+              "Recovery API did not return JSON. Check sign-in and configuration.",
+            );
+          }
+          if (!response.ok)
+            throw Error(
+              data.error || "Recovery request failed (" + response.status + ")",
+            );
+          return data;
+        }
+        function controls() {
+          const locked = busy || !!intent;
+          for (const id of ["checkpoint", "destination"])
+            $(id).disabled = locked || !ready;
+          for (const id of ["fenced", "evidence"]) $(id).disabled = locked;
+          $("start").disabled =
+            locked ||
+            !ready ||
+            !historyReady ||
+            !$("checkpoint").value ||
+            !$("destination").value ||
+            !$("fenced").checked ||
+            !$("evidence").value.trim() ||
+            operations.some((o) => !terminal(o));
+          $("load").disabled = busy;
+          $("refresh").disabled = !vm || busy;
+          $("retry").disabled = busy;
+          $("inspect").disabled = busy;
+        }
+        function showIntent() {
+          $("intent").hidden = !intent;
+          if (intent)
+            $("intent-summary").textContent =
+              "Operation " +
+              intent.operation_id +
+              " · checkpoint " +
+              intent.checkpoint_id +
+              " → " +
+              intent.destination_backend_id;
+          controls();
+        }
+        function checkpointDetail() {
+          const c = checkpoints.find(
+            (c) => c.checkpoint_id === $("checkpoint").value,
+          );
+          $("checkpoint-detail").textContent = c
+            ? "Captured " +
+              date(c.committed_at) +
+              " (" +
+              age(c.committed_at) +
+              ") · source " +
+              c.backend_id +
+              " · checkpoint " +
+              c.checkpoint_id
+            : "No committed checkpoint available.";
+        }
+        function option(select, value, text, disabled = false) {
+          const o = new Option(text, value);
+          o.disabled = disabled;
+          select.add(o);
+        }
+        function renderHistory() {
+          const root = $("operations");
+          root.replaceChildren();
+          $("history-message").textContent = operations.length
+            ? "Status is durable in Cloud. Active operations refresh every 5 seconds."
+            : "No recovery operations recorded.";
+          for (const op of operations) {
+            const item = document.createElement("article");
+            item.className = "operation";
+            const title = document.createElement("p");
+            title.className = "phase";
+            title.textContent =
+              (op.error ? "Needs attention · " : "") + op.phase;
+            item.append(title);
+            for (const text of [
+              op.operation_id,
+              op.source_backend_id + " → " + op.destination_backend_id,
+              "Checkpoint " + op.recovery_checkpoint_id,
+              "Updated " + date(op.updated_at),
+              op.error,
+            ]) {
+              if (!text) continue;
+              const p = document.createElement("p");
+              p.textContent = text;
+              item.append(p);
+            }
+            if (!terminal(op)) {
+              const b = document.createElement("button");
+              b.textContent = "Inspect / retry this operation";
+              b.disabled = busy;
+              b.onclick = () => {
+                if (busy) return;
+                intent = {
+                  operation_id: op.operation_id,
+                  checkpoint_id: op.recovery_checkpoint_id,
+                  destination_backend_id: op.destination_backend_id,
+                  source_fenced: op.source_fenced,
+                  fencing_evidence: op.fencing_evidence,
+                };
+                sessionStorage.setItem(key(vm), JSON.stringify(intent));
+                showIntent();
+              };
+              item.append(b);
+            }
+            root.append(item);
+          }
+          controls();
+        }
+        async function refreshHistory() {
+          if (!vm || busy) return;
+          const id = vm,
+            gen = generation;
+          clearTimeout(timer);
+          try {
+            const rows = await api(id, "recoveries");
+            if (gen !== generation || busy) return;
+            historyReady = true;
+            operations = rows;
+            renderHistory();
+            const current =
+              intent &&
+              rows.find((o) => o.operation_id === intent.operation_id);
+            if (current?.error)
+              message(
+                "Recovery needs attention: " +
+                  current.error +
+                  "\nKeep the source fenced. Inspect status before retrying the identical request.",
+              );
+            if (
+              intent &&
+              rows.some(
+                (o) => o.operation_id === intent.operation_id && terminal(o),
+              )
+            ) {
+              sessionStorage.removeItem(key(vm));
+              intent = null;
+              ready = false;
+              showIntent();
+              message(
+                "Recovery completed. The Cloud VM now points to the destination.",
+              );
+            }
+            if (rows.some((o) => !terminal(o) && !o.error))
+              timer = setTimeout(refreshHistory, 5000);
+          } catch (e) {
+            if (gen === generation) {
+              historyReady = false;
+              $("history-message").textContent =
+                "Progress unavailable: " + e.message;
+              controls();
+            }
+          }
+        }
+        async function loadVm(event) {
+          event?.preventDefault();
+          if (busy) return;
+          const id = $("vm").value.trim();
+          if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return;
+          vm = id;
+          const gen = ++generation;
+          clearTimeout(timer);
+          ready = false;
+          historyReady = false;
+          operations = [];
+          intent = null;
+          checkpoints = [];
+          $("fenced").checked = false;
+          $("evidence").value = "";
+          $("checkpoint").replaceChildren(
+            new Option("Loading checkpoints…", ""),
+          );
+          $("destination").replaceChildren(
+            new Option("Loading destinations…", ""),
+          );
+          $("destination-reasons").textContent = "";
+          $("source").textContent = "Source server: —";
+          message("Loading checkpoint history and checking destinations…");
+          try {
+            intent = JSON.parse(sessionStorage.getItem(key(id)) || "null");
+          } catch {}
+          showIntent();
+          history.replaceState(null, "", "?vm=" + encodeURIComponent(id));
+          await refreshHistory();
+          const results = await Promise.allSettled([
+            api(id, "checkpoints"),
+            api(id, "destinations"),
+          ]);
+          if (gen !== generation) return;
+          const errors = [];
+          if (results[0].status === "fulfilled") {
+            checkpoints = results[0].value;
+            $("checkpoint").replaceChildren(
+              new Option("Choose a checkpoint", ""),
+            );
+            for (const c of checkpoints) {
+              option(
+                $("checkpoint"),
+                c.checkpoint_id,
+                date(c.committed_at || c.created_at) +
+                  " · " +
+                  age(c.committed_at || c.created_at) +
+                  " · " +
+                  c.state +
+                  " · " +
+                  c.checkpoint_id,
+                c.state !== "committed" || !!c.deleted_at,
+              );
+            }
+          } else {
+            errors.push(results[0].reason.message);
+            $("checkpoint").replaceChildren(
+              new Option("Checkpoints unavailable", ""),
+            );
+          }
+          if (results[1].status === "fulfilled") {
+            const d = results[1].value;
+            $("source").textContent = "Source server: " + d.source_backend_id;
+            $("destination").replaceChildren(
+              new Option("Choose a destination", ""),
+            );
+            for (const host of d.destinations)
+              option(
+                $("destination"),
+                host.id,
+                host.id +
+                  (host.region ? " · " + host.region : "") +
+                  (host.eligible ? "" : " · unavailable"),
+                !host.eligible,
+              );
+            $("destination-reasons").textContent =
+              d.destinations
+                .filter((h) => !h.eligible)
+                .map((h) => h.id + ": " + h.reason)
+                .join("\n") ||
+              (!d.destinations.length
+                ? "No destination servers available."
+                : "");
+          } else {
+            errors.push(results[1].reason.message);
+            $("destination").replaceChildren(
+              new Option("Destinations unavailable", ""),
+            );
+          }
+          ready = !errors.length;
+          message(errors.join("\n"));
+          checkpointDetail();
+          controls();
+        }
+        async function sendIntent() {
+          if (!intent || busy) return;
+          const request = intent;
+          clearTimeout(timer);
+          busy = true;
+          controls();
+          message("Submitting operation " + request.operation_id + "…");
+          try {
+            await api(vm, "recoveries", request);
+            message("Recovery accepted. Following durable progress.");
+          } catch (e) {
+            message(
+              e.message +
+                "\nOperation " +
+                request.operation_id +
+                " is retained. Check status before retrying.",
+            );
+          } finally {
+            busy = false;
+            controls();
+            await refreshHistory();
+          }
+        }
+        $("recover").onsubmit = async (event) => {
+          event.preventDefault();
+          if ($("start").disabled) return;
+          if (
+            !confirm(
+              "Recover " +
+                vm +
+                " on " +
+                $("destination").value +
+                "? The old source must remain fenced. Changes after the selected checkpoint will be lost.",
+            )
+          )
+            return;
+          intent = {
+            operation_id: crypto.randomUUID(),
+            checkpoint_id: $("checkpoint").value,
+            destination_backend_id: $("destination").value,
+            source_fenced: true,
+            fencing_evidence: $("evidence").value.trim(),
+          };
+          try {
+            sessionStorage.setItem(key(vm), JSON.stringify(intent));
+          } catch {
+            intent = null;
+            message(
+              "Cannot save the operation ID in this tab. Use heyctl with an explicit operation ID instead.",
+            );
+            return;
+          }
+          showIntent();
+          await sendIntent();
+        };
+        $("lookup").onsubmit = loadVm;
+        $("checkpoint").onchange = () => {
+          checkpointDetail();
+          controls();
+        };
+        for (const id of ["destination", "fenced", "evidence"])
+          $(id).oninput = controls;
+        $("refresh").onclick = refreshHistory;
+        $("retry").onclick = () => {
+          if (
+            confirm(
+              "Retry the identical recovery request with operation " +
+                intent.operation_id +
+                "?",
+            )
+          )
+            sendIntent();
+        };
+        $("inspect").onclick = async () => {
+          if (!intent) return;
+          try {
+            const op = await api(
+              vm,
+              "recoveries/" + encodeURIComponent(intent.operation_id),
+            );
+            message(
+              "Operation " +
+                op.operation_id +
+                ": " +
+                op.phase +
+                (op.error ? " · " + op.error : ""),
+            );
+            await refreshHistory();
+          } catch (e) {
+            message(e.message + "\nKeep this operation ID if retrying.");
+          }
+        };
+        const initial = new URLSearchParams(location.search).get("vm");
+        if (initial) {
+          $("vm").value = initial;
+          loadVm();
+        }
+      </script>
+    </main>
+  </body>
+</html>

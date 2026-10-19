@@ -88,6 +88,22 @@ macro_rules! run {
 }
 
 impl Client {
+    pub fn recovery_checkpoints(&self, id: &str) -> Result<Vec<crate::recovery::RecoveryCheckpoint>> {
+        run!(self, self.inner.recovery_checkpoints(id))
+    }
+    pub fn recovery_destinations(&self, id: &str) -> Result<crate::recovery::RecoveryDestinations> {
+        run!(self, self.inner.recovery_destinations(id))
+    }
+    pub fn recoveries(&self, id: &str) -> Result<Vec<crate::recovery::RecoveryOperation>> {
+        run!(self, self.inner.recoveries(id))
+    }
+    pub fn recovery_status(&self, id: &str, operation_id: &str) -> Result<crate::recovery::RecoveryOperation> {
+        run!(self, self.inner.recovery_status(id, operation_id))
+    }
+    pub fn start_recovery(&self, id: &str, request: &crate::recovery::RecoveryRequest) -> Result<crate::recovery::RecoveryOperation> {
+        run!(self, self.inner.start_recovery(id, request))
+    }
+
     pub fn new(server: impl Into<String>, auth: Auth) -> Result<Self> {
         Self::builder(server).auth(auth).build()
     }

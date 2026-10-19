@@ -78,6 +78,7 @@ pub mod artifacts;
 pub mod error;
 pub mod gate;
 pub mod images;
+pub mod recovery;
 pub mod obs;
 pub mod postgres;
 pub mod shell;

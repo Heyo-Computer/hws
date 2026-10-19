@@ -22,6 +22,36 @@ Prefer the CLI over raw API calls. Use `--format json` when scripting if the
 subcommand supports it. Never print, log, or paste passwords, API keys, or
 tokens; ask the user to run interactive login when credentials are needed.
 
+## Operator checkpoint recovery
+
+For a standalone Cloud Firecracker VM, use the control panel's **VM recovery**
+page or `heyctl recovery`, authenticated as a fleet administrator. These are
+Cloud VM IDs (`dep-…`), not app-lb-managed deployment IDs. Cloud owns admission
+and progress; do not recreate its state with raw runtime restore commands.
+
+1. Run `heyctl recovery checkpoints <cloud-id>` and `heyctl recovery destinations <cloud-id>`.
+   Select a committed, retained checkpoint and an eligible destination. Explain
+   the checkpoint age: recovery loses subsequent disk writes and all memory.
+2. Independently fence the old source and prevent restart. A failed health check
+   or timeout is not fencing. Record concrete power-off, isolation or runtime
+   reclamation evidence. Keep it fenced until authorized cleanup is complete.
+3. Choose and retain one operation UUID before starting:
+   `heyctl recovery start <cloud-id> --checkpoint <checkpoint-uuid> --destination <backend-id> --operation-id <operation-uuid> --source-fenced --fencing-evidence '<evidence>'`.
+4. Use `heyctl recovery status <cloud-id> <operation-uuid>` or
+   `heyctl recovery list <cloud-id>` after interruption. Retry the **same** UUID
+   and exact request only; do not create a replacement operation to bypass an error.
+5. Verify the same Cloud identity, guest data, access and resources on the new
+   server. Clean up only explicitly disposable test resources, through supported
+   APIs, and preserve operation evidence.
+
+This is operator-triggered cold recovery, not live migration or automatic
+failover. App-lb-managed deployments and source-bound SDN services remain with
+their owning controllers. The browser and CLI must never receive Cloud's
+internal key. Configure it server-side through HeyoSecret; see
+`app-lb/README.md` under “Operator VM recovery”. Missing discovery routes or
+configuration are deployment prerequisites, not permission to bypass admission.
+Distinguish backend live proof from fixture-based UI/CLI verification.
+
 ## Environment
 
 Global options can be passed before the command or on most subcommands:

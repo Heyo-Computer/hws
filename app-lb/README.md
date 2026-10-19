@@ -2618,6 +2618,49 @@ It exercises selection, rollback and hold/resume payloads, disabled controls,
 responsive rendering and CI-unavailable errors. These fixtures are not live
 rollout or multi-region availability evidence.
 
+### Operator VM recovery
+
+The **VM recovery** link opens `/vm-recovery`. Enter a Cloud VM ID (`dep-…`,
+not an app-lb deployment ID), select a committed checkpoint and a destination,
+then confirm external fencing and record its evidence. The UI displays checkpoint
+age, ineligible destination reasons, and durable recovery history. It polls active
+operations, retains an interrupted request in the current tab, and retries only
+the identical operation ID and payload. `heyctl recovery` provides the same
+workflow; see [the command reference](../docs/heyctl.md#operator-vm-recovery).
+
+This is **cold disk recovery**, not live migration or automatic failover. Changes
+after the checkpoint and running memory are lost. The source must be powered off,
+isolated from writes and prevented from restarting, or its runtime must be
+reclaimed. A timeout alone is not evidence. The UI does not perform fencing.
+App-lb-managed deployments and source-bound SDN services use their owning
+controllers instead. Cloud remains the authority for admission and progress;
+destination discovery is not a capacity reservation.
+
+Configure each control-panel gateway with `APP_LB_RECOVERY_CLOUD_URL`, an HTTPS
+Cloud base URL including any path prefix (for example
+`https://stage.heyo.computer/cloud`), and `APP_LB_RECOVERY_CLOUD_API_KEY`, injected
+server-side from the environment's canonical HeyoSecret `cloud/internal-api-key`.
+Never store the key in browser code, `heyctl` configuration, or Git. The routes
+require an authenticated **fleet administrator** even if other admin routes are
+ungated. Namespace tokens and read-only credentials cannot recover VMs. This
+proxy replaces the incoming credential with the configured Cloud operator key;
+it never returns that key or restored runtime environment variables. Redirects
+and automatic POST retries are disabled. Browser sessions retain same-origin
+write protection.
+
+Deploy the companion Cloud recovery-discovery API first: GET
+`/deployed-sandboxes/{id}/recovery-destinations` and GET
+`/deployed-sandboxes/{id}/recoveries`, alongside PR677's checkpoint and recovery
+APIs. Until configured and deployed, the page reports unavailable rather than
+pretending recovery is ready. This change does not activate or deploy anything.
+
+Browser verification: `PLAYWRIGHT_MODULE=<installed-playwright> SCREENSHOT_DIR=<directory> node app-lb/testdata/vm-recovery.cjs`.
+The fixtures cover fencing, unavailable destinations, interrupted submission,
+reload, exact retry, durable errors/completion and mobile rendering. They are
+not a live recovery test. The previous deployed Cloud API was exercised US3 → EU1
+with a disposable VM; the new UI/proxy/CLI still need an integrated stage test
+after deployment.
+
 On a control plane (an app-lb with `gateways` configured), `/dashboard` defaults
 to the fleet overview: a tile per server, workloads across servers, global
 applications and [tokens for every server](#tokens-for-every-server). It does not

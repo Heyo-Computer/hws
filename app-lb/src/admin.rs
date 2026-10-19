@@ -37,6 +37,9 @@ mod browser_login;
 #[path = "release_console.rs"]
 mod release_console;
 
+#[path = "vm_recovery_console.rs"]
+mod vm_recovery_console;
+
 /// The live dashboard page. Self-contained (no external fetches beyond the
 /// same-origin `/metrics` poll) so it works over an SSH tunnel with no assets.
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
@@ -8260,6 +8263,13 @@ fn router(state: AdminState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(8192))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
 
+    let vm_recovery = Router::new()
+        .route("/vm-recovery", get(vm_recovery_console::page))
+        .route("/api/vm-recovery/:vm/:resource", get(vm_recovery_console::api).post(vm_recovery_console::api))
+        .route("/api/vm-recovery/:vm/recoveries/:operation", get(vm_recovery_console::status))
+        .layer(axum::extract::DefaultBodyLimit::max(8192))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
+
     // Each plugin's own routes, under `/api/plugins/<id>/…`, on the same two
     // tiers. They carry no state of ours, so the gate goes on them here and
     // they are merged after `with_state` below.
@@ -8302,6 +8312,7 @@ fn router(state: AdminState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .merge(releases)
+        .merge(vm_recovery)
         .merge(views)
         .merge(fleet)
         .merge(fleet_hosts)

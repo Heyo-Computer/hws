@@ -74,6 +74,10 @@ enum Command {
     #[command(subcommand, visible_alias = "image")]
     Images(cmd::images::ImagesCmd),
 
+    /// Inspect checkpoints and explicitly recover an externally fenced VM.
+    #[command(subcommand)]
+    Recovery(cmd::recovery::RecoveryCmd),
+
     /// Manage stored contexts.
     Config {
         #[command(subcommand)]
@@ -327,6 +331,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Feed(args) => cmd::feed::run(&Ctx::new(g)?, args),
         Command::Plugins(cmd) => cmd::plugins::run(&Ctx::new(g)?, cmd),
         Command::Images(cmd) => cmd::images::run(&Ctx::new(g)?, cmd),
+        Command::Recovery(cmd) => cmd::recovery::run(&Ctx::new(g)?, cmd),
         Command::Completion { shell } => {
             let mut command = Cli::command();
             let name = command.get_name().to_string();
