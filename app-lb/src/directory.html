@@ -163,6 +163,25 @@
   nav.addEventListener("click", function (e) { if (e.target.closest("a")) close(); });
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") close(); });
 })();
+
+// A caller inside a namespace wall: the fleet's Disks and Plugins pages
+// refuse it, so Disks goes and Plugins leads to its namespace's console.
+(function () {
+  fetch("/whoami", { headers: { accept: "application/json" }, cache: "no-store" })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (who) {
+      if (!who || who.fleet) return;
+      var pinned = new URLSearchParams(location.search).get("namespace");
+      var granted = Object.keys(who.namespaces || {});
+      var ns = pinned || who.namespace || (granted.length === 1 ? granted[0] : "");
+      document.querySelectorAll('.topbar-nav a[href="/storage"]').forEach(function (a) { a.hidden = true; });
+      document.querySelectorAll('.topbar-nav a[href="/plugins"]').forEach(function (a) {
+        if (ns) a.href = "/namespaces/" + encodeURIComponent(ns) + "/plugin-console";
+        else a.hidden = true;
+      });
+    })
+    .catch(function () {});
+})();
 </script>
 </body>
 </html>

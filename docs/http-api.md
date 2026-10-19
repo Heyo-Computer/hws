@@ -116,7 +116,7 @@ A *confined* caller is a namespace token or a federated grant without `fleet:adm
 | `/jobs/:job_id` | Allowed. A job on a deployment the caller cannot touch answers `404`, exactly as an unknown id does. `GET /jobs` (the full list) stays fleet-only. |
 | `/feeds/:namespace`, `/namespaces/:name/plugins…` | Allowed when `:namespace` / `:name` is one of the caller's. |
 | `/fleet/deployments`, `/fleet/gateways/:id/metrics` | Allowed with `?namespace=` set to one of the caller's namespaces. |
-| Everything else | `403 this token is scoped to specific deployments, so it cannot use a fleet-wide route`. This covers `/jobs`, `/feeds`, `/disks*`, `/images*`, `/storage`, `/plugins`, `/api/plugins*`, `/certs`, `/security/rules*`, `/workflows*`, `POST /namespaces`, `DELETE /namespaces/:name`, `/fleet`, `/fleet/network`, `/fleet/tokens`, `/services` and `/control-plane/config`. |
+| Everything else | `403 this credential is confined to namespace "<ns>", and this route covers the whole fleet` (a caller in one namespace), `… confined to its namespaces …` (a federated grant over several), or `403 this token is scoped to specific deployments, so it cannot use a fleet-wide route` (a deployment-list token). This covers `/jobs`, `/feeds`, `/disks*`, `/images*`, `/storage`, `/plugins`, `/api/plugins*`, `/certs`, `/security/rules*`, `/workflows*`, `POST /namespaces`, `DELETE /namespaces/:name`, `/fleet`, `/fleet/network`, `/fleet/tokens`, `/services` and `/control-plane/config`. |
 
 Deployment ids are globally unique. Because of that, a confined `POST /deployments` that is refused with `403` (the id exists in another namespace) can still be told apart from one that succeeds with `201`.
 

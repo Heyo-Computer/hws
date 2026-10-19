@@ -42,6 +42,7 @@ pub struct GlobalStore {
     base: String,
     api_key: Option<String>,
     http: reqwest::Client,
+    limits: Limits,
 }
 
 impl std::fmt::Debug for GlobalStore {
@@ -82,14 +83,15 @@ impl GlobalStore {
         if parsed.query().is_some() || parsed.fragment().is_some() {
             return Err(format!("{STORE_ENV}={base:?} must not carry a query or fragment"));
         }
+        // No `read_timeout`: reqwest runs it while the request body is still
+        // going out, so a push that took more than a minute failed however
+        // steadily its bytes moved. [`GlobalStore::forward`] times stalls
+        // itself, from the last byte moved in either direction.
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            // Per read, not per request: a multi-gigabyte rootfs upload or
-            // download is fine as long as bytes keep moving.
-            .read_timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| format!("artifact store client: {e}"))?;
-        Ok(Self { base, api_key: api_key.map(|k| k.trim().to_string()), http })
+        Ok(Self { base, api_key: api_key.map(|k| k.trim().to_string()), http, limits: Limits::default() })
     }
 
     pub fn base(&self) -> &str {
@@ -143,12 +145,33 @@ impl GlobalStore {
                 req = req.header(name, v.clone());
             }
         }
+        let length = headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+        let progress = Progress::new(body.is_some(), length, self.limits);
         if let Some(body) = body {
-            req = req.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+            req = req.body(reqwest::Body::wrap_stream(progress.watch(body.into_data_stream())));
+        } else {
+            progress.finish();
         }
-        let resp = match req.send().await {
+        let send = req.send();
+        tokio::pin!(send);
+        let resp = loop {
+            tokio::select! {
+                r = &mut send => break r,
+                _ = tokio::time::sleep_until(progress.deadline()) => {
+                    if let Some(why) = progress.expired() {
+                        tracing::warn!(path, "artifact store request timed out: {why}");
+                        return gateway_error(StatusCode::GATEWAY_TIMEOUT, why);
+                    }
+                }
+            }
+        };
+        let resp = match resp {
             Ok(r) => r,
             Err(e) => {
+                let e = error_chain(&e);
                 tracing::warn!(error = %e, path, "artifact store request failed");
                 return gateway_error(StatusCode::BAD_GATEWAY, format!("the artifact store did not answer: {e}"));
             }
@@ -167,8 +190,7 @@ impl GlobalStore {
                 out = out.header(name, v.clone());
             }
         }
-        let stream = resp.bytes_stream().map_err(std::io::Error::other);
-        out.body(Body::from_stream(stream))
+        out.body(Body::from_stream(idle_limited(resp.bytes_stream().map_err(std::io::Error::other), self.limits.stall)))
             .unwrap_or_else(|e| gateway_error(StatusCode::BAD_GATEWAY, e.to_string()))
     }
 
@@ -176,13 +198,18 @@ impl GlobalStore {
     /// query, so the filter has to happen here, and nothing outside `<ns>/`
     /// may leave app-lb — not even a tag's name.
     pub async fn namespace_tags(&self, namespace: &str) -> Response {
-        let mut req = self.http.get(format!("{}/tags", self.base));
+        let mut req = self.http.get(format!("{}/tags", self.base)).timeout(self.limits.stall);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => return gateway_error(StatusCode::BAD_GATEWAY, format!("the artifact store did not answer: {e}")),
+            Err(e) => {
+                return gateway_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("the artifact store did not answer: {}", error_chain(&e)),
+                );
+            }
         };
         match resp.status().as_u16() {
             200 => {}
@@ -202,6 +229,141 @@ impl GlobalStore {
             Err(e) => gateway_error(StatusCode::BAD_GATEWAY, format!("the artifact store's tag listing did not parse: {e}")),
         }
     }
+}
+
+/// How long a request to the store may go without progress.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// Bytes stopped moving, either way.
+    stall: Duration,
+    /// The store has the whole body and has not answered. It publishes a blob
+    /// to its remote tier before it says "stored", and a multi-gigabyte
+    /// rootfs takes minutes to upload there.
+    reply_wait: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { stall: Duration::from_secs(60), reply_wait: Duration::from_secs(900) }
+    }
+}
+
+/// Where a forwarded request stands, for timing out a stall rather than a
+/// slow but moving transfer.
+struct Progress {
+    has_body: bool,
+    /// The body's declared length. Once that much is sent hyper never asks
+    /// for the stream's end, so the end is the byte count reaching it.
+    length: Option<u64>,
+    sent: std::sync::atomic::AtomicU64,
+    limits: Limits,
+    state: std::sync::Mutex<(tokio::time::Instant, Option<tokio::time::Instant>)>,
+}
+
+impl Progress {
+    fn new(has_body: bool, length: Option<u64>, limits: Limits) -> Arc<Self> {
+        Arc::new(Self { has_body, length, sent: Default::default(), limits, state: std::sync::Mutex::new((tokio::time::Instant::now(), None)) })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, (tokio::time::Instant, Option<tokio::time::Instant>)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn touch(&self, n: usize) {
+        self.lock().0 = tokio::time::Instant::now();
+        let sent = self.sent.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed) + n as u64;
+        if self.length.is_some_and(|len| sent >= len) {
+            self.finish();
+        }
+    }
+
+    fn finish(&self) {
+        self.lock().1 = Some(tokio::time::Instant::now());
+    }
+
+    /// When the request runs out of time if nothing changes before then.
+    fn deadline(&self) -> tokio::time::Instant {
+        match *self.lock() {
+            (last, None) => last + self.limits.stall,
+            (_, Some(sent)) => sent + if self.has_body { self.limits.reply_wait } else { self.limits.stall },
+        }
+    }
+
+    /// Why the request has run out of time, if it has.
+    fn expired(&self) -> Option<String> {
+        if tokio::time::Instant::now() < self.deadline() {
+            return None;
+        }
+        Some(match self.lock().1 {
+            None => format!(
+                "the upload to the artifact store stalled: no bytes moved for {}s",
+                self.limits.stall.as_secs()
+            ),
+            Some(_) if self.has_body => format!(
+                "the artifact store took the whole upload but did not answer within {}s",
+                self.limits.reply_wait.as_secs()
+            ),
+            Some(_) => format!("the artifact store did not answer within {}s", self.limits.stall.as_secs()),
+        })
+    }
+
+    /// `body`, noting each chunk as it is taken and the end when it comes.
+    /// A chunk is only asked for once the store has taken the last one, so
+    /// this sees a store that stops reading as surely as a caller that stops
+    /// sending.
+    fn watch<S, E>(self: &Arc<Self>, body: S) -> impl futures::Stream<Item = Result<bytes::Bytes, E>> + use<S, E>
+    where
+        S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    {
+        use futures::StreamExt;
+        futures::stream::unfold((body, self.clone()), |(mut body, progress)| async move {
+            match body.next().await {
+                Some(chunk) => {
+                    progress.touch(chunk.as_ref().map_or(0, |c| c.len()));
+                    Some((chunk, (body, progress)))
+                }
+                None => {
+                    progress.finish();
+                    None
+                }
+            }
+        })
+    }
+}
+
+/// `stream`, ended with an error once it has gone `stall` without a chunk.
+fn idle_limited<S>(stream: S, stall: Duration) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    use futures::StreamExt;
+    futures::stream::unfold(Some(stream), move |stream| async move {
+        let mut stream = stream?;
+        match tokio::time::timeout(stall, stream.next()).await {
+            Ok(Some(chunk)) => Some((chunk, Some(stream))),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("the artifact store sent nothing for {}s", stall.as_secs()),
+                )),
+                None,
+            )),
+        }
+    })
+}
+
+/// An error and its causes on one line: reqwest's own text stops at "error
+/// sending request for url (…)" and leaves out why.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// The global store as it stands right now: the `artifacts` plugin's while
@@ -532,5 +694,99 @@ mod tests {
     fn debug_never_prints_the_key() {
         let g = GlobalStore::new("https://art.example.com", Some("sekrit".into())).unwrap();
         assert!(!format!("{g:?}").contains("sekrit"));
+    }
+
+    /// Pushes against a real socket whose reader behaves as `store` says.
+    mod pushes {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Clone, Copy)]
+        enum Store {
+            /// Reads 256 KiB every 10ms, then answers 201.
+            Slow,
+            /// Reads 64 KiB, then nothing more.
+            StopsReading,
+            /// Reads everything, then never answers.
+            Silent,
+        }
+
+        const BODY: usize = 1024 * 1024;
+
+        async fn push(store: Store, body_len: usize) -> (StatusCode, String, Duration) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut head = Vec::new();
+                let mut body = 0usize;
+                loop {
+                    if matches!(store, Store::StopsReading) && body >= 64 * 1024 {
+                        std::future::pending::<()>().await;
+                    }
+                    let n = s.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    if body == 0 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        head.extend_from_slice(&buf[..n]);
+                        if let Some(i) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                            body = head.len() - i - 4;
+                        }
+                    } else {
+                        body += n;
+                    }
+                    if body >= body_len {
+                        break;
+                    }
+                    if matches!(store, Store::Slow) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                if matches!(store, Store::Silent) {
+                    std::future::pending::<()>().await;
+                }
+                s.write_all(b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\n{}").await.unwrap();
+            });
+            let mut g = GlobalStore::new(&format!("http://{addr}"), Some("k".into())).unwrap();
+            g.limits = Limits { stall: Duration::from_millis(300), reply_wait: Duration::from_millis(1500) };
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_LENGTH, body_len.into());
+            let chunks = futures::stream::iter(
+                (0..body_len / (16 * 1024)).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![7u8; 16 * 1024]))),
+            );
+            let started = std::time::Instant::now();
+            let r = g
+                .forward(Method::PUT, &format!("/blobs/{D}"), &headers, Some(Body::from_stream(chunks)))
+                .await;
+            let status = r.status();
+            let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned(), started.elapsed())
+        }
+
+        /// Regression: the client's 60s `read_timeout` ran while the body was
+        /// still going out, so any push longer than a minute failed.
+        #[tokio::test]
+        async fn a_slow_push_that_keeps_moving_outlasts_the_stall_limit() {
+            let (status, body, took) = push(Store::Slow, 32 * BODY).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert!(took > Duration::from_millis(900), "the push must outlast the stall limit thrice over: {took:?}");
+        }
+
+        #[tokio::test]
+        async fn a_store_that_stops_reading_is_a_stall() {
+            let (status, body, _) = push(Store::StopsReading, 32 * BODY).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            assert!(body.contains("stalled"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_store_that_takes_the_body_and_never_answers_runs_out_the_reply_wait() {
+            let (status, body, took) = push(Store::Silent, BODY / 4).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            assert!(body.contains("did not answer"), "{body}");
+            assert!(took >= Duration::from_millis(1500), "{took:?}");
+        }
     }
 }
