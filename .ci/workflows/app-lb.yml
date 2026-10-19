@@ -217,7 +217,7 @@ jobs:
       # `app-lb` itself takes no arguments — it is configured entirely from
       # `APP_LB_*` environment variables and, run bare, binds its proxy and
       # admin listeners and never returns. So there is no `--version` to call
-      # here the way there is for `codegraph`, and starting it to see whether it
+      # here the way there is for `art`, and starting it to see whether it
       # starts would mean a step that has to be killed.
       #
       # What is checkable without running it is that the dynamic linker can

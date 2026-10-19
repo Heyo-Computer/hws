@@ -1,8 +1,10 @@
 # Build the `art` release binary — the artifact store's CLI and server — and
 # upload it as an artifact, so a host can install it from the store.
 #
-# Submitted from the repository root, with an ordinary bundle (`git submit`);
-# see `codegraph.yml` for why no `--archive`, and what the bundle buys.
+# Submitted from the repository root with `git submit`. `.git` exists in the
+# guest, so the version stamp below is a real `git describe`, and the `paths:`
+# filter below actually filters: a commit touching only `app-lb/` starts no run
+# here at all.
 #
 # ## Why this exists
 #
@@ -22,14 +24,14 @@
 # This workflow is the second one. `.ci/install.sh art` puts the result at
 # `/usr/local/bin/art`, which is what `APP_LB_ART_BIN` should name.
 #
-# ## The image is `codegraph`'s
+# ## The image
 #
-# Shared deliberately: `artifacts` is 131 registry crates with no system
-# library in its graph — no `openssl-src`, no `aws-lc-sys`, no `cmake` — so
-# `build-essential` and `git` are all it needs, and that is exactly what
-# `.ci/image/codegraph/` is. The image is named by a hash of its inputs, so
-# every field under `vm.build` below must stay equal to `codegraph.yml`'s:
-# one runner builds it once and both workflows reuse it.
+# `artifacts` is 131 registry crates with no system library in its graph — no
+# `openssl-src`, no `aws-lc-sys`, no `cmake` — so `build-essential` and `git`
+# are all it needs, and that is exactly what `.ci/image/rust/` is. The image is
+# named by a hash of its inputs, so a workflow that later shares it must keep
+# every field under `vm.build` equal to this one's: one runner builds it once
+# and both workflows reuse it.
 name: art
 
 on:
@@ -44,23 +46,26 @@ on:
       - 'ui/**'
       # This workflow and the image it builds in — named precisely rather than
       # as `.ci/**`, so adding a workflow for another crate does not rebuild
-      # this one. The image is shared with `codegraph.yml`, so editing it
-      # rebuilds both, which is the one change that genuinely must.
+      # this one.
       - '.ci/workflows/art.yml'
       - '.ci/rust-cache.sh'
-      - '.ci/image/codegraph/**'
+      - '.ci/image/rust/**'
 
 jobs:
   release:
-    # Any online host in the network the repository is assigned on /repos —
-    # not pinned, for the same reason as `codegraph.yml`: nothing here needs a
-    # particular machine, and a small build should take the first free runner.
+    # Any online host in the network the repository is assigned on /repos.
+    # Deliberately not pinned: nothing here needs a particular machine, and a
+    # small build should take the first free runner rather than idle behind one
+    # host's queue. Add `uses: <network>/<node>` if a specific runner is wanted.
     vm:
       driver: firecracker
       build:
-        dockerfile: .ci/image/codegraph/Dockerfile
-        context: .ci/image/codegraph
-        # Must match `codegraph.yml` exactly — see the head of this file.
+        dockerfile: .ci/image/rust/Dockerfile
+        context: .ci/image/rust
+        # 6 GB, the same as the `ci` image and for the same reason: what fills
+        # a rootfs is the Rust toolchain (~1 GB) plus a CARGO_HOME registry
+        # that grows at runtime. Shrinking it buys nothing but a narrower
+        # margin against the SIGBUS that a full rootfs produces.
         size_mb: 6144
       # `medium` (2 CPU, 4 GB). axum, tokio and clap; nothing in this graph
       # generates code the way arrow does, and the whole build is a few
@@ -82,8 +87,13 @@ jobs:
       CARGO_TERM_COLOR: never
     timeout-minutes: 45
     steps:
-      # See `codegraph.yml` for why a warm VM needs this guard even though
-      # init.sh runs the same check at boot.
+      # The image's init runs the same guard, but only at boot — a warm VM
+      # serves many runs between boots, and the disk fills *while* warm.
+      # Without this a pooled VM that crosses the threshold mid-lifetime fails
+      # every build with SIGBUS (rustc writes its output through mmap) until
+      # the VM happens to be retired. It also refuses to build without the
+      # data disk at all, which names the actual problem in one line instead
+      # of an unreadable SIGBUS mid-compile.
       - name: Guard the cache disk
         run: |
           df -P "$CARGO_TARGET_DIR" /
@@ -99,8 +109,9 @@ jobs:
           fi
 
       - name: Build
-        # Absolute — `ci` renders `working-directory:` verbatim rather than
-        # joining it onto /workspace (see `codegraph.yml`).
+        # Absolute — `ci` renders `working-directory:` verbatim as
+        # `cd <value> && …` rather than joining it onto /workspace, so a
+        # relative value resolves from the login shell's home directory.
         working-directory: /workspace/artifacts
         # `--locked`, because the VM is fingerprinted on `Cargo.lock`.
         # `--bin art` rather than a bare `--release`: the crate is a lib plus
@@ -109,8 +120,10 @@ jobs:
         # do both is one artifact to track, and the server half is small.
         #
         # On failure, the guest kernel's ring buffer is what tells an OOM
-        # kill, a full disk and a host-injected SIGBUS apart; see
-        # `codegraph.yml` for the reasoning.
+        # kill, a block-layer I/O error, a full disk and a host-injected SIGBUS
+        # apart — rustc dying on a signal looks identical from the outside in
+        # every case. Printing it is safe: step output rides the exec channel,
+        # not the serial console that carries the marker protocol.
         env: &rust_cache_env
           CI_RUST_CACHE_MODE: ${{ vars.CI_RUST_CACHE_MODE }}
           SCCACHE_BUCKET: ${{ vars.CI_RUST_CACHE_BUCKET }}
@@ -167,9 +180,10 @@ jobs:
           esac
           rm -rf "$root" "$root.in" "$root.out"
 
-      # See `codegraph.yml` for why the binary is copied into the workspace
-      # (`ci/upload-artifact` tars relative to /workspace) and stripped (this
-      # is a CLI people install, not one they debug from a core dump).
+      # Copied into the workspace because `ci/upload-artifact` tars its `path`
+      # relative to /workspace and CARGO_TARGET_DIR is outside it; stripped
+      # because this is a CLI people install, not one they debug from a core
+      # dump.
       #
       # No supervisor unit: on a host `art` is a CLI app-lb calls, not a
       # service. `art serve` runs inside the `artifacts` VM image.
@@ -203,8 +217,10 @@ jobs:
           cat dist/BUILD-INFO
 
       # Tagged `ci-art-<run>-release-art` in the store, which is what
-      # `.ci/install.sh art` looks for. See `codegraph.yml` for why
-      # `description:` is a label rather than a manifest annotation.
+      # `.ci/install.sh art` looks for. `description:` is set as a label on
+      # the blob and the manifest rather than as a manifest annotation — a
+      # manifest is addressed by its own hash, so editing that line would
+      # otherwise fork the manifest for byte-identical builds.
       - uses: ci/upload-artifact
         with:
           name: art

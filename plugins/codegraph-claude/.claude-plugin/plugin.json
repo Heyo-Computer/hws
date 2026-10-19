@@ -1,6 +1,0 @@
-{
-  "name": "codegraph",
-  "version": "0.1.0",
-  "description": "Tree-sitter-backed code navigation and patching. Adds `/cg-*` slash commands and a SessionStart hook that keeps the index live via `codegraph watch`. Steers the agent away from Read/Edit/Write for source files.",
-  "author": { "name": "sarocu" }
-}

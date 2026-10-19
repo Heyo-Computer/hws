@@ -997,7 +997,7 @@ jobs:
     /// and one level up from it: since the subtree merge this crate is `ci/`
     /// inside the monorepo, while the workflows it must satisfy live at the
     /// repository root, which is the only place `ci` reads them from. So this
-    /// now checks every workflow here — `app-lb.yml`, `app-obs.yml` and `codegraph.yml` as well
+    /// now checks every workflow here — `app-lb.yml`, `app-obs.yml` and `art.yml` as well
     /// as this crate's own — which is strictly more than it covered before.
     #[test]
     fn this_repositorys_own_workflows_parse_and_plan() {
@@ -1628,7 +1628,7 @@ mod repo_workflow {
             .find(|s| s.name.as_deref() == Some("Build")).unwrap().env;
         for (file, phases) in [
             ("ci", 2), ("app-lb", 2), ("app-obs", 1), ("art", 1),
-            ("codegraph", 1), ("heyosecret", 2), ("orchestrator", 1),
+            ("heyosecret", 2), ("orchestrator", 1),
             ("pg-fc", 1), ("queue", 1), ("regional-drain-validation", 2),
         ] {
             let path = dir.join(format!("{file}.yml"));
