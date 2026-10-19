@@ -3242,7 +3242,11 @@ async function applyNamespaceTier() {
   if (!pinnedNamespace) return;
   const who = await api("GET", "whoami").catch(() => ({ ok: false }));
   if (!who.ok) { if (who.status === 401) sessionExpired(); return; }
-  const tier = who.data.fleet ? "admin" : (who.data.namespaces || {})[pinnedNamespace];
+  // A federated grant has a tier per namespace; an app-token has one
+  // namespace and one tier in it, and no `namespaces` map at all.
+  const tier = who.data.fleet ? "admin"
+    : who.data.namespaces ? who.data.namespaces[pinnedNamespace]
+    : who.data.namespace === pinnedNamespace ? who.data.admin_scope : undefined;
   document.body.dataset.tier = tier || "none";
   if (tier) { showPluginsNav(); return; }
   const banner = $("ns-banner");

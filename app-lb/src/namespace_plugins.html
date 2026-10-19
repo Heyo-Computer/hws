@@ -138,7 +138,11 @@ function failure(r, what) {
 async function loadTier() {
   const who = await api("GET", "/whoami");
   if (!who.ok) return;
-  tier = who.data.fleet ? "admin" : ((who.data.namespaces || {})[NS] || "none");
+  // A federated grant has a tier per namespace; an app-token has one
+  // namespace and one tier in it, and no `namespaces` map at all.
+  tier = who.data.fleet ? "admin"
+    : who.data.namespaces ? (who.data.namespaces[NS] || "none")
+    : who.data.namespace === NS ? who.data.admin_scope : "none";
   if (!who.data.fleet) document.querySelectorAll("[data-fleet-only]").forEach(a => a.hidden = true);
 }
 

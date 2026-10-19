@@ -988,11 +988,21 @@ fn decide_access(
             // never existed; the job list stays fleet-wide.
             None if matched == "/jobs/:job_id" && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
-                return Verdict::Forbidden(
-                    "this token is scoped to specific deployments, so it cannot use a \
-                     fleet-wide route — mint one scoped to \"*\" if that is what you want"
+                // Named by what actually confines the caller: a namespace
+                // token told it was "scoped to specific deployments" went
+                // looking for a deployment list it never had.
+                return Verdict::Forbidden(match caller.sole_namespace() {
+                    Some(ns) => format!(
+                        "this credential is confined to namespace \"{ns}\", and this route \
+                         covers the whole fleet"
+                    ),
+                    None if caller.confined() => "this credential is confined to its \
+                        namespaces, and this route covers the whole fleet"
                         .into(),
-                );
+                    None => "this token is scoped to specific deployments, so it cannot use a \
+                         fleet-wide route — mint one scoped to \"*\" if that is what you want"
+                        .into(),
+                });
             }
             _ => {}
         }
@@ -11414,6 +11424,35 @@ mod tests {
             assert!(html.contains(r#"<meta name="plugin-namespace" content="team-a">"#));
             assert!(!html.contains("{{"), "an unfilled placeholder shipped");
             f.state.plugins.set("secrets", false, None).await.unwrap();
+        }
+
+        /// Regression: a namespace token refused a fleet-wide page was told it
+        /// was "scoped to specific deployments", which it never was.
+        #[tokio::test]
+        async fn a_fleet_route_refuses_a_namespace_token_by_its_namespace() {
+            use crate::tokens::{AdminScope, NewToken};
+            let mut f = fixture(true).await;
+            f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
+            f.state.gate_admin = true;
+            f.state.gate_view = true;
+            let token = f.state.tokens.mint(NewToken {
+                fleet: false, name: "ns".into(), admin: AdminScope::Admin,
+                namespace: Some("team-a".into()), deployments: vec![], expires_in_secs: None,
+            }, now_secs()).unwrap().1;
+            for uri in ["/storage", "/plugins"] {
+                let req = Request::builder().uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty()).unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+                let resp = app.call(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let body = String::from_utf8_lossy(&body);
+                assert!(body.contains(r#"confined to namespace \"team-a\""#), "{uri}: {body}");
+                assert!(!body.contains("specific deployments"), "{uri}: {body}");
+            }
         }
 
         /// A machine route is reached with the plugin's own token through a
