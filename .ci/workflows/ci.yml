@@ -21,7 +21,7 @@
 # ## Validation, merge, and deployment status
 #
 # One buildable thing in one file, like every workflow here: whether `ci`
-# passes says nothing about the platform or about codegraph, so it earns its
+# passes says nothing about the platform or about art, so it earns its
 # own file and its own run page.
 #
 # `cargo fmt --check` and `cargo clippy` would work here — the image installs
@@ -328,7 +328,7 @@ jobs:
 
       # `ci` takes no arguments at all — no clap, no `env::args` anywhere in
       # `src/` — and is configured entirely from `CI_*` variables, so there is
-      # no `--version` to call the way there is for `codegraph`. That is the
+      # no `--version` to call the way there is for `art`. That is the
       # same situation `app-lb` is in, and it gets the same link check first:
       # weaker than "it boots", but it is precisely the failure an image missing
       # a runtime library produces, and this binary is the one here that most
@@ -415,7 +415,7 @@ jobs:
           # submit would have neither, which is why `ci.sha` is recorded beside
           # it rather than instead of it.
           describe="$(git -C /workspace describe --tags --always --dirty 2>/dev/null || echo 'no-git')"
-          # Read out of the manifest rather than from the binary: `codegraph`
+          # Read out of the manifest rather than from the binary: `art`
           # and `heyctl` can be asked with `--version`, and this cannot, because
           # it parses no arguments. The manifest in the submitted tree is the
           # only statement of the version there is.

@@ -28,28 +28,6 @@
 - Do not tell the user to wait for GitHub PR CI and do not use GitHub-hosted checks as the readiness signal unless the user explicitly asks for them.
 - Do not run `git submit` unless the user explicitly asks; report that it is ready for the user to submit.
 
-## General
-- build and install CLIs: `make install`
-
-## Computer
-- path: `computer/`
-- build: `cargo build`
-- lint: `cargo clippy`
-- format: `cargo fmt`
-
-## Codegraph
-- path: `codegraph/`
-- build: `cargo build`
-- lint: `cargo clippy`
-- format: `cargo fmt`
-
-## Printer
-- path: `printer/`
-- build: `cargo build`
-- lint: `cargo clippy`
-- format: `cargo fmt`
-- test: `cargo test`
-
 ## Platform services
 - paths: `heyosecret/`, `heyosecret-client/`, `orchestrator/`, `app-lb/`, `app-obs/`, `artifacts/`, `ci/`, `queue/`, `pg-fc/`, `remote/`
 - build: `cargo build --locked --manifest-path <path>/Cargo.toml`

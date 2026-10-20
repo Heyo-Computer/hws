@@ -358,5 +358,4 @@ Pointed at the gated host, those tools fail with this explanation rather than a 
 
 - [app-lb](app-lb.md) and [app-lb auth](app-lb-auth.md): the deployment spec, gates and app tokens
 - [heyctl](heyctl.md): the CLI for the same APIs
-- [developer-tools](developer-tools.md)
 - [Component README](../mcp/README.md)

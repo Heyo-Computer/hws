@@ -30,7 +30,7 @@ mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
 # of a step's output — or worse, swallow the end marker.
 dmesg -n 1 2>/dev/null
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
-hostname ci-codegraph
+hostname ci-art
 
 # Network: the kernel ip= param may not be fully applied before init runs. A
 # build needs it working — `cargo` fetches crates from the registry.

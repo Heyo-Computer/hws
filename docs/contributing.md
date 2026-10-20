@@ -24,31 +24,16 @@ There is no root workspace, so you build and test each one with
 | `mcp/` | MCP server (Node.js/TypeScript) exposing app-lb, app-obs, ci, and art to agents | [mcp](mcp.md) |
 | `ui/` | Shared dashboard stylesheet, theme script, fonts, and Rust helpers | [below](#shared-dashboard-ui) |
 
-### Developer tools
-
-| Directory | What it is | Docs |
-| --- | --- | --- |
-| `printer/` | Spec-driven agent driver CLI | [developer tools](developer-tools.md#printer) |
-| `codegraph/` | Tree-sitter code index and patch CLI | [developer tools](developer-tools.md#codegraph) |
-| `computer/` | Desktop automation CLI | [developer tools](developer-tools.md#computer) |
-| `plugins/` | printer plugins and integrations for Claude Code, OpenCode, and pi | [developer tools](developer-tools.md#printer-plugins) |
-| `skills/` | Agent skills: `heyvm`, `git-submit` | [developer tools](developer-tools.md#skills) |
-
 ### Everything else
 
 | Path | What it is |
 | --- | --- |
 | `docs/` | These pages. `docs/design/` holds design documents |
-| `examples/` | Example projects built with the developer tools |
-| `specs/` | printer specs used to develop printer itself |
+| `examples/` | Example projects |
+| `skills/` | Agent skills: `heyvm`, `git-submit` |
 | `.ci/` | This repository's CI: `workflows/`, build images in `image/`, installers, and `README.md` |
 | `.heyo/` | Workflows and deployment metadata for the external Heyo CI/CD service: `workflows/`, `services/`, `regions/`, `fleet/`, `deployment-environments.json` |
-| `.github/workflows/` | GitHub Actions build of the printer/codegraph/computer release tarballs |
-| `.opencode/`, `opencode.json` | OpenCode codegraph agent and `/cg-*` commands for working in this repository |
-| `.poolside/`, `.printer/` | Local agent-tool state checked into the repository |
 | `AGENTS.md` | Instructions for coding agents working in the repository |
-| `INTEGRATION.md` | How a desktop app embeds printer, codegraph, and computer |
-| `Makefile`, `install.sh` | Build/install and binary installer for the three developer CLIs |
 | `LICENSE` | Apache License 2.0 |
 
 ## Building and testing
@@ -84,24 +69,9 @@ Operational scripts have Python `unittest` tests beside them, for example
 `.heyo/test_*.py`, `ci/deploy/test_start_artifact.py`, and
 `pg-fc/deploy/test_*.py`. Run one with `python3 <file>`.
 
-### Developer tools
-
-```sh
-cargo build --manifest-path printer/Cargo.toml
-cargo test  --manifest-path printer/Cargo.toml
-cargo clippy --manifest-path printer/Cargo.toml -- -D warnings
-cargo fmt   --manifest-path printer/Cargo.toml
-```
-
-The same commands work for `codegraph/` and `computer/`. `make check` and
-`make test` run all three; `make install` builds and installs them into
-`~/.local/bin`.
-
 ### Formatting and lint
 
-Run `cargo fmt` and `cargo clippy` for any crate you touch. Printer's CI runs
-`cargo fmt --check` and `cargo clippy -- -D warnings`, so warnings fail its
-build.
+Run `cargo fmt` and `cargo clippy` for any crate you touch.
 
 ## Shared dashboard UI
 
@@ -166,7 +136,6 @@ workflow with one job, gated by a `paths:` filter.
 | `app-obs.yml` | submit | `app-obs` and `app-obs-dump`, with `app-obs.conf` |
 | `art.yml` | submit | `art` |
 | `ci.yml` | submit | `ci` and its migrations, with `ci.conf` |
-| `codegraph.yml` | submit | `codegraph` |
 | `heyosecret.yml` | submit | `heyosecret`, migrations, `heyosecret.conf` |
 | `orchestrator.yml` | submit | Tests (including Postgres-backed ones) and packages `orchestrator` |
 | `pg-fc.yml` | submit | `pg-vm-pool` |
@@ -178,7 +147,7 @@ Each release artifact contains the binaries plus `SHA256SUMS` and
 `BUILD-INFO`, and is tagged `ci-<workflow>-<run>-<job>-<name>` in the artifact
 store. The installers in [installation](installation.md) consume these.
 
-Build images live in `.ci/image/` (`apps/`, `ci/`, `codegraph/`). An image is
+Build images live in `.ci/image/` (`apps/`, `ci/`, `rust/`). An image is
 named by the hash of its Dockerfile, context, and `size_mb`, so any edit builds
 a new one automatically.
 
@@ -210,11 +179,7 @@ CI/CD service:
 | `app-lb.yml` | Tests app-lb, heyctl, and the TypeScript SDK |
 | `app-obs.yml` | Tests app-obs |
 | `artifacts.yml` | Tests artifacts |
-| `printer.yml` | `fmt --check`, `clippy -D warnings`, and tests for printer |
 | `deploy-heyo-services.yml` | Deploys heyosecret, orchestrator, and app-obs through the orchestrator API, using `.heyo/services/*.json` and `.heyo/deployment-environments.json` |
-
-`.github/workflows/build.yml` separately builds the printer, codegraph, and
-computer release tarballs for Linux and macOS on GitHub Actions.
 
 ## Submitting changes with `git submit`
 

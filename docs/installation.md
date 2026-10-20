@@ -208,8 +208,8 @@ PREFIX=~/.local SUPERVISOR_DIR= sh .ci/install.sh               # unprivileged, 
 | `SUPERVISOR_DIR` | `/etc/supervisor/conf.d` | Set empty to skip supervisor files |
 | `APPS` | `app-lb app-obs ci art` | Which apps to install when none are named |
 
-Installable names: `app-lb`, `app-obs`, `ci`, `art`, `codegraph`, `queue`,
-`heyosecret`, `pg-fc`. `queue` and `pg-fc` are deliberately not in the default
+Installable names: `app-lb`, `app-obs`, `ci`, `art`, `queue`, `heyosecret`,
+`pg-fc`. `queue` and `pg-fc` are deliberately not in the default
 set: queue belongs only on the host that runs `nats-server`, and `pg-fc`
 installs only the `pg-vm-pool` binary without configuring or restarting a
 pooler.
@@ -245,7 +245,7 @@ System packages the builds need:
 | app-lb | `build-essential cmake perl pkg-config` (OpenSSL and zlib-ng are compiled from source) |
 | app-obs | `build-essential cmake pkg-config` |
 | ci | `build-essential pkg-config libssl-dev` |
-| codegraph | `build-essential` |
+| artifacts | `build-essential` |
 
 Without `--workspace`, the app-lb build produces only `app-lb`, not `heyctl`.
 app-obs needs noticeably more memory to compile than the other crates; lower

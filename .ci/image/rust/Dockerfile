@@ -1,6 +1,7 @@
-# Firecracker microVM rootfs for building `codegraph`.
+# Firecracker microVM rootfs for small Rust builds with no system libraries
+# in their dependency graph (today, `art`).
 #
-# `ci` builds this itself: `.ci/workflows/codegraph.yml` points
+# `ci` builds this itself: `.ci/workflows/art.yml` points
 # `vm.build.dockerfile` here, and the first job to land on a host uploads this
 # file plus its context to the daemon's `POST /images/build`, which runs the
 # `docker build -> docker export -> mke2fs` pipeline behind `heyvm mvm build`.
@@ -22,20 +23,17 @@ FROM ubuntu:24.04
 # iproute2 to bring up eth0 from the kernel command line, e2fsprogs to format
 # the attached data disk on first boot.
 #
-# The second is what building `codegraph` needs, and it is short because the
-# dependency graph is short — 109 crates, none of which links a system library:
+# The second is what building `art` needs, and it is short because none of
+# its 131 crates links a system library:
 #
-# - `build-essential` for `cc`. The four tree-sitter grammars
-#   (rust/python/javascript/typescript) each compile a generated `parser.c`,
-#   so a C compiler is not optional even though nothing here is a C project.
+# - `build-essential` for `cc` and the linker.
 # - `git` is **not optional**, and for a different reason than in a repository
 #   that uses `--archive`: this repository's bundle is small enough to submit
 #   as one, and a bundle is cloned *inside the guest* by the checkout step. An
 #   image without git fails a run before its first step.
 #
 # Deliberately absent, because `cargo tree` reaches none of them:
-# `pkg-config`/`libssl-dev` (nothing here speaks HTTP — no reqwest, no
-# openssl-sys), `cmake` (no aws-lc-sys), `perl` (no openssl-src), `libclang-dev`
+# `pkg-config`/`libssl-dev` (no openssl-sys), `cmake` (no aws-lc-sys), `perl` (no openssl-src), `libclang-dev`
 # (no bindgen). Adding a package "just in case" costs image build time on every
 # runner and hides what the build actually depends on.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -73,10 +71,9 @@ RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
 # fail with `no such command`, which reads as broken CI rather than as a missing
 # component.
 #
-# `codegraph` is `edition = "2024"`, which needs Rust 1.85 or newer. `stable` is
-# well past that; pinning a version here would be a second place to remember
-# when the repository grows a rust-toolchain.toml, which the workflow already
-# watches through `cache_key_files`.
+# `stable`, not a pinned version: a pin here would be a second place to
+# remember when the repository grows a rust-toolchain.toml, which the workflow
+# already watches through `cache_key_files`.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 RUN curl -sSf https://sh.rustup.rs \
       | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \

@@ -59,7 +59,7 @@ jobs:
         # inputs and none of the three jobs would reuse the others'.
         size_mb: 10240
       # `large` (4 CPU, 8 GB) for 191 crates, which looks generous next to
-      # `codegraph`'s `medium` for 109 — but the README's rule is to pick on
+      # `art`'s `medium` for 131 — but the README's rule is to pick on
       # memory and on what actually compiles, not on crate count.
       #
       # What decides it is `aws-lc-sys`. `reqwest 0.13`'s rustls stack reaches

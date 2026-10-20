@@ -1,9 +1,0 @@
-# printer plan checkpoint
-spec: /home/sarocu/Projects/printer/specs/003-followups.md
-created_at: 2026-04-29T03:36:56.320101922+00:00
-
-## Final agent output
-
-Plans recorded for T-009, T-010, T-011 with dependencies T-010 → {T-009, T-011}.
-
-<<PLAN_READY>>

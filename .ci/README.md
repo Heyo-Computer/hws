@@ -7,7 +7,6 @@ to "did this commit pass"; every file here holds one job. See
 
 | Workflow | Job | Builds | Artifact |
 | --- | --- | --- | --- |
-| `codegraph.yml` | `release` | `codegraph` | `codegraph` — binary, `SHA256SUMS`, `BUILD-INFO` |
 | `app-lb.yml` | `release` | `app-lb`, `heyctl` | `app-lb` — both binaries, `app-lb.conf`, `SHA256SUMS`, `BUILD-INFO` |
 | `app-obs.yml` | `release` | `app-obs`, `app-obs-dump` | `app-obs` — both binaries, `app-obs.conf`, `SHA256SUMS`, `BUILD-INFO` |
 | `ci.yml` | `release` | `ci` | `ci` — binary, `ci.conf`, `migrations/`, `SHA256SUMS`, `BUILD-INFO` |
@@ -16,8 +15,7 @@ to "did this commit pass"; every file here holds one job. See
 | `pg-fc.yml` | `release` | `pg-vm-pool` | `pg-fc` — tested host binary, `SHA256SUMS`, `BUILD-INFO` |
 | `heyosecret.yml` | `release` | `heyosecret` | `heyosecret` — binary, `migrations/`, `heyosecret.conf`, `SHA256SUMS`, `BUILD-INFO` |
 
-The other crates here (`computer`, `heyosecret-client`, `printer`) have no
-release workflow yet. `orchestrator.yml` tests and packages the orchestrator,
+`heyosecret-client` is a library and has no release workflow. `orchestrator.yml` tests and packages the orchestrator,
 and `regional-*.yml` validate and sequence regional releases. Adding one
 is the recipe at the bottom.
 
@@ -41,7 +39,7 @@ queue, so the self-reference costs less than it looks like it should.
 
 All active Linux Rust build/test workflows use [`rust-cache.sh`](rust-cache.sh)
 with pinned sccache 0.18.0: ci, app-lb (including protocol checks), app-obs,
-art, codegraph, heyosecret, orchestrator, pg-fc, queue and regional-drain-validation.
+art, heyosecret, orchestrator, pg-fc, queue and regional-drain-validation.
 Job VMs and disks remain disposable. `ci.yml` also measures dependency-fetch time.
 The script downloads a checksum-verified Linux binary into the job's data disk;
 it does not rebuild the base image or change the Rust toolchain.
@@ -333,7 +331,7 @@ ci-<workflow>-<run>-<job>-<name>
 
 which for the table above is `ci-app-lb-<run>-release-app-lb`,
 `ci-app-obs-<run>-release-app-obs`, `ci-ci-<run>-release-ci`,
-`ci-codegraph-<run>-release-codegraph`, `ci-art-<run>-release-art` and
+`ci-art-<run>-release-art` and
 `ci-queue-<run>-release-queue`. The workflow name being in the tag
 means renaming a workflow starts a new series: app-lb and app-obs were built
 by `apps.yml` until 2026-08-27, and their older builds are tagged
@@ -379,21 +377,21 @@ must be pushed first. Two things follow:
 
 - **`.git` exists in the guest.** `git describe`, `git log` and `git rev-parse`
   work in a step (a `--dirty` submission may have a synthetic `HEAD`).
-  `codegraph.yml` uses that for its version stamp.
+  `art.yml` uses that for its version stamp.
 - **Path filters actually filter.** The client computes the changed paths across
   the full trunk-to-feature diff, and `ci` matches `paths:` against them. A
-  commit touching only `app-lb/` starts no `codegraph` run at all.
+  commit touching only `app-lb/` starts no `art` run at all.
 
 ## Adding a workflow
 
-Copy `codegraph.yml`, or `app-obs.yml` if the build is big enough to need a
+Copy `art.yml`, or `app-obs.yml` if the build is big enough to need a
 log file and an in-guest timeout. Then change these:
 
 1. **`paths:`** — the crate's subtree, **plus every path dependency of it**.
    Cargo does not record a path dep's contents in the lockfile, so a sibling
    crate's source is a change to your build even though nothing in your own
-   directory moved. `codegraph` has none, which is why its list is short; most
-   of the others here do.
+   directory moved. `art`'s only one is `ui/`, which is why its list is short;
+   most of the others here have more.
 2. **`cache_key_files:`** — the lockfile, plus every `Cargo.toml` that can change
    what gets compiled without moving the lockfile: sibling path deps, and
    **workspace members**. `heyctl` is a member of the `app-lb` workspace, so
@@ -405,8 +403,8 @@ log file and an in-guest timeout. Then change these:
    later busts the pool at the moment it most needs busting.
 3. **`working-directory:` on the build step — absolute.** Unlike GitHub, `ci`
    renders `cd <value> && …` verbatim rather than joining it onto the workspace,
-   so a bare `codegraph` resolves against the login shell's home directory and
-   the step dies on `cd: no such file`. Write `/workspace/codegraph`.
+   so a bare `artifacts` resolves against the login shell's home directory and
+   the step dies on `cd: no such file`. Write `/workspace/artifacts`.
 4. **`cargo build` flags.** `--locked`, always, because the VM's fingerprint is
    a claim about the lockfile. `--bins` to skip test and example targets. And
    `--workspace` **if the crate has members** — without it cargo builds only the
@@ -414,7 +412,7 @@ log file and an in-guest timeout. Then change these:
    artifact is quietly missing a binary.
 5. **The image**, if the toolchain differs. There are three here and none was
    guessed — each package was read off `cargo tree`:
-   - `image/codegraph/`: `build-essential` and `git` only. Nothing in that graph
+   - `image/rust/`: `build-essential` and `git` only. Nothing in that graph
      links a system library.
    - `image/apps/`: adds `cmake`, `perl` and `pkg-config`, because both app
      graphs reach `aws-lc-sys` (cmake) and app-lb also builds OpenSSL and

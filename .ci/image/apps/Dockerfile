@@ -13,7 +13,7 @@
 # a C compiler, cmake and perl — so a second Dockerfile would only mean a second
 # 10-to-20-minute image build on every runner for no difference in contents.
 # They still get separate warm VM pools, because the pool fingerprint includes
-# `cache_key_files` and those differ per job. See `.ci/image/codegraph/` for the
+# `cache_key_files` and those differ per job. See `.ci/image/rust/` for the
 # other case: a genuinely smaller graph that earns its own image.
 #
 # **`docker export` discards OCI metadata.** ENTRYPOINT, CMD and — the one that
