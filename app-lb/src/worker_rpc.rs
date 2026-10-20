@@ -29,6 +29,9 @@ use tokio::sync::watch;
 
 const VERSION: u16 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
+/// The worker bootstrap carries every certificate and key, so it grows with
+/// the fleet's hostnames; request-control frames do not.
+pub(crate) const MAX_BOOTSTRAP_FRAME: usize = 64 * 1024 * 1024;
 
 fn check_version(version: u16) -> Result<(), String> {
     (version == VERSION).then_some(()).ok_or_else(|| {
@@ -553,15 +556,23 @@ async fn protocol_fail(stream: &mut UnixStream, message: &str) -> Result<(), Str
 }
 
 pub(crate) async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<(), String> {
+    write_frame_within(stream, value, MAX_FRAME).await
+}
+
+pub(crate) async fn write_frame_within<T: Serialize>(stream: &mut UnixStream, value: &T, limit: usize) -> Result<(), String> {
     let body = serde_json::to_vec(value).map_err(|e| format!("request control encode failed: {e}"))?;
-    if body.len() > MAX_FRAME { return Err("request control frame exceeds limit".into()); }
+    if body.len() > limit { return Err(format!("request control frame of {} bytes exceeds the {limit}-byte limit", body.len())); }
     stream.write_all(&(body.len() as u32).to_be_bytes()).await.map_err(|e| format!("request control write failed: {e}"))?;
     stream.write_all(&body).await.map_err(|e| format!("request control write failed: {e}"))
 }
 
 pub(crate) async fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T, String> {
+    read_frame_within(stream, MAX_FRAME).await
+}
+
+pub(crate) async fn read_frame_within<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream, limit: usize) -> Result<T, String> {
     let length = stream.read_u32().await.map_err(|e| format!("request control read failed: {e}"))? as usize;
-    if length > MAX_FRAME { return Err("request control frame exceeds limit".into()); }
+    if length > limit { return Err(format!("request control frame of {length} bytes exceeds the {limit}-byte limit")); }
     let mut body = vec![0; length];
     stream.read_exact(&mut body).await.map_err(|e| format!("request control read failed: {e}"))?;
     serde_json::from_slice(&body).map_err(|e| format!("invalid request control frame: {e}"))
@@ -676,7 +687,21 @@ mod tests {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(&((MAX_FRAME + 1) as u32).to_be_bytes()).await.unwrap();
         let error = match read_frame::<ClientMessage>(&mut reader).await { Err(error) => error, Ok(_) => panic!("oversized frame accepted") };
-        assert!(error.contains("exceeds limit"));
+        assert!(error.contains("exceeds the"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_frames_may_outgrow_the_request_control_limit() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let big = "x".repeat(MAX_FRAME * 2);
+        let sent = big.clone();
+        let write = tokio::spawn(async move { write_frame_within(&mut writer, &sent, MAX_BOOTSTRAP_FRAME).await });
+        let received: String = read_frame_within(&mut reader, MAX_BOOTSTRAP_FRAME).await.unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(received.len(), big.len());
+
+        let (mut writer, _reader) = UnixStream::pair().unwrap();
+        assert!(write_frame(&mut writer, &big).await.unwrap_err().contains("exceeds the"));
     }
 
     #[tokio::test]

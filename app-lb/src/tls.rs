@@ -157,8 +157,36 @@ pub struct CertSnapshot {
 
 #[derive(Serialize, Deserialize)]
 struct SnapshotCert {
+    #[serde(with = "pem_text")]
     chain_pem: Vec<u8>,
+    #[serde(with = "pem_text")]
     key_pem: Vec<u8>,
+}
+
+/// PEM is ASCII, so it travels as a JSON string. As a `Vec<u8>` it became an
+/// array of decimal numbers, ~3.5 bytes on the wire per PEM byte, and 63
+/// certificates outgrew the worker frame limit. Arrays are still read.
+mod pem_text {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(pem: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        let text = std::str::from_utf8(pem).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(text)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Pem {
+        Text(String),
+        Bytes(Vec<u8>),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        Ok(match Pem::deserialize(deserializer)? {
+            Pem::Text(text) => text.into_bytes(),
+            Pem::Bytes(bytes) => bytes,
+        })
+    }
 }
 
 struct CertView {
@@ -729,6 +757,24 @@ pub(crate) mod tests {
         assert!(worker.resolve(Some("unknown.example.com")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn snapshot_pem_travels_as_text_and_legacy_arrays_still_parse() {
+        let dir = tmpdir("snapshot-wire");
+        let (crt, key) = self_signed("wire.example.com", 90);
+        let manager = CertStore::new(&dir, None);
+        manager.insert("wire.example.com", &crt, &key).unwrap();
+        let wire = serde_json::to_vec(&manager.snapshot().unwrap()).unwrap();
+        assert!(wire.len() < (crt.len() + key.len()) * 3 / 2, "{} bytes on the wire", wire.len());
+
+        let legacy = serde_json::json!({
+            "certs": { "wire.example.com": { "chain_pem": crt, "key_pem": key } },
+            "fallback": null,
+        });
+        let worker = CertStore::from_snapshot(serde_json::from_value(legacy).unwrap()).unwrap();
+        assert!(worker.lookup("wire.example.com").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
