@@ -526,24 +526,7 @@
           if (gen !== generation) return;
           const errors = [];
           if (results[0].status === "fulfilled") {
-            checkpoints = results[0].value;
-            $("checkpoint").replaceChildren(
-              new Option("Choose a checkpoint", ""),
-            );
-            for (const c of checkpoints) {
-              option(
-                $("checkpoint"),
-                c.checkpoint_id,
-                date(c.committed_at || c.created_at) +
-                  " · " +
-                  age(c.committed_at || c.created_at) +
-                  " · " +
-                  c.state +
-                  " · " +
-                  c.checkpoint_id,
-                c.state !== "committed" || !!c.deleted_at,
-              );
-            }
+            renderCheckpoints(results[0].value);
           } else {
             errors.push(results[0].reason.message);
             $("checkpoint").replaceChildren(
@@ -676,6 +659,19 @@
             message(e.message + "\nKeep this operation ID if retrying.");
           }
         };
+        function renderCheckpoints(rows) {
+          const selected = $("checkpoint").value;
+          checkpoints = rows;
+          $("checkpoint").replaceChildren(new Option("Choose a checkpoint", ""));
+          for (const c of rows) {
+            option($("checkpoint"), c.checkpoint_id,
+              date(c.committed_at || c.created_at) + " · " + age(c.committed_at || c.created_at) + " · " + c.state + " · " + c.checkpoint_id,
+              c.state !== "committed" || !!c.deleted_at);
+          }
+          if (rows.some(c => c.checkpoint_id === selected && c.state === "committed" && !c.deleted_at)) $("checkpoint").value = selected;
+          checkpointDetail();
+          controls();
+        }
         async function refreshProtection() {
           const id = vm, gen = generation;
           $("policy-fields").disabled = true;
@@ -685,6 +681,7 @@
           try {
             const [policy, captures] = await Promise.all([api(id, "checkpoint-policy"), api(id, "checkpoints")]);
             if (gen !== generation) return;
+            renderCheckpoints(captures);
             $("policy-enabled").checked = policy.enabled;
             $("policy-interval").value = policy.interval_seconds;
             $("policy-retain").value = policy.retain_count;

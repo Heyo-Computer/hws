@@ -8,6 +8,7 @@ const root = path.resolve(__dirname, '../..');
     const page = await browser.newPage({viewport:{width:1320,height:1050}});
     const errors=[],posts=[]; let operations=[], unavailable=false, interrupted=true;
     let policy={enabled:false,interval_seconds:3600,retain_count:3}, policyWrites=[];
+    let pendingState='pending';
     const checkpoint='12345678-0000-4000-8000-000000000001';
     page.on('pageerror', e=>errors.push(e.message));
     page.on('dialog', d=>d.accept());
@@ -25,7 +26,7 @@ const root = path.resolve(__dirname, '../..');
           if(interrupted){interrupted=false;return route.abort();}
           return route.fulfill({json:operations[0]});
         }
-        if(url.pathname.endsWith('/checkpoints'))return route.fulfill({json:[{checkpoint_id:checkpoint,state:'committed',backend_id:'host-a',committed_at:new Date(Date.now()-600000).toISOString()},{checkpoint_id:'pending-checkpoint',state:'pending',created_at:new Date().toISOString()}]});
+        if(url.pathname.endsWith('/checkpoints'))return route.fulfill({json:[{checkpoint_id:checkpoint,state:'committed',backend_id:'host-a',committed_at:new Date(Date.now()-600000).toISOString()},{checkpoint_id:'pending-checkpoint',state:pendingState,committed_at:pendingState==='committed'?new Date().toISOString():null,created_at:new Date().toISOString()}]});
         if(url.pathname.endsWith('/destinations'))return route.fulfill({json:{source_backend_id:'host-a',destinations:[{id:'host-b',region:'eu',eligible:true},{id:'host-c',region:'us',eligible:false,reason:'destination lacks memory capacity'}]}});
         return route.fulfill({json:url.pathname.endsWith('/recoveries')?operations:operations[0]});
       }
@@ -55,6 +56,13 @@ const root = path.resolve(__dirname, '../..');
     await page.waitForFunction(()=>document.getElementById('policy-status').textContent.includes('Protection disabled'));
     assert.equal(policyWrites[1].enabled,false);
     await capture('protection-disabled');
+    pendingState='committed';await page.locator('#policy-refresh').click();
+    await page.waitForFunction(()=>document.getElementById('capture-status').textContent.includes('2 retained'));
+    assert(await page.locator('option[value="pending-checkpoint"]').isEnabled(),'new capture is immediately selectable');
+    await page.locator('#checkpoint').selectOption('pending-checkpoint');
+    pendingState='deleted';await page.locator('#policy-refresh').click();
+    await page.waitForFunction(()=>!document.getElementById('policy-fields').disabled);
+    assert.equal(await page.locator('#checkpoint').inputValue(),'','retention removes stale selection');
     assert(await page.locator('option[value="pending-checkpoint"]').isDisabled());
     assert(await page.locator('option[value="host-c"]').isDisabled());
     await page.locator('#checkpoint').selectOption(checkpoint);await page.locator('#destination').selectOption('host-b');
