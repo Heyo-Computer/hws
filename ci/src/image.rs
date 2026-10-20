@@ -219,6 +219,25 @@ pub async fn build_remote<F, Fut>(
     source_id: &str,
     name: &str,
     deadline: Duration,
+    renew: F,
+) -> Result<Built, ImageError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // One budget includes acceptance, polling, claim renewal and restart POSTs.
+    // Timing out drops only our waiter, not the remote build; callers must
+    // retain uncertain preparation ownership.
+    tokio::time::timeout(deadline, build_remote_inner(options, source_id, name, deadline, renew))
+        .await
+        .unwrap_or_else(|_| Err(ImageError::BuildTimeout { name: name.into(), after: deadline }))
+}
+
+async fn build_remote_inner<F, Fut>(
+    options: impl Into<crate::runners::Connection>,
+    source_id: &str,
+    name: &str,
+    deadline: Duration,
     mut renew: F,
 ) -> Result<Built, ImageError>
 where
@@ -279,7 +298,7 @@ where
         tokio::time::sleep(poll).await;
         renew().await;
 
-        let status: BuildStatus = client
+        let result = client
             .request(
                 Method::GET,
                 &path,
@@ -289,8 +308,18 @@ where
                     query: vec![],
                 },
             )
-            .await
-            .map_err(|e| map_build_error("polling the image build", e))?;
+            .await;
+        let status: BuildStatus = match result {
+            Ok(status) => status,
+            // Reads are safe to retry. Never turn an uncertain read into a
+            // POST, source replay, or VM acquisition. Auth/protocol errors and
+            // explicit source expiry still fail closed.
+            Err(source) if transient_build_read(&source) => {
+                let _ = writeln!(log, "[ci] retrying image status read: {source}");
+                continue;
+            }
+            Err(source) => return Err(map_build_error("polling the image build", source)),
+        };
 
         validate_build_name(&status, name)?;
         match status.status.as_str() {
@@ -344,6 +373,13 @@ fn validate_build_name(status: &BuildStatus, expected: &str) -> Result<(), Image
     if status.name.as_deref() == Some(expected) { Ok(()) } else {
         Err(ImageError::Protocol(format!("runner image response named {:?}, expected {expected:?}", status.name)))
     }
+}
+
+fn transient_build_read(error: &heyo_sdk::HeyoError) -> bool {
+    matches!(error,
+        heyo_sdk::HeyoError::Api { status: 0 | 408 | 429 | 500..=599, .. }
+        | heyo_sdk::HeyoError::Timeout(..)
+        | heyo_sdk::HeyoError::Connection(_))
 }
 
 // ---- the catalog -------------------------------------------------------
@@ -975,6 +1011,58 @@ mod tests {
             Json(serde_json::json!({"status":"ready","name":"another"}))
         }));
         assert!(matches!(build_remote(http_options(wrong).await, "source_1", "image", Duration::from_secs(1), || async {}).await, Err(ImageError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn build_poll_retries_transient_reads_without_reposting() {
+        use axum::{Json, Router, body::Body, extract::State, response::IntoResponse, routing::post};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let counts = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let app = Router::new().route("/sources/source_1/image", post(
+            |State(n): State<Arc<(AtomicUsize, AtomicUsize)>>| async move {
+                n.0.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({"status":"building","name":"image"}))
+            }
+        ).get(|State(n): State<Arc<(AtomicUsize, AtomicUsize)>>| async move {
+            match n.1.fetch_add(1, Ordering::SeqCst) {
+                // A broken response body exercises SDK transport status 0,
+                // the same classification used for network timeouts.
+                0 => axum::response::Response::new(Body::from_stream(futures::stream::once(async {
+                    Err::<String, _>(std::io::Error::other("connection reset"))
+                }))),
+                1 => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                _ => Json(serde_json::json!({"status":"ready","name":"image","size_bytes":9})).into_response(),
+            }
+        })).with_state(counts.clone());
+        let renewals = AtomicUsize::new(0);
+        let built = build_remote(http_options(app).await, "source_1", "image", Duration::from_secs(2), || async {
+            renewals.fetch_add(1, Ordering::SeqCst);
+        }).await.unwrap();
+        assert_eq!(built.size_bytes, 9);
+        assert_eq!(counts.0.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.1.load(Ordering::SeqCst), 3);
+        assert_eq!(renewals.load(Ordering::SeqCst), 3);
+        assert_eq!(built.log.matches("retrying image status read").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn build_budget_bounds_acceptance_reads_and_renewal() {
+        use axum::{Json, Router, routing::post};
+        for stage in ["post", "get", "renew", "transient"] {
+            let app = Router::new().route("/sources/source_1/image", post(move || async move {
+                if stage == "post" { std::future::pending::<()>().await; }
+                Json(serde_json::json!({"status":"building","name":"image"}))
+            }).get(move || async move {
+                if stage == "get" { std::future::pending::<()>().await; }
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }));
+            let result = tokio::time::timeout(Duration::from_secs(2), build_remote(
+                http_options(app).await, "source_1", "image", Duration::from_millis(80), || async {
+                    if stage == "renew" { std::future::pending::<()>().await; }
+                },
+            )).await.expect("overall build budget was not enforced");
+            assert!(matches!(result, Err(ImageError::BuildTimeout { .. })), "stage {stage}");
+        }
     }
 
     #[tokio::test]
