@@ -203,6 +203,32 @@ pub struct Built {
     pub log: String,
 }
 
+pub struct Submission<'a> {
+    pub store: &'a crate::store::Store,
+    pub job: &'a str,
+    pub runner: &'a str,
+    pub attempt: i32,
+    pub boot: uuid::Uuid,
+}
+
+impl Submission<'_> {
+    pub async fn record(&self, source: &str, image: &str, state: crate::store::ImageSubmission) -> Result<(), ImageError> {
+        self.store.image_submission(self.job, self.runner, self.attempt, self.boot, source, image, state)
+            .await.map_err(|e| ImageError::Protocol(format!("persisting image submission: {e}")))
+    }
+}
+
+/// Read only: never restart work while reconciling detached evidence.
+pub async fn terminal_image(options: crate::runners::Connection, source: &str, image: &str) -> Result<bool, ImageError> {
+    validate_source_id(source)?;
+    let client = HeyoClient::new(options.options).map_err(|source| ImageError::Daemon { what: "building reconciliation client", source })?;
+    let status: BuildStatus = client.request(Method::GET, &format!("/sources/{source}/image"), None::<&()>, RequestOptions {
+        timeout: Some(Duration::from_secs(30)), query: vec![],
+    }).await.map_err(|source| ImageError::Daemon { what: "reconciling image build", source })?;
+    validate_build_name(&status, image)?;
+    Ok(matches!(status.status.as_str(), "ready" | "failed"))
+}
+
 /// Ask `runner`'s daemon to build `plan` and wait for the result.
 ///
 /// `options` point at the runner's tunnel, exactly as VM operations do. The
@@ -228,7 +254,16 @@ where
     // One budget includes acceptance, polling, claim renewal and restart POSTs.
     // Timing out drops only our waiter, not the remote build; callers must
     // retain uncertain preparation ownership.
-    tokio::time::timeout(deadline, build_remote_inner(options, source_id, name, deadline, renew))
+    build_remote_tracked(options, source_id, name, deadline, renew, None).await
+}
+
+pub async fn build_remote_tracked<F, Fut>(
+    options: impl Into<crate::runners::Connection>, source_id: &str, name: &str,
+    deadline: Duration, renew: F, submission: Option<&Submission<'_>>,
+) -> Result<Built, ImageError>
+where F: FnMut() -> Fut, Fut: std::future::Future<Output = ()>,
+{
+    tokio::time::timeout(deadline, build_remote_inner(options, source_id, name, deadline, renew, submission))
         .await
         .unwrap_or_else(|_| Err(ImageError::BuildTimeout { name: name.into(), after: deadline }))
 }
@@ -239,6 +274,7 @@ async fn build_remote_inner<F, Fut>(
     name: &str,
     deadline: Duration,
     mut renew: F,
+    submission: Option<&Submission<'_>>,
 ) -> Result<Built, ImageError>
 where
     F: FnMut() -> Fut,
@@ -282,8 +318,12 @@ where
         heyo_sdk::HeyoError::NotFound(_) => ImageError::SourceExpired,
         source => ImageError::Daemon { what, source },
     };
+    if let Some(s) = submission { s.record(source_id, name, crate::store::ImageSubmission::Uncertain).await?; }
     let first = post(&client).await.map_err(|e| map_build_error("starting the image build", e))?;
     validate_build_name(&first, name)?;
+    if matches!(first.status.as_str(), "ready" | "building" | "failed") {
+        if let Some(s) = submission { s.record(source_id, name, crate::store::ImageSubmission::Acknowledged).await?; }
+    }
     if first.status == "ready" {
         // The daemon already had it — the whole point of content-hashed names.
         let _ = writeln!(log, "[ci] the runner already has this image");
@@ -347,9 +387,13 @@ where
             }
             "building" => {}
             "unknown" => {
+                if let Some(s) = submission { s.record(source_id, name, crate::store::ImageSubmission::Uncertain).await?; }
                 let restarted = post(&client).await
                     .map_err(|e| map_build_error("restarting the interrupted image build", e))?;
                 validate_build_name(&restarted, name)?;
+                if matches!(restarted.status.as_str(), "ready" | "building" | "failed") {
+                    if let Some(s) = submission { s.record(source_id, name, crate::store::ImageSubmission::Acknowledged).await?; }
+                }
                 match restarted.status.as_str() {
                     "ready" => return Ok(Built { size_bytes: restarted.size_bytes.unwrap_or(0), log }),
                     "building" => {}
@@ -937,6 +981,26 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         HeyoClientOptions { api_key: None, base_url: Some(format!("http://{addr}")), timeout: None }
+    }
+
+    #[tokio::test]
+    async fn detached_image_evidence_requires_exact_terminal_response() {
+        use axum::{Json, Router, routing::get};
+        for (status, name, expected) in [
+            ("ready", "image", Some(true)), ("failed", "image", Some(true)),
+            ("unknown", "image", Some(false)), ("building", "image", Some(false)),
+            ("ready", "wrong", None),
+        ] {
+            let app = Router::new().route("/sources/source_1/image", get(move || async move {
+                Json(serde_json::json!({"status":status,"name":name}))
+            }));
+            let result = terminal_image(http_options(app).await.into(), "source_1", "image").await;
+            assert_eq!(result.ok(), expected);
+        }
+        for code in [axum::http::StatusCode::NOT_FOUND, axum::http::StatusCode::UNAUTHORIZED, axum::http::StatusCode::SERVICE_UNAVAILABLE] {
+            let app = Router::new().route("/sources/source_1/image", get(move || async move { code }));
+            assert!(terminal_image(http_options(app).await.into(), "source_1", "image").await.is_err());
+        }
     }
 
     fn ready_source(id: &str) -> serde_json::Value {

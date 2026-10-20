@@ -720,6 +720,15 @@ impl Dispatcher {
                 "jobs in this run are still active; wait for them to finish before re-running it".into()
             ));
         }
+        // Authenticated rerun callers may reconcile only proven detached image
+        // polling obligations. A failed read leaves the ordinary rerun fence.
+        for (job, runner, attempt, boot, source, image) in self.store.image_poll_candidates(run_id).await? {
+            if let Ok(options) = self.runners.options_for(&runner).await {
+                if matches!(crate::image::terminal_image(options, &source, &image).await, Ok(true)) {
+                    self.store.clear_image_poll(&job, &runner, attempt, boot, &source, &image).await?;
+                }
+            }
+        }
         if self.store.has_unresolved_execution(run_id).await? {
             return Err(DispatchError::Workflow(
                 "this run still owns unresolved execution; reconcile its workers before re-running it".into()
@@ -1954,17 +1963,23 @@ impl Dispatcher {
         );
         let mut current = prepared.clone();
         let mut replays = 0usize;
+        let job = self.store.get_job(&msg.job_id).await?
+            .ok_or_else(|| DispatchError::Workflow("image job disappeared".into()))?;
+        let submission = crate::image::Submission {
+            store: &self.store, job: &msg.job_id, runner, attempt: job.attempt,
+            boot: self.executor.boot_id(),
+        };
         let outcome = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break Err(crate::image::ImageError::BuildTimeout { name: name.clone(), after: BUILD_BUDGET });
             }
             let options = self.runners.options_for(runner).await?;
-            let result = crate::image::build_remote(options, &current.source_id, &name, remaining, || async {
+            let result = crate::image::build_remote_tracked(options, &current.source_id, &name, remaining, || async {
                 if let Err(e) = self.images.renew(&name, runner, crate::image::BUILD_LEASE).await {
                     tracing::warn!("could not renew the image build claim: {e}");
                 }
-            }).await;
+            }, Some(&submission)).await;
             if !matches!(result, Err(crate::image::ImageError::SourceExpired)) {
                 break result;
             }
@@ -1972,6 +1987,7 @@ impl Dispatcher {
                 break Err(crate::image::ImageError::Source("prepared source repeatedly expired during image build".into()));
             }
             replays += 1;
+            submission.record(&current.source_id, &name, crate::store::ImageSubmission::Uncertain).await?;
             // Keep the shared image-name lock live while source is recreated.
             self.images.renew(&name, runner, crate::image::BUILD_LEASE).await?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -7392,7 +7408,7 @@ jobs:
         let run = crate::vm::new_id();
         d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
         let job = d.store.jobs_of(&run).await.unwrap().remove(0);
-        assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+        assert_eq!(d.store.claim_job_for_boot(&job.id, "hd-local", 1, d.executor.boot_id()).await.unwrap(), JobClaim::Claimed);
         d.images.claim(name, "hd-local", "wf", &job.id, crate::image::BUILD_LEASE).await.unwrap();
         d.images.mark_ready(name, "hd-local", 1024).await.unwrap();
         let prepared = crate::image::PreparedSource { source_id: "src-rebuild".into(), cache_keys: Default::default(),

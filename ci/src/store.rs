@@ -523,6 +523,12 @@ pub struct RunRequest {
     pub namespace: String,
 }
 
+#[derive(Clone, Copy)]
+pub enum ImageSubmission {
+    Uncertain,
+    Acknowledged,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -1587,6 +1593,31 @@ impl Store {
             None, "ci.job.status.v1", status.as_str(), Some(error)).await?;
         tx.commit().await.map_err(StoreError::sql)?;
         Ok(Some(status))
+    }
+
+    /// Persist uncertainty before every POST or source replay. Only a matching
+    /// acknowledged response may promote it; old rows are never inferred safe.
+    pub async fn image_submission(&self, job: &str, runner: &str, attempt: i32, boot: Uuid,
+        source: &str, image: &str, state: ImageSubmission) -> Result<(), StoreError> {
+        let changed = sqlx::query("UPDATE ci_host_work w SET image_source=$5,image_name=$6,image_submission=$7 FROM ci_job j WHERE j.id=w.job_id AND w.job_id=$1 AND w.runner_hd_id=$2 AND w.attempt=$3 AND w.executor_boot=$4 AND w.phase='preparing' AND j.status='running' AND j.executor_boot=$4 AND j.attempt=$3 AND j.runner_hd_id=$2")
+            .bind(job).bind(runner).bind(attempt).bind(boot).bind(source).bind(image)
+            .bind(match state { ImageSubmission::Acknowledged => "acknowledged", ImageSubmission::Uncertain => "uncertain" })
+            .execute(&self.pool).await.map_err(StoreError::sql)?.rows_affected();
+        if changed != 1 { return Err(StoreError::Sql("image preparation ownership changed".into())); }
+        Ok(())
+    }
+
+    pub async fn image_poll_candidates(&self, run: &str) -> Result<Vec<(String,String,i32,Uuid,String,String)>, StoreError> {
+        sqlx::query_as("SELECT w.job_id,w.runner_hd_id,w.attempt,w.executor_boot,w.image_source,w.image_name FROM ci_host_work w JOIN ci_job j ON j.id=w.job_id WHERE j.run_id=$1 AND w.phase='detached_preparation' AND w.image_submission='acknowledged' AND w.image_source IS NOT NULL AND w.image_name IS NOT NULL AND w.executor_boot IS NOT NULL AND j.status IN ('success','failure','cancelled','skipped') AND j.executor_boot IS NULL AND j.attempt=w.attempt AND j.runner_hd_id=w.runner_hd_id")
+            .bind(run).fetch_all(&self.pool).await.map_err(StoreError::sql)
+    }
+
+    pub async fn clear_image_poll(&self, job: &str, runner: &str, attempt: i32, boot: Uuid, source: &str, image: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        sqlx::query("SELECT id FROM ci_job WHERE id=$1 FOR UPDATE").bind(job).fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+        sqlx::query("DELETE FROM ci_host_work w USING ci_job j WHERE j.id=w.job_id AND w.job_id=$1 AND w.runner_hd_id=$2 AND w.attempt=$3 AND w.executor_boot=$4 AND w.image_source=$5 AND w.image_name=$6 AND w.image_submission='acknowledged' AND w.phase='detached_preparation' AND j.status IN ('success','failure','cancelled','skipped') AND j.executor_boot IS NULL AND j.attempt=w.attempt AND j.runner_hd_id=w.runner_hd_id")
+            .bind(job).bind(runner).bind(attempt).bind(boot).bind(source).bind(image).execute(&mut *tx).await.map_err(StoreError::sql)?;
+        tx.commit().await.map_err(StoreError::sql)
     }
 
     /// Only an executor with a verified VM release may clear drain evidence.
@@ -4182,6 +4213,77 @@ jobs:
         let (began, finished) = tokio::join!(store.begin_job_execution(&job, 1, boot),
             store.finish_job_preparation(&job, 1, boot, "preparation ended", false));
         assert_ne!(began.unwrap(), finished.unwrap().is_some(), "only one side of the VM boundary may win");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn acknowledged_image_poll_recovery_is_exact_and_fail_closed() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        use heyo_sdk::HeyoClientOptions;
+        let store = test_store().await;
+        // Initial POST timeout and restart POST timeout must both exclude a
+        // stale ready response, even if an earlier POST was acknowledged.
+        for mode in 0..3 {
+            let uncertain_post = mode != 0;
+            let terminal = Arc::new(AtomicBool::new(false));
+            let state = terminal.clone();
+            let posts = Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route("/sources/source_1/image", post(move || {
+                let posts = posts.clone();
+                async move {
+                    let prior = posts.fetch_add(1, Ordering::SeqCst);
+                    if mode == 1 || (mode == 2 && prior > 0) { tokio::time::sleep(Duration::from_secs(5)).await; }
+                    Json(serde_json::json!({"name":"image", "status":"building"}))
+                }
+            }).get(move || {
+                let state = state.clone();
+                async move {
+                    if !state.load(Ordering::SeqCst) {
+                        if mode == 2 { return Json(serde_json::json!({"name":"image", "status":"unknown"})); }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    Json(serde_json::json!({"name":"image", "status":"ready"}))
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let options = HeyoClientOptions { base_url: Some(format!("http://{}", listener.local_addr().unwrap())), api_key: None, timeout: None };
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let run = crate::vm::new_id();
+            store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+            let job = job_id(&run, "build-x86_64");
+            let owner = crate::executor::ExecutorInstance::register(store.pool().clone(), &run).await.unwrap();
+            let boot = owner.boot_id();
+            assert_eq!(store.claim_job_for_boot(&job, "runner", 1, boot).await.unwrap(), JobClaim::Claimed);
+            let submission = crate::image::Submission { store: &store, job: &job, runner: "runner", attempt: 1, boot };
+            assert!(matches!(crate::image::build_remote_tracked(options.clone(), "source_1", "image", Duration::from_millis(250), || async {}, Some(&submission)).await,
+                Err(crate::image::ImageError::BuildTimeout { .. })));
+            assert!(store.image_poll_candidates(&run).await.unwrap().is_empty(), "live producer cannot reconcile");
+            store.finish_job_preparation(&job, 1, boot, "timeout", false).await.unwrap().unwrap();
+            terminal.store(true, Ordering::SeqCst);
+            assert!(crate::image::terminal_image(options.clone().into(), "source_1", "image").await.unwrap());
+            assert_eq!(store.image_poll_candidates(&run).await.unwrap().len(), usize::from(!uncertain_post));
+            for (runner, attempt, owner, source, image) in [
+                ("wrong", 1, boot, "source_1", "image"),
+                ("runner", 2, boot, "source_1", "image"),
+                ("runner", 1, Uuid::new_v4(), "source_1", "image"),
+                ("runner", 1, boot, "wrong", "image"),
+                ("runner", 1, boot, "source_1", "wrong"),
+            ] {
+                store.clear_image_poll(&job, runner, attempt, owner, source, image).await.unwrap();
+                assert!(store.has_host_work(&job).await.unwrap());
+            }
+            // Recheck terminal job state even after an eligible snapshot/read.
+            sqlx::query("UPDATE ci_job SET status='running' WHERE id=$1").bind(&job).execute(store.pool()).await.unwrap();
+            store.clear_image_poll(&job, "runner", 1, boot, "source_1", "image").await.unwrap();
+            assert!(store.has_host_work(&job).await.unwrap());
+            sqlx::query("UPDATE ci_job SET status='failure' WHERE id=$1").bind(&job).execute(store.pool()).await.unwrap();
+            store.clear_image_poll(&job, "runner", 1, boot, "source_1", "image").await.unwrap();
+            assert_eq!(store.has_host_work(&job).await.unwrap(), uncertain_post, "a stale terminal GET cannot clear an uncertain POST");
+            store.end_host_work(&job, "runner", 1).await.unwrap();
+            sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(store.pool()).await.unwrap();
+            server.abort();
+        }
     }
 
     #[tokio::test]

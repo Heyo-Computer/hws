@@ -3021,29 +3021,36 @@ build budget, renewing the catalog claim between reads. A failed read does not
 issue another POST or acquire a VM. The budget also bounds the initial POST,
 restart POSTs and claim renewal; expiration stops the waiter, not remote work.
 
-Detached preparation still blocks reruns and runner maintenance. There is no
-safe automatic reconciliation API under the current remote contract:
+Authenticated rerun attempts now reconcile one narrow subset of detached
+preparation before checking the unresolved-work fence. CI stores source ID and
+expected image against the exact job/runner/attempt/boot before the image POST,
+and records eligibility only after a matching POST acknowledgment. Before any
+image restart POST or source replay it durably removes that eligibility. An
+uncertain POST cannot be reconciled using a possibly stale terminal GET.
+
+Only a detached row whose job is terminal and has no executor owner is eligible.
+CI reads the recorded source on the recorded runner using its normal authenticated
+connection. Only a matching image `ready` or `failed` response permits an exact
+transactional compare-delete, rechecking identity and eligibility. The preparation
+producer has already ended at this boundary; the daemon's acknowledged build
+holds the same lock that GET takes before reporting terminal status. This clears
+maintenance evidence, not job status, and does not declare a failed job successful.
+Unknown, building, missing, mismatched or unreadable evidence retains the row.
+
+This is not general executor or source preparation recovery:
 
 - `/sources/prepare` accepts no caller-chosen operation identity. Its opaque
   `sourceId` arrives only after effects can start. A lost POST response or CI
   restart before persisting it cannot be correlated from durable CI state.
-- Image GET evidence contains a content-derived `name` and status, not an
-  attempt/generation or durable operation completion receipt. Shared content
-  identity alone is not an executor fence or proof that an old sender cannot
-  subsequently issue another effect.
-- Existing detached rows contain job/runner/attempt/boot provenance, but no
+- Shared content identity alone is not an executor fence. Live producers,
+  execution-phase work and unacknowledged image submissions remain blocked.
+- Older detached rows contain job/runner/attempt/boot provenance, but no
   source/image operation identity. Do not backfill one from an image name in
   logs, missing VM/source rows, or stale executor heartbeats.
 
-A supported release path needs a remote operation identity reserved and stored
-against the exact CI job/runner/attempt/boot **before** effects, authenticated
-terminal evidence for that identity surviving daemon restart, and a fence that
-prevents further effects from the old sender. CI can then compare-and-delete
-only the matching detached obligation after the preparation producer is
-settled. Unknown, nonterminal, absent or mismatched evidence must retain it.
-Until that contract exists, no reconciliation endpoint or ownership-clearing
-migration is provided; operational reconciliation requires separate verified
-quiescence and authorization.
+No old rows are backfilled or cleared by migration. Unsupported cases require
+separate verified quiescence and authorized operational reconciliation. There is
+no new recovery UI or general ownership-clearing endpoint.
 
 Working: workflow parsing and planning (matrix, `needs`, `if`, `max-parallel`),
 branch and path filters with the `changed()` condition, runner discovery, the VM
