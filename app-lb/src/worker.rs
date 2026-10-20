@@ -544,8 +544,12 @@ impl BackgroundService for Supervisor {
                             .unwrap_or_else(|e| supervision_failed(&e.to_string())),
                     };
                     tokio::spawn(async move {
-                        if let Err(error) = worker_rpc::write_frame(&mut stream, &bootstrap).await {
-                            tracing::debug!(%error, "worker bootstrap connection ended");
+                        if let Err(error) =
+                            worker_rpc::write_frame_within(&mut stream, &bootstrap, worker_rpc::MAX_BOOTSTRAP_FRAME).await
+                        {
+                            // A refused bootstrap starves every worker of
+                            // certificates and stops new ones starting at all.
+                            tracing::warn!(%error, "worker bootstrap failed");
                         }
                     });
                 }
@@ -599,7 +603,7 @@ async fn bootstrap(dir: &Path) -> Result<Bootstrap, String> {
         let mut stream = UnixStream::connect(dir.join("bootstrap"))
             .await
             .map_err(|e| e.to_string())?;
-        let value: Bootstrap = worker_rpc::read_frame(&mut stream).await?;
+        let value: Bootstrap = worker_rpc::read_frame_within(&mut stream, worker_rpc::MAX_BOOTSTRAP_FRAME).await?;
         if value.version != VERSION {
             return Err("worker bootstrap protocol mismatch".into());
         }
