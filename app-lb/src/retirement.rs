@@ -236,6 +236,11 @@ mod tests {
         let lock=registry.controller_lock().unwrap();
         let other=Registry::new(root.path().join("state.json"));
         assert!(other.controller_lock().is_err());
+        // Parallel tests spawn children. On Linux a fork temporarily inherits
+        // this open file description until exec; closing our descriptor alone
+        // need not release its flock immediately. Release explicitly here so
+        // the next acquisition tests unlock, not unrelated child scheduling.
+        lock.unlock().unwrap();
         drop(lock);
         let _next_lock=other.controller_lock().unwrap();
         let d=registry.upsert(serde_json::from_value(serde_json::json!({
