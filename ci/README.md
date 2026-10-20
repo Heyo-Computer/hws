@@ -3014,6 +3014,37 @@ CI_TEST_STREAM_PREFIXES=citest cargo test -- --ignored delete_leftover
 
 ## Status
 
+### Interrupted source/image preparation
+
+Image status GETs retry transport failures, 408/429 and 5xx within the original
+build budget, renewing the catalog claim between reads. A failed read does not
+issue another POST or acquire a VM. The budget also bounds the initial POST,
+restart POSTs and claim renewal; expiration stops the waiter, not remote work.
+
+Detached preparation still blocks reruns and runner maintenance. There is no
+safe automatic reconciliation API under the current remote contract:
+
+- `/sources/prepare` accepts no caller-chosen operation identity. Its opaque
+  `sourceId` arrives only after effects can start. A lost POST response or CI
+  restart before persisting it cannot be correlated from durable CI state.
+- Image GET evidence contains a content-derived `name` and status, not an
+  attempt/generation or durable operation completion receipt. Shared content
+  identity alone is not an executor fence or proof that an old sender cannot
+  subsequently issue another effect.
+- Existing detached rows contain job/runner/attempt/boot provenance, but no
+  source/image operation identity. Do not backfill one from an image name in
+  logs, missing VM/source rows, or stale executor heartbeats.
+
+A supported release path needs a remote operation identity reserved and stored
+against the exact CI job/runner/attempt/boot **before** effects, authenticated
+terminal evidence for that identity surviving daemon restart, and a fence that
+prevents further effects from the old sender. CI can then compare-and-delete
+only the matching detached obligation after the preparation producer is
+settled. Unknown, nonterminal, absent or mismatched evidence must retain it.
+Until that contract exists, no reconciliation endpoint or ownership-clearing
+migration is provided; operational reconciliation requires separate verified
+quiescence and authorization.
+
 Working: workflow parsing and planning (matrix, `needs`, `if`, `max-parallel`),
 branch and path filters with the `changed()` condition, runner discovery, the VM
 pool, the job queue, `git submit` with per-repository tokens, secrets with
