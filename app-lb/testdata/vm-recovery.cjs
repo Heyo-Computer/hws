@@ -7,6 +7,7 @@ const root = path.resolve(__dirname, '../..');
   try {
     const page = await browser.newPage({viewport:{width:1320,height:1050}});
     const errors=[],posts=[]; let operations=[], unavailable=false, interrupted=true;
+    let policy={enabled:false,interval_seconds:3600,retain_count:3}, policyWrites=[];
     const checkpoint='12345678-0000-4000-8000-000000000001';
     page.on('pageerror', e=>errors.push(e.message));
     page.on('dialog', d=>d.accept());
@@ -14,6 +15,10 @@ const root = path.resolve(__dirname, '../..');
       const req=route.request(),url=new URL(req.url());
       if(url.pathname.startsWith('/api/vm-recovery/')) {
         if(unavailable)return route.fulfill({status:503,json:{error:'Cloud unavailable'}});
+        if(url.pathname.endsWith('/checkpoint-policy')) {
+          if(req.method()==='PUT'){policy=req.postDataJSON();policyWrites.push(policy);}
+          return route.fulfill({json:policy});
+        }
         if(req.method()==='POST') {
           const body=req.postDataJSON();posts.push(body);
           operations=[{...body,sandbox_id:'dep-demo',source_backend_id:'host-a',recovery_checkpoint_id:body.checkpoint_id,phase:'restore',error:null,created_at:new Date().toISOString(),updated_at:new Date().toISOString()}];
@@ -33,6 +38,23 @@ const root = path.resolve(__dirname, '../..');
     assert(await page.locator('#start').isDisabled());await capture('recovery-default');
     await page.locator('#vm').fill('dep-demo');await page.locator('#load').click();
     await page.waitForFunction(()=>!document.getElementById('checkpoint').disabled);
+    await page.waitForFunction(()=>!document.getElementById('policy-fields').disabled);
+    assert.equal(await page.locator('#policy-enabled').isChecked(),false);
+    await page.locator('#policy-enabled').check();
+    await page.locator('#policy-interval').fill('120');await page.locator('#policy-retain').fill('2');
+    await page.getByRole('button',{name:'Save protection',exact:true}).click();
+    await page.waitForFunction(()=>document.getElementById('policy-status').textContent.includes('Protection enabled'));
+    assert.deepEqual(policyWrites,[{enabled:true,interval_seconds:120,retain_count:2}]);
+    assert((await page.locator('#capture-status').innerText()).includes('1 retained'));
+    await capture('protection-enabled');
+    policy.error='Checkpoint storage unavailable';await page.locator('#policy-refresh').click();
+    await page.waitForFunction(()=>document.getElementById('policy-status').textContent.includes('Checkpoint storage unavailable'));
+    await capture('protection-error');
+    policy.error=null;
+    await page.locator('#policy-enabled').uncheck();await page.getByRole('button',{name:'Save protection',exact:true}).click();
+    await page.waitForFunction(()=>document.getElementById('policy-status').textContent.includes('Protection disabled'));
+    assert.equal(policyWrites[1].enabled,false);
+    await capture('protection-disabled');
     assert(await page.locator('option[value="pending-checkpoint"]').isDisabled());
     assert(await page.locator('option[value="host-c"]').isDisabled());
     await page.locator('#checkpoint').selectOption(checkpoint);await page.locator('#destination').selectOption('host-b');

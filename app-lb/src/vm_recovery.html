@@ -51,6 +51,8 @@
         background: var(--bg-panel);
         min-width: 0;
       }
+      #policy-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+      #policy-fields label { color: var(--text-secondary); }
       label {
         display: block;
         font-size: 13px;
@@ -209,6 +211,21 @@
         ><button id="load" type="submit">Load checkpoints</button>
       </form>
       <div id="message" role="status" aria-live="polite"></div>
+      <form id="protection" class="panel">
+        <h2>Checkpoint protection</h2>
+        <p class="muted">Periodic disk checkpoints, not automatic failover. Disabling stops new captures; retained checkpoints remain subject to retention.</p>
+        <fieldset id="policy-fields" disabled>
+          <label class="check"><input id="policy-enabled" type="checkbox" />Enable periodic checkpoints</label>
+          <div class="row">
+            <label>Capture interval (seconds)<input id="policy-interval" type="number" min="60" max="86400" step="1" value="3600" required /></label>
+            <label>Checkpoints to retain<input id="policy-retain" type="number" min="1" max="100" step="1" value="3" required /></label>
+            <button type="submit">Save protection</button>
+          </div>
+        </fieldset>
+        <p id="policy-status" role="status" aria-live="polite">Load a VM to see its protection policy.</p>
+        <p id="capture-status" class="muted"></p>
+        <button id="policy-refresh" type="button" disabled>Refresh protection status</button>
+      </form>
       <form id="recover">
         <div class="grid">
           <section class="panel">
@@ -299,11 +316,11 @@
                 : Math.floor(n / 3600000) + "h") + " ago"
             : "unknown age";
         }
-        async function api(id, path, body) {
+        async function api(id, path, body, method) {
           const response = await fetch(
             "/api/vm-recovery/" + encodeURIComponent(id) + "/" + path,
             {
-              method: body ? "POST" : "GET",
+              method: method || (body ? "POST" : "GET"),
               headers: body ? { "Content-Type": "application/json" } : {},
               body: body ? JSON.stringify(body) : undefined,
               cache: "no-store",
@@ -367,7 +384,9 @@
               c.backend_id +
               " · checkpoint " +
               c.checkpoint_id
-            : "No committed checkpoint available.";
+            : checkpoints.some(c => c.state === "committed" && !c.deleted_at)
+              ? "Choose a retained checkpoint to view its details."
+              : "No committed checkpoint available.";
         }
         function option(select, value, text, disabled = false) {
           const o = new Option(text, value);
@@ -474,6 +493,9 @@
           if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return;
           vm = id;
           const gen = ++generation;
+          $("policy-fields").disabled = true;
+          $("policy-refresh").disabled = true;
+          refreshProtection();
           clearTimeout(timer);
           ready = false;
           historyReady = false;
@@ -652,6 +674,49 @@
             await refreshHistory();
           } catch (e) {
             message(e.message + "\nKeep this operation ID if retrying.");
+          }
+        };
+        async function refreshProtection() {
+          const id = vm, gen = generation;
+          $("policy-fields").disabled = true;
+          $("policy-refresh").disabled = true;
+          $("policy-status").textContent = "Loading protection…";
+          $("capture-status").textContent = "";
+          try {
+            const [policy, captures] = await Promise.all([api(id, "checkpoint-policy"), api(id, "checkpoints")]);
+            if (gen !== generation) return;
+            $("policy-enabled").checked = policy.enabled;
+            $("policy-interval").value = policy.interval_seconds;
+            $("policy-retain").value = policy.retain_count;
+            $("policy-status").textContent = (policy.enabled ? "Protection enabled." : "Protection disabled.") + (policy.error ? " Capture error: " + policy.error : "");
+            const committed = captures.filter(c => c.state === "committed" && !c.deleted_at).sort((a,b) => Date.parse(b.committed_at)-Date.parse(a.committed_at));
+            $("capture-status").textContent = committed.length ? "Last successful checkpoint: " + date(committed[0].committed_at) + " · " + age(committed[0].committed_at) + " · " + committed.length + " retained." : "No retained successful checkpoint. This VM has no restore point.";
+            const pending = captures.some(c => c.state === "pending");
+            if (pending) $("capture-status").textContent += " Capture in progress.";
+            const failed = captures.find(c => c.error);
+            if (failed) $("capture-status").textContent += " Checkpoint error: " + failed.error;
+            $("policy-fields").disabled = false;
+          } catch (e) {
+            if (gen === generation) $("policy-status").textContent = "Protection unavailable: " + e.message;
+          } finally {
+            if (gen === generation) $("policy-refresh").disabled = false;
+          }
+        }
+        $("policy-refresh").onclick = refreshProtection;
+        $("protection").onsubmit = async event => {
+          event.preventDefault();
+          const id = vm, gen = generation;
+          const policy = {enabled: $("policy-enabled").checked, interval_seconds: Number($("policy-interval").value), retain_count: Number($("policy-retain").value)};
+          $("policy-fields").disabled = true;
+          $("policy-refresh").disabled = true;
+          try {
+            await api(id, "checkpoint-policy", policy, "PUT");
+            if (gen === generation) await refreshProtection();
+          } catch (e) {
+            if (gen === generation) {
+              $("policy-status").textContent = "Save not confirmed: " + e.message + ". Refresh protection status before retrying.";
+              $("policy-refresh").disabled = false;
+            }
           }
         };
         const initial = new URLSearchParams(location.search).get("vm");

@@ -49,7 +49,8 @@ fn endpoint(
     }
     if !matches!(
         (method.as_str(), resource),
-        ("GET", "checkpoints" | "destinations" | "recoveries") | ("POST", "recoveries")
+        ("GET", "checkpoints" | "destinations" | "recoveries" | "checkpoint-policy")
+            | ("PUT", "checkpoint-policy") | ("POST", "recoveries")
     ) || operation.is_some() && (resource != "recoveries" || method != axum::http::Method::GET)
     {
         return Err("unsupported recovery operation");
@@ -169,6 +170,17 @@ async fn proxy(
     if !fleet_handoff_authorized(&caller) {
         return forbidden("authenticated fleet admin required");
     }
+    if method == axum::http::Method::PUT {
+        let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        if resource != "checkpoint-policy"
+            || value.as_object().map(|v| v.len()) != Some(3)
+            || !value["enabled"].is_boolean()
+            || !value["interval_seconds"].as_u64().is_some_and(|v| (60..=86400).contains(&v))
+            || !value["retain_count"].as_u64().is_some_and(|v| (1..=100).contains(&v))
+        {
+            return err(StatusCode::BAD_REQUEST, "Use enabled, interval_seconds (60–86400), and retain_count (1–100)").into_response();
+        }
+    }
     if method == axum::http::Method::POST {
         let value = match serde_json::from_slice::<Value>(&body) {
             Ok(v) => v,
@@ -226,6 +238,23 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn policy_write_requires_admin_and_valid_bounds() {
+        let body = json!({"enabled":true,"interval_seconds":120,"retain_count":2});
+        let response = proxy(Caller::Ungated, "dep-test".into(), "checkpoint-policy".into(), None,
+            axum::http::Method::PUT, serde_json::to_vec(&body).unwrap().into()).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        for (field, invalid) in [("interval_seconds", json!(59)), ("interval_seconds", json!(86401)),
+            ("retain_count", json!(0)), ("retain_count", json!(101)), ("enabled", json!("true")), ("extra", json!(1))] {
+            let mut invalid_body = body.clone();
+            invalid_body[field] = invalid;
+            let response = proxy(Caller::Operator, "dep-test".into(), "checkpoint-policy".into(), None,
+                axum::http::Method::PUT, serde_json::to_vec(&invalid_body).unwrap().into()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+        }
+        assert!(endpoint("https://example/cloud", "dep-test", "checkpoint-policy", None, &axum::http::Method::PUT).is_ok());
+        assert!(endpoint("https://example/cloud", "dep-test", "recoveries", None, &axum::http::Method::PUT).is_err());
+    }
     #[tokio::test]
     async fn recovery_requires_authenticated_fleet_admin_and_explicit_fencing() {
         let response = proxy(

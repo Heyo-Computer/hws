@@ -2620,6 +2620,14 @@ rollout or multi-region availability evidence.
 
 ### Operator VM recovery
 
+The checkpoint protection panel on `/vm-recovery` lets fleet administrators
+enable or disable captures, choose an interval of 60–86400 seconds and retain
+1–100 checkpoints per Cloud VM. It shows the latest retained successful capture,
+its age, pending captures and capture errors. Refresh status to read current
+Cloud state. An interrupted save is not reported as success: refresh before
+retrying. Disabling stops new captures, not retention cleanup or an in-flight
+capture. This does not enable automatic failover or change other VMs' policies.
+
 The **VM recovery** link opens `/vm-recovery`. Enter a Cloud VM ID (`dep-…`,
 not an app-lb deployment ID), select a committed checkpoint and a destination,
 then confirm external fencing and record its evidence. The UI displays checkpoint

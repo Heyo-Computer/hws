@@ -8265,7 +8265,7 @@ fn router(state: AdminState) -> Router {
 
     let vm_recovery = Router::new()
         .route("/vm-recovery", get(vm_recovery_console::page))
-        .route("/api/vm-recovery/:vm/:resource", get(vm_recovery_console::api).post(vm_recovery_console::api))
+        .route("/api/vm-recovery/:vm/:resource", get(vm_recovery_console::api).post(vm_recovery_console::api).put(vm_recovery_console::api))
         .route("/api/vm-recovery/:vm/recoveries/:operation", get(vm_recovery_console::status))
         .layer(axum::extract::DefaultBodyLimit::max(8192))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
