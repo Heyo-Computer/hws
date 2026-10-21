@@ -1224,7 +1224,6 @@ mod tests {
     #[tokio::test]
     async fn stopping_drains_the_streams_being_served() {
         use iroh::endpoint::presets::Minimal;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let dir = tempfile::tempdir().unwrap();
         let plugin = TunnelPlugin::new(
