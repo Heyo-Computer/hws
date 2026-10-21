@@ -207,6 +207,16 @@ pub struct Peer {
     pub address: SocketAddr,
     pub tls: bool,
     pub sni: String,
+    /// For a tunnel: the node behind it. `address` is then the manager's
+    /// bridge to it, which a worker with its own dialer goes around, so a
+    /// manager restart does not cut what the worker is carrying.
+    pub tunnel: Option<TunnelTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelTarget {
+    pub node_id: String,
+    pub relay_url: Option<String>,
 }
 
 #[derive(Default)]
@@ -515,9 +525,14 @@ impl RequestControl {
             }
             let fleet = self.hop.as_ref().ok_or_else(|| RequestError::internal("fleet hop without fleet mode"))?;
             let address = fleet.address_of(&hop.home).await.map_err(RequestError::connect)?;
-            return Ok(Peer { address, tls: true, sni: hop.sni.clone() });
+            return Ok(Peer { address, tls: true, sni: hop.sni.clone(), tunnel: None });
         }
-        state.next_peer(&self.registry, &self.metrics, &self.feed).await
+        let mut peer = state.next_peer(&self.registry, &self.metrics, &self.feed).await?;
+        peer.tunnel = state.deployment.as_ref().and_then(|d| d.spec.tunnel.as_ref()).map(|t| TunnelTarget {
+            node_id: t.node_id.clone(),
+            relay_url: t.relay_url.clone(),
+        });
+        Ok(peer)
     }
 
     /// The peer a request for a `spread` deployment should go to, if this
@@ -770,6 +785,7 @@ fn peer(backend: &VmBackend, address: SocketAddr) -> Peer {
         address,
         tls: backend.tls,
         sni: backend.sni.clone(),
+        tunnel: None,
     }
 }
 

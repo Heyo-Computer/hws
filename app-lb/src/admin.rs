@@ -2895,7 +2895,7 @@ async fn register_tunnel(
     if !same_pool {
         tracing::info!(namespace = %ns, tunnel = %name, hosts = ?hosts, "tunnel registered");
     }
-    Json(TunnelRegistered { deployment: name, namespace: ns, urls, dialer_ids: vec![dialer.id()], lease_secs }).into_response()
+    Json(TunnelRegistered { deployment: name, namespace: ns, urls, dialer_ids: dialer.ids(), lease_secs }).into_response()
 }
 
 /// `DELETE /namespaces/:name/tunnels/:tunnel` — release one.

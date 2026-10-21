@@ -1374,7 +1374,7 @@ fn main() {
     // Background commands in sandboxes: the records sit beside the state file,
     // and the watcher holds each busy VM and follows its operations.
     // Dials `tunnel` deployments' remote app-lbs, from a key of this host's own.
-    let tunnel_dialer = tunnel_dialer::TunnelDialer::open(&tunnel_dialer::key_path(&cfg.state_path), registry.clone())
+    let tunnel_dialer = tunnel_dialer::TunnelDialer::open_with_workers(&tunnel_dialer::key_path(&cfg.state_path), registry.clone(), &worker_dir)
         .unwrap_or_else(|e| panic!("cannot open the tunnel dialer's key: {e}"));
 
     let operations = operations::Operations::open(
