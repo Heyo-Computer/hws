@@ -2744,7 +2744,7 @@ mod tests {
     use crate::config::Driver;
 
     fn spec() -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,
@@ -2797,7 +2797,7 @@ mod tests {
 
     /// A static (proxy_pass) deployment with fixed upstreams.
     fn static_spec() -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,

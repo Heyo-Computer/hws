@@ -3638,6 +3638,50 @@ pub struct DeploymentSpec {
     /// single server is the only host there is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<Placement>,
+    /// A *tunnel*: the backend is another app-lb, which the internet cannot
+    /// reach, named by its iroh node id. This app-lb dials it and bridges
+    /// matched requests to it. See [`TunnelSpec`]. The fourth kind of
+    /// deployment, exclusive with `vm`, `upstreams` and `site`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<TunnelSpec>,
+}
+
+/// Where a tunnel deployment's backend is: an app-lb behind NAT that
+/// registered itself through `PUT /namespaces/:ns/tunnels/:name`
+/// (`docs/design/app-lb-namespace-tunnels.md`).
+///
+/// No address is ever given: a node id is a public key iroh authenticates on
+/// connect, so a namespace cannot aim this at the public host's loopback or
+/// private network the way a static upstream list can.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelSpec {
+    /// The remote app-lb's iroh endpoint id (64 hex characters).
+    pub node_id: String,
+    /// The relay it is reachable through, as it reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// How long a registration stays live without a refresh. Past it the
+    /// tunnel is offline (no backend) but stays registered.
+    #[serde(default = "default_tunnel_lease")]
+    pub lease_secs: u64,
+    /// When the remote last registered, stamped by app-lb.
+    #[serde(default)]
+    pub renewed_at: u64,
+}
+
+pub const MIN_TUNNEL_LEASE: u64 = 60;
+pub const MAX_TUNNEL_LEASE: u64 = 3600;
+
+fn default_tunnel_lease() -> u64 {
+    300
+}
+
+impl TunnelSpec {
+    /// Whether the registration is live at `now`.
+    pub fn live(&self, now: u64) -> bool {
+        now < self.renewed_at.saturating_add(self.lease_secs)
+    }
 }
 
 /// Where a deployment runs when several app-lb hosts share one fleet store
@@ -4103,6 +4147,8 @@ pub enum SpecError {
     DescriptionTooLong,
     /// A namespace outside the id alphabet; it appears in URLs and filenames.
     BadNamespace(String),
+    /// A `tunnel` deployment that is not one, with why.
+    InvalidTunnel(String),
     /// A namespace host pattern that is not a lowercase hostname, optionally
     /// with a `*` prefix on its first label — or too many of them.
     BadHostPattern(String),
@@ -4384,6 +4430,7 @@ impl std::fmt::Display for SpecError {
             Self::DescriptionTooLong => {
                 write!(f, "a namespace description must be 400 characters or fewer")
             }
+            Self::InvalidTunnel(why) => write!(f, "invalid tunnel deployment: {why}"),
             Self::BadHostPattern(p) => write!(
                 f,
                 "namespace host pattern {p:?} must be a lowercase hostname, optionally starting \
@@ -4998,7 +5045,9 @@ impl DeploymentSpec {
     pub fn backend(&self) -> Backend {
         if self.site.is_some() {
             Backend::Site
-        } else if !self.upstreams.is_empty() || self.discovery.is_some() {
+        } else if !self.upstreams.is_empty() || self.discovery.is_some() || self.tunnel.is_some() {
+            // A tunnel is served like a static deployment whose one upstream
+            // is the loopback bridge the tunnel dialer gives it.
             Backend::Upstreams
         } else {
             Backend::Vm
@@ -5295,12 +5344,40 @@ impl DeploymentSpec {
         None
     }
 
+    /// The rest of `validate` for a tunnel: nothing else may say where the
+    /// backend is, and its routes are exact hosts, which is what its
+    /// registration claims and what certificates are ordered for.
+    fn validate_tunnel(&self, tunnel: &TunnelSpec) -> Result<(), SpecError> {
+        let bad = |why: &str| Err(SpecError::InvalidTunnel(why.into()));
+        if self.vm.is_some() || !self.upstreams.is_empty() || self.discovery.is_some() || self.site.is_some() {
+            return bad("a tunnel's backend is its node; it cannot also set `vm`, `upstreams`, `discovery` or `site`");
+        }
+        if self.build.is_some() || self.artifact.is_some() || self.update.is_some() || self.ingress.is_some() {
+            return bad("a tunnel has no image or host-side commands: `build`, `artifact`, `update` and `ingress` do not apply");
+        }
+        if self.routes.iter().any(|r| r.host.is_none() || r.host_suffix.is_some()) {
+            return bad("every route of a tunnel names one exact `host`");
+        }
+        if tunnel.node_id.len() != 64 || !tunnel.node_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return bad("`tunnel.node_id` is an iroh endpoint id: 64 hex characters");
+        }
+        if !(MIN_TUNNEL_LEASE..=MAX_TUNNEL_LEASE).contains(&tunnel.lease_secs) {
+            return bad("`tunnel.lease_secs` must be between 60 and 3600");
+        }
+        if let Some(relay) = &tunnel.relay_url
+            && !(relay.starts_with("https://") || relay.starts_with("http://"))
+        {
+            return bad("`tunnel.relay_url` must be an http(s) URL");
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
         }
         if let Some(gateway) = &self.gateway {
-            if self.vm.is_some() || self.discovery.is_some() || self.site.is_some()
+            if self.vm.is_some() || self.discovery.is_some() || self.site.is_some() || self.tunnel.is_some()
                 || self.routes.len() != 1 || self.routes[0].host.is_none()
                 || self.routes[0].strip_prefix || self.routes[0].host_suffix.is_some() {
                 return Err(SpecError::InvalidGateway("gateway transport requires static upstreams and one exact-host route with preserved path".into()));
@@ -5368,6 +5445,10 @@ impl DeploymentSpec {
         // whichever backend the deployment has.
         if let Some(auth) = &self.auth {
             auth.validate(&self.routes)?;
+        }
+
+        if let Some(tunnel) = &self.tunnel {
+            return self.validate_tunnel(tunnel);
         }
 
         // Exactly one backend kind.
@@ -5962,6 +6043,44 @@ mod tests {
 
     /// A declared namespace is an object with a name and very little else, so
     /// validation is where all of its rules live.
+    mod tunnel_specs {
+        use super::*;
+
+        fn tunnel(extra: serde_json::Value) -> DeploymentSpec {
+            let mut v = serde_json::json!({
+                "id": "desktop", "namespace": "sam",
+                "routes": [{"host": "desktop--sam.us2.heyo.work"}],
+                "tunnel": {"node_id": "ab".repeat(32)},
+            });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        }
+
+        #[test]
+        fn a_tunnel_is_its_own_backend_and_is_served_like_a_static_one() {
+            let t = tunnel(serde_json::json!({}));
+            assert_eq!(t.validate(), Ok(()));
+            assert_eq!(t.backend(), Backend::Upstreams);
+            assert_eq!(t.tunnel.as_ref().unwrap().lease_secs, 300);
+            assert!(t.tunnel.as_ref().unwrap().live(299) && !t.tunnel.as_ref().unwrap().live(300));
+        }
+
+        #[test]
+        fn a_tunnel_names_nothing_else_and_routes_exact_hosts() {
+            for extra in [
+                serde_json::json!({"upstreams": ["127.0.0.1:1"]}),
+                serde_json::json!({"routes": [{"host_suffix": ".heyo.work"}]}),
+                serde_json::json!({"routes": [{"path_prefix": "/x"}]}),
+                serde_json::json!({"routes": []}),
+                serde_json::json!({"tunnel": {"node_id": "not-hex"}}),
+                serde_json::json!({"tunnel": {"node_id": "ab".repeat(32), "lease_secs": 10}}),
+                serde_json::json!({"tunnel": {"node_id": "ab".repeat(32), "relay_url": "file:///x"}}),
+            ] {
+                assert!(tunnel(extra.clone()).validate().is_err(), "{extra}");
+            }
+        }
+    }
+
     mod namespace_objects {
         use super::*;
 
@@ -6300,7 +6419,7 @@ mod tests {
     }
 
     fn spec() -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,
@@ -6380,7 +6499,7 @@ mod tests {
 
     /// A static (proxy_pass) deployment: `upstreams` set, no `vm`.
     fn static_spec(upstreams: &[&str]) -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,

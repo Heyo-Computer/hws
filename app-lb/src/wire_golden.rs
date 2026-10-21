@@ -71,7 +71,7 @@ pub(crate) fn golden(name: &str, value: &impl Serialize) {
 /// `upstreams` and `site` together would serialize fine and describe a
 /// deployment that cannot exist.
 fn vm_spec() -> DeploymentSpec {
-    DeploymentSpec {
+    DeploymentSpec { tunnel: None,
         placement: None,
         ingress: None,
         account_id: None,
@@ -233,7 +233,7 @@ fn owned_vm_spec() -> DeploymentSpec {
 }
 
 fn site_spec() -> DeploymentSpec {
-    DeploymentSpec {
+    DeploymentSpec { tunnel: None,
         placement: None,
         ingress: None,
         account_id: None,
@@ -293,7 +293,7 @@ fn site_spec() -> DeploymentSpec {
 }
 
 fn static_spec() -> DeploymentSpec {
-    DeploymentSpec {
+    DeploymentSpec { tunnel: None,
         placement: None,
         ingress: None,
         account_id: None,

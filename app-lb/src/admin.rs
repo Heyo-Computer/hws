@@ -1265,6 +1265,7 @@ fn is_default_namespace_str(ns: &String) -> bool {
 fn deployment_kind(d: &crate::deployment::Deployment) -> &'static str {
     match d.spec.backend() {
         crate::config::Backend::Site => "site",
+        crate::config::Backend::Upstreams if d.spec.tunnel.is_some() => "tunnel",
         crate::config::Backend::Upstreams => "static",
         crate::config::Backend::Vm => "vm",
     }
@@ -3584,6 +3585,7 @@ fn lifecycle_detail(state: &AdminState, spec: &DeploymentSpec) -> String {
     if urls.is_empty() {
         let kind = match spec.backend() {
             crate::config::Backend::Vm => "vm",
+            crate::config::Backend::Upstreams if spec.tunnel.is_some() => "tunnel",
             crate::config::Backend::Upstreams => "static",
             crate::config::Backend::Site => "site",
         };
