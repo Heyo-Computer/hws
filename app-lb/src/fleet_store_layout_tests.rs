@@ -113,6 +113,7 @@ fn every_store_writes_the_files_it_always_wrote() {
         name: "sam".into(),
         description: Some("Sam's".into()),
         created_at: 1,
+        hosts: vec![],
     };
     namespaces.upsert(ns.clone()).unwrap();
 
@@ -281,6 +282,7 @@ fn a_state_tree_left_by_an_older_binary_loads_unchanged() {
         name: "legacy".into(),
         description: None,
         created_at: 5,
+        hosts: vec![],
     };
     std::fs::create_dir_all(root.path("app-lb-namespaces.d")).unwrap();
     std::fs::write(root.path("app-lb-namespaces.d/legacy.json"), pretty(&ns)).unwrap();

@@ -206,7 +206,7 @@ mod tests {
     }
 
     fn spec(name: &str) -> NamespaceSpec {
-        NamespaceSpec { name: name.into(), description: None, created_at: 1 }
+        NamespaceSpec { name: name.into(), description: None, created_at: 1, hosts: vec![] }
     }
 
     #[test]

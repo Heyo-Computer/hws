@@ -2838,6 +2838,9 @@ struct NamespaceEntry {
     declared: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// The operator's hostname policy, when one is declared.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hosts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     created_at: Option<u64>,
 }
@@ -3026,6 +3029,7 @@ async fn namespaces(
                     deployments,
                     declared: declared.is_some(),
                     description: declared.as_ref().and_then(|d| d.description.clone()),
+                    hosts: declared.as_ref().map(|d| d.hosts.clone()).unwrap_or_default(),
                     created_at: declared.as_ref().map(|d| d.created_at),
                     namespace,
                 }
@@ -3058,6 +3062,21 @@ async fn create_namespace(
     }
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    // The hostname policy is the operator's alone: it decides which public
+    // names a namespace's narrow tokens may claim, so a fleet-scoped token
+    // re-declaring the namespace keeps whatever the operator set.
+    let operator = matches!(caller.as_ref().map(|c| &c.0), None | Some(Caller::Operator | Caller::Ungated));
+    if !operator {
+        let existing = state.namespaces.get(&spec.name).map(|e| e.hosts.clone()).unwrap_or_default();
+        if !spec.hosts.is_empty() && spec.hosts != existing {
+            return err(
+                StatusCode::FORBIDDEN,
+                "a namespace's hosts are set by the operator (the Basic admin credential) alone",
+            )
+            .into_response();
+        }
+        spec.hosts = existing;
     }
     // Stamped here, never taken from the body: a client-supplied creation time
     // is a client-supplied claim. Re-declaring keeps the original, so `apply`
@@ -4208,6 +4227,45 @@ fn discovery_route_conflicts(registry: &Registry, spec: &DeploymentSpec) -> bool
     })
 }
 
+/// The first route host in `spec` that its namespace may not claim: one
+/// another namespace's deployment already routes (here or on another fleet
+/// host), or one outside the namespace's declared `hosts`. Applied to confined
+/// callers — a namespace's own credentials — and never to the operator, whose
+/// deployments may share a host across namespaces on purpose.
+fn unclaimable_host(state: &AdminState, spec: &DeploymentSpec) -> Option<String> {
+    let policy = state.namespaces.get(&spec.namespace).map(|n| n.hosts.clone()).unwrap_or_default();
+    let local = state.registry.deployments();
+    let foreign = state.registry.foreign();
+    let others = local
+        .values()
+        .map(|d| &d.spec)
+        .chain(foreign.values().map(|s| &**s))
+        .filter(|other| other.id != spec.id && other.namespace != spec.namespace);
+    let others: Vec<&DeploymentSpec> = others.collect();
+    spec.routes.iter().filter_map(|r| r.host.as_deref()).map(str::to_ascii_lowercase).find(|host| {
+        (!policy.is_empty() && !crate::config::host_allowed(&policy, host))
+            || others.iter().any(|o| {
+                o.routes.iter().any(|r| r.host.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(host)))
+            })
+    })
+}
+
+fn refuse_unclaimable(state: &AdminState, caller: Option<&Caller>, spec: &DeploymentSpec) -> Option<Response> {
+    caller.filter(|c| c.confined())?;
+    let host = unclaimable_host(state, spec)?;
+    Some(
+        err(
+            StatusCode::CONFLICT,
+            format!(
+                "host {host:?} is not available to namespace {:?}: another namespace routes it, \
+                 or it is outside the hosts the operator gave this namespace",
+                spec.namespace
+            ),
+        )
+        .into_response(),
+    )
+}
+
 async fn register(
     State(state): State<AdminState>,
     caller: Option<axum::Extension<Caller>>,
@@ -4306,6 +4364,9 @@ async fn register(
     }
     if create_only && spec.discovery.is_some() && discovery_route_conflicts(&state.registry, &spec) {
         return err(StatusCode::CONFLICT, "discovery bootstrap needs an unclaimed exact-host route").into_response();
+    }
+    if let Some(refused) = refuse_unclaimable(&state, caller.as_ref().map(|c| &c.0), &spec) {
+        return refused;
     }
     if old.as_ref().is_some_and(|d| crate::rollout::reserved(d)) {
         return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
@@ -4436,6 +4497,9 @@ async fn update(
     };
     if crate::rollout::reserved(&old) {
         return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
+    if let Some(refused) = refuse_unclaimable(&state, caller.as_ref().map(|c| &c.0), &spec) {
+        return refused;
     }
     // Compare while holding the same writer guard that covers fencing, the
     // registry swap, persistence and teardown scheduling. A stale request must
@@ -10576,6 +10640,96 @@ mod tests {
                 let f = gated(Some(GlobalStore::new(&url, None).unwrap())).await;
                 let admin = token(&f, "us5", AdminScope::Admin, &[]);
                 assert_eq!(send(&f, "PUT", "/namespaces/us5/artifacts/tags/us5/app:v1", &admin, D.as_bytes()).await.0, StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
+
+        /// Hostnames a namespace may claim, and tunnels registered through
+        /// the namespace surface.
+        mod namespace_hosts {
+            use super::*;
+            use crate::tokens::{AdminScope, NewToken};
+
+            async fn gated() -> Fixture {
+                let mut f = fixture(true).await;
+                f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
+                f.state.gate_admin = true;
+                f.state.gate_view = true;
+                f
+            }
+
+            fn token(f: &Fixture, ns: &str) -> String {
+                f.state.tokens.mint(NewToken {
+                    fleet: false,
+                    name: "hosts test".into(),
+                    admin: AdminScope::Admin,
+                    namespace: Some(ns.into()),
+                    deployments: vec![],
+                    expires_in_secs: None,
+                }, now_secs()).unwrap().1
+            }
+
+            async fn send(f: &Fixture, method: &str, path: &str, auth: &str, body: String) -> (StatusCode, String) {
+                let req = Request::builder().method(method).uri(path)
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body)).unwrap();
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+                let response = app.call(req).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+
+            fn operator() -> String {
+                use base64::Engine;
+                format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("operator:password"))
+            }
+
+            fn static_spec(id: &str, ns: &str, host: &str) -> String {
+                serde_json::json!({"id": id, "namespace": ns, "routes": [{"host": host}], "upstreams": ["127.0.0.1:1"]}).to_string()
+            }
+
+            #[tokio::test]
+            async fn a_namespace_cannot_route_a_host_another_namespace_routes() {
+                let f = gated().await;
+                let (status, body) = send(&f, "POST", "/deployments", &operator(), static_spec("shop", "team-a", "shop.example.com")).await;
+                assert!(status.is_success(), "{status} {body}");
+                let bob = format!("Bearer {}", token(&f, "team-b"));
+                let (status, body) = send(&f, "POST", "/deployments", &bob, static_spec("copy", "team-b", "SHOP.example.com")).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                let (status, body) = send(&f, "POST", "/deployments", &bob, static_spec("mine", "team-b", "bob.example.com")).await;
+                assert!(status.is_success(), "{status} {body}");
+                // The operator may share a host across namespaces on purpose.
+                let (status, body) = send(&f, "POST", "/deployments", &operator(), static_spec("shared", "team-b", "shop.example.com")).await;
+                assert!(status.is_success(), "{status} {body}");
+            }
+
+            #[tokio::test]
+            async fn a_declared_policy_confines_a_namespace_and_only_the_operator_sets_it() {
+                let f = gated().await;
+                let ns = serde_json::json!({"name": "team-a", "hosts": ["*--team-a.example.com"]}).to_string();
+                let (status, body) = send(&f, "POST", "/namespaces", &operator(), ns).await;
+                assert!(status.is_success(), "{status} {body}");
+                let alice = format!("Bearer {}", token(&f, "team-a"));
+                let (status, _) = send(&f, "POST", "/deployments", &alice, static_spec("a", "team-a", "web--team-a.example.com")).await;
+                assert!(status.is_success());
+                let (status, _) = send(&f, "POST", "/deployments", &alice, static_spec("b", "team-a", "web.example.com")).await;
+                assert_eq!(status, StatusCode::CONFLICT);
+
+                // A fleet-scoped token is not the operator: it cannot widen the
+                // policy, and re-declaring keeps it.
+                let fleet = f.state.tokens.mint(NewToken {
+                    fleet: false, name: "fleet".into(), admin: AdminScope::Admin,
+                    namespace: None, deployments: vec!["*".into()], expires_in_secs: None,
+                }, now_secs()).unwrap().1;
+                let wider = serde_json::json!({"name": "team-a", "hosts": ["*.example.com"]}).to_string();
+                let (status, _) = send(&f, "POST", "/namespaces", &format!("Bearer {fleet}"), wider).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                let plain = serde_json::json!({"name": "team-a", "description": "relabelled"}).to_string();
+                let (status, _) = send(&f, "POST", "/namespaces", &format!("Bearer {fleet}"), plain).await;
+                assert!(status.is_success());
+                assert_eq!(f.state.namespaces.get("team-a").unwrap().hosts, vec!["*--team-a.example.com".to_string()]);
             }
         }
 
