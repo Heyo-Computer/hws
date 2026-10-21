@@ -557,8 +557,12 @@ impl Plugin for TunnelPlugin {
         tracing::info!(node = %node_id, online, relay = ?relay_url, "tunnel endpoint bound");
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let accept = self.spawn_accept(endpoint.clone(), shutdown_rx.clone());
+        // Register before accepting: registration is what fills the edge
+        // allow-list, and `stop` emptied it. Accepting first refuses the edge
+        // itself if it dials in that window — which it does right after a
+        // restart. Connections that arrive meanwhile wait for `accept`.
         let first = self.register_all(&cfg, &node_id, relay_url).await;
+        let accept = self.spawn_accept(endpoint.clone(), shutdown_rx.clone());
         let refresh = {
             let me = self.me.clone();
             let endpoint = endpoint.clone();
