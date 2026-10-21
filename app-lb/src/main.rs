@@ -772,6 +772,7 @@ fn main() {
     let tunnel_plugin = plugins::tunnel::TunnelPlugin::new(
         plugins::tunnel::key_path(&cfg.state_path),
         external_tls.clone(),
+        secrets.clone(),
     );
     let plugin_host = Arc::new(plugins::PluginHost::new(
         vec![

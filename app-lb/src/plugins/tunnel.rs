@@ -82,7 +82,97 @@ fn yes() -> bool {
     true
 }
 
-fn parse_config(config: &Value) -> Result<TunnelConfig, String> {
+/// Where this app-lb's tunnels are registered.
+#[derive(Debug, Clone)]
+pub enum Config {
+    /// Heyo Cloud, through heyvmd: the cloud edge serves the hostname.
+    Cloud(TunnelConfig),
+    /// A namespace on a public app-lb, which serves the hostname itself
+    /// (`docs/design/app-lb-namespace-tunnels.md`).
+    Remote(RemoteConfig),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteConfig {
+    /// `"app-lb"`.
+    pub provider: String,
+    /// The public app-lb's admin API, e.g. `https://admin.us2.heyo.work`.
+    pub remote: String,
+    pub namespace: String,
+    /// A tunnel token minted for this machine on the public app-lb, stored
+    /// here as a secret.
+    pub token: crate::secrets::SecretRef,
+    pub tunnels: Vec<RemoteTunnel>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteTunnel {
+    /// The tunnel's name there, which is its deployment id.
+    pub name: String,
+    pub hostnames: Vec<String>,
+}
+
+impl RemoteConfig {
+    fn base(&self) -> &str {
+        self.remote.trim_end_matches('/')
+    }
+
+    /// The public app-lb's hostname, as a proof names it.
+    fn host(&self) -> String {
+        url::Url::parse(&self.remote)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
+            .unwrap_or_default()
+    }
+}
+
+fn parse_remote(config: &Value) -> Result<RemoteConfig, String> {
+    let cfg: RemoteConfig = serde_json::from_value(config.clone()).map_err(|e| e.to_string())?;
+    let url = url::Url::parse(&cfg.remote).map_err(|e| format!("remote {:?}: {e}", cfg.remote))?;
+    if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
+        return Err("remote is the public app-lb's admin URL, like https://admin.us2.heyo.work".into());
+    }
+    if !crate::config::is_valid_namespace(&cfg.namespace) {
+        return Err(format!("namespace {:?} is not a namespace name", cfg.namespace));
+    }
+    if cfg.tunnels.is_empty() || cfg.tunnels.len() > 10 {
+        return Err("list 1 to 10 tunnels: {\"tunnels\": [{\"name\": \"desktop\", \"hostnames\": [\"desktop--<ns>.<domain>\"]}]}".into());
+    }
+    let mut seen = HashSet::new();
+    for t in &cfg.tunnels {
+        let label = (1..=63).contains(&t.name.len())
+            && t.name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !t.name.starts_with('-')
+            && !t.name.ends_with('-');
+        if !label {
+            return Err(format!("tunnel name {:?}: one lowercase DNS label", t.name));
+        }
+        if !seen.insert(t.name.as_str()) {
+            return Err(format!("tunnel {:?} is listed twice", t.name));
+        }
+        if t.hostnames.is_empty() || t.hostnames.len() > 10 {
+            return Err(format!("tunnel {:?}: list 1 to 10 hostnames", t.name));
+        }
+    }
+    Ok(cfg)
+}
+
+fn parse_config(config: &Value) -> Result<Config, String> {
+    match config.get("provider").and_then(Value::as_str) {
+        Some("app-lb") => parse_remote(config).map(Config::Remote),
+        Some("cloud") => {
+            let mut cloud = config.clone();
+            cloud.as_object_mut().map(|o| o.remove("provider"));
+            parse_cloud(&cloud).map(Config::Cloud)
+        }
+        Some(other) => Err(format!("provider {other:?}: use \"cloud\" or \"app-lb\"")),
+        None => parse_cloud(config).map(Config::Cloud),
+    }
+}
+
+fn parse_cloud(config: &Value) -> Result<TunnelConfig, String> {
     // Enabled with nothing configured: one public hostname the cloud picks,
     // which is what "put this app-lb on the internet" means.
     if config.is_null() {
@@ -209,6 +299,21 @@ pub(crate) fn relay_mode() -> iroh::RelayMode {
 /// manager so it never orders certificates for them.
 pub type ExternalTlsHosts = Arc<RwLock<HashSet<String>>>;
 
+/// What a public app-lb answers a registration with.
+#[derive(Debug, Deserialize)]
+struct RemoteRegistered {
+    urls: Vec<String>,
+    dialer_ids: Vec<String>,
+}
+
+/// For talking to a public app-lb's admin API.
+fn remote_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("a reqwest client builds")
+}
+
 /// One hostname as heyvmd (and the cloud) registered it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Registered {
@@ -244,6 +349,10 @@ pub struct TunnelPlugin {
     /// heyvmd, which holds the cloud credential. Attached with `app`: the
     /// daemon client is built after the plugin host.
     daemon: OnceLock<HeyoClient>,
+    /// Where a remote provider's tunnel token is kept.
+    secrets: Arc<crate::secrets::SecretStore>,
+    /// The configuration last applied, which says where tunnels live.
+    config: RwLock<Option<Config>>,
     external_tls: ExternalTlsHosts,
     /// The pingora app streams are served by. Attached by `main` once the
     /// proxy exists, which is after the plugin host is built.
@@ -258,11 +367,17 @@ pub struct TunnelPlugin {
 }
 
 impl TunnelPlugin {
-    pub fn new(key_path: PathBuf, external_tls: ExternalTlsHosts) -> Arc<Self> {
+    pub fn new(
+        key_path: PathBuf,
+        external_tls: ExternalTlsHosts,
+        secrets: Arc<crate::secrets::SecretStore>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             key_path,
             daemon: OnceLock::new(),
+            secrets,
+            config: RwLock::new(None),
             external_tls,
             app: OnceLock::new(),
             running: tokio::sync::Mutex::new(None),
@@ -329,12 +444,89 @@ impl TunnelPlugin {
     /// and the edge allow-list; returns the failures.
     async fn register_all(
         &self,
-        cfg: &TunnelConfig,
-        node_id: &str,
+        cfg: &Config,
+        key: &SecretKey,
         relay_url: Option<String>,
     ) -> Result<(), String> {
+        let node_id = key.public().to_string();
+        let (registered, errors) = match cfg {
+            Config::Cloud(cfg) => self.register_cloud(cfg, &node_id, &relay_url).await,
+            Config::Remote(cfg) => self.register_remote(cfg, key, &relay_url).await,
+        };
+        self.record(registered, &errors, relay_url);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// Register at a public app-lb's namespace, proving the node is ours.
+    async fn register_remote(
+        &self,
+        cfg: &RemoteConfig,
+        key: &SecretKey,
+        relay_url: &Option<String>,
+    ) -> (Vec<Registered>, Vec<String>) {
+        let token = match self.secrets.resolve(&cfg.token) {
+            Ok(t) => t,
+            Err(e) => return (Vec::new(), vec![format!("the tunnel token secret: {e}")]),
+        };
+        let node_id = key.public().to_string();
+        let host = cfg.host();
+        let client = remote_client();
         let mut registered = Vec::new();
         let mut errors = Vec::new();
+        for t in &cfg.tunnels {
+            let ts = crate::deployment::now_secs();
+            let msg = crate::tunnel_dialer::proof_message(&cfg.namespace, &t.name, &node_id, ts, &host);
+            let body = json!({
+                "node_id": node_id,
+                "relay_url": relay_url,
+                "hostnames": t.hostnames,
+                "proof": {"ts": ts, "sig": crate::tunnel_dialer::sign_proof(key, &msg)},
+            });
+            let url = format!("{}/namespaces/{}/tunnels/{}", cfg.base(), cfg.namespace, t.name);
+            match client.put(&url).bearer_auth(&token).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.json::<RemoteRegistered>().await {
+                    Ok(r) => registered.extend(r.urls.iter().map(|u| Registered {
+                        subdomain: t.name.clone(),
+                        hostname: u.trim_start_matches("https://").trim_start_matches("http://").to_string(),
+                        url: u.clone(),
+                        is_public: true,
+                        edge_node_ids: r.dialer_ids.clone(),
+                    })),
+                    Err(e) => errors.push(format!("{}: {} answered something else: {e}", t.name, cfg.base())),
+                },
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    let why = if matches!(status.as_u16(), 401 | 403) {
+                        format!("{} refused this app-lb's tunnel token ({status}): {}", cfg.base(), text.trim())
+                    } else {
+                        format!("{} refused the tunnel ({status}): {}", cfg.base(), text.trim())
+                    };
+                    errors.push(format!("{}: {why}", t.name));
+                }
+                Err(e) => errors.push(format!("{}: could not reach {}: {e}", t.name, cfg.base())),
+            }
+        }
+        (registered, errors)
+    }
+
+    /// Register through heyvmd with Heyo Cloud.
+    async fn register_cloud(
+        &self,
+        cfg: &TunnelConfig,
+        node_id: &str,
+        relay_url: &Option<String>,
+    ) -> (Vec<Registered>, Vec<String>) {
+        let mut registered = Vec::new();
+        let mut errors = Vec::new();
+        let daemon = match self.daemon() {
+            Ok(d) => d,
+            Err(e) => return (registered, vec![e]),
+        };
         for h in &cfg.hostnames {
             let body = json!({
                 "node_id": node_id,
@@ -342,8 +534,7 @@ impl TunnelPlugin {
                 "subdomain": h.subdomain,
                 "is_public": h.public,
             });
-            match self
-                .daemon()?
+            match daemon
                 .request::<Registered>(
                     Method::POST,
                     "/tunnels",
@@ -360,6 +551,12 @@ impl TunnelPlugin {
                 )),
             }
         }
+        (registered, errors)
+    }
+
+    /// Take in a registration pass: the status, the dialer allow-list, and
+    /// the hostnames served here.
+    fn record(&self, registered: Vec<Registered>, errors: &[String], relay_url: Option<String>) {
         {
             // Keep a hostname that failed to refresh this pass (a transient
             // cloud error) rather than dropping it from the page and the
@@ -383,11 +580,6 @@ impl TunnelPlugin {
             }
             *self.external_tls.write().unwrap() =
                 st.tunnels.iter().map(|t| t.hostname.to_ascii_lowercase()).collect();
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
         }
     }
 
@@ -498,14 +690,23 @@ impl Plugin for TunnelPlugin {
     fn meta(&self) -> PluginMeta {
         PluginMeta {
             id: "tunnel",
-            name: "Heyo Cloud tunnel",
-            description: "Serve this app-lb at a public Heyo Cloud hostname without exposing the \
-                          machine: the cloud edge reaches it over iroh. Needs heyvmd on this host, \
-                          logged in with `heyvm login`.",
+            name: "Tunnel",
+            description: "Serve this app-lb at a public hostname without exposing the machine. \
+                          Either Heyo Cloud's edge reaches it over iroh (needs heyvmd here, logged \
+                          in with `heyvm login`), or a public app-lb does, through a namespace \
+                          there (`\"provider\": \"app-lb\"`, with a tunnel token).",
             config_schema: json!({
                 "type": "object",
-                "required": ["hostnames"],
                 "properties": {
+                    "provider": {"enum": ["cloud", "app-lb"], "default": "cloud"},
+                    "remote": {"type": "string", "description": "app-lb provider: the public app-lb's admin URL"},
+                    "namespace": {"type": "string", "description": "app-lb provider: the namespace there"},
+                    "token": {"type": "object", "description": "app-lb provider: the secret holding a tunnel token",
+                              "properties": {"secret": {"type": "string"}, "key": {"type": "string"}}},
+                    "tunnels": {"type": "array", "maxItems": 10, "description": "app-lb provider",
+                                "items": {"type": "object", "required": ["name", "hostnames"],
+                                          "properties": {"name": {"type": "string"},
+                                                         "hostnames": {"type": "array", "items": {"type": "string"}}}}},
                     "hostnames": {
                         "type": "array",
                         "maxItems": 10,
@@ -535,10 +736,13 @@ impl Plugin for TunnelPlugin {
         if self.app.get().is_none() {
             return Err("the tunnel ingress is not wired to the proxy; this is a bug".into());
         }
-        self.daemon()?;
+        if matches!(cfg, Config::Cloud(_)) {
+            self.daemon()?;
+        }
+        *self.config.write().unwrap() = Some(cfg.clone());
         let key = load_or_create_key(&self.key_path)?;
         let endpoint = Endpoint::builder(N0)
-            .secret_key(key)
+            .secret_key(key.clone())
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(relay_mode())
             .bind()
@@ -561,7 +765,7 @@ impl Plugin for TunnelPlugin {
         // allow-list, and `stop` emptied it. Accepting first refuses the edge
         // itself if it dials in that window — which it does right after a
         // restart. Connections that arrive meanwhile wait for `accept`.
-        let first = self.register_all(&cfg, &node_id, relay_url).await;
+        let first = self.register_all(&cfg, &key, relay_url).await;
         let accept = self.spawn_accept(endpoint.clone(), shutdown_rx.clone());
         let refresh = {
             let me = self.me.clone();
@@ -574,8 +778,7 @@ impl Plugin for TunnelPlugin {
                     let Some(me) = me.upgrade() else { return };
                     let relay = endpoint.addr().relay_urls().next().map(|u| u.to_string());
                     me.status.write().unwrap().online = relay.is_some();
-                    let id = endpoint.id().to_string();
-                    if let Err(e) = me.register_all(&cfg, &id, relay).await {
+                    if let Err(e) = me.register_all(&cfg, &key, relay).await {
                         tracing::warn!(error = %e, "tunnel: re-registration failed");
                     }
                 }
@@ -615,7 +818,64 @@ impl Plugin for TunnelPlugin {
 
 /// `GET …/tunnels` — what heyvmd has registered, including hostnames this
 /// app-lb no longer configures (so they can be released).
+fn gateway_error(e: impl std::fmt::Display) -> Response {
+    (StatusCode::BAD_GATEWAY, axum::Json(json!({ "error": e.to_string() }))).into_response()
+}
+
+impl TunnelPlugin {
+    fn remote(&self) -> Option<RemoteConfig> {
+        match self.config.read().unwrap().as_ref() {
+            Some(Config::Remote(cfg)) => Some(cfg.clone()),
+            _ => None,
+        }
+    }
+
+    /// The public app-lb's answer to `method` on this namespace's tunnels.
+    async fn remote_call(&self, cfg: &RemoteConfig, method: reqwest::Method, suffix: &str) -> Result<reqwest::Response, String> {
+        let token = self.secrets.resolve(&cfg.token).map_err(|e| format!("the tunnel token secret: {e}"))?;
+        let url = format!("{}/namespaces/{}/tunnels{suffix}", cfg.base(), cfg.namespace);
+        remote_client()
+            .request(method, &url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| format!("could not reach {}: {e}", cfg.base()))
+    }
+}
+
+/// A public app-lb's tunnel rows, in the shape the panel shows the cloud's.
+async fn list_remote(p: &TunnelPlugin, cfg: &RemoteConfig) -> Response {
+    let resp = match p.remote_call(cfg, reqwest::Method::GET, "").await {
+        Ok(r) => r,
+        Err(e) => return gateway_error(e),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return gateway_error(format!("{} answered {status}: {}", cfg.base(), resp.text().await.unwrap_or_default().trim()));
+    }
+    let rows: Vec<Value> = match resp.json().await {
+        Ok(rows) => rows,
+        Err(e) => return gateway_error(format!("{} answered something else: {e}", cfg.base())),
+    };
+    let out: Vec<Value> = rows
+        .iter()
+        .flat_map(|row| {
+            let hosts = row["hostnames"].as_array().cloned().unwrap_or_default();
+            hosts.into_iter().filter_map(|h| h.as_str().map(str::to_string)).map(move |h| {
+                json!({
+                    "subdomain": row["name"], "hostname": h, "url": format!("https://{h}"),
+                    "is_public": true, "node_id": row["node_id"], "live": row["live"], "healthy": row["healthy"],
+                })
+            })
+        })
+        .collect();
+    axum::Json(out).into_response()
+}
+
 async fn list_tunnels(State(p): State<Arc<TunnelPlugin>>) -> Response {
+    if let Some(cfg) = p.remote() {
+        return list_remote(&p, &cfg).await;
+    }
     let daemon = match p.daemon() {
         Ok(d) => d,
         Err(e) => {
@@ -648,6 +908,25 @@ async fn release_tunnel(
     State(p): State<Arc<TunnelPlugin>>,
     UrlPath(subdomain): UrlPath<String>,
 ) -> Response {
+    if let Some(cfg) = p.remote() {
+        let suffix = format!("/{}", urlencoding_segment(&subdomain));
+        return match p.remote_call(&cfg, reqwest::Method::DELETE, &suffix).await {
+            Ok(r) if r.status().is_success() => {
+                p.status.write().unwrap().tunnels.retain(|t| t.subdomain != subdomain);
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({ "error": format!("no tunnel named {subdomain:?}") })),
+            )
+                .into_response(),
+            Ok(r) => {
+                let status = r.status();
+                gateway_error(format!("{} answered {status}: {}", cfg.base(), r.text().await.unwrap_or_default().trim()))
+            }
+            Err(e) => gateway_error(e),
+        };
+    }
     let daemon = match p.daemon() {
         Ok(d) => d,
         Err(e) => {
@@ -697,9 +976,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_remote_config_names_the_app_lb_namespace_and_tunnels() {
+        let ok = json!({"provider": "app-lb", "remote": "https://Admin.us2.heyo.work/", "namespace": "sam",
+                        "token": {"secret": "tunnel-us2", "key": "token"},
+                        "tunnels": [{"name": "desktop", "hostnames": ["desktop--sam.us2.heyo.work"]}]});
+        let Config::Remote(cfg) = parse_config(&ok).unwrap() else { panic!("remote") };
+        assert_eq!(cfg.host(), "admin.us2.heyo.work");
+        assert_eq!(cfg.base(), "https://Admin.us2.heyo.work");
+        assert!(matches!(parse_config(&json!({"provider": "cloud", "hostnames": [{}]})), Ok(Config::Cloud(_))));
+        let with = |k: &str, v: Value| { let mut c = ok.clone(); c[k] = v; c };
+        for bad in [
+            with("remote", json!("admin.us2.heyo.work")),
+            with("namespace", json!("no spaces")),
+            with("tunnels", json!([])),
+            with("tunnels", json!([{"name": "Desktop", "hostnames": ["a.b"]}])),
+            with("tunnels", json!([{"name": "a", "hostnames": []}])),
+            with("tunnels", json!([{"name": "a", "hostnames": ["x.y"]}, {"name": "a", "hostnames": ["x.y"]}])),
+            with("provider", json!("ngrok")),
+        ] {
+            assert!(parse_config(&bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
     fn a_config_is_checked_before_it_is_stored() {
         assert!(parse_config(&json!({"hostnames": [{"public": true}]})).is_ok());
-        let default = parse_config(&Value::Null).expect("enabling with no configuration works");
+        let Config::Cloud(default) = parse_config(&Value::Null).expect("enabling with no configuration works") else {
+            panic!("no configuration is the cloud provider");
+        };
         assert_eq!(default.hostnames.len(), 1);
         assert!(default.hostnames[0].subdomain.is_none() && default.hostnames[0].public);
         assert!(parse_config(&json!({"hostnames": [{"subdomain": "my-shop"}, {}]})).is_ok());
@@ -785,7 +1089,11 @@ mod tests {
             timeout: None,
         })
         .unwrap();
-        let plugin = TunnelPlugin::new(dir.path().join("k"), Default::default());
+        let plugin = TunnelPlugin::new(
+            dir.path().join("k"),
+            Default::default(),
+            Arc::new(crate::secrets::SecretStore::new(dir.path().join("s.json"), None)),
+        );
         let _ = plugin.app.set(Arc::new(Pingora(Arc::new(Echo))));
         let _ = plugin.daemon.set(daemon);
 

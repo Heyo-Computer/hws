@@ -65,6 +65,10 @@ pub struct TunnelDialer {
     bridges: Mutex<HashMap<String, Bridge>>,
     /// One QUIC connection per remote node, shared by its bridges.
     connections: tokio::sync::Mutex<HashMap<String, Connection>>,
+    /// Tests dial loopback endpoints by their direct address, with no relay
+    /// or discovery to find them.
+    #[cfg(test)]
+    direct: Mutex<HashMap<String, EndpointAddr>>,
 }
 
 impl TunnelDialer {
@@ -76,7 +80,23 @@ impl TunnelDialer {
             endpoint: tokio::sync::OnceCell::new(),
             bridges: Mutex::new(HashMap::new()),
             connections: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            direct: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// A dialer on an endpoint the test bound, reaching `direct` nodes by
+    /// address.
+    #[cfg(test)]
+    pub fn for_test(registry: Arc<Registry>, endpoint: Endpoint, direct: Vec<EndpointAddr>) -> Arc<Self> {
+        Arc::new(Self {
+            secret: endpoint.secret_key().clone(),
+            registry,
+            endpoint: tokio::sync::OnceCell::new_with(Some(endpoint)),
+            bridges: Mutex::new(HashMap::new()),
+            connections: tokio::sync::Mutex::new(HashMap::new()),
+            direct: Mutex::new(direct.into_iter().map(|a| (a.id.to_string(), a)).collect()),
+        })
     }
 
     /// The id a remote app-lb must accept streams from.
@@ -123,6 +143,8 @@ impl TunnelDialer {
         conns.remove(node_id);
         let endpoint = self.endpoint().await?;
         let addr = Self::addr_for(node_id, relay_url)?;
+        #[cfg(test)]
+        let addr = self.direct.lock().unwrap().get(node_id).cloned().unwrap_or(addr);
         let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, crate::plugins::tunnel::ALPN))
             .await
             .map_err(|_| format!("timed out dialing tunnel node {node_id}"))?

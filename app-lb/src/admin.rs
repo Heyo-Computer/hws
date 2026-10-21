@@ -11081,6 +11081,69 @@ mod tests {
                 assert!(f.registry.get("desktop").is_none());
             }
 
+            /// The whole public side over real (loopback, relay-less) iroh: a
+            /// node registers, the dialer bridges a plain TCP request to it,
+            /// and the ordinary static health probe passes through the bridge.
+            #[tokio::test]
+            async fn a_registered_tunnel_is_bridged_to_its_node() {
+                use iroh::endpoint::presets::Minimal;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let bind = |alpn: bool| async move {
+                    let mut b = iroh::Endpoint::builder(Minimal).relay_mode(iroh::RelayMode::Disabled);
+                    if alpn {
+                        b = b.alpns(vec![crate::plugins::tunnel::ALPN.to_vec()]);
+                    }
+                    b.bind().await.unwrap()
+                };
+                // The node: answers every request on every stream with what it saw.
+                let node = bind(true).await;
+                let serving = node.clone();
+                tokio::spawn(async move {
+                    while let Some(incoming) = serving.accept().await {
+                        let Ok(conn) = incoming.await else { continue };
+                        tokio::spawn(async move {
+                            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                                tokio::spawn(async move {
+                                    let mut buf = vec![0u8; 4096];
+                                    let mut got = Vec::new();
+                                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        let Ok(Some(n)) = recv.read(&mut buf).await else { return };
+                                        got.extend_from_slice(&buf[..n]);
+                                    }
+                                    let head = String::from_utf8_lossy(&got).to_string();
+                                    let line = head.lines().next().unwrap_or_default().to_string();
+                                    let body = format!("node saw {line}");
+                                    let _ = send.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                                    let _ = send.finish();
+                                });
+                            }
+                        });
+                    }
+                });
+
+                let mut f = gated().await;
+                f.state.deploy_base_domain = Some("us2.heyo.work".into());
+                let dialer = crate::tunnel_dialer::TunnelDialer::for_test(f.registry.clone(), bind(false).await, vec![node.addr()]);
+                f.state.tunnels = Some(dialer.clone());
+
+                let auth = tunnel_token(&f, "sam", &[]);
+                let key = node.secret_key().clone();
+                let body = registration(&key, &key, "sam", "desktop", "admin.test", &["desktop--sam.us2.heyo.work"]);
+                let (status, out) = send(&f, "PUT", "/namespaces/sam/tunnels/desktop", &auth, body).await;
+                assert_eq!(status, StatusCode::OK, "{out}");
+
+                let d = f.registry.get("desktop").unwrap();
+                let bridge: std::net::SocketAddr = d.backends()[0].address.parse().unwrap();
+                let mut tcp = tokio::net::TcpStream::connect(bridge).await.unwrap();
+                tcp.write_all(b"GET /hello HTTP/1.1\r\nhost: desktop--sam.us2.heyo.work\r\n\r\n").await.unwrap();
+                let mut answer = String::new();
+                tokio::time::timeout(std::time::Duration::from_secs(10), tcp.read_to_string(&mut answer)).await.unwrap().unwrap();
+                assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+                assert!(answer.ends_with("node saw GET /hello HTTP/1.1"), "{answer}");
+
+                assert!(crate::health::probe(bridge, &d.spec.health).await, "the static probe reaches the node's health path");
+            }
+
             #[tokio::test]
             async fn a_registration_must_be_the_nodes_own_for_this_app_lb_and_within_policy() {
                 let f = with_tunnels().await;
