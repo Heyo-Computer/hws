@@ -355,6 +355,10 @@ pub struct TunnelPlugin {
     secrets: Arc<crate::secrets::SecretStore>,
     /// The configuration last applied, which says where tunnels live.
     config: RwLock<Option<Config>>,
+    /// This endpoint's incarnation, new on every apply: a dialer that sees
+    /// it change drops its connections to the old one instead of waiting for
+    /// them to time out.
+    epoch: RwLock<String>,
     external_tls: ExternalTlsHosts,
     /// Makes the pingora app streams are served by. Attached by `main` once
     /// the proxy exists, which is after the plugin host is built.
@@ -383,6 +387,7 @@ impl TunnelPlugin {
             daemon: OnceLock::new(),
             secrets,
             config: RwLock::new(None),
+            epoch: RwLock::new(String::new()),
             external_tls,
             app: OnceLock::new(),
             current: RwLock::new(None),
@@ -535,6 +540,7 @@ impl TunnelPlugin {
                 "node_id": node_id,
                 "relay_url": relay_url,
                 "hostnames": t.hostnames,
+                "epoch": *self.epoch.read().unwrap(),
                 "proof": {"ts": ts, "sig": crate::tunnel_dialer::sign_proof(key, &msg)},
             });
             let url = format!("{}/namespaces/{}/tunnels/{}", cfg.base(), cfg.namespace, t.name);
@@ -821,6 +827,11 @@ impl Plugin for TunnelPlugin {
             self.daemon()?;
         }
         *self.config.write().unwrap() = Some(cfg.clone());
+        *self.epoch.write().unwrap() = {
+            let mut bytes = [0u8; 8];
+            openssl::rand::rand_bytes(&mut bytes).map_err(|e| format!("entropy for the tunnel epoch: {e}"))?;
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        };
         let key = load_or_create_key(&self.key_path)?;
         let endpoint = Endpoint::builder(N0)
             .secret_key(key.clone())

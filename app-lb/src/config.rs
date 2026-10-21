@@ -3667,6 +3667,11 @@ pub struct TunnelSpec {
     /// When the remote last registered, stamped by app-lb.
     #[serde(default)]
     pub renewed_at: u64,
+    /// The remote's endpoint incarnation, new each time it comes up. A change
+    /// means the connections to the old one are dead, however alive they
+    /// look: they are dropped and dialed again at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
 }
 
 pub const MIN_TUNNEL_LEASE: u64 = 60;

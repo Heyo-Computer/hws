@@ -397,6 +397,8 @@ struct WireTunnel {
     node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<String>,
 }
 
 impl WirePeer {
@@ -405,7 +407,7 @@ impl WirePeer {
             address: self.address.parse().map_err(|e| format!("invalid manager peer address: {e}"))?,
             tls: self.tls,
             sni: self.sni,
-            tunnel: self.tunnel.map(|t| crate::request_control::TunnelTarget { node_id: t.node_id, relay_url: t.relay_url }),
+            tunnel: self.tunnel.map(|t| crate::request_control::TunnelTarget { node_id: t.node_id, relay_url: t.relay_url, epoch: t.epoch }),
         })
     }
 }
@@ -507,7 +509,7 @@ pub async fn serve(
                         address: peer.address.to_string(),
                         tls: peer.tls,
                         sni: peer.sni,
-                        tunnel: peer.tunnel.map(|t| WireTunnel { node_id: t.node_id, relay_url: t.relay_url }),
+                        tunnel: peer.tunnel.map(|t| WireTunnel { node_id: t.node_id, relay_url: t.relay_url, epoch: t.epoch }),
                     };
                     send!(ServerMessage::Peer { peer: wire, sandbox_id, retry_allowed: state.retry_allowed() });
                 }

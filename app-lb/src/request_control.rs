@@ -217,6 +217,7 @@ pub struct Peer {
 pub struct TunnelTarget {
     pub node_id: String,
     pub relay_url: Option<String>,
+    pub epoch: Option<String>,
 }
 
 #[derive(Default)]
@@ -531,6 +532,7 @@ impl RequestControl {
         peer.tunnel = state.deployment.as_ref().and_then(|d| d.spec.tunnel.as_ref()).map(|t| TunnelTarget {
             node_id: t.node_id.clone(),
             relay_url: t.relay_url.clone(),
+            epoch: t.epoch.clone(),
         });
         Ok(peer)
     }

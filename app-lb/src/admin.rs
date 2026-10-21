@@ -2672,6 +2672,9 @@ struct TunnelRegistration {
     hostnames: Vec<String>,
     #[serde(default)]
     lease_secs: Option<u64>,
+    /// The node's incarnation; see `TunnelSpec::epoch`.
+    #[serde(default)]
+    epoch: Option<String>,
     proof: TunnelProof,
 }
 
@@ -2844,6 +2847,7 @@ async fn register_tunnel(
         relay_url: body.relay_url.filter(|r| !r.is_empty()),
         lease_secs: body.lease_secs.unwrap_or(300),
         renewed_at: now,
+        epoch: body.epoch.filter(|e| !e.is_empty() && e.len() <= 64),
     };
     let routes: Vec<crate::config::RouteRule> = hosts
         .iter()
@@ -2853,7 +2857,7 @@ async fn register_tunnel(
     // maintenance): only where the node is, and what it claims, are the
     // node's to say.
     let same_pool = existing.as_ref().is_some_and(|old| {
-        old.spec.tunnel.as_ref().is_some_and(|t| t.node_id == tunnel.node_id && t.relay_url == tunnel.relay_url)
+        old.spec.tunnel.as_ref().is_some_and(|t| t.node_id == tunnel.node_id && t.relay_url == tunnel.relay_url && t.epoch == tunnel.epoch)
             && old.spec.routes == routes
     });
     let mut spec = match &existing {

@@ -1257,6 +1257,13 @@
       "description": "Where a tunnel deployment's backend is: an app-lb behind NAT that\nregistered itself through `PUT /namespaces/:ns/tunnels/:name`\n(`docs/design/app-lb-namespace-tunnels.md`).\n\nNo address is ever given: a node id is a public key iroh authenticates on\nconnect, so a namespace cannot aim this at the public host's loopback or\nprivate network the way a static upstream list can.",
       "type": "object",
       "properties": {
+        "epoch": {
+          "description": "The remote's endpoint incarnation, new each time it comes up. A change\nmeans the connections to the old one are dead, however alive they\nlook: they are dropped and dialed again at once.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "lease_secs": {
           "description": "How long a registration stays live without a refresh. Past it the\ntunnel is offline (no backend) but stays registered.",
           "type": "integer",

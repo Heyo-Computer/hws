@@ -66,9 +66,22 @@ pub fn key_path(state_path: &str) -> PathBuf {
     p.with_file_name(format!("{base}-tunnel-dialer.key"))
 }
 
-struct Bridge {
+/// Which node, where, and which incarnation of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
     node_id: String,
     relay_url: Option<String>,
+    epoch: Option<String>,
+}
+
+impl Target {
+    fn new(node_id: &str, relay_url: Option<&str>, epoch: Option<&str>) -> Self {
+        Self { node_id: node_id.into(), relay_url: relay_url.map(Into::into), epoch: epoch.map(Into::into) }
+    }
+}
+
+struct Bridge {
+    target: Target,
     /// The loopback `host:port` the deployment's backend points at.
     address: String,
     accept: tokio::task::JoinHandle<()>,
@@ -94,8 +107,9 @@ pub struct TunnelDialer {
     endpoint: tokio::sync::OnceCell<Endpoint>,
     /// One per tunnel deployment this host serves, by deployment id.
     bridges: Mutex<HashMap<String, Bridge>>,
-    /// One QUIC connection per remote node, shared by its bridges.
-    connections: tokio::sync::Mutex<HashMap<String, Connection>>,
+    /// One QUIC connection per remote node, shared by its bridges, with the
+    /// incarnation it was made to.
+    connections: tokio::sync::Mutex<HashMap<String, (Option<String>, Connection)>>,
     /// Tests dial loopback endpoints by their direct address, with no relay
     /// or discovery to find them.
     #[cfg(test)]
@@ -169,14 +183,20 @@ impl TunnelDialer {
 
     /// A worker's loopback bridge to `node_id`, opened the first time it is
     /// asked for.
-    pub fn address_for(self: &Arc<Self>, node_id: &str, relay_url: Option<&str>) -> std::io::Result<std::net::SocketAddr> {
+    pub fn address_for(
+        self: &Arc<Self>,
+        node_id: &str,
+        relay_url: Option<&str>,
+        epoch: Option<&str>,
+    ) -> std::io::Result<std::net::SocketAddr> {
+        let target = Target::new(node_id, relay_url, epoch);
         let mut bridges = self.by_node.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(b) = bridges.get(node_id)
-            && b.relay_url.as_deref() == relay_url
+            && b.target == target
         {
             return b.address.parse().map_err(std::io::Error::other);
         }
-        let b = self.start_bridge(node_id, relay_url)?;
+        let b = self.start_bridge(target)?;
         let address = b.address.parse().map_err(std::io::Error::other)?;
         tracing::info!(node = node_id, bridge = %b.address, "worker tunnel bridge listening");
         bridges.insert(node_id.to_string(), b);
@@ -186,8 +206,15 @@ impl TunnelDialer {
     async fn endpoint(&self) -> Result<&Endpoint, String> {
         self.endpoint
             .get_or_try_init(|| async {
+                // Keep-alives every 5s (iroh's default) and a 10s idle
+                // timeout, so a node that vanished without a word is noticed
+                // in seconds rather than iroh's default 30.
+                let transport = iroh::endpoint::QuicTransportConfig::builder()
+                    .max_idle_timeout(Some(Duration::from_secs(10).try_into().expect("10s is a valid idle timeout")))
+                    .build();
                 let ep = Endpoint::builder(N0)
                     .secret_key(self.secret.clone())
+                    .transport_config(transport)
                     .relay_mode(crate::plugins::tunnel::relay_mode())
                     .bind()
                     .await
@@ -212,14 +239,21 @@ impl TunnelDialer {
         Ok(addr)
     }
 
-    async fn connection(&self, node_id: &str, relay_url: Option<&str>) -> Result<Connection, String> {
+    async fn connection(&self, target: &Target) -> Result<Connection, String> {
+        let node_id = target.node_id.as_str();
         let mut conns = self.connections.lock().await;
-        if let Some(conn) = conns.get(node_id)
-            && conn.close_reason().is_none()
-        {
-            return Ok(conn.clone());
+        if let Some((epoch, conn)) = conns.get(node_id) {
+            if conn.close_reason().is_none() && *epoch == target.epoch {
+                return Ok(conn.clone());
+            }
+            if *epoch != target.epoch {
+                // The node came up again: what this connection reached is gone.
+                tracing::info!(node = node_id, "tunnel node restarted; dialing its new incarnation");
+                conn.close(0u32.into(), b"superseded");
+            }
         }
         conns.remove(node_id);
+        let relay_url = target.relay_url.as_deref();
         let endpoint = self.endpoint().await?;
         let addr = Self::addr_for(node_id, relay_url)?;
         #[cfg(test)]
@@ -229,29 +263,25 @@ impl TunnelDialer {
             .map_err(|_| format!("timed out dialing tunnel node {node_id}"))?
             .map_err(|e| format!("dialing tunnel node {node_id}: {e}"))?;
         tracing::info!(node = node_id, "tunnel connected");
-        conns.insert(node_id.to_string(), conn.clone());
+        conns.insert(node_id.to_string(), (target.epoch.clone(), conn.clone()));
         Ok(conn)
     }
 
     async fn evict(&self, node_id: &str) {
-        if let Some(conn) = self.connections.lock().await.remove(node_id) {
+        if let Some((_, conn)) = self.connections.lock().await.remove(node_id) {
             conn.close(0u32.into(), b"evicted");
         }
     }
 
-    /// Carry one loopback connection over a fresh stream to the node.
     /// A fresh stream to the node. A connection that turns out to be dead
     /// when the stream is opened — the node restarted, and its old connection
     /// is gone — is dropped and dialed again once: nothing has been sent on it,
     /// so a retry cannot repeat anything.
-    pub async fn open_stream(
-        &self,
-        node_id: &str,
-        relay_url: Option<&str>,
-    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), String> {
+    async fn open_stream(&self, target: &Target) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), String> {
+        let node_id = target.node_id.as_str();
         let mut last = String::new();
         for attempt in 0..2 {
-            let conn = match self.connection(node_id, relay_url).await {
+            let conn = match self.connection(target).await {
                 Ok(conn) => conn,
                 Err(e) => return Err(e),
             };
@@ -269,8 +299,9 @@ impl TunnelDialer {
     }
 
     /// Carry one loopback connection over a fresh stream to the node.
-    async fn bridge(self: Arc<Self>, mut tcp: tokio::net::TcpStream, node_id: String, relay_url: Option<String>) {
-        let (send, recv) = match self.open_stream(&node_id, relay_url.as_deref()).await {
+    async fn bridge(self: Arc<Self>, mut tcp: tokio::net::TcpStream, target: Target) {
+        let node_id = &target.node_id;
+        let (send, recv) = match self.open_stream(&target).await {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(node = %node_id, error = %e, "tunnel unreachable");
@@ -283,21 +314,21 @@ impl TunnelDialer {
         }
     }
 
-    fn start_bridge(self: &Arc<Self>, node_id: &str, relay_url: Option<&str>) -> std::io::Result<Bridge> {
+    fn start_bridge(self: &Arc<Self>, target: Target) -> std::io::Result<Bridge> {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         std_listener.set_nonblocking(true)?;
         let address = std_listener.local_addr()?.to_string();
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
         let me = Arc::downgrade(self);
-        let (node, relay) = (node_id.to_string(), relay_url.map(str::to_string));
+        let bridged = target.clone();
         let accept = tokio::spawn(async move {
             loop {
                 let Ok((tcp, _)) = listener.accept().await else { continue };
                 let Some(me) = me.upgrade() else { return };
-                tokio::spawn(me.bridge(tcp, node.clone(), relay.clone()));
+                tokio::spawn(me.bridge(tcp, bridged.clone()));
             }
         });
-        Ok(Bridge { node_id: node_id.to_string(), relay_url: relay_url.map(str::to_string), address, accept })
+        Ok(Bridge { target, address, accept })
     }
 
     /// Bring bridges and backends in line with the registry: a bridge per
@@ -310,14 +341,14 @@ impl TunnelDialer {
         let mut bridges = self.bridges.lock().unwrap_or_else(|e| e.into_inner());
         bridges.retain(|id, b| {
             deployments.get(id.as_str()).and_then(|d| d.spec.tunnel.as_ref()).is_some_and(|t| {
-                t.node_id == b.node_id && t.relay_url == b.relay_url
+                b.target == Target::new(&t.node_id, t.relay_url.as_deref(), t.epoch.as_deref())
             })
         });
         for d in deployments.values() {
             let Some(tunnel) = &d.spec.tunnel else { continue };
             let id = d.spec.id.clone();
             if !bridges.contains_key(&id) {
-                match self.start_bridge(&tunnel.node_id, tunnel.relay_url.as_deref()) {
+                match self.start_bridge(Target::new(&tunnel.node_id, tunnel.relay_url.as_deref(), tunnel.epoch.as_deref())) {
                     Ok(b) => {
                         tracing::info!(deployment = %id, node = %tunnel.node_id, bridge = %b.address, "tunnel bridge listening");
                         bridges.insert(id.clone(), b);
@@ -471,13 +502,78 @@ mod tests {
             direct: Mutex::new([(node.id().to_string(), node.addr())].into_iter().collect()),
         });
         let node_id = node.id().to_string();
-        let address = dialer.address_for(&node_id, None).unwrap();
-        assert_eq!(dialer.address_for(&node_id, None).unwrap(), address, "one bridge per node");
+        let address = dialer.address_for(&node_id, None, Some("e1")).unwrap();
+        assert_eq!(dialer.address_for(&node_id, None, Some("e1")).unwrap(), address, "one bridge per node");
         let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
         tcp.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
         let mut got = String::new();
         tokio::time::timeout(Duration::from_secs(10), tcp.read_to_string(&mut got)).await.unwrap().unwrap();
         assert_eq!(got, "from the node");
+    }
+
+    /// A node that came up again is dialed at once, however alive the old
+    /// connection looks: its new epoch says the old one reaches nothing.
+    #[tokio::test]
+    async fn a_new_epoch_is_dialed_at_once_instead_of_waiting_out_a_stale_connection() {
+        use iroh::endpoint::presets::Minimal;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = SecretKey::generate();
+        let bind = |key: Option<SecretKey>| async move {
+            let mut b = Endpoint::builder(Minimal).relay_mode(iroh::RelayMode::Disabled);
+            if let Some(key) = key {
+                b = b.secret_key(key).alpns(vec![crate::plugins::tunnel::ALPN.to_vec()]);
+            }
+            b.bind().await.unwrap()
+        };
+        let serve = |ep: Endpoint, says: &'static [u8]| {
+            tokio::spawn(async move {
+                while let Some(incoming) = ep.accept().await {
+                    let Ok(conn) = incoming.await else { continue };
+                    tokio::spawn(async move {
+                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            let mut buf = [0u8; 64];
+                            let _ = recv.read(&mut buf).await;
+                            let _ = send.write_all(says).await;
+                            let _ = send.finish();
+                        }
+                    });
+                }
+            })
+        };
+        let ask = |address: std::net::SocketAddr| async move {
+            let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+            tcp.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+            let mut got = String::new();
+            tokio::time::timeout(Duration::from_secs(3), tcp.read_to_string(&mut got)).await.map(|_| got)
+        };
+
+        let old = bind(Some(key.clone())).await;
+        let serving = serve(old.clone(), b"old");
+        let endpoint = bind(None).await;
+        let node_id = key.public().to_string();
+        let dialer = Arc::new(TunnelDialer {
+            secret: endpoint.secret_key().clone(),
+            registry: None,
+            worker_ids: Vec::new(),
+            by_node: Mutex::new(HashMap::new()),
+            endpoint: tokio::sync::OnceCell::new_with(Some(endpoint)),
+            bridges: Mutex::new(HashMap::new()),
+            connections: tokio::sync::Mutex::new(HashMap::new()),
+            direct: Mutex::new([(node_id.clone(), old.addr())].into_iter().collect()),
+        });
+        let first = dialer.address_for(&node_id, None, Some("e1")).unwrap();
+        assert_eq!(ask(first).await.unwrap(), "old");
+
+        // It goes quiet without a word (the old process is gone), and comes
+        // back as a new endpoint with the same key.
+        serving.abort();
+        let new = bind(Some(key)).await;
+        let _serving = serve(new.clone(), b"new");
+        dialer.direct.lock().unwrap().insert(node_id.clone(), new.addr());
+
+        let again = dialer.address_for(&node_id, None, Some("e2")).unwrap();
+        assert_eq!(ask(again).await.expect("the new incarnation is dialed, not waited for"), "new");
+        drop(old);
     }
 
     #[test]

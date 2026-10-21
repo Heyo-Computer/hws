@@ -542,7 +542,7 @@ impl ProxyHttp for LbProxy {
         };
         let mut selected_peer = selected.peer;
         if let (Some(target), Some(dialer)) = (&selected_peer.tunnel, &self.tunnels) {
-            match dialer.address_for(&target.node_id, target.relay_url.as_deref()) {
+            match dialer.address_for(&target.node_id, target.relay_url.as_deref(), target.epoch.as_deref()) {
                 Ok(address) => selected_peer.address = address,
                 Err(e) => tracing::warn!(node = %target.node_id, error = %e, "worker tunnel bridge unavailable; using the manager's"),
             }
