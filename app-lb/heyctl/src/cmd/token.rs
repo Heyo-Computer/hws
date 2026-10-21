@@ -61,6 +61,12 @@ pub struct MintArgs {
     #[arg(long, value_name = "NAMESPACE")]
     pub namespace: Option<String>,
 
+    /// A tunnel token, for an app-lb behind NAT: it may only register the
+    /// namespace's tunnels — the named ones, or any with no name — and reach
+    /// nothing else. Needs --namespace; implies no admin scope.
+    #[arg(long, value_name = "NAME", num_args = 0.., requires = "namespace", conflicts_with_all = ["deployments", "all_deployments", "all_servers"])]
+    pub tunnel: Option<Vec<String>>,
+
     /// Expire after this many hours.
     #[arg(long, value_name = "HOURS")]
     pub expires_in: Option<u64>,
@@ -143,7 +149,13 @@ fn scope_of(deployments: &[String], all: bool) -> Vec<String> {
 }
 
 fn mint(ctx: &Ctx, args: &MintArgs) -> Result<()> {
-    let deployments = scope_of(&args.deployments, args.all_deployments);
+    let deployments = match &args.tunnel {
+        Some(names) => names.clone(),
+        None => scope_of(&args.deployments, args.all_deployments),
+    };
+    if args.tunnel.is_some() && !matches!(args.admin, AdminScopeArg::None) {
+        bail!("a tunnel token holds no admin scope; drop --admin");
+    }
 
     // A token with neither an admin scope nor a deployment can do nothing at
     // all. That is a safe default for a *forgotten* field and a mistake when
@@ -171,6 +183,9 @@ fn mint(ctx: &Ctx, args: &MintArgs) -> Result<()> {
     }
     if args.all_servers {
         req = req.on_all_servers();
+    }
+    if args.tunnel.is_some() {
+        req = req.for_tunnels();
     }
 
     let minted = ctx.client.raw().mint_token(&req)?;
@@ -208,10 +223,11 @@ fn scope_cell(t: &TokenSummary) -> String {
     } else {
         t.deployments.join(",")
     };
-    match &t.namespace {
+    let scope = match &t.namespace {
         Some(ns) => format!("{ns}:{deployments}"),
         None => deployments,
-    }
+    };
+    if t.tunnel { format!("tunnel {scope}") } else { scope }
 }
 
 /// Where the token works: this server, every server, or every server by way
@@ -383,7 +399,7 @@ mod tests {
     }
 
     fn token(deployments: &[&str], expires_at: Option<u64>) -> TokenSummary {
-        TokenSummary {
+        TokenSummary { tunnel: false,
             id: "abc".into(),
             name: "t".into(),
             admin: AdminScope::Admin,
