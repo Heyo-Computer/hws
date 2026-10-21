@@ -1283,7 +1283,6 @@
           "minimum": 0
         }
       },
-      "additionalProperties": false,
       "required": [
         "node_id"
       ]

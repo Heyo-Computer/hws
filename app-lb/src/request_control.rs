@@ -231,6 +231,10 @@ pub struct RequestState {
     fleet: bool,
     /// This request goes to its deployment's home host, once.
     hop_out: Option<HopOut>,
+    /// The client, as this host judged it: the socket peer, a fleet hop's
+    /// vouched client, or a tunnel ingress's dialer's word. Told to a
+    /// tunnel's remote app-lb, which has no socket peer of its own.
+    client: Option<std::net::IpAddr>,
 }
 
 impl RequestState {
@@ -298,6 +302,16 @@ impl RequestState {
         }
         if let Some(prefix) = self.route_prefix.as_deref() {
             out.push(HeaderModification::RewriteUri(strip_uri_prefix(uri, prefix)));
+        }
+        // A tunnel's remote app-lb sees the dialer, not the visitor: tell it
+        // who this host judged the visitor to be. Whatever the client sent
+        // under this name was stripped at ingress.
+        if self.deployment.as_ref().is_some_and(|d| d.spec.tunnel.is_some()) {
+            let name = http::HeaderName::from_static(crate::proxy::TUNNEL_CLIENT_IP);
+            match self.client {
+                Some(ip) => out.push(HeaderModification::Set(name, value(&ip.to_string(), "tunnel client")?)),
+                None => out.push(HeaderModification::Remove(name)),
+            }
         }
         match &self.cookie_rewrite {
             None => {}
@@ -550,6 +564,7 @@ impl RequestControl {
             }
             _ => head,
         };
+        state.client = head.peer.map(|p| p.ip());
         let mut routed = self.registry.route(host.as_deref(), &path);
         if routed.is_none() && let Some(foreign) = self.registry.route_foreign(host.as_deref(), &path) {
             // A pinned deployment's home, or, for a spread one this host does

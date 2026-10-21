@@ -942,7 +942,7 @@ fn job_records_are_stable() {
 fn token_responses_are_stable() {
     use crate::tokens::{AdminScope, TokenSummary};
 
-    let fleet = TokenSummary {
+    let fleet = TokenSummary { tunnel: false,
         id: "7f3a9c2b1e4d".into(),
         name: "ci".into(),
         admin: AdminScope::Admin,
@@ -961,7 +961,7 @@ fn token_responses_are_stable() {
     // `us2`, mirrored here, and changed or revoked only there.
     golden(
         "token-summary-mirrored",
-        &TokenSummary {
+        &TokenSummary { tunnel: false,
             id: "c3d4e5f6a1b2".into(),
             name: "deploy bot".into(),
             admin: AdminScope::Admin,
@@ -979,7 +979,7 @@ fn token_responses_are_stable() {
     // The narrow shape: an agent's own sandbox, no admin API access, expiring.
     golden(
         "token-summary-scoped",
-        &TokenSummary {
+        &TokenSummary { tunnel: false,
             id: "a1b2c3d4e5f6".into(),
             name: "sandbox sb-7f3a9c".into(),
             admin: AdminScope::None,
@@ -999,7 +999,7 @@ fn token_responses_are_stable() {
     // that misreads this walls a token into the wrong rooms.
     golden(
         "token-summary-namespaced",
-        &TokenSummary {
+        &TokenSummary { tunnel: false,
             id: "b2c3d4e5f6a1".into(),
             name: "team-a operator".into(),
             admin: AdminScope::Admin,

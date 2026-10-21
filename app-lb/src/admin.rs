@@ -179,6 +179,10 @@ struct AdminState {
     /// One-time transfer URLs for large files. Absent without
     /// `APP_LB_TRANSFER_URL`, where the routes answer 501.
     transfers: Option<Arc<crate::transfers::Transfers>>,
+    /// Dials tunnel deployments' remote app-lbs. Absent where tunnels are not
+    /// served (tests that do not need them), and the registration routes
+    /// then answer 501.
+    tunnels: Option<Arc<crate::tunnel_dialer::TunnelDialer>>,
     /// The shared fleet store, in fleet mode. Mutations are refused while it
     /// cannot be written, and a write it refuses answers 409 or 503.
     fleet_store: Option<Arc<crate::fleet_sync::Fleet>>,
@@ -406,6 +410,7 @@ impl AdminApi {
                 views: None,
                 operations: None,
                 transfers: None,
+                tunnels: None,
                 fleet_store: None,
                 token_sync: Default::default(),
                 images: None,
@@ -458,6 +463,11 @@ impl AdminApi {
 
     pub fn with_transfers(mut self, transfers: Option<Arc<crate::transfers::Transfers>>) -> Self {
         self.state.transfers = transfers;
+        self
+    }
+
+    pub fn with_tunnel_dialer(mut self, dialer: Arc<crate::tunnel_dialer::TunnelDialer>) -> Self {
+        self.state.tunnels = Some(dialer);
         self
     }
 
@@ -911,6 +921,18 @@ fn decide_access(
         return Verdict::Unauthorized;
     };
 
+    // A tunnel token registers its tunnels and does nothing else: no other
+    // route, and no tier — it holds none, which is what keeps it narrow.
+    if let Caller::Token(t) = &caller
+        && t.tunnel
+    {
+        let ns = req.matched.and_then(|m| namespace_tunnel_target(m, req.path));
+        return match ns {
+            Some(ns) if caller.reaches_namespace(ns) => Verdict::Allow(caller),
+            _ => Verdict::Forbidden("a tunnel token can only register its own namespace's tunnels".into()),
+        };
+    }
+
     if !caller.satisfies_in(want, req.target_namespace) {
         return Verdict::Forbidden(
             match want {
@@ -939,6 +961,14 @@ fn decide_access(
                 if !caller.reaches_namespace(ns) {
                     return Verdict::Forbidden(format!(
                         "this token cannot reach the \"{ns}\" namespace's artifacts"
+                    ));
+                }
+            }
+            None if namespace_tunnel_target(matched, req.path).is_some() => {
+                let ns = namespace_tunnel_target(matched, req.path).unwrap_or_default();
+                if !caller.reaches_namespace(ns) {
+                    return Verdict::Forbidden(format!(
+                        "this token cannot reach the \"{ns}\" namespace's tunnels"
                     ));
                 }
             }
@@ -1072,7 +1102,7 @@ async fn authorize(
             matched
                 .as_deref()
                 .and_then(|m| {
-                    namespace_plugin_target(m, &path).or_else(|| namespace_artifact_target(m, &path))
+                    namespace_plugin_target(m, &path).or_else(|| namespace_artifact_target(m, &path)).or_else(|| namespace_tunnel_target(m, &path))
                 })
                 .map(str::to_owned)
         });
@@ -2536,6 +2566,14 @@ fn namespace_plugin_target<'a>(matched: &str, path: &'a str) -> Option<&'a str> 
     path.split('/').nth(2).filter(|s| !s.is_empty())
 }
 
+/// The namespace a `/namespaces/:name/tunnels…` route acts on.
+fn namespace_tunnel_target<'a>(matched: &str, path: &'a str) -> Option<&'a str> {
+    if !matched.starts_with("/namespaces/:name/tunnels") {
+        return None;
+    }
+    path.split('/').nth(2).filter(|s| !s.is_empty())
+}
+
 /// The namespace a `/namespaces/:name/artifacts…` route acts on.
 fn namespace_artifact_target<'a>(matched: &str, path: &'a str) -> Option<&'a str> {
     if matched != "/namespaces/:name/artifacts" && !matched.starts_with("/namespaces/:name/artifacts/") {
@@ -2610,6 +2648,269 @@ fn bad_namespace(ns: &str) -> Option<Response> {
     (!crate::config::is_valid_namespace(ns)).then(|| {
         err(StatusCode::BAD_REQUEST, format!("{ns:?} is not a valid namespace name")).into_response()
     })
+}
+
+// ---- namespace tunnels ----------------------------------------------------
+//
+// An app-lb behind NAT registers itself here as a `tunnel` deployment in a
+// namespace (`docs/design/app-lb-namespace-tunnels.md`). The deployment is an
+// ordinary one — routes, certificates, the auth gate — whose backend this
+// host's tunnel dialer bridges to the registering node.
+
+/// The most hostnames one tunnel may claim.
+const MAX_TUNNEL_HOSTS: usize = 10;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TunnelRegistration {
+    node_id: String,
+    #[serde(default)]
+    relay_url: Option<String>,
+    hostnames: Vec<String>,
+    #[serde(default)]
+    lease_secs: Option<u64>,
+    proof: TunnelProof,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TunnelProof {
+    ts: u64,
+    sig: String,
+}
+
+#[derive(Serialize)]
+struct TunnelRegistered {
+    deployment: String,
+    namespace: String,
+    urls: Vec<String>,
+    /// The endpoint ids that will dial the node: the only ones it should let in.
+    dialer_ids: Vec<String>,
+    lease_secs: u64,
+}
+
+/// A tunnel's name is its deployment id: one DNS-safe label.
+fn valid_tunnel_name(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The host this request was addressed to, as a proof names it.
+fn request_host(headers: &HeaderMap) -> String {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let host = host
+        .rsplit_once(':')
+        .filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(host, |(h, _)| h);
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// May `caller` register or release tunnel `name` in `ns`? The gate has
+/// already confined it to `ns`.
+fn may_register_tunnel(caller: Option<&Caller>, ns: &str, name: &str) -> bool {
+    match caller {
+        None | Some(Caller::Operator | Caller::Ungated) => true,
+        Some(Caller::Token(t)) if t.tunnel => t.deployments.is_empty() || t.allows(name),
+        Some(c) => c.administers_namespace(ns),
+    }
+}
+
+/// `GET /namespaces/:name/tunnels` — the namespace's tunnels and whether each
+/// is live.
+async fn namespace_tunnels(State(state): State<AdminState>, Path(ns): Path<String>) -> Response {
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    let now = now_secs();
+    let mut rows: Vec<serde_json::Value> = state
+        .registry
+        .deployments()
+        .values()
+        .filter(|d| d.spec.namespace == ns)
+        .filter_map(|d| {
+            let t = d.spec.tunnel.as_ref()?;
+            Some(serde_json::json!({
+                "name": d.spec.id,
+                "hostnames": d.spec.routes.iter().filter_map(|r| r.host.clone()).collect::<Vec<_>>(),
+                "node_id": t.node_id,
+                "live": t.live(now),
+                "healthy": d.backends().iter().any(|b| b.is_available()),
+                "renewed_at": t.renewed_at,
+                "lease_secs": t.lease_secs,
+            }))
+        })
+        .collect();
+    rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Json(rows).into_response()
+}
+
+/// `PUT /namespaces/:name/tunnels/:tunnel` — register, or refresh, a tunnel.
+async fn register_tunnel(
+    State(state): State<AdminState>,
+    Path((ns, name)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+    headers: HeaderMap,
+    Json(body): Json<TunnelRegistration>,
+) -> Response {
+    let caller = caller.as_deref();
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    let Some(dialer) = state.tunnels.clone() else {
+        return err(StatusCode::NOT_IMPLEMENTED, "this app-lb does not serve tunnels").into_response();
+    };
+    if !valid_tunnel_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "a tunnel name is one lowercase DNS label").into_response();
+    }
+    if !may_register_tunnel(caller, &ns, &name) {
+        return err(StatusCode::FORBIDDEN, out_of_scope(&name)).into_response();
+    }
+
+    // The node proves it is the node: otherwise a namespace could point its
+    // hostname at somebody else's app-lb.
+    let now = now_secs();
+    if body.proof.ts.abs_diff(now) > crate::tunnel_dialer::PROOF_SKEW_SECS {
+        return err(StatusCode::BAD_REQUEST, "proof.ts is too far from this app-lb's clock").into_response();
+    }
+    let message = crate::tunnel_dialer::proof_message(&ns, &name, &body.node_id, body.proof.ts, &request_host(&headers));
+    if let Err(why) = crate::tunnel_dialer::verify_proof(&body.node_id, &message, &body.proof.sig) {
+        return err(StatusCode::FORBIDDEN, why).into_response();
+    }
+
+    // Which hostnames: the operator's policy for the namespace, else one label
+    // under the deploy base ending `--<namespace>`.
+    let mut hosts: Vec<String> = body.hostnames.iter().map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase()).collect();
+    hosts.sort();
+    hosts.dedup();
+    if hosts.is_empty() || hosts.len() > MAX_TUNNEL_HOSTS {
+        return err(StatusCode::BAD_REQUEST, format!("a tunnel claims 1 to {MAX_TUNNEL_HOSTS} hostnames")).into_response();
+    }
+    let declared = state.namespaces.get(&ns).map(|n| n.hosts.clone()).unwrap_or_default();
+    let policy = if declared.is_empty() {
+        crate::config::default_tunnel_hosts(&ns, state.deploy_base_domain.as_deref())
+    } else {
+        Some(declared)
+    };
+    let Some(policy) = policy else {
+        return err(
+            StatusCode::CONFLICT,
+            format!("namespace {ns:?} has no hostnames for tunnels: the operator declares its `hosts`"),
+        )
+        .into_response();
+    };
+    if let Some(bad) = hosts.iter().find(|h| !crate::config::host_allowed(&policy, h)) {
+        return err(
+            StatusCode::FORBIDDEN,
+            format!("{bad:?} is outside the hostnames namespace {ns:?} may claim ({})", policy.join(", ")),
+        )
+        .into_response();
+    }
+
+    let _change = state.registry.change_guard().await;
+    let existing = state.registry.get(&name);
+    if let Some(old) = &existing {
+        if old.spec.namespace != ns {
+            return err(StatusCode::FORBIDDEN, out_of_scope(&name)).into_response();
+        }
+        if old.spec.tunnel.is_none() {
+            return err(StatusCode::CONFLICT, format!("{name:?} is a deployment, not a tunnel")).into_response();
+        }
+    }
+    if state.registry.foreign().contains_key(&name) {
+        return err(StatusCode::CONFLICT, format!("{name:?} is placed on another fleet host")).into_response();
+    }
+
+    let tunnel = crate::config::TunnelSpec {
+        node_id: body.node_id.to_ascii_lowercase(),
+        relay_url: body.relay_url.filter(|r| !r.is_empty()),
+        lease_secs: body.lease_secs.unwrap_or(300),
+        renewed_at: now,
+    };
+    let routes: Vec<crate::config::RouteRule> = hosts
+        .iter()
+        .map(|h| serde_json::from_value(serde_json::json!({ "host": h })).expect("a host route"))
+        .collect();
+    // A refresh keeps everything the namespace set since (an auth gate,
+    // maintenance): only where the node is, and what it claims, are the
+    // node's to say.
+    let same_pool = existing.as_ref().is_some_and(|old| {
+        old.spec.tunnel.as_ref().is_some_and(|t| t.node_id == tunnel.node_id && t.relay_url == tunnel.relay_url)
+            && old.spec.routes == routes
+    });
+    let mut spec = match &existing {
+        Some(old) => old.spec.clone(),
+        None => match serde_json::from_value::<DeploymentSpec>(serde_json::json!({
+            "id": name, "namespace": ns, "routes": [], "tunnel": tunnel,
+        })) {
+            Ok(spec) => spec,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+    };
+    spec.routes = routes;
+    spec.tunnel = Some(tunnel);
+    spec.health.path = Some(crate::proxy::TUNNEL_HEALTH_PATH.into());
+    if spec.placement.is_none()
+        && let Some(host) = state.registry.fleet_host()
+    {
+        spec.placement = Some(crate::config::Placement::pinned(host));
+    }
+    stamp_owner(&mut spec, caller);
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Some(host) = unclaimable_host(&state, &spec) {
+        return err(StatusCode::CONFLICT, format!("host {host:?} is routed by another namespace")).into_response();
+    }
+    let lease_secs = spec.tunnel.as_ref().map_or(300, |t| t.lease_secs);
+    let urls = hosts.iter().map(|h| format!("https://{h}")).collect();
+    if same_pool {
+        state.registry.update(spec);
+    } else {
+        state.registry.upsert(spec);
+    }
+    if let Err(e) = state.registry.persist_one(&name) {
+        tracing::error!(tunnel = %name, error = %e, "tunnel registration was not persisted");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not persist the tunnel").into_response();
+    }
+    dialer.sync();
+    if !same_pool {
+        tracing::info!(namespace = %ns, tunnel = %name, hosts = ?hosts, "tunnel registered");
+    }
+    Json(TunnelRegistered { deployment: name, namespace: ns, urls, dialer_ids: vec![dialer.id()], lease_secs }).into_response()
+}
+
+/// `DELETE /namespaces/:name/tunnels/:tunnel` — release one.
+async fn release_namespace_tunnel(
+    State(state): State<AdminState>,
+    Path((ns, name)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    let caller = caller.as_deref();
+    if let Some(r) = bad_namespace(&ns) {
+        return r;
+    }
+    if !may_register_tunnel(caller, &ns, &name) {
+        return err(StatusCode::FORBIDDEN, out_of_scope(&name)).into_response();
+    }
+    let _change = state.registry.change_guard().await;
+    match state.registry.get(&name) {
+        Some(d) if d.spec.namespace == ns && d.spec.tunnel.is_some() => {}
+        _ => return err(StatusCode::NOT_FOUND, format!("no tunnel {name:?} in {ns:?}")).into_response(),
+    }
+    if state.registry.remove(&name).is_none() {
+        return err(StatusCode::CONFLICT, format!("{name:?} cannot be removed while work is pending on it")).into_response();
+    }
+    if let Err(e) = state.registry.persist_one(&name) {
+        tracing::error!(tunnel = %name, error = %e, "tunnel release was not persisted");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not persist the release").into_response();
+    }
+    if let Some(dialer) = &state.tunnels {
+        dialer.sync();
+    }
+    tracing::info!(namespace = %ns, tunnel = %name, "tunnel released");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `GET /namespaces/:name/plugins` — what this namespace may install and
@@ -8082,6 +8383,7 @@ fn router(state: AdminState) -> Router {
         // `decide_access`), so a namespace token reaches these for its own
         // namespace. Every `GET` is view tier; the methods that change
         // something are on the CRUD side below.
+        .route("/namespaces/:name/tunnels", get(namespace_tunnels))
         .route("/namespaces/:name/plugins", get(namespace_plugins))
         .route("/namespaces/:name/plugins/:id", get(namespace_plugin))
         .route("/namespaces/:name/plugins/:id/*rest", get(namespace_plugin_surface))
@@ -8214,6 +8516,10 @@ fn router(state: AdminState) -> Router {
         // matches on path, not method.
         .route("/namespaces", post(create_namespace))
         .route("/namespaces/:name", delete(delete_namespace))
+        .route(
+            "/namespaces/:name/tunnels/:tunnel",
+            put(register_tunnel).delete(release_namespace_tunnel),
+        )
         // Auth providers. `POST` shares its path with the view-tier list above,
         // exactly as `/namespaces` does; the item read sits here beside its
         // delete so one path lives on one tier. The item GET is CRUD-tier out of
@@ -10352,7 +10658,7 @@ mod tests {
             use crate::tokens::{AdminScope, NewToken};
 
             fn new(name: &str, fleet: bool) -> NewToken {
-                NewToken { fleet, name: name.into(), admin: AdminScope::Admin, namespace: None,
+                NewToken { tunnel: false, fleet, name: name.into(), admin: AdminScope::Admin, namespace: None,
                     deployments: vec!["*".into()], expires_in_secs: None }
             }
 
@@ -10519,7 +10825,7 @@ mod tests {
             }
 
             fn token(f: &Fixture, ns: &str, admin: AdminScope, deployments: &[&str]) -> String {
-                f.state.tokens.mint(NewToken {
+                f.state.tokens.mint(NewToken { tunnel: false,
                     fleet: false,
                     name: "artifact test".into(),
                     admin,
@@ -10660,7 +10966,7 @@ mod tests {
             }
 
             fn token(f: &Fixture, ns: &str) -> String {
-                f.state.tokens.mint(NewToken {
+                f.state.tokens.mint(NewToken { tunnel: false,
                     fleet: false,
                     name: "hosts test".into(),
                     admin: AdminScope::Admin,
@@ -10673,6 +10979,7 @@ mod tests {
             async fn send(f: &Fixture, method: &str, path: &str, auth: &str, body: String) -> (StatusCode, String) {
                 let req = Request::builder().method(method).uri(path)
                     .header(header::AUTHORIZATION, auth)
+                    .header(header::HOST, "admin.test:9090")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body)).unwrap();
                 let mut app = router(f.state.clone());
@@ -10707,6 +11014,101 @@ mod tests {
                 assert!(status.is_success(), "{status} {body}");
             }
 
+            async fn with_tunnels() -> Fixture {
+                let mut f = gated().await;
+                f.state.deploy_base_domain = Some("us2.heyo.work".into());
+                let dialer = crate::tunnel_dialer::TunnelDialer::open(&f.root.join("dialer.key"), f.registry.clone()).unwrap();
+                f.state.tunnels = Some(dialer);
+                f
+            }
+
+            fn tunnel_token(f: &Fixture, ns: &str, names: &[&str]) -> String {
+                let raw = f.state.tokens.mint(NewToken {
+                    fleet: false, tunnel: true, name: "desktop".into(), admin: AdminScope::None,
+                    namespace: Some(ns.into()), deployments: names.iter().map(|n| n.to_string()).collect(),
+                    expires_in_secs: None,
+                }, now_secs()).unwrap().1;
+                format!("Bearer {raw}")
+            }
+
+            fn registration(key: &iroh::SecretKey, signer: &iroh::SecretKey, ns: &str, name: &str, host: &str, hosts: &[&str]) -> String {
+                let ts = now_secs();
+                let node = key.public().to_string();
+                let msg = crate::tunnel_dialer::proof_message(ns, name, &node, ts, host);
+                serde_json::json!({
+                    "node_id": node, "hostnames": hosts,
+                    "proof": {"ts": ts, "sig": crate::tunnel_dialer::sign_proof(signer, &msg)},
+                }).to_string()
+            }
+
+            #[tokio::test]
+            async fn a_tunnel_token_registers_its_tunnel_and_nothing_else() {
+                let f = with_tunnels().await;
+                let auth = tunnel_token(&f, "sam", &["desktop"]);
+                let key = iroh::SecretKey::generate();
+                let body = registration(&key, &key, "sam", "desktop", "admin.test", &["desktop--sam.us2.heyo.work"]);
+                let (status, out) = send(&f, "PUT", "/namespaces/sam/tunnels/desktop", &auth, body).await;
+                assert_eq!(status, StatusCode::OK, "{out}");
+                let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(out["urls"][0], "https://desktop--sam.us2.heyo.work");
+                assert_eq!(out["dialer_ids"][0], f.state.tunnels.as_ref().unwrap().id());
+                let d = f.registry.get("desktop").unwrap();
+                assert_eq!(d.spec.namespace, "sam");
+                assert_eq!(d.spec.tunnel.as_ref().unwrap().node_id, key.public().to_string());
+                assert_eq!(d.spec.health.path.as_deref(), Some(crate::proxy::TUNNEL_HEALTH_PATH));
+                assert_eq!(d.backends().len(), 1, "the dialer gave it its bridge");
+                assert!(d.backends()[0].peer.starts_with("127.0.0.1:"));
+
+                // A refresh keeps the live pool: no gap while it re-bridges.
+                let again = registration(&key, &key, "sam", "desktop", "admin.test", &["desktop--sam.us2.heyo.work"]);
+                let (status, _) = send(&f, "PUT", "/namespaces/sam/tunnels/desktop", &auth, again).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(Arc::ptr_eq(&d.backends()[0], &f.registry.get("desktop").unwrap().backends()[0]));
+
+                // Nothing else: not the deployment API, not another name, not
+                // another namespace.
+                let (status, _) = send(&f, "GET", "/deployments", &auth, String::new()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                let other = registration(&key, &key, "sam", "laptop", "admin.test", &["laptop--sam.us2.heyo.work"]);
+                let (status, _) = send(&f, "PUT", "/namespaces/sam/tunnels/laptop", &auth, other).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                let elsewhere = registration(&key, &key, "bob", "desktop", "admin.test", &["desktop--bob.us2.heyo.work"]);
+                let (status, _) = send(&f, "PUT", "/namespaces/bob/tunnels/desktop", &auth, elsewhere).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+
+                let (status, _) = send(&f, "DELETE", "/namespaces/sam/tunnels/desktop", &auth, String::new()).await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+                assert!(f.registry.get("desktop").is_none());
+            }
+
+            #[tokio::test]
+            async fn a_registration_must_be_the_nodes_own_for_this_app_lb_and_within_policy() {
+                let f = with_tunnels().await;
+                let auth = tunnel_token(&f, "sam", &[]);
+                let key = iroh::SecretKey::generate();
+                let thief = iroh::SecretKey::generate();
+                let path = "/namespaces/sam/tunnels/desktop";
+                for (body, want) in [
+                    // Signed by someone else: pointing a hostname at a node it does not hold.
+                    (registration(&key, &thief, "sam", "desktop", "admin.test", &["desktop--sam.us2.heyo.work"]), StatusCode::FORBIDDEN),
+                    // Signed for another app-lb: a replay.
+                    (registration(&key, &key, "sam", "desktop", "admin.eu1.test", &["desktop--sam.us2.heyo.work"]), StatusCode::FORBIDDEN),
+                    // Outside the namespace's default `*--sam.us2.heyo.work`.
+                    (registration(&key, &key, "sam", "desktop", "admin.test", &["desktop.us2.heyo.work"]), StatusCode::FORBIDDEN),
+                    (registration(&key, &key, "sam", "desktop", "admin.test", &["desktop--bob.us2.heyo.work"]), StatusCode::FORBIDDEN),
+                ] {
+                    let (status, out) = send(&f, "PUT", path, &auth, body).await;
+                    assert_eq!(status, want, "{out}");
+                }
+                assert!(f.registry.get("desktop").is_none());
+                // An ordinary deployment's id is not a tunnel's to take.
+                let (status, _) = send(&f, "POST", "/deployments", &operator(), static_spec("desktop", "sam", "x.example.com")).await;
+                assert!(status.is_success());
+                let body = registration(&key, &key, "sam", "desktop", "admin.test", &["desktop--sam.us2.heyo.work"]);
+                let (status, _) = send(&f, "PUT", path, &auth, body).await;
+                assert_eq!(status, StatusCode::CONFLICT);
+            }
+
             #[tokio::test]
             async fn a_declared_policy_confines_a_namespace_and_only_the_operator_sets_it() {
                 let f = gated().await;
@@ -10721,7 +11123,7 @@ mod tests {
 
                 // A fleet-scoped token is not the operator: it cannot widen the
                 // policy, and re-declaring keeps it.
-                let fleet = f.state.tokens.mint(NewToken {
+                let fleet = f.state.tokens.mint(NewToken { tunnel: false,
                     fleet: false, name: "fleet".into(), admin: AdminScope::Admin,
                     namespace: None, deployments: vec!["*".into()], expires_in_secs: None,
                 }, now_secs()).unwrap().1;
@@ -10740,7 +11142,7 @@ mod tests {
             use crate::tokens::{AdminScope, NewToken, TokenPatch};
 
             fn new(name: &str, ns: Option<&str>, admin: AdminScope, ttl: Option<u64>) -> NewToken {
-                NewToken {
+                NewToken { tunnel: false,
                     fleet: false,
                     name: name.into(),
                     admin,
@@ -11340,7 +11742,7 @@ mod tests {
         async fn a_namespace_caller_gets_its_view_and_no_server_details() {
             let f = fixture(true).await;
             let (summary, _) = f.state.tokens.mint(
-                crate::tokens::NewToken {
+                crate::tokens::NewToken { tunnel: false,
                     name: "ns".into(),
                     admin: crate::tokens::AdminScope::View,
                     namespace: Some("team-a".into()),
@@ -11402,7 +11804,7 @@ mod tests {
                 .state
                 .tokens
                 .mint(
-                    crate::tokens::NewToken {
+                    crate::tokens::NewToken { tunnel: false,
                         name: "ns".into(),
                         admin: crate::tokens::AdminScope::Admin,
                         namespace: Some("team-a".into()),
@@ -11602,7 +12004,7 @@ mod tests {
             f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
             f.state.gate_admin = true;
             f.state.gate_view = true;
-            let token = f.state.tokens.mint(NewToken {
+            let token = f.state.tokens.mint(NewToken { tunnel: false,
                 fleet: false, name: "ns".into(), admin: AdminScope::Admin,
                 namespace: Some("team-a".into()), deployments: vec![], expires_in_secs: None,
             }, now_secs()).unwrap().1;
@@ -11633,7 +12035,7 @@ mod tests {
             f.state.gate_admin = true;
             f.state.gate_view = true;
             let token = |admin: AdminScope| {
-                f.state.tokens.mint(NewToken {
+                f.state.tokens.mint(NewToken { tunnel: false,
                     fleet: false, name: "plugin test".into(), admin,
                     namespace: Some("team-a".into()), deployments: vec![], expires_in_secs: None,
                 }, now_secs()).unwrap().1
@@ -12878,7 +13280,7 @@ mod tests {
 
         fn mint(s: &TokenStore, admin: AdminScope, deployments: &[&str]) -> String {
             s.mint(
-                NewToken {
+                NewToken { tunnel: false,
                     fleet: false,
                     name: "test".into(),
                     admin,
@@ -12937,7 +13339,7 @@ mod tests {
 
         fn mint_in_namespace(s: &TokenStore, admin: AdminScope, ns: &str) -> String {
             s.mint(
-                NewToken {
+                NewToken { tunnel: false,
                     fleet: false,
                     name: "ns test".into(),
                     admin,
@@ -13198,7 +13600,7 @@ mod tests {
         fn all_server_tokens_are_delegated_without_widening_namespace_scope() {
             let authority = store();
             for fleet in [false, true] {
-                let (_, raw) = authority.mint(NewToken {
+                let (_, raw) = authority.mint(NewToken { tunnel: false,
                     fleet, name: "regional-reader".into(), admin: AdminScope::View,
                     namespace: Some("team-a".into()), deployments: vec![], expires_in_secs: None,
                 }, NOW).unwrap();
@@ -13490,7 +13892,7 @@ mod tests {
             let token = |namespace: Option<&str>, deployments: &[&str]| {
                 let secret = s
                     .mint(
-                        NewToken {
+                        NewToken { tunnel: false,
                             fleet: false,
                             name: "test".into(),
                             admin: AdminScope::Admin,
@@ -13827,7 +14229,7 @@ mod tests {
             let t = store();
             let narrow = t
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "narrow".into(),
                         admin: AdminScope::Admin,
@@ -14101,7 +14503,7 @@ mod tests {
             let t = store();
             let secret = t
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "sam".into(),
                         admin: AdminScope::Admin,
@@ -14148,7 +14550,7 @@ mod tests {
             let t = store();
             let secret = t
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "sam".into(),
                         admin: AdminScope::Admin,
@@ -14338,7 +14740,7 @@ mod tests {
             let t = store();
             let secret = t
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "short".into(),
                         admin: AdminScope::Admin,

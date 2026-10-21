@@ -3654,7 +3654,6 @@ pub struct DeploymentSpec {
 /// connect, so a namespace cannot aim this at the public host's loopback or
 /// private network the way a static upstream list can.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct TunnelSpec {
     /// The remote app-lb's iroh endpoint id (64 hex characters).
     pub node_id: String,

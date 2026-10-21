@@ -152,7 +152,7 @@ pub fn key_path(state_path: &str) -> PathBuf {
 }
 
 /// Read the endpoint key, or create and persist one (0600).
-fn load_or_create_key(path: &Path) -> Result<SecretKey, String> {
+pub(crate) fn load_or_create_key(path: &Path) -> Result<SecretKey, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => text
             .trim()
@@ -188,7 +188,7 @@ fn load_or_create_key(path: &Path) -> Result<SecretKey, String> {
 }
 
 /// `HEYO_IROH_RELAY_URL`, as every other Heyo iroh endpoint reads it.
-fn relay_mode() -> iroh::RelayMode {
+pub(crate) fn relay_mode() -> iroh::RelayMode {
     match std::env::var("HEYO_IROH_RELAY_URL") {
         Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<iroh::RelayUrl>() {
             Ok(url) => iroh::RelayMode::Custom(iroh::RelayMap::from(url)),
