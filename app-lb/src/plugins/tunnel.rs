@@ -1124,7 +1124,6 @@ mod tests {
     #[tokio::test]
     async fn only_the_edge_may_open_streams_and_its_requests_are_served() {
         use iroh::endpoint::presets::Minimal;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let dir = tempfile::tempdir().unwrap();
         let daemon = HeyoClient::new(heyo_sdk::HeyoClientOptions {

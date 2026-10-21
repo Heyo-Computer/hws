@@ -262,6 +262,17 @@ impl TunnelDialer {
     }
 }
 
+pub const TUNNELS_PER_NAMESPACE_ENV: &str = "APP_LB_TUNNELS_PER_NAMESPACE";
+const DEFAULT_TUNNELS_PER_NAMESPACE: usize = 10;
+
+/// How many tunnels one namespace may register.
+pub fn per_namespace_limit() -> usize {
+    std::env::var(TUNNELS_PER_NAMESPACE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_TUNNELS_PER_NAMESPACE)
+}
+
 /// How far a registration's timestamp may be from this host's clock.
 pub const PROOF_SKEW_SECS: u64 = 300;
 

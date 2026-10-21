@@ -183,6 +183,8 @@ struct AdminState {
     /// served (tests that do not need them), and the registration routes
     /// then answer 501.
     tunnels: Option<Arc<crate::tunnel_dialer::TunnelDialer>>,
+    /// How many tunnels one namespace may hold (`APP_LB_TUNNELS_PER_NAMESPACE`).
+    tunnels_per_namespace: usize,
     /// The shared fleet store, in fleet mode. Mutations are refused while it
     /// cannot be written, and a write it refuses answers 409 or 503.
     fleet_store: Option<Arc<crate::fleet_sync::Fleet>>,
@@ -411,6 +413,7 @@ impl AdminApi {
                 operations: None,
                 transfers: None,
                 tunnels: None,
+                tunnels_per_namespace: crate::tunnel_dialer::per_namespace_limit(),
                 fleet_store: None,
                 token_sync: Default::default(),
                 images: None,
@@ -2820,6 +2823,20 @@ async fn register_tunnel(
     }
     if state.registry.foreign().contains_key(&name) {
         return err(StatusCode::CONFLICT, format!("{name:?} is placed on another fleet host")).into_response();
+    }
+    if existing.is_none() {
+        let local = state.registry.deployments();
+        let foreign = state.registry.foreign();
+        let held = local.values().map(|d| &d.spec).chain(foreign.values().map(|s| &**s))
+            .filter(|s| s.namespace == ns && s.tunnel.is_some())
+            .count();
+        if held >= state.tunnels_per_namespace {
+            return err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("namespace {ns:?} already holds {held} tunnels, its limit; release one first"),
+            )
+            .into_response();
+        }
     }
 
     let tunnel = crate::config::TunnelSpec {
@@ -11142,6 +11159,24 @@ mod tests {
                 assert!(answer.ends_with("node saw GET /hello HTTP/1.1"), "{answer}");
 
                 assert!(crate::health::probe(bridge, &d.spec.health).await, "the static probe reaches the node's health path");
+            }
+
+            #[tokio::test]
+            async fn a_namespace_holds_at_most_its_limit_of_tunnels() {
+                let mut f = with_tunnels().await;
+                f.state.tunnels_per_namespace = 2;
+                let auth = tunnel_token(&f, "sam", &[]);
+                let key = iroh::SecretKey::generate();
+                for (name, want) in [("a", StatusCode::OK), ("b", StatusCode::OK), ("c", StatusCode::TOO_MANY_REQUESTS)] {
+                    let host = format!("{name}--sam.us2.heyo.work");
+                    let body = registration(&key, &key, "sam", name, "admin.test", &[host.as_str()]);
+                    let (status, out) = send(&f, "PUT", &format!("/namespaces/sam/tunnels/{name}"), &auth, body).await;
+                    assert_eq!(status, want, "{name}: {out}");
+                }
+                // A refresh of one it holds is not a new one.
+                let body = registration(&key, &key, "sam", "a", "admin.test", &["a--sam.us2.heyo.work"]);
+                let (status, _) = send(&f, "PUT", "/namespaces/sam/tunnels/a", &auth, body).await;
+                assert_eq!(status, StatusCode::OK);
             }
 
             #[tokio::test]
