@@ -3370,6 +3370,68 @@ To use it:
 - **Release a hostname** from the card, which also removes it from the
   configuration.
 
+- Only hostnames this app-lb registered are served over a tunnel. A tunnel
+  request for any other `Host` gets 421, so a stranger who registers this
+  node under their own hostname reaches nothing. Tunnel ingress answers
+  `GET /.well-known/heyo-tunnel/health` itself, before routing.
+
+#### Through a public app-lb's namespace (`"provider": "app-lb"`)
+
+The same plugin can register with a public app-lb instead of Heyo Cloud. The
+public app-lb then serves the hostname itself: its routes, its certificates,
+its sign-in gate and its access log. Design:
+[`docs/design/app-lb-namespace-tunnels.md`](../docs/design/app-lb-namespace-tunnels.md).
+
+On the public app-lb, mint a token that can only register tunnels:
+
+```sh
+heyctl --context us2 token mint desktop --namespace sam --tunnel desktop -q
+```
+
+On this app-lb, store it and point the plugin there:
+
+```sh
+heyctl create secret tunnel-us2 --from-stdin token <<< 'applb_…'
+heyctl plugins set tunnel --enable -f - <<'JSON'
+{"provider": "app-lb", "remote": "https://admin.us2.heyo.work", "namespace": "sam",
+ "token": {"secret": "tunnel-us2", "key": "token"},
+ "tunnels": [{"name": "desktop", "hostnames": ["desktop--sam.us2.heyo.work"]}]}
+JSON
+```
+
+- Registration is `PUT /namespaces/:ns/tunnels/:name` on the public app-lb,
+  every minute. It creates a deployment of kind `tunnel` named after the
+  tunnel. Add an `auth` gate or maintenance to it as to any other
+  deployment; a refresh keeps them.
+- Each registration carries a proof: the endpoint's own key signs the
+  namespace, name, node id, time and the public app-lb's hostname. A
+  namespace therefore cannot point a hostname at a node it does not hold.
+- Which hostnames a namespace may claim is the operator's call: a declared
+  namespace's `hosts` (exact names, or `*`-prefixed one-label patterns), else
+  `*--<namespace>.<deploy base domain>`. A namespace can never claim a host
+  another namespace routes.
+- The public app-lb dials from a key of its own, `app-lb-tunnel-dialer.key`
+  beside its state file, and answers registration with that id. This app-lb
+  lets in nothing else.
+- On the public side the tunnel is a static deployment whose one upstream is
+  a loopback bridge to the node. Its health check is the node's health path.
+  A registration not refreshed within its lease (default 300s) leaves the
+  tunnel offline until it registers again.
+
+### Namespace hosts
+
+A declared namespace may carry `hosts`, which only the operator (the Basic
+admin credential) sets, with `POST /namespaces`:
+
+```json
+{"name": "sam", "hosts": ["*--sam.us2.heyo.work", "shop.example.com"]}
+```
+
+A credential confined to the namespace (a namespace token, or a Heyo sign-in
+without fleet scope) may then route only those hosts. Whether or not `hosts`
+is declared, it is refused a host another namespace already routes, on this
+server or another fleet host.
+
 ## Clients
 
 | | |
