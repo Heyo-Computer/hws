@@ -1503,16 +1503,18 @@ fn main() {
     // forwarding worker runs, asking this manager for each decision over the
     // same socket. They arrive over the manager's iroh endpoint, so they do
     // not outlive it the way the worker's listeners do; the edge redials.
-    tunnel_plugin.attach(
-        Arc::new(pingora_proxy::http_proxy(
-            &server.configuration,
-            proxy::LbProxy::for_tunnel_ingress(
-                worker_rpc::Client::new(worker_dir.join("requests")),
-                external_tls.clone(),
-            ),
-        )),
-        vms.client().clone(),
-    );
+    {
+        let (conf, requests, hosts) = (server.configuration.clone(), worker_dir.join("requests"), external_tls.clone());
+        tunnel_plugin.attach(
+            plugins::tunnel::pingora_factory(move || {
+                pingora_proxy::http_proxy(
+                    &conf,
+                    proxy::LbProxy::for_tunnel_ingress(worker_rpc::Client::new(requests.clone()), hosts.clone()),
+                )
+            }),
+            vms.client().clone(),
+        );
+    }
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
         control: Arc::new(request_control::RequestControl::new(
             registry.clone(), metrics.clone(), challenges, auth, guard.clone(),

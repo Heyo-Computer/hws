@@ -39,13 +39,11 @@ use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, SecretKey};
 use pingora_core::apps::ServerApp;
 use pingora_core::protocols::Stream;
-use pingora_proxy::HttpProxy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use super::{Plugin, PluginMeta};
-use crate::proxy::LbProxy;
 
 /// Must match the cloud's `services::tunnel_dialer::ALPN`.
 pub const ALPN: &[u8] = b"heyo/applb-ingress/1";
@@ -358,9 +356,12 @@ pub struct TunnelPlugin {
     /// The configuration last applied, which says where tunnels live.
     config: RwLock<Option<Config>>,
     external_tls: ExternalTlsHosts,
-    /// The pingora app streams are served by. Attached by `main` once the
-    /// proxy exists, which is after the plugin host is built.
-    app: OnceLock<Arc<dyn StreamServer>>,
+    /// Makes the pingora app streams are served by. Attached by `main` once
+    /// the proxy exists, which is after the plugin host is built.
+    app: OnceLock<AppFactory>,
+    /// The app serving now. Fresh on every apply: stopping winds an app's
+    /// idle keep-alive sessions down for good, so it is not used again.
+    current: RwLock<Option<Arc<dyn StreamServer>>>,
     running: tokio::sync::Mutex<Option<Running>>,
     status: RwLock<Status>,
     /// Endpoint ids allowed to open streams: the cloud edge's.
@@ -384,6 +385,7 @@ impl TunnelPlugin {
             config: RwLock::new(None),
             external_tls,
             app: OnceLock::new(),
+            current: RwLock::new(None),
             running: tokio::sync::Mutex::new(None),
             status: RwLock::new(Status::default()),
             allowed: RwLock::new(HashSet::new()),
@@ -395,9 +397,19 @@ impl TunnelPlugin {
 
     /// Hand the plugin the proxy to serve tunnel streams with, and the
     /// daemon to register them through.
-    pub fn attach(&self, app: Arc<HttpProxy<LbProxy>>, daemon: HeyoClient) {
-        let _ = self.app.set(Arc::new(Pingora(app)));
+    pub fn attach(&self, app: AppFactory, daemon: HeyoClient) {
+        let _ = self.app.set(app);
         let _ = self.daemon.set(daemon);
+    }
+
+    /// The app serving now, made on first use.
+    fn app(&self) -> Option<Arc<dyn StreamServer>> {
+        if let Some(app) = self.current.read().unwrap().clone() {
+            return Some(app);
+        }
+        let app = (self.app.get()?)();
+        *self.current.write().unwrap() = Some(app.clone());
+        Some(app)
     }
 
     fn daemon(&self) -> Result<&HeyoClient, String> {
@@ -435,6 +447,12 @@ impl TunnelPlugin {
             let _ = r.shutdown.send(true);
             for t in r.tasks {
                 t.abort();
+            }
+            // Sessions parked waiting for a keep-alive request end now; those
+            // in the middle of one finish it first.
+            let current = self.current.write().unwrap().take();
+            if let Some(app) = current {
+                app.cleanup().await;
             }
             self.drain().await;
             r.endpoint.close().await;
@@ -630,7 +648,7 @@ impl TunnelPlugin {
             conn.close(1u32.into(), b"not an edge");
             return;
         }
-        let Some(app) = self.app.get().cloned() else {
+        let Some(app) = self.app() else {
             conn.close(2u32.into(), b"not ready");
             return;
         };
@@ -666,6 +684,20 @@ pub(crate) trait StreamServer: Send + Sync + 'static {
         io: Box<dyn TunnelIo>,
         shutdown: watch::Receiver<bool>,
     ) -> futures::future::BoxFuture<'static, ()>;
+    /// Stop: no session waits for another request.
+    fn cleanup(&self) -> futures::future::BoxFuture<'static, ()>;
+}
+
+/// Makes a fresh app for each apply.
+pub type AppFactory = Arc<dyn Fn() -> Arc<dyn StreamServer> + Send + Sync>;
+
+/// A factory of pingora apps, each made by `make`.
+pub fn pingora_factory<A, F>(make: F) -> AppFactory
+where
+    A: ServerApp + Send + Sync + 'static,
+    F: Fn() -> A + Send + Sync + 'static,
+{
+    Arc::new(move || Arc::new(Pingora(Arc::new(make()))) as Arc<dyn StreamServer>)
 }
 
 /// Any pingora app, as a [`StreamServer`].
@@ -678,6 +710,11 @@ impl<A: ServerApp + Send + Sync + 'static> StreamServer for Pingora<A> {
         shutdown: watch::Receiver<bool>,
     ) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(serve_stream(self.0.clone(), io, shutdown))
+    }
+
+    fn cleanup(&self) -> futures::future::BoxFuture<'static, ()> {
+        let app = self.0.clone();
+        Box::pin(async move { app.cleanup().await })
     }
 }
 
@@ -1137,7 +1174,7 @@ mod tests {
             Default::default(),
             Arc::new(crate::secrets::SecretStore::new(dir.path().join("s.json"), None)),
         );
-        let _ = plugin.app.set(Arc::new(Pingora(Arc::new(Echo))));
+        let _ = plugin.app.set(pingora_factory(|| Echo));
         let _ = plugin.daemon.set(daemon);
 
         let bind = |alpn: bool| async move {
@@ -1231,7 +1268,7 @@ mod tests {
             Default::default(),
             Arc::new(crate::secrets::SecretStore::new(dir.path().join("s.json"), None)),
         );
-        let _ = plugin.app.set(Arc::new(Pingora(Arc::new(SlowEcho))));
+        let _ = plugin.app.set(pingora_factory(|| SlowEcho));
         let bind = |alpn: bool| async move {
             let mut b = Endpoint::builder(Minimal).relay_mode(iroh::RelayMode::Disabled);
             if alpn {
@@ -1267,6 +1304,66 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), plugin.stop()).await.expect("the drain is bounded");
         let got = tokio::time::timeout(Duration::from_secs(5), answer).await.unwrap().unwrap();
         assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("slow and whole"), "cut off: {got:?}");
+    }
+
+    /// A dialer holding a kept-alive stream between requests does not keep
+    /// a stop waiting: the session is parked, not working.
+    #[tokio::test]
+    async fn an_idle_kept_alive_stream_does_not_hold_up_a_stop() {
+        use iroh::endpoint::presets::Minimal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = TunnelPlugin::new(
+            dir.path().join("k"),
+            Default::default(),
+            Arc::new(crate::secrets::SecretStore::new(dir.path().join("s.json"), None)),
+        );
+        // The real ingress app: pingora's proxy, which is what a stop winds
+        // down. No manager answers, so each request gets the 503 a restarting
+        // app-lb gives — a whole response, and the stream kept alive after it.
+        let hosts: ExternalTlsHosts = Default::default();
+        hosts.write().unwrap().insert("shop.heyo.test".into());
+        let requests = dir.path().join("requests");
+        let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
+        let _ = plugin.app.set(pingora_factory(move || {
+            pingora_proxy::http_proxy(
+                &conf,
+                crate::proxy::LbProxy::for_tunnel_ingress(
+                    crate::worker_rpc::Client::with_wait(requests.clone(), Duration::ZERO),
+                    hosts.clone(),
+                ),
+            )
+        }));
+        let bind = |alpn: bool| async move {
+            let mut b = Endpoint::builder(Minimal).relay_mode(iroh::RelayMode::Disabled);
+            if alpn {
+                b = b.alpns(vec![ALPN.to_vec()]);
+            }
+            b.bind().await.unwrap()
+        };
+        let server = bind(true).await;
+        let edge = bind(false).await;
+        plugin.allowed.write().unwrap().insert(edge.id().to_string());
+        let (tx, rx) = watch::channel(false);
+        let accept = plugin.spawn_accept(server.clone(), rx);
+        *plugin.running.lock().await = Some(Running { endpoint: server.clone(), tasks: vec![accept], shutdown: tx });
+
+        let conn = edge.connect(server.addr(), ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"GET /one HTTP/1.1\r\nHost: shop.heyo.test\r\n\r\n").await.unwrap();
+        let mut got = String::new();
+        let mut buf = [0u8; 1024];
+        while !got.ends_with("retry shortly\n") {
+            let n = recv.read(&mut buf).await.unwrap().unwrap();
+            got.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+        }
+        // The stream stays open, waiting for a next request that never comes.
+        assert_eq!(plugin.streams_active.load(Ordering::Relaxed), 1);
+        let started = std::time::Instant::now();
+        plugin.stop().await;
+        assert!(started.elapsed() < Duration::from_secs(3), "stop waited {:?} on an idle stream", started.elapsed());
+        assert_eq!(plugin.streams_active.load(Ordering::Relaxed), 0);
+        drop(send);
     }
 
     #[tokio::test]
