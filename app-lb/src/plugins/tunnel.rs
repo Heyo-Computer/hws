@@ -57,6 +57,10 @@ const REFRESH: Duration = Duration::from_secs(60);
 /// How long to wait for the endpoint to reach a relay before registering
 /// without one.
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long stopping the plugin waits for the streams it is serving.
+const STOP_DRAIN: Duration = Duration::from_secs(10);
+/// How long no stream must be open before a drain counts as done.
+const DRAIN_QUIET: Duration = Duration::from_millis(300);
 
 // ---- configuration --------------------------------------------------------
 
@@ -426,10 +430,13 @@ impl TunnelPlugin {
 
     async fn stop(&self) {
         if let Some(r) = self.running.lock().await.take() {
+            // No new connections and no more registrations; sessions finish
+            // the request they are on instead of waiting for another.
             let _ = r.shutdown.send(true);
             for t in r.tasks {
                 t.abort();
             }
+            self.drain().await;
             r.endpoint.close().await;
         }
         let mut st = self.status.write().unwrap();
@@ -438,6 +445,32 @@ impl TunnelPlugin {
         st.error = None;
         self.allowed.write().unwrap().clear();
         self.external_tls.write().unwrap().clear();
+    }
+
+    /// Wait for the streams being served to finish — quiet for a moment, so
+    /// one that a dialer opened just now is not cut — up to [`STOP_DRAIN`].
+    async fn drain(&self) {
+        let deadline = tokio::time::Instant::now() + STOP_DRAIN;
+        let mut quiet_since = None;
+        loop {
+            let now = tokio::time::Instant::now();
+            if self.streams_active.load(Ordering::Relaxed) == 0 {
+                let since = *quiet_since.get_or_insert(now);
+                if now - since >= DRAIN_QUIET {
+                    return;
+                }
+            } else {
+                quiet_since = None;
+            }
+            if now >= deadline {
+                tracing::warn!(
+                    active = self.streams_active.load(Ordering::Relaxed),
+                    "tunnel: streams still open after the drain; closing them"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Register every configured hostname through heyvmd. Updates the status
@@ -651,22 +684,33 @@ impl<A: ServerApp + Send + Sync + 'static> StreamServer for Pingora<A> {
 /// Bridge one byte stream into a pingora app and serve requests on it until
 /// either side closes it. Generic so the tests can drive it without a full
 /// `LbProxy`.
-pub(crate) async fn serve_stream<A, S>(app: Arc<A>, mut io: S, shutdown: watch::Receiver<bool>)
+pub(crate) async fn serve_stream<A, S>(app: Arc<A>, io: S, shutdown: watch::Receiver<bool>)
 where
     A: ServerApp + Send + Sync + 'static,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
-    let bridge = tokio::spawn(async move {
-        let _ = tokio::io::copy_bidirectional(&mut io, &mut ours).await;
+    let (ours, theirs) = tokio::io::duplex(64 * 1024);
+    let (mut io_read, mut io_write) = tokio::io::split(io);
+    let (mut ours_read, mut ours_write) = tokio::io::split(ours);
+    // The dialer's bytes in, pingora's answers out.
+    let inbound = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut io_read, &mut ours_write).await;
+        // The dialer hung up its side: pingora sees the end of the input.
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut ours_write).await;
+    });
+    let outbound = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut ours_read, &mut io_write).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut io_write).await;
     });
     let mut stream: Option<Stream> = Some(Box::new(theirs));
     while let Some(s) = stream.take() {
         stream = app.process_new(s, &shutdown).await;
     }
-    // The duplex end pingora held is dropped with its last session, which
-    // ends the copy above.
-    let _ = bridge.await;
+    // Pingora is done with this stream and dropped its end: once what it
+    // wrote has reached the dialer, the stream is over, whether or not the
+    // dialer has hung up its side yet.
+    let _ = outbound.await;
+    inbound.abort();
 }
 
 /// Turn heyvmd's answer into something an operator can act on.
@@ -1150,6 +1194,81 @@ mod tests {
         );
         assert_eq!(plugin.rejected.load(Ordering::Relaxed), 1);
         assert_eq!(plugin.streams_total.load(Ordering::Relaxed), 1);
+    }
+
+    /// Answers after a pause, like a slow upstream.
+    struct SlowEcho;
+
+    #[async_trait]
+    impl pingora_core::apps::HttpServerApp for SlowEcho {
+        async fn process_new_http(
+            self: &Arc<Self>,
+            mut session: pingora_core::protocols::http::ServerSession,
+            _shutdown: &pingora_core::server::ShutdownWatch,
+        ) -> Option<pingora_core::apps::ReusedHttpStream> {
+            if !session.read_request().await.ok()? {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let body = "slow and whole";
+            let mut resp = pingora_http::ResponseHeader::build(200, None).unwrap();
+            resp.insert_header("content-length", body.len().to_string()).unwrap();
+            session.write_response_header(Box::new(resp)).await.ok()?;
+            session.write_response_body(body.into(), true).await.ok()?;
+            let _ = session.finish().await;
+            None
+        }
+    }
+
+    /// Stopping the plugin (a reconfigure, or disabling it) lets a request it
+    /// is serving finish instead of cutting it off.
+    #[tokio::test]
+    async fn stopping_drains_the_streams_being_served() {
+        use iroh::endpoint::presets::Minimal;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = TunnelPlugin::new(
+            dir.path().join("k"),
+            Default::default(),
+            Arc::new(crate::secrets::SecretStore::new(dir.path().join("s.json"), None)),
+        );
+        let _ = plugin.app.set(Arc::new(Pingora(Arc::new(SlowEcho))));
+        let bind = |alpn: bool| async move {
+            let mut b = Endpoint::builder(Minimal).relay_mode(iroh::RelayMode::Disabled);
+            if alpn {
+                b = b.alpns(vec![ALPN.to_vec()]);
+            }
+            b.bind().await.unwrap()
+        };
+        let server = bind(true).await;
+        let edge = bind(false).await;
+        plugin.allowed.write().unwrap().insert(edge.id().to_string());
+        let (tx, rx) = watch::channel(false);
+        let accept = plugin.spawn_accept(server.clone(), rx);
+        *plugin.running.lock().await = Some(Running { endpoint: server.clone(), tasks: vec![accept], shutdown: tx });
+
+        let conn = edge.connect(server.addr(), ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"GET /slow HTTP/1.1\r\nHost: shop.heyo.test\r\n\r\n").await.unwrap();
+        let answer = tokio::spawn(async move {
+            let mut got = String::new();
+            let mut buf = [0u8; 1024];
+            while let Ok(Some(n)) = recv.read(&mut buf).await {
+                got.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+                if got.ends_with("slow and whole") {
+                    break;
+                }
+            }
+            got
+        });
+        // Stop once the request is being served.
+        while plugin.streams_active.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), plugin.stop()).await.expect("the drain is bounded");
+        let got = tokio::time::timeout(Duration::from_secs(5), answer).await.unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("slow and whole"), "cut off: {got:?}");
     }
 
     #[tokio::test]

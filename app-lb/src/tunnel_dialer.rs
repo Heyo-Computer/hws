@@ -161,24 +161,40 @@ impl TunnelDialer {
     }
 
     /// Carry one loopback connection over a fresh stream to the node.
+    /// A fresh stream to the node. A connection that turns out to be dead
+    /// when the stream is opened — the node restarted, and its old connection
+    /// is gone — is dropped and dialed again once: nothing has been sent on it,
+    /// so a retry cannot repeat anything.
+    pub async fn open_stream(
+        &self,
+        node_id: &str,
+        relay_url: Option<&str>,
+    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), String> {
+        let mut last = String::new();
+        for attempt in 0..2 {
+            let conn = match self.connection(node_id, relay_url).await {
+                Ok(conn) => conn,
+                Err(e) => return Err(e),
+            };
+            match tokio::time::timeout(DIAL_TIMEOUT, conn.open_bi()).await {
+                Ok(Ok(pair)) => return Ok(pair),
+                Ok(Err(e)) => last = format!("opening a tunnel stream: {e}"),
+                Err(_) => last = "timed out opening a tunnel stream".into(),
+            }
+            self.evict(node_id).await;
+            if attempt == 0 {
+                tracing::info!(node = node_id, error = %last, "tunnel connection was stale; dialing again");
+            }
+        }
+        Err(last)
+    }
+
+    /// Carry one loopback connection over a fresh stream to the node.
     async fn bridge(self: Arc<Self>, mut tcp: tokio::net::TcpStream, node_id: String, relay_url: Option<String>) {
-        let conn = match self.connection(&node_id, relay_url.as_deref()).await {
-            Ok(conn) => conn,
+        let (send, recv) = match self.open_stream(&node_id, relay_url.as_deref()).await {
+            Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(node = %node_id, error = %e, "tunnel unreachable");
-                return;
-            }
-        };
-        let (send, recv) = match tokio::time::timeout(DIAL_TIMEOUT, conn.open_bi()).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => {
-                tracing::warn!(node = %node_id, error = %e, "opening a tunnel stream failed; redialing next time");
-                self.evict(&node_id).await;
-                return;
-            }
-            Err(_) => {
-                tracing::warn!(node = %node_id, "timed out opening a tunnel stream; redialing next time");
-                self.evict(&node_id).await;
                 return;
             }
         };
