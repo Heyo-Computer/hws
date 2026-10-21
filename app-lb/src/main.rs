@@ -1499,7 +1499,10 @@ fn main() {
     tunnel_plugin.attach(
         Arc::new(pingora_proxy::http_proxy(
             &server.configuration,
-            proxy::LbProxy::for_tunnel_ingress(worker_rpc::Client::new(worker_dir.join("requests"))),
+            proxy::LbProxy::for_tunnel_ingress(
+                worker_rpc::Client::new(worker_dir.join("requests")),
+                external_tls.clone(),
+            ),
         )),
         vms.client().clone(),
     );

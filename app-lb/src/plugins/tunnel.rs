@@ -382,7 +382,7 @@ impl TunnelPlugin {
                 allowed.extend(t.edge_node_ids.iter().cloned());
             }
             *self.external_tls.write().unwrap() =
-                st.tunnels.iter().map(|t| t.hostname.clone()).collect();
+                st.tunnels.iter().map(|t| t.hostname.to_ascii_lowercase()).collect();
         }
         if errors.is_empty() {
             Ok(())
@@ -842,6 +842,46 @@ mod tests {
         );
         assert_eq!(plugin.rejected.load(Ordering::Relaxed), 1);
         assert_eq!(plugin.streams_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn tunnel_ingress_serves_only_registered_hostnames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let hosts: ExternalTlsHosts = Default::default();
+        hosts.write().unwrap().insert("mine.heyo.test".into());
+        // No manager answers this socket: a request that passes the gate gets
+        // the 503 a restarting app-lb gives, which proves it was let through.
+        let control = crate::worker_rpc::Client::with_wait(dir.path().join("requests"), Duration::ZERO);
+        let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
+        let app = Arc::new(pingora_proxy::http_proxy(
+            &conf,
+            crate::proxy::LbProxy::for_tunnel_ingress(control, hosts),
+        ));
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (_tx, rx) = watch::channel(false);
+        let served = tokio::spawn(serve_stream(app, server, rx));
+
+        for (host, path, status) in [
+            ("someone-else.heyo.test", "/", "421"),
+            ("anything", crate::proxy::TUNNEL_HEALTH_PATH, "200"),
+            ("MINE.heyo.test:443", "/", "503"),
+        ] {
+            client
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut got = String::new();
+            while !got.contains("\r\n\r\n") || !got.ends_with('\n') {
+                let n = client.read(&mut buf).await.unwrap();
+                assert!(n > 0, "stream closed early; got {got:?}");
+                got.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+            }
+            assert!(got.starts_with(&format!("HTTP/1.1 {status}")), "{host}{path}: {got}");
+        }
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), served).await.unwrap().unwrap();
     }
 
     #[tokio::test]

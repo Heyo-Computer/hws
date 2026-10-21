@@ -43,7 +43,16 @@ pub struct LbProxy {
     /// the far end of the stream — so the visitor's address comes from the
     /// edge's [`TUNNEL_CLIENT_IP`] instead, and the edge terminated TLS.
     tunnel_ingress: bool,
+    /// On tunnel ingress, the hostnames this app-lb registered. A stream from
+    /// an allowed dialer is served only for these: whoever can register a
+    /// tunnel at the same dialer could otherwise point their own hostname at
+    /// this node and reach its catch-all routes.
+    tunnel_hosts: crate::plugins::tunnel::ExternalTlsHosts,
 }
+
+/// Answered by tunnel ingress itself, before routing, so the dialer can tell
+/// a live tunnel from a dead one without knowing any of its hostnames.
+pub const TUNNEL_HEALTH_PATH: &str = "/.well-known/heyo-tunnel/health";
 
 /// The header the cloud edge sets on tunnel ingress: the visitor's address as
 /// the edge's own proxy saw it. Trusted only on tunnel ingress, and removed
@@ -52,12 +61,42 @@ pub const TUNNEL_CLIENT_IP: &str = "x-heyo-client-ip";
 
 impl LbProxy {
     pub fn new(control: Client) -> Self {
-        Self { control, tunnel_ingress: false }
+        Self { control, tunnel_ingress: false, tunnel_hosts: Default::default() }
     }
 
-    /// The proxy for streams that arrived over an app-lb tunnel.
-    pub fn for_tunnel_ingress(control: Client) -> Self {
-        Self { control, tunnel_ingress: true }
+    /// The proxy for streams that arrived over an app-lb tunnel, serving only
+    /// `hosts`.
+    pub fn for_tunnel_ingress(control: Client, hosts: crate::plugins::tunnel::ExternalTlsHosts) -> Self {
+        Self { control, tunnel_ingress: true, tunnel_hosts: hosts }
+    }
+
+    /// Tunnel ingress only: answer what is not this app-lb's to serve, before
+    /// anything is decided. `Some` when the request was answered.
+    async fn tunnel_gate(&self, session: &mut Session) -> Result<Option<bool>> {
+        if !self.tunnel_ingress {
+            return Ok(None);
+        }
+        let req = session.req_header();
+        if req.uri.path() == TUNNEL_HEALTH_PATH {
+            write_plain(session, 200, "ok\n").await?;
+            return Ok(Some(true));
+        }
+        let host = req
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req.uri.host())
+            .map(|h| h.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(h, |(h, _)| h))
+            .map(|h| h.trim_end_matches('.').to_ascii_lowercase());
+        let served = host.as_deref().is_some_and(|h| {
+            self.tunnel_hosts.read().is_ok_and(|hosts| hosts.contains(h))
+        });
+        if !served {
+            tracing::warn!(host = ?host, "tunnel request for a hostname this app-lb did not register; answering 421");
+            write_plain(session, 421, "this hostname is not served here\n").await?;
+            return Ok(Some(true));
+        }
+        Ok(None)
     }
 
     /// The address the request came from: the socket peer, never a
@@ -356,6 +395,10 @@ impl ProxyHttp for LbProxy {
         // Start the latency clock before anything else so the span reflects the
         // whole time app-lb held the request, cold-start wait included.
         ctx.started_at = Some(Instant::now());
+
+        if let Some(answered) = self.tunnel_gate(session).await? {
+            return Ok(answered);
+        }
 
         let req = session.req_header();
         let head = crate::request_control::RequestHead {
