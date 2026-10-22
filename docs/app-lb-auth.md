@@ -490,7 +490,9 @@ So on a host with `APP_LB_AUTH_URL`, a deployment can use Heyo sign-in with noth
 heyctl set auth reports --provider-ref heyo
 ```
 
-`auth-heyo`'s fleet configuration is optional: `jwks_url` (default `{APP_LB_AUTH_URL}/.well-known/jwks.json`), `login_url` and `cookie` for the hosted sign-in page, and `auto_install`. It is enabled once, on the first boot that finds no record for it; an operator who disables it keeps it disabled.
+`auth-heyo`'s fleet configuration is optional: `jwks_url` (default `{APP_LB_AUTH_URL}/.well-known/jwks.json`), `scoped_signin`, `authorize_url` and `token_url`, `login_url` and `cookie` for the hosted sign-in page, and `auto_install`. It is enabled once, on the first boot that finds no record for it; an operator who disables it keeps it disabled.
+
+By default the `heyo` provider runs scoped sign-in (`jwt.authorize_url`, see [JWT and OIDC](#jwt-and-oidc)): a browser with no token is sent to `{APP_LB_AUTH_URL}/oauth/authorize` for this deployment's namespace and comes back with a host-only session. A program still gets the `401`. The default applies only when `APP_LB_AUTH_URL` is `https://`; otherwise set `authorize_url` and `token_url`. Setting `login_url` replaces scoped sign-in with that hosted page, and `"scoped_signin": false` turns browser sign-in off. The auth service must list the gated hosts in `LOGIN_ALLOWED_REDIRECT_HOSTS`, or it refuses to send people back. A change to this configuration, or a new default after an upgrade, is applied to every namespace's `heyo` provider when the plugin starts or is reconfigured.
 
 Google for one namespace:
 

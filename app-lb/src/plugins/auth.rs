@@ -14,7 +14,10 @@
 //!   auth service (`APP_LB_AUTH_URL`), and installs itself into every
 //!   namespace, so `"auth": {"provider_ref": "heyo"}` works out of the box.
 //!   A namespace narrows who gets in with `require` in its install
-//!   configuration (`{"require": {"accountId": ["acct_…"]}}`).
+//!   configuration (`{"require": {"accountId": ["acct_…"]}}`). A browser that
+//!   arrives with no token is sent through the auth service's scoped sign-in
+//!   (`/oauth/authorize`, `/oauth/token`), so a person signs in with Heyo and
+//!   comes back to the deployment, rather than meeting a bare `401`.
 //! - **`auth-google`** declares `google`: Google sign-in with the namespace's
 //!   own OAuth client. Opt-in: the operator enables it, and a namespace
 //!   installs it with its client id, a reference to the namespace secret
@@ -73,7 +76,7 @@ impl Kind {
 }
 
 /// `auth-heyo`'s fleet configuration. Every field is optional.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeyoFleetConfig {
     /// Where the auth service publishes its key set. Defaults to
@@ -81,12 +84,40 @@ pub struct HeyoFleetConfig {
     #[serde(default)]
     pub jwks_url: Option<String>,
     /// The hosted sign-in page a browser is sent to, and the cookie it sets.
+    /// Setting `login_url` turns the scoped sign-in below off: the gate would
+    /// otherwise prefer it, and the operator asked for this one.
     #[serde(default)]
     pub login_url: Option<String>,
     #[serde(default)]
     pub cookie: Option<String>,
+    /// Scoped sign-in for a token-less browser. On by default, at
+    /// `{APP_LB_AUTH_URL}/oauth/authorize` and `/oauth/token`; `false` leaves
+    /// the gate answering `401`, as a program-only gate wants.
+    #[serde(default = "yes")]
+    pub scoped_signin: bool,
+    /// Where the browser is sent, and where the code is redeemed, when the
+    /// auth service is reached by another name than `APP_LB_AUTH_URL`.
+    #[serde(default)]
+    pub authorize_url: Option<String>,
+    #[serde(default)]
+    pub token_url: Option<String>,
     #[serde(default = "yes")]
     pub auto_install: bool,
+}
+
+// By hand, so an absent configuration means what an empty one does.
+impl Default for HeyoFleetConfig {
+    fn default() -> Self {
+        Self {
+            jwks_url: None,
+            login_url: None,
+            cookie: None,
+            scoped_signin: true,
+            authorize_url: None,
+            token_url: None,
+            auto_install: true,
+        }
+    }
 }
 
 /// `auth-heyo`'s per-namespace configuration.
@@ -182,6 +213,23 @@ impl AuthPlugin {
             })
     }
 
+    /// The scoped sign-in endpoints `heyo` providers get under `fleet`, if any.
+    ///
+    /// Derived only from an `https://` `APP_LB_AUTH_URL`: the authorize URL is
+    /// a page the browser is sent to, and a plaintext or internal-only address
+    /// there would refuse every install rather than merely not redirect.
+    fn scoped_signin(&self, fleet: &HeyoFleetConfig) -> Option<(String, String)> {
+        if !fleet.scoped_signin || fleet.login_url.is_some() {
+            return None;
+        }
+        let given = |u: &Option<String>| u.clone().filter(|u| !u.trim().is_empty());
+        let base = self.auth_url.as_ref().filter(|b| b.starts_with("https://"));
+        let authorize =
+            given(&fleet.authorize_url).or_else(|| base.map(|b| format!("{b}/oauth/authorize")))?;
+        let token = given(&fleet.token_url).or_else(|| base.map(|b| format!("{b}/oauth/token")))?;
+        Some((authorize, token))
+    }
+
     /// The provider `namespace`'s install describes, fully materialised.
     fn provider(
         &self,
@@ -216,6 +264,10 @@ impl AuthPlugin {
                 })?;
                 let mut jwt = JwtSpec::heyo_jwks(jwks);
                 jwt.require.extend(install.require);
+                if let Some((authorize, token)) = self.scoped_signin(&fleet) {
+                    jwt.authorize_url = Some(authorize);
+                    jwt.token_url = Some(token);
+                }
                 if fleet.login_url.is_some() {
                     jwt.login_url = fleet.login_url;
                 }
@@ -305,6 +357,9 @@ impl Plugin for AuthPlugin {
                         "jwks_url": {"type": "string", "description": "The auth service's key set. Defaults to {APP_LB_AUTH_URL}/.well-known/jwks.json."},
                         "login_url": {"type": "string", "description": "The hosted sign-in page a browser is sent to."},
                         "cookie": {"type": "string", "description": "The cookie the sign-in page sets."},
+                        "scoped_signin": {"type": "boolean", "default": true, "description": "Send a browser with no token through the auth service's scoped sign-in. Off when login_url is set."},
+                        "authorize_url": {"type": "string", "description": "Scoped sign-in's authorization endpoint. Defaults to {APP_LB_AUTH_URL}/oauth/authorize."},
+                        "token_url": {"type": "string", "description": "Scoped sign-in's token endpoint. Defaults to {APP_LB_AUTH_URL}/oauth/token."},
                         "auto_install": {"type": "boolean", "default": true}
                     }
                 }),
@@ -350,6 +405,9 @@ impl Plugin for AuthPlugin {
         match self.kind {
             Kind::Heyo => json!({
                 "jwks_url": self.jwks_url(&HeyoFleetConfig::default()),
+                "authorize_url": self
+                    .scoped_signin(&HeyoFleetConfig::default())
+                    .map(|(authorize, _)| authorize),
             }),
             Kind::Google => json!({}),
         }
@@ -396,6 +454,10 @@ impl Plugin for AuthPlugin {
                 )));
             }
             spec.created_at = existing.created_at;
+            // A refresh that changes nothing writes nothing.
+            if *existing == spec {
+                return Ok(());
+            }
         } else {
             spec.created_at = crate::deployment::now_secs();
         }
@@ -581,6 +643,100 @@ mod tests {
             f.host.auto_install("team-a", None).await.is_empty(),
             "the opt-out sticks"
         );
+    }
+
+    #[tokio::test]
+    async fn heyo_sends_a_browser_through_scoped_signin_by_default() {
+        let f = fixture("scoped", Some("https://auth.example.com/"));
+        f.host.start_enabled().await;
+        f.host.auto_install("team-a", None).await;
+        let jwt = f
+            .providers
+            .get("team-a", "heyo")
+            .unwrap()
+            .jwt
+            .clone()
+            .unwrap();
+        assert_eq!(
+            jwt.scoped_signin(),
+            Some((
+                "https://auth.example.com/oauth/authorize",
+                "https://auth.example.com/oauth/token"
+            ))
+        );
+
+        // A hosted login page the operator chose takes its place, and reaches
+        // the namespace that installed before the change.
+        f.host
+            .set(
+                "auth-heyo",
+                true,
+                Some(json!({"login_url": "https://auth.example.com/login", "cookie": "heyo_gate"})),
+            )
+            .await
+            .unwrap();
+        let jwt = f
+            .providers
+            .get("team-a", "heyo")
+            .unwrap()
+            .jwt
+            .clone()
+            .unwrap();
+        assert_eq!(jwt.scoped_signin(), None);
+        assert_eq!(
+            jwt.login_url.as_deref(),
+            Some("https://auth.example.com/login")
+        );
+
+        // Switched off, the gate answers 401 again.
+        f.host
+            .set("auth-heyo", true, Some(json!({"scoped_signin": false})))
+            .await
+            .unwrap();
+        let jwt = f
+            .providers
+            .get("team-a", "heyo")
+            .unwrap()
+            .jwt
+            .clone()
+            .unwrap();
+        assert_eq!(jwt.scoped_signin(), None);
+        assert_eq!(jwt.login_url, None);
+    }
+
+    #[tokio::test]
+    async fn heyo_derives_scoped_signin_only_from_an_https_auth_url() {
+        let f = fixture("scoped-http", Some("http://127.0.0.1:3000"));
+        f.host.start_enabled().await;
+        f.host.auto_install("team-a", None).await;
+        let jwt = f
+            .providers
+            .get("team-a", "heyo")
+            .unwrap()
+            .jwt
+            .clone()
+            .unwrap();
+        assert_eq!(jwt.scoped_signin(), None, "the install still succeeds");
+
+        f.host
+            .set(
+                "auth-heyo",
+                true,
+                Some(json!({
+                    "authorize_url": "https://auth.example.com/oauth/authorize",
+                    "token_url": "https://auth.example.com/oauth/token"
+                })),
+            )
+            .await
+            .unwrap();
+        let jwt = f
+            .providers
+            .get("team-a", "heyo")
+            .unwrap()
+            .jwt
+            .clone()
+            .unwrap();
+        assert!(jwt.scoped_signin().is_some());
     }
 
     #[tokio::test]
