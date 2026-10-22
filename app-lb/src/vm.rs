@@ -487,6 +487,11 @@ impl VmManager {
         &self.client
     }
 
+    /// Where this host keeps its mount trees.
+    pub fn mount_store(&self) -> &MountStore {
+        &self.mounts
+    }
+
     /// Which daemon endpoint this manager reached — a socket path or a URL.
     pub fn transport(&self) -> &str {
         &self.transport

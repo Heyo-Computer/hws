@@ -1495,7 +1495,7 @@ impl Autoscaler {
         // A VM is created only once its image is on heyvm: a missing one is
         // pulled or thawed first, instead of booting heyvm's default image.
         if let Some(images) = self.images.get()
-            && !images.ensure_image(d).await
+            && !(images.ensure_image(d).await && images.ensure_mounts(d).await)
         {
             return;
         }

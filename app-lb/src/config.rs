@@ -1194,6 +1194,14 @@ impl MountSpec {
         is_remote_store(&self.store)
     }
 
+    /// The bytes this mount names whatever host asks: its `digest`, or a
+    /// digest given as its `ref`. `None` for a bare tag nothing has resolved.
+    pub fn pinned_digest(&self) -> Option<&str> {
+        self.digest
+            .as_deref()
+            .or_else(|| is_sha256_hex(&self.artifact_ref).then_some(self.artifact_ref.as_str()))
+    }
+
     /// The mount path with no trailing slash, which is how it is compared,
     /// nested-checked and sent to the daemon. `path` is validated into this
     /// shape, so this only ever trims whitespace.
@@ -5327,8 +5335,14 @@ impl DeploymentSpec {
         if vm.workspace.is_some() {
             return Some("vm.workspace lives on one host");
         }
-        if !vm.mounts.is_empty() {
-            return Some("vm.mounts live on one host");
+        // A mount is portable when every host can fetch the same bytes: a URL
+        // store and a digest. Each host pulls it before its first create, as it
+        // pulls the rootfs (`ImageCatalog::ensure_mounts`).
+        if vm.mounts.iter().any(|m| !m.is_remote()) {
+            return Some("a vm.mounts store given as a path is on one host");
+        }
+        if vm.mounts.iter().any(|m| m.pinned_digest().is_none()) {
+            return Some("a vm.mounts entry without a `digest` (or a digest as its `ref`) may resolve differently on each host");
         }
         if vm.disk_size_gb.is_some() {
             return Some("a vm.disk_size_gb disk lives on one host");
@@ -6217,6 +6231,28 @@ mod tests {
             assert!(s.validate().is_err(), "a data disk is host-bound");
             s.vm.as_mut().unwrap().disk_size_gb = None;
             assert!(s.validate().is_ok());
+
+            let digest = "a".repeat(64);
+            let mount = |store: &str, reference: &str, pinned: Option<&str>| MountSpec {
+                path: "/opt/app".into(),
+                store: store.into(),
+                artifact_ref: reference.into(),
+                auth: None,
+                strip_components: None,
+                read_only: true,
+                digest: pinned.map(str::to_string),
+            };
+            s.vm.as_mut().unwrap().mounts = vec![mount("https://art.example", "release", Some(&digest))];
+            assert!(s.validate().is_ok(), "a digest-pinned URL mount spreads");
+            s.vm.as_mut().unwrap().mounts = vec![mount("https://art.example", &digest, None)];
+            assert!(s.validate().is_ok(), "a digest as the ref is pinned");
+            s.vm.as_mut().unwrap().mounts = vec![mount("https://art.example", "release", None)];
+            let e = s.validate().unwrap_err().to_string();
+            assert!(e.contains("digest"), "a bare tag is not: {e}");
+            s.vm.as_mut().unwrap().mounts = vec![mount("/srv/art", "release", Some(&digest))];
+            let e = s.validate().unwrap_err().to_string();
+            assert!(e.contains("path"), "a store on one host's disk is not: {e}");
+            s.vm.as_mut().unwrap().mounts.clear();
         }
 
         #[test]
