@@ -157,6 +157,9 @@ pub trait Plugin: Send + Sync + 'static {
     /// configuration), after [`Self::validate_install`] and before the install
     /// is recorded. An error refuses the install. For a plugin whose install
     /// *creates* something in the namespace — an auth provider, say.
+    ///
+    /// Also re-run for every existing install when the plugin starts or its
+    /// fleet configuration changes, so it must be idempotent.
     async fn on_install(
         &self,
         _namespace: &str,
@@ -587,7 +590,11 @@ impl PluginHost {
         let here = self.runs_here(&record);
         self.store.put(id, record).map_err(SetError::Io)?;
         if here {
-            self.apply_slot(&slot, enabled.then_some(config)).await;
+            self.apply_slot(&slot, enabled.then_some(config.clone()))
+                .await;
+            if enabled {
+                self.refresh_installs(&slot, &config).await;
+            }
         }
         drop(_held);
         Ok(self.view(&slot).await)
@@ -783,6 +790,23 @@ impl PluginHost {
         }
     }
 
+    /// Re-run [`Plugin::on_install`] for every namespace that installed the
+    /// plugin, under fleet configuration `fleet`. What an install created is
+    /// built from both configurations, so a new fleet configuration, or a
+    /// build whose defaults moved, reaches namespaces that installed earlier.
+    /// The caller holds the slot's lock.
+    async fn refresh_installs(&self, slot: &Slot, fleet: &Value) {
+        let id = slot.plugin.meta().id;
+        let Some(record) = self.store.get(id) else {
+            return;
+        };
+        for (ns, install) in &record.installs {
+            if let Err(e) = slot.plugin.on_install(ns, &install.config, fleet).await {
+                tracing::warn!(plugin = id, namespace = %ns, error = %e, "could not refresh a namespace's install");
+            }
+        }
+    }
+
     async fn apply_slot(&self, slot: &Slot, config: Option<Value>) {
         let id = slot.plugin.meta().id;
         let on = config.is_some();
@@ -834,7 +858,8 @@ impl PluginHost {
                 *slot.last_error.lock().unwrap() = Some(format!("invalid configuration: {e}"));
                 continue;
             }
-            self.apply_slot(slot, Some(record.config)).await;
+            self.apply_slot(slot, Some(record.config.clone())).await;
+            self.refresh_installs(slot, &record.config).await;
         }
         defaulted
     }
