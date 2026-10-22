@@ -119,12 +119,13 @@ impl MountStore {
     /// yet.
     ///
     /// Two ways to get `None`, and the caller does not need to tell them apart:
-    /// no `digest` (nothing has been pulled) and a `digest` whose tree is not on
-    /// this host (pulled somewhere else, or reclaimed). Both mean the same thing
+    /// no `digest` and no digest as the `ref` (nothing has been pulled), and a
+    /// digest whose tree is not on this host (pulled somewhere else, or
+    /// reclaimed). Both mean the same thing
     /// to a create — this VM cannot be given its data — and both are fixed by
     /// the same pull.
     pub fn resolve(&self, mount: &MountSpec) -> Option<PathBuf> {
-        let digest = mount.digest.as_deref()?;
+        let digest = mount.pinned_digest()?;
         let path = self.tree_path(digest, mount.strip());
         path.is_dir().then_some(path)
     }

@@ -53,7 +53,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::Puller;
-use crate::config::ArtifactSpec;
+use crate::config::{ArtifactSpec, MountSpec};
 use crate::deployment::{Deployment, now_secs};
 use crate::jobs::{JobRecord, JobStatus, Jobs};
 use crate::registry::Registry;
@@ -1465,6 +1465,31 @@ impl ImageCatalog {
         Ok(())
     }
 
+    /// Unpack a `spread` deployment's mount from its store by the digest
+    /// its spec pins, never by tag, so every host mounts the same bytes.
+    /// Only the tree lands; the spec is the fleet's and stays as it is.
+    async fn fetch_mount(&self, mount: &MountSpec, digest: &str) -> Result<(), String> {
+        let key = self.store_key(mount.auth.as_ref()).await?;
+        let pinned = MountSpec {
+            artifact_ref: digest.to_string(),
+            ..mount.clone()
+        };
+        let path = mount.guest_path().to_string();
+        let mut log = |line: String| tracing::info!(mount = %path, "fetch: {line}");
+        let pulled = self
+            .puller
+            .pull_mount(&pinned, self.vms.mount_store(), key.as_deref(), false, &mut log)
+            .await?;
+        if pulled.digest != digest {
+            return Err(format!(
+                "the store answered {} for the pinned digest {digest}",
+                pulled.digest
+            ));
+        }
+        tracing::info!(mount = %path, digest, "mount fetched for a spread deployment");
+        Ok(())
+    }
+
     async fn present(&self, name: &str) -> Result<bool, String> {
         if self
             .present_cache
@@ -1488,6 +1513,58 @@ impl ImageCatalog {
                 .insert(name.to_string(), Instant::now());
         }
         Ok(found)
+    }
+
+    /// Before a VM is created for a `spread` deployment `d`: whether every
+    /// mount's tree is on this host. Its spec came from the fleet, so the
+    /// pull job that resolved it ran on another host. A missing tree is
+    /// fetched by its pinned digest and `false` is answered, so the create
+    /// waits rather than failing with `MountNotPulled`. Every other
+    /// deployment answers `true`: its own pull job puts its trees here.
+    pub async fn ensure_mounts(self: &Arc<Self>, d: &Arc<Deployment>) -> bool {
+        if !crate::fleet_placement::spreads(&d.spec) {
+            return true;
+        }
+        let Some(vm) = d.spec.vm.as_ref() else {
+            return true;
+        };
+        let store = self.vms.mount_store();
+        let missing: Vec<(MountSpec, String)> = vm
+            .mounts
+            .iter()
+            .filter(|m| m.is_remote() && store.resolve(m).is_none())
+            .filter_map(|m| Some((m.clone(), m.pinned_digest()?.to_string())))
+            .collect();
+        if missing.is_empty() {
+            self.thaws.lock().unwrap().remove(&mounts_key(&d.spec.id));
+            return true;
+        }
+
+        let now = now_secs();
+        {
+            let mut thaws = self.thaws.lock().unwrap();
+            let state = thaws.entry(mounts_key(&d.spec.id)).or_default();
+            if now < state.next_at {
+                return false;
+            }
+            state.attempts = state.attempts.saturating_add(1);
+            state.next_at = now + (30u64 << (state.attempts - 1).min(6)).min(1800);
+        }
+        for (mount, digest) in missing {
+            let flight = format!("mount:{digest}-s{}", mount.strip());
+            if !self.thawing.lock().unwrap().insert(flight.clone()) {
+                continue;
+            }
+            tracing::info!(deployment = %d.spec.id, mount = %mount.guest_path(), %digest, "a spread deployment's mount is not on this host; fetching it");
+            let me = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = me.fetch_mount(&mount, &digest).await {
+                    tracing::warn!(mount = %mount.guest_path(), %digest, error = %e, "fetching a spread deployment's mount failed");
+                }
+                me.thawing.lock().unwrap().remove(&flight);
+            });
+        }
+        false
     }
 
     /// Before a VM is created for `d`: whether its image is on heyvm. When it
@@ -1592,6 +1669,11 @@ impl ImageCatalog {
         // Missing, not ours to fetch: let the create fail and report it.
         true
     }
+}
+
+/// The backoff entry for a deployment's mounts, beside its image's.
+fn mounts_key(id: &str) -> String {
+    format!("{id}#mounts")
 }
 
 struct RemoteCopy {
@@ -2511,6 +2593,40 @@ mod tests {
             !h.catalog.ensure_image(&gone).await,
             "still held, and backing off rather than re-thawing"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_mounts_holds_a_spread_create_until_its_pinned_tree_is_here() {
+        let h = harness(&[]).await;
+        let digest = "b".repeat(64);
+        let deployment = |placement: serde_json::Value| {
+            let mut spec: crate::config::DeploymentSpec =
+                serde_json::from_value(serde_json::json!({
+                    "id": "x", "routes": [], "placement": placement,
+                    "vm": {"driver": "firecracker", "port": 8080, "mounts": [
+                        {"path": "/opt/app", "store": h.url, "ref": digest}
+                    ]}
+                }))
+                .unwrap();
+            spec.normalize();
+            Arc::new(Deployment::new(spec))
+        };
+        let pinned = deployment(serde_json::json!({"mode": "pinned", "home": "us5"}));
+        assert!(
+            h.catalog.ensure_mounts(&pinned).await,
+            "a pinned deployment's own pull job fetches its trees"
+        );
+        // Missing here: held, and a fetch by digest is started (it fails —
+        // the fake store serves no such blob — which is fine).
+        let spread = deployment(serde_json::json!({"mode": "spread"}));
+        assert!(!h.catalog.ensure_mounts(&spread).await);
+        assert!(
+            !h.catalog.ensure_mounts(&spread).await,
+            "still held, and backing off rather than re-fetching"
+        );
+        // Once the tree is on this host, the create goes ahead.
+        std::fs::create_dir_all(h._dir.path().join("mounts").join(&digest)).unwrap();
+        assert!(h.catalog.ensure_mounts(&spread).await);
     }
 
     #[test]

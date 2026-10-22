@@ -637,7 +637,7 @@ Done 2026-10-14. us5 and us4 are members of one fleet, and the fleet database's 
 
 #### 6c as built: spread placement and the controller (2026-10-15)
 
-- **Spec.** `placement.mode: spread` is accepted for VM pools with no host-bound state. Refused: no VM pool, `vm.workspace`, `vm.mounts`, `vm.disk_size_gb`, `idle_action: retain`, `vm.build`, an artifact store given as a path, and regional discovery or gateways.
+- **Spec.** `placement.mode: spread` is accepted for VM pools with no host-bound state. Refused: no VM pool, `vm.workspace`, a `vm.mounts` entry whose store is a path or that pins no digest (a digest-pinned URL mount is fetched by each host before its first create), `vm.disk_size_gb`, `idle_action: retain`, `vm.build`, an artifact store given as a path, and regional discovery or gateways.
 - **Tables (migration 3).**
   - `host_demand(host, deployment, in_flight, waiters, ready, booting, idle_secs)`: each host writes its rows once a second, only when they change, and clears them at start.
   - `placement_targets(deployment, host, desired, generation)`.
