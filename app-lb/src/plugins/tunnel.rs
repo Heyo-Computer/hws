@@ -343,6 +343,8 @@ struct Running {
     endpoint: Endpoint,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     shutdown: watch::Sender<bool>,
+    /// The registration refresh loop, replaced on a reconfigure.
+    refresh: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct TunnelPlugin {
@@ -450,7 +452,7 @@ impl TunnelPlugin {
             // No new connections and no more registrations; sessions finish
             // the request they are on instead of waiting for another.
             let _ = r.shutdown.send(true);
-            for t in r.tasks {
+            for t in r.tasks.into_iter().chain(r.refresh) {
                 t.abort();
             }
             // Sessions parked waiting for a keep-alive request end now; those
@@ -468,6 +470,25 @@ impl TunnelPlugin {
         st.error = None;
         self.allowed.write().unwrap().clear();
         self.external_tls.write().unwrap().clear();
+    }
+
+    /// Re-register every minute: a new relay, a cloud or remote that
+    /// restarted, and the lease, all come back this way.
+    fn spawn_refresh(&self, endpoint: Endpoint, cfg: Config, key: SecretKey) -> tokio::task::JoinHandle<()> {
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(REFRESH);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let Some(me) = me.upgrade() else { return };
+                let relay = endpoint.addr().relay_urls().next().map(|u| u.to_string());
+                me.status.write().unwrap().online = relay.is_some();
+                if let Err(e) = me.register_all(&cfg, &key, relay).await {
+                    tracing::warn!(error = %e, "tunnel: re-registration failed");
+                }
+            }
+        })
     }
 
     /// Wait for the streams being served to finish — quiet for a moment, so
@@ -631,10 +652,11 @@ impl TunnelPlugin {
             st.relay_url = relay_url;
             st.last_registered_at = crate::deployment::now_secs();
             st.error = (!errors.is_empty()).then(|| errors.join("; "));
-            let mut allowed = self.allowed.write().unwrap();
-            for t in &st.tunnels {
-                allowed.extend(t.edge_node_ids.iter().cloned());
-            }
+            // Replaced, not added to: a dialer the configuration no longer
+            // registers with is not let in again. Connections already open
+            // were checked when they opened.
+            *self.allowed.write().unwrap() =
+                st.tunnels.iter().flat_map(|t| t.edge_node_ids.iter().cloned()).collect();
             *self.external_tls.write().unwrap() =
                 st.tunnels.iter().map(|t| t.hostname.to_ascii_lowercase()).collect();
         }
@@ -817,14 +839,34 @@ impl Plugin for TunnelPlugin {
     }
 
     async fn apply(&self, config: Option<Value>) -> Result<(), String> {
-        self.stop().await;
-        let Some(config) = config else { return Ok(()) };
+        let Some(config) = config else {
+            self.stop().await;
+            return Ok(());
+        };
         let cfg = parse_config(&config)?;
         if self.app.get().is_none() {
             return Err("the tunnel ingress is not wired to the proxy; this is a bug".into());
         }
         if matches!(cfg, Config::Cloud(_)) {
             self.daemon()?;
+        }
+        // Running already: reconfigure in place. The endpoint's identity is
+        // the key, which does not change, so its connections, and what they
+        // are carrying, stay; only what is registered, and with whom, moves.
+        {
+            let mut running = self.running.lock().await;
+            if let Some(r) = running.as_mut() {
+                *self.config.write().unwrap() = Some(cfg.clone());
+                if let Some(t) = r.refresh.take() {
+                    t.abort();
+                }
+                let key = load_or_create_key(&self.key_path)?;
+                let relay_url = r.endpoint.addr().relay_urls().next().map(|u| u.to_string());
+                let first = self.register_all(&cfg, &key, relay_url).await;
+                r.refresh = Some(self.spawn_refresh(r.endpoint.clone(), cfg, key));
+                tracing::info!("tunnel reconfigured in place");
+                return first;
+            }
         }
         *self.config.write().unwrap() = Some(cfg.clone());
         *self.epoch.write().unwrap() = {
@@ -859,27 +901,12 @@ impl Plugin for TunnelPlugin {
         // restart. Connections that arrive meanwhile wait for `accept`.
         let first = self.register_all(&cfg, &key, relay_url).await;
         let accept = self.spawn_accept(endpoint.clone(), shutdown_rx.clone());
-        let refresh = {
-            let me = self.me.clone();
-            let endpoint = endpoint.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(REFRESH);
-                tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    let Some(me) = me.upgrade() else { return };
-                    let relay = endpoint.addr().relay_urls().next().map(|u| u.to_string());
-                    me.status.write().unwrap().online = relay.is_some();
-                    if let Err(e) = me.register_all(&cfg, &key, relay).await {
-                        tracing::warn!(error = %e, "tunnel: re-registration failed");
-                    }
-                }
-            })
-        };
+        let refresh = self.spawn_refresh(endpoint.clone(), cfg, key);
         *self.running.lock().await = Some(Running {
             endpoint,
-            tasks: vec![accept, refresh],
+            tasks: vec![accept],
             shutdown: shutdown_tx,
+            refresh: Some(refresh),
         });
         // Serving continues either way: the refresh loop retries, and a
         // hostname that did register works now.
@@ -1292,7 +1319,7 @@ mod tests {
         plugin.allowed.write().unwrap().insert(edge.id().to_string());
         let (tx, rx) = watch::channel(false);
         let accept = plugin.spawn_accept(server.clone(), rx);
-        *plugin.running.lock().await = Some(Running { endpoint: server.clone(), tasks: vec![accept], shutdown: tx });
+        *plugin.running.lock().await = Some(Running { endpoint: server.clone(), tasks: vec![accept], shutdown: tx, refresh: None });
 
         let conn = edge.connect(server.addr(), ALPN).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -1357,7 +1384,7 @@ mod tests {
         plugin.allowed.write().unwrap().insert(edge.id().to_string());
         let (tx, rx) = watch::channel(false);
         let accept = plugin.spawn_accept(server.clone(), rx);
-        *plugin.running.lock().await = Some(Running { endpoint: server.clone(), tasks: vec![accept], shutdown: tx });
+        *plugin.running.lock().await = Some(Running { endpoint: server.clone(), tasks: vec![accept], shutdown: tx, refresh: None });
 
         let conn = edge.connect(server.addr(), ALPN).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
