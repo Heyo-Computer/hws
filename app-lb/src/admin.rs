@@ -469,8 +469,8 @@ impl AdminApi {
         self
     }
 
-    pub fn with_tunnel_dialer(mut self, dialer: Arc<crate::tunnel_dialer::TunnelDialer>) -> Self {
-        self.state.tunnels = Some(dialer);
+    pub fn with_tunnel_dialer(mut self, dialer: Option<Arc<crate::tunnel_dialer::TunnelDialer>>) -> Self {
+        self.state.tunnels = dialer;
         self
     }
 
