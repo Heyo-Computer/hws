@@ -3352,8 +3352,13 @@ Requirements and behaviour:
   terminates their TLS.
 - Tunnel streams are served by the app-lb manager, not the forwarding
   worker: they arrive over the manager's endpoint. A manager restart drops
-  streams in flight and the edge redials; the worker's own listeners are
-  unaffected.
+  the streams in flight at that moment; requests that arrive during it wait
+  for the dialer to reach the new process, which registers at once with a
+  new epoch so the dialer stops using the old connection.
+- Reconfiguring the plugin keeps the endpoint and its connections: only the
+  registrations change. Disabling it stops taking new connections, lets
+  requests in progress finish (up to 10s) and winds idle keep-alive streams
+  down.
 
 To use it:
 
@@ -3416,7 +3421,15 @@ JSON
 - On the public side the tunnel is a static deployment whose one upstream is
   a loopback bridge to the node. Its health check is the node's health path.
   A registration not refreshed within its lease (default 300s) leaves the
-  tunnel offline until it registers again.
+  tunnel offline (503, `Retry-After`) until it registers again.
+- Requests are carried by the forwarding worker's own dialer, so a public
+  manager restart does not cut them. Workers alternate between two dialer
+  keys (`tunnel-w0.key`, `tunnel-w1.key` in the worker directory), so the
+  worker draining after a takeover and its replacement never share an
+  identity; registration names all of them. The manager's own dialer is
+  used for health probes.
+- A namespace holds at most `APP_LB_TUNNELS_PER_NAMESPACE` tunnels
+  (default 10).
 
 ### Namespace hosts
 

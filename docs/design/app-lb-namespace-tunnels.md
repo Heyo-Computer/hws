@@ -212,8 +212,11 @@ certificate order per tunnel.
 
 | Event | Behaviour |
 |---|---|
-| Local app-lb restarts | same key, same node id; the next refresh renews the lease; the public side redials. Streams in flight are dropped. |
-| Public manager restarts | the bridge (in the manager) drops streams in flight and redials on start. The worker keeps its listeners. Phase 3 moves the dialer into the worker. |
+| Local app-lb restarts | same key, same node id, a new epoch. It registers at once; the epoch tells the public side to drop its connections to the old process and dial the new one. Streams in flight at the moment of the restart are dropped (the ingress is in the local manager). Measured: one request in flight failed; everything else succeeded. |
+| Local plugin reconfigured | in place: the endpoint and its connections stay, only registrations change. Measured: 68/68, no gap. |
+| Local plugin disabled | stops taking connections, lets requests in progress finish (≤10s), winds idle keep-alive streams down, then closes. |
+| Public manager restarts | nothing is cut: the forwarding worker dials the node itself, and each worker generation uses the other of two keys. Measured: an 8s request across the restart completed; 112/112. |
+| A node vanishes without a word | the dialers' QUIC idle timeout (10s, keep-alives every 5s) notices it. |
 | A fleet host is added | its id appears in `dialer_ids` on the next refresh; until then the local side refuses it, and its health probe keeps it from serving the tunnel |
 | Token revoked | refresh gets 401; the plugin card says so; the lease lapses and the tunnel answers 503 |
 | Network partition | probe fails, so the tunnel answers 503; the lease is independent of the dial |
@@ -233,10 +236,11 @@ certificate order per tunnel.
    - The `app-lb` provider in the `tunnel` plugin: config, proof signing,
      registration loop, `dialer_ids` allow-list, health path.
    - The Plugins page and `heyctl` show both providers.
-3. **Hardening.**
-   - Drain on shutdown, on both sides.
-   - Dialer in the worker, so a public manager restart drops nothing.
-   - Per-namespace limits.
+3. **Hardening** (done, except where noted).
+   - Drain on plugin stop; reconfigure in place; a node epoch so a restarted node is dialed at once.
+   - Dialer in the worker, with two alternating keys, so a public manager restart drops nothing.
+   - Per-namespace tunnel count limit. *Not done:* bandwidth limits.
+   - *Not done:* the local ingress still lives in the local manager, so a local manager restart drops the streams in flight at that instant.
 4. **Acceptance (live).** With a disposable app behind a local app-lb,
    registered with us2's app-lb:
    - continuous requests through the public hostname;
