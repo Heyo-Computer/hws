@@ -866,6 +866,9 @@ impl Client {
         if req.all_servers {
             body["fleet"] = json!(true);
         }
+        if req.tunnel {
+            body["tunnel"] = json!(true);
+        }
         self.read(
             Request::new(Method::Post, "/tokens").json(body),
             "token",
@@ -1420,6 +1423,7 @@ impl Raw<'_> {
             "deployments": req.deployments,
             "expires_in_secs": req.expires_in_secs,
             "fleet": req.all_servers,
+            "tunnel": req.tunnel,
         });
         self.0
             .read(
@@ -1774,6 +1778,8 @@ pub struct NewToken {
     pub expires_in_secs: Option<u64>,
     /// Valid on every server of the fleet. See [`NewToken::on_all_servers`].
     pub all_servers: bool,
+    /// Registers tunnels only. See [`NewToken::for_tunnels`].
+    pub tunnel: bool,
 }
 
 impl NewToken {
@@ -1824,6 +1830,14 @@ impl NewToken {
     /// app-lb (one with gateways configured) accepts it.
     pub fn on_all_servers(mut self) -> Self {
         self.all_servers = true;
+        self
+    }
+
+    /// A tunnel token: registers its namespace's tunnels (the ones in
+    /// `deployments`, or any when that is empty) and reaches no other route.
+    /// Needs a namespace and no admin scope.
+    pub fn for_tunnels(mut self) -> Self {
+        self.tunnel = true;
         self
     }
 }

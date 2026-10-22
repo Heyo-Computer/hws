@@ -3638,6 +3638,49 @@ pub struct DeploymentSpec {
     /// single server is the only host there is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<Placement>,
+    /// A *tunnel*: the backend is another app-lb, which the internet cannot
+    /// reach, named by its iroh node id. This app-lb dials it and bridges
+    /// matched requests to it. See [`TunnelSpec`]. The fourth kind of
+    /// deployment, exclusive with `vm`, `upstreams` and `site`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<TunnelSpec>,
+}
+
+/// Where a tunnel deployment's backend is: an app-lb behind NAT that
+/// registered itself through `PUT /namespaces/:ns/tunnels/:name`
+/// (`docs/design/app-lb-namespace-tunnels.md`).
+///
+/// No address is ever given: a node id is a public key iroh authenticates on
+/// connect, so a namespace cannot aim this at the public host's loopback or
+/// private network the way a static upstream list can.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TunnelSpec {
+    /// The remote app-lb's iroh endpoint id (64 hex characters).
+    pub node_id: String,
+    /// The relay it is reachable through, as it reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// How long a registration stays live without a refresh. Past it the
+    /// tunnel is offline (no backend) but stays registered.
+    #[serde(default = "default_tunnel_lease")]
+    pub lease_secs: u64,
+    /// When the remote last registered, stamped by app-lb.
+    #[serde(default)]
+    pub renewed_at: u64,
+}
+
+pub const MIN_TUNNEL_LEASE: u64 = 60;
+pub const MAX_TUNNEL_LEASE: u64 = 3600;
+
+fn default_tunnel_lease() -> u64 {
+    300
+}
+
+impl TunnelSpec {
+    /// Whether the registration is live at `now`.
+    pub fn live(&self, now: u64) -> bool {
+        now < self.renewed_at.saturating_add(self.lease_secs)
+    }
 }
 
 /// Where a deployment runs when several app-lb hosts share one fleet store
@@ -4103,6 +4146,11 @@ pub enum SpecError {
     DescriptionTooLong,
     /// A namespace outside the id alphabet; it appears in URLs and filenames.
     BadNamespace(String),
+    /// A `tunnel` deployment that is not one, with why.
+    InvalidTunnel(String),
+    /// A namespace host pattern that is not a lowercase hostname, optionally
+    /// with a `*` prefix on its first label — or too many of them.
+    BadHostPattern(String),
     /// A `feed.expose` path that is not an absolute, traversal-free path.
     BadFeedExpose(String),
     /// A `feed.expose` on a deployment with no routes to serve it from.
@@ -4381,6 +4429,13 @@ impl std::fmt::Display for SpecError {
             Self::DescriptionTooLong => {
                 write!(f, "a namespace description must be 400 characters or fewer")
             }
+            Self::InvalidTunnel(why) => write!(f, "invalid tunnel deployment: {why}"),
+            Self::BadHostPattern(p) => write!(
+                f,
+                "namespace host pattern {p:?} must be a lowercase hostname, optionally starting \
+                 with '*' in its first label (\"*--sam.example.com\"), and a namespace may \
+                 declare at most {MAX_NAMESPACE_HOSTS}"
+            ),
             Self::BadNamespace(ns) => write!(
                 f,
                 "namespace {ns:?} must contain only letters, digits, '-', '_' and '.' — \
@@ -4989,7 +5044,9 @@ impl DeploymentSpec {
     pub fn backend(&self) -> Backend {
         if self.site.is_some() {
             Backend::Site
-        } else if !self.upstreams.is_empty() || self.discovery.is_some() {
+        } else if !self.upstreams.is_empty() || self.discovery.is_some() || self.tunnel.is_some() {
+            // A tunnel is served like a static deployment whose one upstream
+            // is the loopback bridge the tunnel dialer gives it.
             Backend::Upstreams
         } else {
             Backend::Vm
@@ -5286,12 +5343,40 @@ impl DeploymentSpec {
         None
     }
 
+    /// The rest of `validate` for a tunnel: nothing else may say where the
+    /// backend is, and its routes are exact hosts, which is what its
+    /// registration claims and what certificates are ordered for.
+    fn validate_tunnel(&self, tunnel: &TunnelSpec) -> Result<(), SpecError> {
+        let bad = |why: &str| Err(SpecError::InvalidTunnel(why.into()));
+        if self.vm.is_some() || !self.upstreams.is_empty() || self.discovery.is_some() || self.site.is_some() {
+            return bad("a tunnel's backend is its node; it cannot also set `vm`, `upstreams`, `discovery` or `site`");
+        }
+        if self.build.is_some() || self.artifact.is_some() || self.update.is_some() || self.ingress.is_some() {
+            return bad("a tunnel has no image or host-side commands: `build`, `artifact`, `update` and `ingress` do not apply");
+        }
+        if self.routes.iter().any(|r| r.host.is_none() || r.host_suffix.is_some()) {
+            return bad("every route of a tunnel names one exact `host`");
+        }
+        if tunnel.node_id.len() != 64 || !tunnel.node_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return bad("`tunnel.node_id` is an iroh endpoint id: 64 hex characters");
+        }
+        if !(MIN_TUNNEL_LEASE..=MAX_TUNNEL_LEASE).contains(&tunnel.lease_secs) {
+            return bad("`tunnel.lease_secs` must be between 60 and 3600");
+        }
+        if let Some(relay) = &tunnel.relay_url
+            && !(relay.starts_with("https://") || relay.starts_with("http://"))
+        {
+            return bad("`tunnel.relay_url` must be an http(s) URL");
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
         }
         if let Some(gateway) = &self.gateway {
-            if self.vm.is_some() || self.discovery.is_some() || self.site.is_some()
+            if self.vm.is_some() || self.discovery.is_some() || self.site.is_some() || self.tunnel.is_some()
                 || self.routes.len() != 1 || self.routes[0].host.is_none()
                 || self.routes[0].strip_prefix || self.routes[0].host_suffix.is_some() {
                 return Err(SpecError::InvalidGateway("gateway transport requires static upstreams and one exact-host route with preserved path".into()));
@@ -5359,6 +5444,10 @@ impl DeploymentSpec {
         // whichever backend the deployment has.
         if let Some(auth) = &self.auth {
             auth.validate(&self.routes)?;
+        }
+
+        if let Some(tunnel) = &self.tunnel {
+            return self.validate_tunnel(tunnel);
         }
 
         // Exactly one backend kind.
@@ -5619,6 +5708,64 @@ pub struct NamespaceSpec {
     /// a client-supplied creation time is a client-supplied lie.
     #[serde(default)]
     pub created_at: u64,
+    /// The hostnames this namespace's deployments may route, set by the
+    /// operator alone: an exact host (`shop.example.com`) or one whose first
+    /// label is `*`-prefixed (`*--sam.us2.heyo.work`, `*.sam.example.com`),
+    /// where `*` stands for one non-empty run of label characters.
+    ///
+    /// Empty means no policy was declared. Ordinary deployments are then
+    /// unconfined, as they always were; a tunnel, whose hostname a narrow
+    /// token claims, falls back to [`default_tunnel_hosts`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+}
+
+/// The most host patterns one namespace may declare.
+pub const MAX_NAMESPACE_HOSTS: usize = 32;
+
+/// Whether `host` (lowercase, no port) matches one of `patterns`.
+pub fn host_allowed(patterns: &[String], host: &str) -> bool {
+    patterns.iter().any(|p| match p.strip_prefix('*') {
+        None => p == host,
+        Some(rest) => host.strip_suffix(rest).is_some_and(|head| {
+            !head.is_empty() && head.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        }),
+    })
+}
+
+/// What a tunnel in `namespace` may claim when the operator declared nothing:
+/// one label under the fleet's deploy base, ending `--<namespace>`. `None`
+/// when there is no base, or the namespace is not usable in a DNS label.
+pub fn default_tunnel_hosts(namespace: &str, base: Option<&str>) -> Option<Vec<String>> {
+    let base = base?.trim_matches('.');
+    let label = !namespace.is_empty()
+        && namespace.len() <= 40
+        && namespace.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !namespace.starts_with('-');
+    (label && !base.is_empty()).then(|| vec![format!("*--{namespace}.{base}")])
+}
+
+fn valid_host_pattern(p: &str) -> bool {
+    let host = p.strip_prefix('*').unwrap_or(p);
+    let host = if p.starts_with('*') {
+        // The rest of the first label, then the dot: `*--sam.base`, `*.base`.
+        match host.split_once('.') {
+            Some((tail, base)) if tail.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') => base,
+            _ => return false,
+        }
+    } else {
+        host
+    };
+    !host.is_empty()
+        && host.len() <= 253
+        && host.contains('.')
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 impl NamespaceSpec {
@@ -5634,6 +5781,12 @@ impl NamespaceSpec {
         }
         if self.description.as_ref().is_some_and(|d| d.len() > 400) {
             return Err(SpecError::DescriptionTooLong);
+        }
+        if self.hosts.len() > MAX_NAMESPACE_HOSTS {
+            return Err(SpecError::BadHostPattern(format!("{} patterns", self.hosts.len())));
+        }
+        if let Some(bad) = self.hosts.iter().find(|p| !valid_host_pattern(p)) {
+            return Err(SpecError::BadHostPattern(bad.clone()));
         }
         Ok(())
     }
@@ -5889,11 +6042,49 @@ mod tests {
 
     /// A declared namespace is an object with a name and very little else, so
     /// validation is where all of its rules live.
+    mod tunnel_specs {
+        use super::*;
+
+        fn tunnel(extra: serde_json::Value) -> DeploymentSpec {
+            let mut v = serde_json::json!({
+                "id": "desktop", "namespace": "sam",
+                "routes": [{"host": "desktop--sam.us2.heyo.work"}],
+                "tunnel": {"node_id": "ab".repeat(32)},
+            });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        }
+
+        #[test]
+        fn a_tunnel_is_its_own_backend_and_is_served_like_a_static_one() {
+            let t = tunnel(serde_json::json!({}));
+            assert_eq!(t.validate(), Ok(()));
+            assert_eq!(t.backend(), Backend::Upstreams);
+            assert_eq!(t.tunnel.as_ref().unwrap().lease_secs, 300);
+            assert!(t.tunnel.as_ref().unwrap().live(299) && !t.tunnel.as_ref().unwrap().live(300));
+        }
+
+        #[test]
+        fn a_tunnel_names_nothing_else_and_routes_exact_hosts() {
+            for extra in [
+                serde_json::json!({"upstreams": ["127.0.0.1:1"]}),
+                serde_json::json!({"routes": [{"host_suffix": ".heyo.work"}]}),
+                serde_json::json!({"routes": [{"path_prefix": "/x"}]}),
+                serde_json::json!({"routes": []}),
+                serde_json::json!({"tunnel": {"node_id": "not-hex"}}),
+                serde_json::json!({"tunnel": {"node_id": "ab".repeat(32), "lease_secs": 10}}),
+                serde_json::json!({"tunnel": {"node_id": "ab".repeat(32), "relay_url": "file:///x"}}),
+            ] {
+                assert!(tunnel(extra.clone()).validate().is_err(), "{extra}");
+            }
+        }
+    }
+
     mod namespace_objects {
         use super::*;
 
         fn ns(name: &str) -> NamespaceSpec {
-            NamespaceSpec { name: name.into(), description: None, created_at: 0 }
+            NamespaceSpec { name: name.into(), description: None, created_at: 0, hosts: vec![] }
         }
 
         #[test]
@@ -5926,6 +6117,39 @@ mod tests {
             ));
             let msg = SpecError::ReservedNamespace.to_string();
             assert!(msg.contains("default"), "{msg}");
+        }
+
+        #[test]
+        fn host_patterns_match_one_label_and_nothing_wider() {
+            let p = vec!["*--sam.us2.heyo.work".to_string(), "shop.example.com".to_string()];
+            assert!(host_allowed(&p, "desktop--sam.us2.heyo.work"));
+            assert!(host_allowed(&p, "shop.example.com"));
+            assert!(!host_allowed(&p, "--sam.us2.heyo.work"), "the star stands for something");
+            assert!(!host_allowed(&p, "a.b--sam.us2.heyo.work"), "one label, not a subtree");
+            assert!(!host_allowed(&p, "desktop--bob.us2.heyo.work"));
+            assert!(!host_allowed(&p, "www.shop.example.com"));
+            assert!(!host_allowed(&[], "shop.example.com"));
+        }
+
+        #[test]
+        fn the_default_tunnel_policy_needs_a_base_and_a_dns_safe_namespace() {
+            assert_eq!(
+                default_tunnel_hosts("sam", Some("us2.heyo.work")),
+                Some(vec!["*--sam.us2.heyo.work".to_string()])
+            );
+            assert_eq!(default_tunnel_hosts("sam", None), None);
+            assert_eq!(default_tunnel_hosts("Sam_Team", Some("us2.heyo.work")), None);
+        }
+
+        #[test]
+        fn host_patterns_are_validated() {
+            let with = |hosts: &[&str]| NamespaceSpec { hosts: hosts.iter().map(|h| h.to_string()).collect(), ..ns("sam") };
+            assert!(with(&["*--sam.us2.heyo.work", "*.sam.example.com", "shop.example.com"]).validate().is_ok());
+            for bad in ["*", "*.com", "Shop.example.com", "a.*.example.com", "**.example.com", "-a.example.com", "example"] {
+                assert!(matches!(with(&[bad]).validate(), Err(SpecError::BadHostPattern(_))), "{bad}");
+            }
+            let many: Vec<String> = (0..=MAX_NAMESPACE_HOSTS).map(|i| format!("h{i}.example.com")).collect();
+            assert!(NamespaceSpec { hosts: many, ..ns("sam") }.validate().is_err());
         }
 
         #[test]
@@ -6194,7 +6418,7 @@ mod tests {
     }
 
     fn spec() -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,
@@ -6274,7 +6498,7 @@ mod tests {
 
     /// A static (proxy_pass) deployment: `upstreams` set, no `vm`.
     fn static_spec(upstreams: &[&str]) -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,

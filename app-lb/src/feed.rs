@@ -310,7 +310,7 @@ mod tests {
     use crate::config::FeedSpec;
 
     fn spec(id: &str, namespace: &str, feed: Option<FeedSpec>) -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,

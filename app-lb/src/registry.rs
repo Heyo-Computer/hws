@@ -1330,7 +1330,7 @@ mod tests {
     use std::path::Path;
 
     fn spec(id: &str, routes: Vec<RouteRule>) -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     fn static_spec(id: &str, routes: Vec<RouteRule>, upstreams: &[&str]) -> DeploymentSpec {
-        DeploymentSpec {
+        DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,

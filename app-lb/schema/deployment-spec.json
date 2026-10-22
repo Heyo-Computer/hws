@@ -151,6 +151,17 @@
         }
       ]
     },
+    "tunnel": {
+      "description": "A *tunnel*: the backend is another app-lb, which the internet cannot\nreach, named by its iroh node id. This app-lb dials it and bridges\nmatched requests to it. See [`TunnelSpec`]. The fourth kind of\ndeployment, exclusive with `vm`, `upstreams` and `site`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TunnelSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "update": {
       "description": "How a *static* deployment's backend is updated: a working directory on\nthis host and commands to run in it. The static counterpart of `build`,\nand mutually exclusive with it for the same reason the backend kinds are.",
       "anyOf": [
@@ -1241,6 +1252,40 @@
           }
         }
       }
+    },
+    "TunnelSpec": {
+      "description": "Where a tunnel deployment's backend is: an app-lb behind NAT that\nregistered itself through `PUT /namespaces/:ns/tunnels/:name`\n(`docs/design/app-lb-namespace-tunnels.md`).\n\nNo address is ever given: a node id is a public key iroh authenticates on\nconnect, so a namespace cannot aim this at the public host's loopback or\nprivate network the way a static upstream list can.",
+      "type": "object",
+      "properties": {
+        "lease_secs": {
+          "description": "How long a registration stays live without a refresh. Past it the\ntunnel is offline (no backend) but stays registered.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 300,
+          "minimum": 0
+        },
+        "node_id": {
+          "description": "The remote app-lb's iroh endpoint id (64 hex characters).",
+          "type": "string"
+        },
+        "relay_url": {
+          "description": "The relay it is reachable through, as it reported it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "renewed_at": {
+          "description": "When the remote last registered, stamped by app-lb.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "node_id"
+      ]
     },
     "UpdateSpec": {
       "description": "How a *static* (proxy_pass) deployment's backend is updated: a working\ndirectory on the app-lb host, and commands to run in it.\n\nThe managed counterpart of this is [`BuildSpec`], and the asymmetry is the\npoint. A managed deployment's backend is a microVM app-lb owns, so updating\nit means producing a new image. A static deployment's backend is a process\nsomebody else runs — usually on this same host, under supervisord or systemd\n— so updating it means doing on the host what a person would otherwise ssh in\nand do: pull, build, restart.\n\nNothing in the spec changes when this runs. The upstreams are the same\naddresses; what moved is the code answering on them. That is why the job\nre-probes those addresses afterwards: \"the commands exited 0\" is not the same\nclaim as \"the service is serving\".",

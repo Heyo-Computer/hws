@@ -71,6 +71,7 @@ mod tls;
 mod tokens;
 mod transfers;
 mod unpack;
+mod tunnel_dialer;
 mod vm;
 mod worker;
 mod worker_rpc;
@@ -764,6 +765,15 @@ fn main() {
         }
     };
     let store_slot = Arc::new(store_gateway::StoreSlot::new(env_store));
+    // Filled by the tunnel plugin with the hostnames the cloud edge serves
+    // TLS for, so ACME never orders certificates it cannot validate.
+    let external_tls = plugins::tunnel::ExternalTlsHosts::default();
+    // Handed its proxy and daemon client below, once both exist.
+    let tunnel_plugin = plugins::tunnel::TunnelPlugin::new(
+        plugins::tunnel::key_path(&cfg.state_path),
+        external_tls.clone(),
+        secrets.clone(),
+    );
     let plugin_host = Arc::new(plugins::PluginHost::new(
         vec![
             plugins::pgfc::PgFcPlugin::new(secrets.clone()),
@@ -773,6 +783,7 @@ fn main() {
             plugins::remote::RemotePlugin::new(secrets.clone()),
             plugins::secrets::SecretsPlugin::new(secrets.clone()),
             plugins::artifacts::ArtifactsPlugin::new(secrets.clone(), store_slot.clone()),
+            tunnel_plugin.clone(),
             plugins::auth::AuthPlugin::new(
                 plugins::auth::Kind::Heyo,
                 auth_providers.clone(),
@@ -1320,6 +1331,7 @@ fn main() {
                         .route53_zone_id
                         .clone()
                         .map(|zone| dns::Route53::new(cfg.aws_bin.clone(), zone)),
+                    external_tls: external_tls.clone(),
                 };
                 match &fleet_stores {
                     Some(fs) => AcmeManager::with_documents(
@@ -1361,6 +1373,10 @@ fn main() {
 
     // Background commands in sandboxes: the records sit beside the state file,
     // and the watcher holds each busy VM and follows its operations.
+    // Dials `tunnel` deployments' remote app-lbs, from a key of this host's own.
+    let tunnel_dialer = tunnel_dialer::TunnelDialer::open(&tunnel_dialer::key_path(&cfg.state_path), registry.clone())
+        .unwrap_or_else(|e| panic!("cannot open the tunnel dialer's key: {e}"));
+
     let operations = operations::Operations::open(
         std::path::Path::new(&cfg.state_path).with_extension("operations.json"),
         registry.clone(),
@@ -1434,6 +1450,7 @@ fn main() {
         .with_artifact_store(store_slot.clone())
         .with_fleet_store(fleet_stores.as_ref().map(|fs| fs.fleet.clone()))
         .with_operations(operations.clone())
+        .with_tunnel_dialer(tunnel_dialer.clone())
         .with_transfers(transfers.clone()),
     );
 
@@ -1482,6 +1499,20 @@ fn main() {
         fleet_placement::install(placer.clone());
         placer
     });
+    // Tunnel streams are served in this process, by the same thin proxy the
+    // forwarding worker runs, asking this manager for each decision over the
+    // same socket. They arrive over the manager's iroh endpoint, so they do
+    // not outlive it the way the worker's listeners do; the edge redials.
+    tunnel_plugin.attach(
+        Arc::new(pingora_proxy::http_proxy(
+            &server.configuration,
+            proxy::LbProxy::for_tunnel_ingress(
+                worker_rpc::Client::new(worker_dir.join("requests")),
+                external_tls.clone(),
+            ),
+        )),
+        vms.client().clone(),
+    );
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
         control: Arc::new(request_control::RequestControl::new(
             registry.clone(), metrics.clone(), challenges, auth, guard.clone(),
@@ -1503,6 +1534,7 @@ fn main() {
     if let Some(placer) = placer {
         server.add_service(background_service("fleet-placement", fleet_placement::Service(placer)));
     }
+    server.add_service(background_service("tunnel-dialer", tunnel_dialer::Service(tunnel_dialer)));
     server.add_service(admin_svc);
     server.add_service(background_service(
         "discovery",

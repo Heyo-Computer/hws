@@ -231,6 +231,10 @@ pub struct RequestState {
     fleet: bool,
     /// This request goes to its deployment's home host, once.
     hop_out: Option<HopOut>,
+    /// The client, as this host judged it: the socket peer, a fleet hop's
+    /// vouched client, or a tunnel ingress's dialer's word. Told to a
+    /// tunnel's remote app-lb, which has no socket peer of its own.
+    client: Option<std::net::IpAddr>,
 }
 
 impl RequestState {
@@ -298,6 +302,16 @@ impl RequestState {
         }
         if let Some(prefix) = self.route_prefix.as_deref() {
             out.push(HeaderModification::RewriteUri(strip_uri_prefix(uri, prefix)));
+        }
+        // A tunnel's remote app-lb sees the dialer, not the visitor: tell it
+        // who this host judged the visitor to be. Whatever the client sent
+        // under this name was stripped at ingress.
+        if self.deployment.as_ref().is_some_and(|d| d.spec.tunnel.is_some()) {
+            let name = http::HeaderName::from_static(crate::proxy::TUNNEL_CLIENT_IP);
+            match self.client {
+                Some(ip) => out.push(HeaderModification::Set(name, value(&ip.to_string(), "tunnel client")?)),
+                None => out.push(HeaderModification::Remove(name)),
+            }
         }
         match &self.cookie_rewrite {
             None => {}
@@ -550,6 +564,7 @@ impl RequestControl {
             }
             _ => head,
         };
+        state.client = head.peer.map(|p| p.ip());
         let mut routed = self.registry.route(host.as_deref(), &path);
         if routed.is_none() && let Some(foreign) = self.registry.route_foreign(host.as_deref(), &path) {
             // A pinned deployment's home, or, for a spread one this host does
@@ -675,6 +690,14 @@ impl RequestControl {
             return RequestDecision::Respond(ResponseData { status: 200, body: doc, content_type: "application/rss+xml; charset=utf-8", headers: vec![], cache_control: Some("public, max-age=300") });
         }
         if let Some(spec) = deployment.spec.site.clone() { state.set_deployment(deployment); return RequestDecision::ServeSite { spec, path }; }
+        // A tunnel with nothing to forward to is a remote app-lb that is not
+        // there: its lease lapsed, or it does not answer. Say so, rather than
+        // the bare 500 a failed upstream selection becomes.
+        if deployment.spec.tunnel.is_some() && !deployment.backends().iter().any(|b| b.is_available()) {
+            let mut offline = ResponseData::plain(503, "this tunnel is offline: the app-lb behind it is not connected\n");
+            offline.headers.push((http::header::RETRY_AFTER, "30".into()));
+            return RequestDecision::Respond(offline);
+        }
         state.set_deployment(deployment);
         RequestDecision::Proxy
     }
@@ -813,6 +836,61 @@ pub async fn wait_for_capacity(
 mod tests {
     use super::*;
     use crate::config::DeploymentSpec;
+
+    /// A tunnel's backend is a bridge the dialer gives it; without one the
+    /// tunnel says it is offline, and with one the node is told the client.
+    mod tunnels {
+        use super::*;
+
+        #[tokio::test]
+        async fn an_offline_tunnel_says_so_and_a_live_one_is_told_the_client() {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Arc::new(Registry::new(dir.path().join("state.json")));
+            let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+                "id": "desktop", "namespace": "sam", "routes": [{"host": "desktop--sam.example"}],
+                "tunnel": {"node_id": "ab".repeat(32)},
+            }))
+            .unwrap();
+            let deployment = registry.upsert(spec);
+            let secrets = Arc::new(crate::secrets::SecretStore::new(dir.path().join("secrets"), None));
+            let control = RequestControl::new(
+                registry,
+                Arc::new(Metrics::new()),
+                Arc::new(crate::acme::ChallengeTable::new()),
+                Arc::new(crate::auth::Authenticator::new(vec![7; 32], secrets.clone(), None, None)),
+                Arc::new(crate::guard::Guard::new(dir.path().join("guard"), true)),
+                Arc::new(Feed::new()),
+                Arc::new(crate::auth_providers::AuthProviderStore::new(dir.path().join("providers"))),
+                secrets,
+            );
+            let mut forged = http::HeaderMap::new();
+            forged.insert(crate::proxy::TUNNEL_CLIENT_IP, "6.6.6.6".parse().unwrap());
+            let head = RequestHead {
+                method: http::Method::GET,
+                uri: "http://desktop--sam.example/x".parse().unwrap(),
+                headers: forged,
+                peer: Some("198.51.100.7:5000".parse().unwrap()),
+                tls_terminated: true,
+            };
+
+            let mut state = RequestState::default();
+            match control.decide(&head, &mut state).await {
+                RequestDecision::Respond(r) => {
+                    assert_eq!(r.status, 503);
+                    assert!(r.headers.iter().any(|(n, _)| n == http::header::RETRY_AFTER));
+                }
+                _ => panic!("an unbridged tunnel answers for itself"),
+            }
+
+            deployment.set_backends(vec![Arc::new(crate::deployment::VmBackend::for_upstream("127.0.0.1:9".into()))]);
+            let mut state = RequestState::default();
+            assert!(matches!(control.decide(&head, &mut state).await, RequestDecision::Proxy));
+            let mods = state.forwarding_modifications(&"/x".parse().unwrap()).unwrap();
+            assert!(mods.iter().any(|m| matches!(m,
+                HeaderModification::Set(n, v) if n == crate::proxy::TUNNEL_CLIENT_IP && v == "198.51.100.7")),
+                "the socket peer, not what the client claimed");
+        }
+    }
 
     /// The fleet hop's decisions, on us4: `local` runs here, `theirs` is
     /// pinned to us5.

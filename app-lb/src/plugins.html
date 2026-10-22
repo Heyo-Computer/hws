@@ -695,6 +695,123 @@ PANELS.vapi = (() => {
   return { render: refresh, refresh };
 })();
 
+// ---- tunnel ------------------------------------------------------------------
+//
+// The hostnames are claimed by editing this plugin's configuration (so they
+// survive restarts and are re-registered every minute); release also drops
+// them from it, or the next refresh would claim them again.
+PANELS.tunnel = (() => {
+  const base = "/api/plugins/tunnel";
+  let el = null, view = null;
+
+  function skeleton() {
+    el.innerHTML = `
+      <div class="tiles" id="tn-tiles"></div>
+      <div class="sub-title">Hostnames</div>
+      <div class="scroll" id="tn-hosts"></div>
+      <div class="sub-title">Claim a hostname</div>
+      <div class="row" style="align-items:center">
+        <input type="text" id="tn-sub" placeholder="subdomain (blank: let the cloud pick)" size="30">
+        <label><input type="checkbox" id="tn-public" checked> public</label>
+        <button class="act" type="button" id="tn-claim">Claim</button>
+      </div>
+      <p class="desc">A private hostname asks visitors to sign in to Heyo with this account before the
+        request reaches app-lb. Route a hostname to a deployment to serve it; until then app-lb answers 404.</p>`;
+    el.querySelector("#tn-claim").addEventListener("click", claim);
+  }
+
+  function config() { return JSON.parse(JSON.stringify(view.config || { hostnames: [] })); }
+
+  async function save(cfg, what) {
+    const r = await api("PUT", `/api/plugins/tunnel`, { enabled: true, config: cfg });
+    if (!r.ok) { flash("bad", failure(r, what)); return false; }
+    flash(r.data.last_error ? "bad" : "ok", r.data.last_error ? `${what}: ${r.data.last_error}` : `${what} done.`);
+    update(r.data);
+    return true;
+  }
+
+  async function claim() {
+    const sub = el.querySelector("#tn-sub").value.trim();
+    const cfg = config();
+    cfg.hostnames = cfg.hostnames || [];
+    const entry = { public: el.querySelector("#tn-public").checked };
+    if (sub) entry.subdomain = sub;
+    cfg.hostnames.push(entry);
+    if (await save(cfg, "Claiming the hostname")) el.querySelector("#tn-sub").value = "";
+  }
+
+  async function release(t) {
+    if (!confirm(`Release ${t.hostname}? Anyone may claim it afterwards.`)) return;
+    const r = await api("DELETE", `${base}/tunnels/${encodeURIComponent(t.subdomain)}`);
+    if (!r.ok && r.status !== 404) { flash("bad", failure(r, "Releasing")); return; }
+    const cfg = config();
+    // A minted hostname has no subdomain in the config; it is the unnamed entry.
+    cfg.hostnames = (cfg.hostnames || []).filter(h => h.subdomain ? h.subdomain !== t.subdomain : !t.subdomain.startsWith("lb-"));
+    if (!cfg.hostnames.length) {
+      const d = await api("POST", `/api/plugins/tunnel/disable`);
+      if (d.ok) { flash("ok", `${t.hostname} released; the tunnel is off.`); update(d.data); }
+      return;
+    }
+    await save(cfg, `Releasing ${t.hostname}`);
+  }
+
+  async function route(t, select) {
+    const id = select.value;
+    if (!id) return;
+    const r = await api("GET", `/deployments/${encodeURIComponent(id)}`);
+    if (!r.ok) { flash("bad", failure(r, "Reading the deployment")); return; }
+    const spec = r.data.spec;
+    spec.routes = spec.routes || [];
+    if (spec.routes.some(x => x.host === t.hostname)) { flash("ok", `${id} already serves ${t.hostname}.`); return; }
+    spec.routes.push({ host: t.hostname });
+    const w = await api("PUT", `/deployments/${encodeURIComponent(id)}`, spec);
+    if (!w.ok) { flash("bad", failure(w, `Routing ${t.hostname} to ${id}`)); return; }
+    flash("ok", `${t.hostname} now routes to ${id}.`);
+    select.value = "";
+  }
+
+  async function render() {
+    const st = view.status || {};
+    const tile = (k, v, sub) => `<div class="tile"><span class="k">${k}</span><div class="v">${v}</div>${sub ? `<div class="s">${sub}</div>` : ""}</div>`;
+    el.querySelector("#tn-tiles").innerHTML =
+      tile("Endpoint", st.online ? `<span class="tag on">online</span>` : `<span class="tag fail">offline</span>`,
+        `<span class="mono">${esc((st.node_id || "").slice(0, 16))}…</span>`) +
+      tile("Relay", esc(st.relay_url ? new URL(st.relay_url).host : "none"), "") +
+      tile("Streams", `${esc(st.streams_active ?? 0)} open`, `${esc(st.streams_total ?? 0)} served · ${esc(st.rejected_connections ?? 0)} refused`);
+    const hosts = el.querySelector("#tn-hosts");
+    const tunnels = st.tunnels || [];
+    if (!tunnels.length) {
+      hosts.innerHTML = `<div class="dim">${st.error ? "No hostname is registered yet." : "Registering…"}</div>`;
+      return;
+    }
+    const deps = await api("GET", "/deployments");
+    const ids = deps.ok ? deps.data.map(d => (d.spec && d.spec.id) || d.id).filter(Boolean) : [];
+    hosts.innerHTML = `<table class="grid"><thead><tr><th>Hostname</th><th>Access</th><th>Route to</th><th></th></tr></thead><tbody>${
+      tunnels.map((t, i) => `<tr>
+        <td><a class="mono" href="${esc(t.url)}" target="_blank" rel="noopener">${esc(t.hostname)}</a></td>
+        <td>${t.is_public ? `<span class="tag on">public</span>` : `<span class="tag warm">Heyo sign-in</span>`}</td>
+        <td><select data-route="${i}"><option value="">deployment…</option>${ids.map(id => `<option>${esc(id)}</option>`).join("")}</select></td>
+        <td class="actions"><button class="act danger" type="button" data-release="${i}">Release</button></td></tr>`).join("")}</tbody></table>`;
+    hosts.querySelectorAll("[data-route]").forEach(s => s.addEventListener("change", () => route(tunnels[+s.dataset.route], s)));
+    hosts.querySelectorAll("[data-release]").forEach(b => b.addEventListener("click", () => release(tunnels[+b.dataset.release])));
+  }
+
+  function refresh(v, target) {
+    view = v;
+    if (!v.enabled) {
+      el = null;
+      target.innerHTML = `<p class="desc">Needs heyvmd on this machine, logged in with <code>heyvm login</code>.
+        Enabling it with no configuration claims one public hostname the cloud picks.</p>`;
+      return;
+    }
+    // Rebuild only when the panel is new, so a half-typed subdomain survives a poll.
+    if (el !== target) { el = target; skeleton(); }
+    render();
+  }
+
+  return { render: refresh, refresh };
+})();
+
 // ---- obs ---------------------------------------------------------------------
 //
 // A plugin installed per namespace: the operator enables it here, and each

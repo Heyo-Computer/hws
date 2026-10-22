@@ -153,6 +153,11 @@ pub struct AppToken {
     /// module docs on fleet tokens.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fleet: bool,
+    /// May only register its namespace's tunnels (`/namespaces/:ns/tunnels`),
+    /// named in `deployments` (empty: any name), and nothing else. Held by an
+    /// app-lb behind NAT, so it is as narrow as a credential gets.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tunnel: bool,
     /// Hex `sha256(secret)`. Leaves this module only in the control plane's
     /// fleet export, to servers that verify the token themselves.
     #[serde(rename = "secret_sha256")]
@@ -241,6 +246,7 @@ impl AppToken {
                 n => Some(n),
             },
             fleet: self.fleet,
+            tunnel: self.tunnel,
             mirrored_from: None,
         }
     }
@@ -268,6 +274,9 @@ pub struct TokenSummary {
     /// Valid on every server that mirrors this control plane's fleet tokens.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fleet: bool,
+    /// Registers tunnels only. See [`AppToken::tunnel`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tunnel: bool,
     /// Set on a server that holds this token only as a mirror: the id of the
     /// control plane it came from, which is where it is changed or revoked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,6 +308,10 @@ pub struct NewToken {
     /// plane mints these; the admin API refuses the flag anywhere else.
     #[serde(default)]
     pub fleet: bool,
+    /// A tunnel registration token. See [`AppToken::tunnel`]; needs a
+    /// namespace and no admin scope.
+    #[serde(default)]
+    pub tunnel: bool,
 }
 
 /// The fields of a token that can be changed after minting. The secret cannot:
@@ -345,12 +358,15 @@ pub enum TokenError {
     UnknownFormat(String),
     /// A record in a control plane's fleet export that is not a token.
     BadFleetRecord(String),
+    /// A tunnel token without a namespace, or with an admin scope.
+    BadTunnelScope,
 }
 
 impl std::fmt::Display for TokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyName => write!(f, "a token needs a name — it is how you know what to revoke"),
+            Self::BadTunnelScope => write!(f, "a tunnel token is confined to one namespace and holds no admin scope (and is not a fleet token)"),
             Self::NameTooLong => write!(f, "token name must be 128 characters or fewer"),
             Self::NoToken(id) => write!(f, "no token \"{id}\""),
             Self::BadScope(s) => write!(
@@ -468,6 +484,9 @@ impl TokenStore {
         }
         validate_scope(&req.deployments)?;
         validate_namespace(req.namespace.as_deref())?;
+        if req.tunnel && (req.namespace.is_none() || req.admin != AdminScope::None || req.fleet) {
+            return Err(TokenError::BadTunnelScope);
+        }
 
         let id = random_hex(ID_LEN / 2);
         let secret = random_b64(SECRET_BYTES);
@@ -481,6 +500,7 @@ impl TokenStore {
             expires_at: req.expires_in_secs.map(|s| now.saturating_add(s)),
             minted_by,
             fleet: req.fleet,
+            tunnel: req.tunnel,
             hash: hash_secret(&secret),
             last_used_at: 0,
             live_last_used: Arc::new(AtomicU64::new(0)),
@@ -1001,7 +1021,7 @@ mod tests {
     }
 
     fn new(name: &str, admin: AdminScope, deployments: &[&str]) -> NewToken {
-        NewToken {
+        NewToken { tunnel: false,
             fleet: false,
             name: name.into(),
             admin,

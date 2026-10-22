@@ -172,6 +172,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "instant-acme",
+ "iroh",
  "libc",
  "openssl",
  "pg-fc-api",

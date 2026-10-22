@@ -2167,6 +2167,9 @@ pub struct TokenSummary {
     pub last_used_at: Option<u64>,
     /// Minted at a control plane and valid on every server that mirrors it.
     pub fleet: bool,
+    /// Registers its namespace's tunnels and nothing else.
+    #[serde(default)]
+    pub tunnel: bool,
     /// Set when this server holds the token only as a mirror: the control
     /// plane it came from, which is where it is changed or revoked.
     pub mirrored_from: Option<String>,

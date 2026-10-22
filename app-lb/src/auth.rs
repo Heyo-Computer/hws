@@ -1347,7 +1347,7 @@ impl Authenticator {
         // by an operator deciding what to revoke, and "session" alone would be
         // a page of identical rows.
         let name = format!("session {} @ {}", identity.email, deployment_id);
-        let req = crate::tokens::NewToken {
+        let req = crate::tokens::NewToken { tunnel: false,
             name,
             admin: scope,
             namespace: None,
@@ -2923,7 +2923,7 @@ mod tests {
 
         fn mint(t: &TokenStore, deployments: &[&str]) -> String {
             t.mint(
-                NewToken {
+                NewToken { tunnel: false,
                     fleet: false,
                     name: "agent".into(),
                     namespace: None,
@@ -3006,7 +3006,7 @@ mod tests {
             let g = token_gate(r#""app-token""#);
             let secret = t
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "team-a agent".into(),
                         namespace: Some("team-a".into()),
@@ -3278,7 +3278,7 @@ mod tests {
 
         fn admin_token(t: &TokenStore, deployments: &[&str], admin: AdminScope) -> String {
             t.mint(
-                NewToken {
+                NewToken { tunnel: false,
                     fleet: false,
                     name: "api".into(),
                     namespace: None,
@@ -3408,7 +3408,7 @@ mod tests {
             // not in — `admits` fails, and the reason is worth saying.
             let confined = tokens
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "ns".into(),
                         admin: AdminScope::Admin,
@@ -3495,7 +3495,7 @@ mod tests {
 
             let confined = tokens
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "ns".into(),
                         admin: AdminScope::Admin,
@@ -3531,7 +3531,7 @@ mod tests {
             // authorization, and a `view` token gets no further than before.
             let low = tokens
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "low".into(),
                         admin: AdminScope::View,
@@ -3570,7 +3570,7 @@ mod tests {
             // help across one.
             let t = tokens
                 .mint(
-                    NewToken {
+                    NewToken { tunnel: false,
                         fleet: false,
                         name: "sam".into(),
                         admin: AdminScope::Admin,

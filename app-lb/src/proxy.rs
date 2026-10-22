@@ -37,11 +37,83 @@ pub struct Ctx {
 
 pub struct LbProxy {
     control: Client,
+    /// True for the instance that serves streams arriving over an app-lb
+    /// tunnel (see `plugins::tunnel`), which runs in the manager rather than
+    /// the forwarding worker. Those have no socket peer — the cloud edge is
+    /// the far end of the stream — so the visitor's address comes from the
+    /// edge's [`TUNNEL_CLIENT_IP`] instead, and the edge terminated TLS.
+    tunnel_ingress: bool,
+    /// On tunnel ingress, the hostnames this app-lb registered. A stream from
+    /// an allowed dialer is served only for these: whoever can register a
+    /// tunnel at the same dialer could otherwise point their own hostname at
+    /// this node and reach its catch-all routes.
+    tunnel_hosts: crate::plugins::tunnel::ExternalTlsHosts,
 }
+
+/// Answered by tunnel ingress itself, before routing, so the dialer can tell
+/// a live tunnel from a dead one without knowing any of its hostnames.
+pub const TUNNEL_HEALTH_PATH: &str = "/.well-known/heyo-tunnel/health";
+
+/// The header the cloud edge sets on tunnel ingress: the visitor's address as
+/// the edge's own proxy saw it. Trusted only on tunnel ingress, and removed
+/// before every upstream request on every ingress.
+pub const TUNNEL_CLIENT_IP: &str = "x-heyo-client-ip";
 
 impl LbProxy {
     pub fn new(control: Client) -> Self {
-        Self { control }
+        Self { control, tunnel_ingress: false, tunnel_hosts: Default::default() }
+    }
+
+    /// The proxy for streams that arrived over an app-lb tunnel, serving only
+    /// `hosts`.
+    pub fn for_tunnel_ingress(control: Client, hosts: crate::plugins::tunnel::ExternalTlsHosts) -> Self {
+        Self { control, tunnel_ingress: true, tunnel_hosts: hosts }
+    }
+
+    /// Tunnel ingress only: answer what is not this app-lb's to serve, before
+    /// anything is decided. `Some` when the request was answered.
+    async fn tunnel_gate(&self, session: &mut Session) -> Result<Option<bool>> {
+        if !self.tunnel_ingress {
+            return Ok(None);
+        }
+        let req = session.req_header();
+        if req.uri.path() == TUNNEL_HEALTH_PATH {
+            write_plain(session, 200, "ok\n").await?;
+            return Ok(Some(true));
+        }
+        let host = req
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req.uri.host())
+            .map(|h| h.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(h, |(h, _)| h))
+            .map(|h| h.trim_end_matches('.').to_ascii_lowercase());
+        let served = host.as_deref().is_some_and(|h| {
+            self.tunnel_hosts.read().is_ok_and(|hosts| hosts.contains(h))
+        });
+        if !served {
+            tracing::warn!(host = ?host, "tunnel request for a hostname this app-lb did not register; answering 421");
+            write_plain(session, 421, "this hostname is not served here\n").await?;
+            return Ok(Some(true));
+        }
+        Ok(None)
+    }
+
+    /// The address the request came from: the socket peer, never a
+    /// client-settable header — except on tunnel ingress, where there is no
+    /// socket peer and the edge (the only party that can open a tunnel
+    /// stream) vouches for the visitor.
+    fn peer(&self, session: &Session) -> Option<std::net::SocketAddr> {
+        if self.tunnel_ingress {
+            return session
+                .req_header()
+                .headers
+                .get(TUNNEL_CLIENT_IP)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+                .map(|ip| std::net::SocketAddr::new(ip, 0));
+        }
+        session.client_addr().and_then(|a| a.as_inet().copied())
     }
 
     /// The manager that began this request has gone (a restart) before the
@@ -49,6 +121,10 @@ impl LbProxy {
     /// that manager still answers — then the failure is its, and is handled
     /// as before — or when the next manager would not simply proxy it.
     async fn begin_again(&self, ctx: &mut Ctx) -> std::result::Result<(), String> {
+        // Tunnel ingress runs in the manager: nothing replaces it mid-request.
+        if self.tunnel_ingress {
+            return Err("tunnel ingress is served by the manager itself".into());
+        }
         let manager = ctx.request.as_ref().and_then(RemoteRequest::manager);
         if manager.is_none() || crate::worker::current_manager().await == manager {
             return Err("the manager that began this request still answers".into());
@@ -320,19 +396,32 @@ impl ProxyHttp for LbProxy {
         // whole time app-lb held the request, cold-start wait included.
         ctx.started_at = Some(Instant::now());
 
+        if let Some(answered) = self.tunnel_gate(session).await? {
+            return Ok(answered);
+        }
+
         let req = session.req_header();
         let head = crate::request_control::RequestHead {
             method: req.method.clone(),
             uri: req.uri.clone(),
             headers: req.headers.clone(),
-            peer: session.client_addr().and_then(|a| a.as_inet().map(|a| *a)),
-            tls_terminated: session.digest().is_some_and(|d| d.ssl_digest.is_some()),
+            peer: self.peer(session),
+            // The edge terminates a tunnel's TLS.
+            tls_terminated: self.tunnel_ingress
+                || session.digest().is_some_and(|d| d.ssl_digest.is_some()),
         };
         ctx.head = Some(head.clone());
         let (request, mut decision) = match self.control.begin(head).await {
             Ok(result) => result,
             Err(crate::worker_rpc::BeginError::HeadersTooLarge) => {
                 write_plain(session, 431, "request headers exceed control transport limit\n").await?;
+                return Ok(true);
+            }
+            // In the manager, a broken control link is this request's
+            // failure, not a reason to stop the process serving everything.
+            Err(crate::worker_rpc::BeginError::Control(error)) if self.tunnel_ingress => {
+                tracing::warn!(%error, "tunnel request: request control failed; answering 502");
+                write_plain(session, 502, "app-lb could not decide this request\n").await?;
                 return Ok(true);
             }
             Err(crate::worker_rpc::BeginError::Control(error)) => crate::worker::control_lost(&error),
@@ -360,9 +449,12 @@ impl ProxyHttp for LbProxy {
         }
         // Pingora tracks header names separately; preserve its bookkeeping in
         // this transport adapter even though authority evaluated owned headers.
+        // The edge's word about the visitor is for app-lb, never for an
+        // upstream — and on any other ingress it is only a client's claim.
         for name in crate::gateway::HEADERS.into_iter().chain([
             crate::regional::GENERATION, crate::regional::ENVIRONMENT,
             crate::regional::PROBE, crate::regional::ACTIVE_PROBE,
+            TUNNEL_CLIENT_IP,
         ]) {
             session.req_header_mut().remove_header(name);
         }
@@ -561,7 +653,7 @@ mod tests {
     }
 
     fn deployment(scaling: ScalingPolicy) -> Arc<Deployment> {
-        Arc::new(Deployment::new(DeploymentSpec {
+        Arc::new(Deployment::new(DeploymentSpec { tunnel: None,
             placement: None,
             ingress: None,
             account_id: None,
