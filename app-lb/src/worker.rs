@@ -713,7 +713,13 @@ pub fn run(dir: PathBuf, takeover: bool) -> ! {
         tracing::info!("received the listening sockets from the previous worker");
     }
     let mut app = pingora_proxy::HttpProxy::new(
-        crate::proxy::LbProxy::new(Client::new(dir.join("requests"))),
+        crate::proxy::LbProxy::new(Client::new(dir.join("requests"))).with_tunnels(
+            // Its own dialer, so what it carries to a tunnel's node survives
+            // a manager restart. Without one it uses the manager's bridge.
+            crate::tunnel_dialer::TunnelDialer::open_for_worker(&dir)
+                .map_err(|e| tracing::warn!(error = %e, "worker tunnel dialer unavailable; tunnels go through the manager"))
+                .ok(),
+        ),
         server.configuration.clone(),
     );
     app.handle_init_modules();

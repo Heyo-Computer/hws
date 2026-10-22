@@ -48,6 +48,9 @@ pub struct LbProxy {
     /// tunnel at the same dialer could otherwise point their own hostname at
     /// this node and reach its catch-all routes.
     tunnel_hosts: crate::plugins::tunnel::ExternalTlsHosts,
+    /// The forwarding worker's own tunnel dialer: a tunnel peer is reached
+    /// through it rather than the manager's bridge.
+    tunnels: Option<std::sync::Arc<crate::tunnel_dialer::TunnelDialer>>,
 }
 
 /// Answered by tunnel ingress itself, before routing, so the dialer can tell
@@ -61,13 +64,18 @@ pub const TUNNEL_CLIENT_IP: &str = "x-heyo-client-ip";
 
 impl LbProxy {
     pub fn new(control: Client) -> Self {
-        Self { control, tunnel_ingress: false, tunnel_hosts: Default::default() }
+        Self { control, tunnel_ingress: false, tunnel_hosts: Default::default(), tunnels: None }
+    }
+
+    pub fn with_tunnels(mut self, dialer: Option<std::sync::Arc<crate::tunnel_dialer::TunnelDialer>>) -> Self {
+        self.tunnels = dialer;
+        self
     }
 
     /// The proxy for streams that arrived over an app-lb tunnel, serving only
     /// `hosts`.
     pub fn for_tunnel_ingress(control: Client, hosts: crate::plugins::tunnel::ExternalTlsHosts) -> Self {
-        Self { control, tunnel_ingress: true, tunnel_hosts: hosts }
+        Self { control, tunnel_ingress: true, tunnel_hosts: hosts, tunnels: None }
     }
 
     /// Tunnel ingress only: answer what is not this app-lb's to serve, before
@@ -532,7 +540,14 @@ impl ProxyHttp for LbProxy {
             }
             Err(error) => return Err(control_error(ctx.request.as_ref().expect("request admitted"), error)),
         };
-        let mut peer = http_peer(selected.peer);
+        let mut selected_peer = selected.peer;
+        if let (Some(target), Some(dialer)) = (&selected_peer.tunnel, &self.tunnels) {
+            match dialer.address_for(&target.node_id, target.relay_url.as_deref(), target.epoch.as_deref()) {
+                Ok(address) => selected_peer.address = address,
+                Err(e) => tracing::warn!(node = %target.node_id, error = %e, "worker tunnel bridge unavailable; using the manager's"),
+            }
+        }
+        let mut peer = http_peer(selected_peer);
         // Pingora 0.9 otherwise strips this authenticated PostgreSQL tunnel's
         // handshake as a non-WebSocket upgrade. Keep the default sanitization
         // for all other requests and unsupported upgrade protocols.
@@ -621,7 +636,7 @@ mod tests {
     fn https_backend_builds_a_tls_peer_with_url_hostname_as_sni() {
         let backend = VmBackend::for_upstream("https://ci.eu1.heyo.work:443".into());
         let peer = http_peer(crate::request_control::Peer {
-            address: "127.0.0.1:443".parse().unwrap(), tls: backend.tls, sni: backend.sni.clone(),
+            address: "127.0.0.1:443".parse().unwrap(), tls: backend.tls, sni: backend.sni.clone(), tunnel: None,
         });
         assert!(peer.is_tls());
         assert_eq!(peer.sni, "ci.eu1.heyo.work");
@@ -633,7 +648,7 @@ mod tests {
     fn upstream_peers_probe_for_a_vanished_backend() {
         let backend = backend("172.25.128.50:8080");
         let peer = http_peer(crate::request_control::Peer {
-            address: "172.25.128.50:8080".parse().unwrap(), tls: backend.tls, sni: backend.sni.clone(),
+            address: "172.25.128.50:8080".parse().unwrap(), tls: backend.tls, sni: backend.sni.clone(), tunnel: None,
         });
         let ka = peer
             .options

@@ -39,13 +39,11 @@ use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, SecretKey};
 use pingora_core::apps::ServerApp;
 use pingora_core::protocols::Stream;
-use pingora_proxy::HttpProxy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use super::{Plugin, PluginMeta};
-use crate::proxy::LbProxy;
 
 /// Must match the cloud's `services::tunnel_dialer::ALPN`.
 pub const ALPN: &[u8] = b"heyo/applb-ingress/1";
@@ -57,6 +55,10 @@ const REFRESH: Duration = Duration::from_secs(60);
 /// How long to wait for the endpoint to reach a relay before registering
 /// without one.
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long stopping the plugin waits for the streams it is serving.
+const STOP_DRAIN: Duration = Duration::from_secs(10);
+/// How long no stream must be open before a drain counts as done.
+const DRAIN_QUIET: Duration = Duration::from_millis(300);
 
 // ---- configuration --------------------------------------------------------
 
@@ -341,6 +343,8 @@ struct Running {
     endpoint: Endpoint,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     shutdown: watch::Sender<bool>,
+    /// The registration refresh loop, replaced on a reconfigure.
+    refresh: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct TunnelPlugin {
@@ -353,10 +357,17 @@ pub struct TunnelPlugin {
     secrets: Arc<crate::secrets::SecretStore>,
     /// The configuration last applied, which says where tunnels live.
     config: RwLock<Option<Config>>,
+    /// This endpoint's incarnation, new on every apply: a dialer that sees
+    /// it change drops its connections to the old one instead of waiting for
+    /// them to time out.
+    epoch: RwLock<String>,
     external_tls: ExternalTlsHosts,
-    /// The pingora app streams are served by. Attached by `main` once the
-    /// proxy exists, which is after the plugin host is built.
-    app: OnceLock<Arc<dyn StreamServer>>,
+    /// Makes the pingora app streams are served by. Attached by `main` once
+    /// the proxy exists, which is after the plugin host is built.
+    app: OnceLock<AppFactory>,
+    /// The app serving now. Fresh on every apply: stopping winds an app's
+    /// idle keep-alive sessions down for good, so it is not used again.
+    current: RwLock<Option<Arc<dyn StreamServer>>>,
     running: tokio::sync::Mutex<Option<Running>>,
     status: RwLock<Status>,
     /// Endpoint ids allowed to open streams: the cloud edge's.
@@ -378,8 +389,10 @@ impl TunnelPlugin {
             daemon: OnceLock::new(),
             secrets,
             config: RwLock::new(None),
+            epoch: RwLock::new(String::new()),
             external_tls,
             app: OnceLock::new(),
+            current: RwLock::new(None),
             running: tokio::sync::Mutex::new(None),
             status: RwLock::new(Status::default()),
             allowed: RwLock::new(HashSet::new()),
@@ -391,9 +404,19 @@ impl TunnelPlugin {
 
     /// Hand the plugin the proxy to serve tunnel streams with, and the
     /// daemon to register them through.
-    pub fn attach(&self, app: Arc<HttpProxy<LbProxy>>, daemon: HeyoClient) {
-        let _ = self.app.set(Arc::new(Pingora(app)));
+    pub fn attach(&self, app: AppFactory, daemon: HeyoClient) {
+        let _ = self.app.set(app);
         let _ = self.daemon.set(daemon);
+    }
+
+    /// The app serving now, made on first use.
+    fn app(&self) -> Option<Arc<dyn StreamServer>> {
+        if let Some(app) = self.current.read().unwrap().clone() {
+            return Some(app);
+        }
+        let app = (self.app.get()?)();
+        *self.current.write().unwrap() = Some(app.clone());
+        Some(app)
     }
 
     fn daemon(&self) -> Result<&HeyoClient, String> {
@@ -426,10 +449,19 @@ impl TunnelPlugin {
 
     async fn stop(&self) {
         if let Some(r) = self.running.lock().await.take() {
+            // No new connections and no more registrations; sessions finish
+            // the request they are on instead of waiting for another.
             let _ = r.shutdown.send(true);
-            for t in r.tasks {
+            for t in r.tasks.into_iter().chain(r.refresh) {
                 t.abort();
             }
+            // Sessions parked waiting for a keep-alive request end now; those
+            // in the middle of one finish it first.
+            let current = self.current.write().unwrap().take();
+            if let Some(app) = current {
+                app.cleanup().await;
+            }
+            self.drain().await;
             r.endpoint.close().await;
         }
         let mut st = self.status.write().unwrap();
@@ -438,6 +470,51 @@ impl TunnelPlugin {
         st.error = None;
         self.allowed.write().unwrap().clear();
         self.external_tls.write().unwrap().clear();
+    }
+
+    /// Re-register every minute: a new relay, a cloud or remote that
+    /// restarted, and the lease, all come back this way.
+    fn spawn_refresh(&self, endpoint: Endpoint, cfg: Config, key: SecretKey) -> tokio::task::JoinHandle<()> {
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(REFRESH);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let Some(me) = me.upgrade() else { return };
+                let relay = endpoint.addr().relay_urls().next().map(|u| u.to_string());
+                me.status.write().unwrap().online = relay.is_some();
+                if let Err(e) = me.register_all(&cfg, &key, relay).await {
+                    tracing::warn!(error = %e, "tunnel: re-registration failed");
+                }
+            }
+        })
+    }
+
+    /// Wait for the streams being served to finish — quiet for a moment, so
+    /// one that a dialer opened just now is not cut — up to [`STOP_DRAIN`].
+    async fn drain(&self) {
+        let deadline = tokio::time::Instant::now() + STOP_DRAIN;
+        let mut quiet_since = None;
+        loop {
+            let now = tokio::time::Instant::now();
+            if self.streams_active.load(Ordering::Relaxed) == 0 {
+                let since = *quiet_since.get_or_insert(now);
+                if now - since >= DRAIN_QUIET {
+                    return;
+                }
+            } else {
+                quiet_since = None;
+            }
+            if now >= deadline {
+                tracing::warn!(
+                    active = self.streams_active.load(Ordering::Relaxed),
+                    "tunnel: streams still open after the drain; closing them"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Register every configured hostname through heyvmd. Updates the status
@@ -484,6 +561,7 @@ impl TunnelPlugin {
                 "node_id": node_id,
                 "relay_url": relay_url,
                 "hostnames": t.hostnames,
+                "epoch": *self.epoch.read().unwrap(),
                 "proof": {"ts": ts, "sig": crate::tunnel_dialer::sign_proof(key, &msg)},
             });
             let url = format!("{}/namespaces/{}/tunnels/{}", cfg.base(), cfg.namespace, t.name);
@@ -574,10 +652,11 @@ impl TunnelPlugin {
             st.relay_url = relay_url;
             st.last_registered_at = crate::deployment::now_secs();
             st.error = (!errors.is_empty()).then(|| errors.join("; "));
-            let mut allowed = self.allowed.write().unwrap();
-            for t in &st.tunnels {
-                allowed.extend(t.edge_node_ids.iter().cloned());
-            }
+            // Replaced, not added to: a dialer the configuration no longer
+            // registers with is not let in again. Connections already open
+            // were checked when they opened.
+            *self.allowed.write().unwrap() =
+                st.tunnels.iter().flat_map(|t| t.edge_node_ids.iter().cloned()).collect();
             *self.external_tls.write().unwrap() =
                 st.tunnels.iter().map(|t| t.hostname.to_ascii_lowercase()).collect();
         }
@@ -597,7 +676,7 @@ impl TunnelPlugin {
             conn.close(1u32.into(), b"not an edge");
             return;
         }
-        let Some(app) = self.app.get().cloned() else {
+        let Some(app) = self.app() else {
             conn.close(2u32.into(), b"not ready");
             return;
         };
@@ -633,6 +712,20 @@ pub(crate) trait StreamServer: Send + Sync + 'static {
         io: Box<dyn TunnelIo>,
         shutdown: watch::Receiver<bool>,
     ) -> futures::future::BoxFuture<'static, ()>;
+    /// Stop: no session waits for another request.
+    fn cleanup(&self) -> futures::future::BoxFuture<'static, ()>;
+}
+
+/// Makes a fresh app for each apply.
+pub type AppFactory = Arc<dyn Fn() -> Arc<dyn StreamServer> + Send + Sync>;
+
+/// A factory of pingora apps, each made by `make`.
+pub fn pingora_factory<A, F>(make: F) -> AppFactory
+where
+    A: ServerApp + Send + Sync + 'static,
+    F: Fn() -> A + Send + Sync + 'static,
+{
+    Arc::new(move || Arc::new(Pingora(Arc::new(make()))) as Arc<dyn StreamServer>)
 }
 
 /// Any pingora app, as a [`StreamServer`].
@@ -646,27 +739,43 @@ impl<A: ServerApp + Send + Sync + 'static> StreamServer for Pingora<A> {
     ) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(serve_stream(self.0.clone(), io, shutdown))
     }
+
+    fn cleanup(&self) -> futures::future::BoxFuture<'static, ()> {
+        let app = self.0.clone();
+        Box::pin(async move { app.cleanup().await })
+    }
 }
 
 /// Bridge one byte stream into a pingora app and serve requests on it until
 /// either side closes it. Generic so the tests can drive it without a full
 /// `LbProxy`.
-pub(crate) async fn serve_stream<A, S>(app: Arc<A>, mut io: S, shutdown: watch::Receiver<bool>)
+pub(crate) async fn serve_stream<A, S>(app: Arc<A>, io: S, shutdown: watch::Receiver<bool>)
 where
     A: ServerApp + Send + Sync + 'static,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
-    let bridge = tokio::spawn(async move {
-        let _ = tokio::io::copy_bidirectional(&mut io, &mut ours).await;
+    let (ours, theirs) = tokio::io::duplex(64 * 1024);
+    let (mut io_read, mut io_write) = tokio::io::split(io);
+    let (mut ours_read, mut ours_write) = tokio::io::split(ours);
+    // The dialer's bytes in, pingora's answers out.
+    let inbound = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut io_read, &mut ours_write).await;
+        // The dialer hung up its side: pingora sees the end of the input.
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut ours_write).await;
+    });
+    let outbound = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut ours_read, &mut io_write).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut io_write).await;
     });
     let mut stream: Option<Stream> = Some(Box::new(theirs));
     while let Some(s) = stream.take() {
         stream = app.process_new(s, &shutdown).await;
     }
-    // The duplex end pingora held is dropped with its last session, which
-    // ends the copy above.
-    let _ = bridge.await;
+    // Pingora is done with this stream and dropped its end: once what it
+    // wrote has reached the dialer, the stream is over, whether or not the
+    // dialer has hung up its side yet.
+    let _ = outbound.await;
+    inbound.abort();
 }
 
 /// Turn heyvmd's answer into something an operator can act on.
@@ -730,8 +839,10 @@ impl Plugin for TunnelPlugin {
     }
 
     async fn apply(&self, config: Option<Value>) -> Result<(), String> {
-        self.stop().await;
-        let Some(config) = config else { return Ok(()) };
+        let Some(config) = config else {
+            self.stop().await;
+            return Ok(());
+        };
         let cfg = parse_config(&config)?;
         if self.app.get().is_none() {
             return Err("the tunnel ingress is not wired to the proxy; this is a bug".into());
@@ -739,7 +850,30 @@ impl Plugin for TunnelPlugin {
         if matches!(cfg, Config::Cloud(_)) {
             self.daemon()?;
         }
+        // Running already: reconfigure in place. The endpoint's identity is
+        // the key, which does not change, so its connections, and what they
+        // are carrying, stay; only what is registered, and with whom, moves.
+        {
+            let mut running = self.running.lock().await;
+            if let Some(r) = running.as_mut() {
+                *self.config.write().unwrap() = Some(cfg.clone());
+                if let Some(t) = r.refresh.take() {
+                    t.abort();
+                }
+                let key = load_or_create_key(&self.key_path)?;
+                let relay_url = r.endpoint.addr().relay_urls().next().map(|u| u.to_string());
+                let first = self.register_all(&cfg, &key, relay_url).await;
+                r.refresh = Some(self.spawn_refresh(r.endpoint.clone(), cfg, key));
+                tracing::info!("tunnel reconfigured in place");
+                return first;
+            }
+        }
         *self.config.write().unwrap() = Some(cfg.clone());
+        *self.epoch.write().unwrap() = {
+            let mut bytes = [0u8; 8];
+            openssl::rand::rand_bytes(&mut bytes).map_err(|e| format!("entropy for the tunnel epoch: {e}"))?;
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        };
         let key = load_or_create_key(&self.key_path)?;
         let endpoint = Endpoint::builder(N0)
             .secret_key(key.clone())
@@ -767,27 +901,12 @@ impl Plugin for TunnelPlugin {
         // restart. Connections that arrive meanwhile wait for `accept`.
         let first = self.register_all(&cfg, &key, relay_url).await;
         let accept = self.spawn_accept(endpoint.clone(), shutdown_rx.clone());
-        let refresh = {
-            let me = self.me.clone();
-            let endpoint = endpoint.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(REFRESH);
-                tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    let Some(me) = me.upgrade() else { return };
-                    let relay = endpoint.addr().relay_urls().next().map(|u| u.to_string());
-                    me.status.write().unwrap().online = relay.is_some();
-                    if let Err(e) = me.register_all(&cfg, &key, relay).await {
-                        tracing::warn!(error = %e, "tunnel: re-registration failed");
-                    }
-                }
-            })
-        };
+        let refresh = self.spawn_refresh(endpoint.clone(), cfg, key);
         *self.running.lock().await = Some(Running {
             endpoint,
-            tasks: vec![accept, refresh],
+            tasks: vec![accept],
             shutdown: shutdown_tx,
+            refresh: Some(refresh),
         });
         // Serving continues either way: the refresh loop retries, and a
         // hostname that did register works now.
@@ -1080,7 +1199,6 @@ mod tests {
     #[tokio::test]
     async fn only_the_edge_may_open_streams_and_its_requests_are_served() {
         use iroh::endpoint::presets::Minimal;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let dir = tempfile::tempdir().unwrap();
         let daemon = HeyoClient::new(heyo_sdk::HeyoClientOptions {
@@ -1094,7 +1212,7 @@ mod tests {
             Default::default(),
             Arc::new(crate::secrets::SecretStore::new(dir.path().join("s.json"), None)),
         );
-        let _ = plugin.app.set(Arc::new(Pingora(Arc::new(Echo))));
+        let _ = plugin.app.set(pingora_factory(|| Echo));
         let _ = plugin.daemon.set(daemon);
 
         let bind = |alpn: bool| async move {
@@ -1150,6 +1268,140 @@ mod tests {
         );
         assert_eq!(plugin.rejected.load(Ordering::Relaxed), 1);
         assert_eq!(plugin.streams_total.load(Ordering::Relaxed), 1);
+    }
+
+    /// Answers after a pause, like a slow upstream.
+    struct SlowEcho;
+
+    #[async_trait]
+    impl pingora_core::apps::HttpServerApp for SlowEcho {
+        async fn process_new_http(
+            self: &Arc<Self>,
+            mut session: pingora_core::protocols::http::ServerSession,
+            _shutdown: &pingora_core::server::ShutdownWatch,
+        ) -> Option<pingora_core::apps::ReusedHttpStream> {
+            if !session.read_request().await.ok()? {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let body = "slow and whole";
+            let mut resp = pingora_http::ResponseHeader::build(200, None).unwrap();
+            resp.insert_header("content-length", body.len().to_string()).unwrap();
+            session.write_response_header(Box::new(resp)).await.ok()?;
+            session.write_response_body(body.into(), true).await.ok()?;
+            let _ = session.finish().await;
+            None
+        }
+    }
+
+    /// Stopping the plugin (a reconfigure, or disabling it) lets a request it
+    /// is serving finish instead of cutting it off.
+    #[tokio::test]
+    async fn stopping_drains_the_streams_being_served() {
+        use iroh::endpoint::presets::Minimal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = TunnelPlugin::new(
+            dir.path().join("k"),
+            Default::default(),
+            Arc::new(crate::secrets::SecretStore::new(dir.path().join("s.json"), None)),
+        );
+        let _ = plugin.app.set(pingora_factory(|| SlowEcho));
+        let bind = |alpn: bool| async move {
+            let mut b = Endpoint::builder(Minimal).relay_mode(iroh::RelayMode::Disabled);
+            if alpn {
+                b = b.alpns(vec![ALPN.to_vec()]);
+            }
+            b.bind().await.unwrap()
+        };
+        let server = bind(true).await;
+        let edge = bind(false).await;
+        plugin.allowed.write().unwrap().insert(edge.id().to_string());
+        let (tx, rx) = watch::channel(false);
+        let accept = plugin.spawn_accept(server.clone(), rx);
+        *plugin.running.lock().await = Some(Running { endpoint: server.clone(), tasks: vec![accept], shutdown: tx, refresh: None });
+
+        let conn = edge.connect(server.addr(), ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"GET /slow HTTP/1.1\r\nHost: shop.heyo.test\r\n\r\n").await.unwrap();
+        let answer = tokio::spawn(async move {
+            let mut got = String::new();
+            let mut buf = [0u8; 1024];
+            while let Ok(Some(n)) = recv.read(&mut buf).await {
+                got.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+                if got.ends_with("slow and whole") {
+                    break;
+                }
+            }
+            got
+        });
+        // Stop once the request is being served.
+        while plugin.streams_active.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), plugin.stop()).await.expect("the drain is bounded");
+        let got = tokio::time::timeout(Duration::from_secs(5), answer).await.unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("slow and whole"), "cut off: {got:?}");
+    }
+
+    /// A dialer holding a kept-alive stream between requests does not keep
+    /// a stop waiting: the session is parked, not working.
+    #[tokio::test]
+    async fn an_idle_kept_alive_stream_does_not_hold_up_a_stop() {
+        use iroh::endpoint::presets::Minimal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = TunnelPlugin::new(
+            dir.path().join("k"),
+            Default::default(),
+            Arc::new(crate::secrets::SecretStore::new(dir.path().join("s.json"), None)),
+        );
+        // The real ingress app: pingora's proxy, which is what a stop winds
+        // down. No manager answers, so each request gets the 503 a restarting
+        // app-lb gives — a whole response, and the stream kept alive after it.
+        let hosts: ExternalTlsHosts = Default::default();
+        hosts.write().unwrap().insert("shop.heyo.test".into());
+        let requests = dir.path().join("requests");
+        let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
+        let _ = plugin.app.set(pingora_factory(move || {
+            pingora_proxy::http_proxy(
+                &conf,
+                crate::proxy::LbProxy::for_tunnel_ingress(
+                    crate::worker_rpc::Client::with_wait(requests.clone(), Duration::ZERO),
+                    hosts.clone(),
+                ),
+            )
+        }));
+        let bind = |alpn: bool| async move {
+            let mut b = Endpoint::builder(Minimal).relay_mode(iroh::RelayMode::Disabled);
+            if alpn {
+                b = b.alpns(vec![ALPN.to_vec()]);
+            }
+            b.bind().await.unwrap()
+        };
+        let server = bind(true).await;
+        let edge = bind(false).await;
+        plugin.allowed.write().unwrap().insert(edge.id().to_string());
+        let (tx, rx) = watch::channel(false);
+        let accept = plugin.spawn_accept(server.clone(), rx);
+        *plugin.running.lock().await = Some(Running { endpoint: server.clone(), tasks: vec![accept], shutdown: tx, refresh: None });
+
+        let conn = edge.connect(server.addr(), ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"GET /one HTTP/1.1\r\nHost: shop.heyo.test\r\n\r\n").await.unwrap();
+        let mut got = String::new();
+        let mut buf = [0u8; 1024];
+        while !got.ends_with("retry shortly\n") {
+            let n = recv.read(&mut buf).await.unwrap().unwrap();
+            got.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+        }
+        // The stream stays open, waiting for a next request that never comes.
+        assert_eq!(plugin.streams_active.load(Ordering::Relaxed), 1);
+        let started = std::time::Instant::now();
+        plugin.stop().await;
+        assert!(started.elapsed() < Duration::from_secs(3), "stop waited {:?} on an idle stream", started.elapsed());
+        assert_eq!(plugin.streams_active.load(Ordering::Relaxed), 0);
+        drop(send);
     }
 
     #[tokio::test]

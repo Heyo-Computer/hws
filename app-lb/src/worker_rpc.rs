@@ -382,10 +382,33 @@ impl WireDecision {
 }
 
 #[derive(Serialize, Deserialize)]
-struct WirePeer { address: String, tls: bool, sni: String }
+struct WirePeer {
+    address: String,
+    tls: bool,
+    sni: String,
+    /// A tunnel's node. Absent for every other peer; a worker too old to
+    /// know the field ignores it and uses `address`, the manager's bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tunnel: Option<WireTunnel>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireTunnel {
+    node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<String>,
+}
+
 impl WirePeer {
     fn into_peer(self) -> Result<crate::request_control::Peer, String> {
-        Ok(crate::request_control::Peer { address: self.address.parse().map_err(|e| format!("invalid manager peer address: {e}"))?, tls: self.tls, sni: self.sni })
+        Ok(crate::request_control::Peer {
+            address: self.address.parse().map_err(|e| format!("invalid manager peer address: {e}"))?,
+            tls: self.tls,
+            sni: self.sni,
+            tunnel: self.tunnel.map(|t| crate::request_control::TunnelTarget { node_id: t.node_id, relay_url: t.relay_url, epoch: t.epoch }),
+        })
     }
 }
 
@@ -482,7 +505,12 @@ pub async fn serve(
                     let sandbox_id = state.backend().map(|b| b.sandbox_id.clone())
                         .or_else(|| state.hop_target().map(|home| format!("{}{home}", crate::fleet_hop::BACKEND_PREFIX)))
                         .ok_or_else(|| "selected peer has no reserved backend".to_string())?;
-                    let wire = WirePeer { address: peer.address.to_string(), tls: peer.tls, sni: peer.sni };
+                    let wire = WirePeer {
+                        address: peer.address.to_string(),
+                        tls: peer.tls,
+                        sni: peer.sni,
+                        tunnel: peer.tunnel.map(|t| WireTunnel { node_id: t.node_id, relay_url: t.relay_url, epoch: t.epoch }),
+                    };
                     send!(ServerMessage::Peer { peer: wire, sandbox_id, retry_allowed: state.retry_allowed() });
                 }
                 Err(error) => send!(ServerMessage::Error { message: error.message.into() }),
