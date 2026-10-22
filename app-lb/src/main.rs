@@ -1371,12 +1371,23 @@ fn main() {
         ),
     }
 
+    // Dials `tunnel` deployments' remote app-lbs, from a key of this host's
+    // own. Without its keys this app-lb serves no tunnels, and says so, rather
+    // than refusing to start: nothing else depends on them.
+    let tunnel_dialer = match tunnel_dialer::TunnelDialer::open_with_workers(
+        &tunnel_dialer::key_path(&cfg.state_path),
+        registry.clone(),
+        &worker_dir,
+    ) {
+        Ok(dialer) => Some(dialer),
+        Err(e) => {
+            tracing::error!(error = %e, "tunnel dialer unavailable; tunnel deployments will not be served");
+            None
+        }
+    };
+
     // Background commands in sandboxes: the records sit beside the state file,
     // and the watcher holds each busy VM and follows its operations.
-    // Dials `tunnel` deployments' remote app-lbs, from a key of this host's own.
-    let tunnel_dialer = tunnel_dialer::TunnelDialer::open_with_workers(&tunnel_dialer::key_path(&cfg.state_path), registry.clone(), &worker_dir)
-        .unwrap_or_else(|e| panic!("cannot open the tunnel dialer's key: {e}"));
-
     let operations = operations::Operations::open(
         std::path::Path::new(&cfg.state_path).with_extension("operations.json"),
         registry.clone(),
@@ -1536,7 +1547,9 @@ fn main() {
     if let Some(placer) = placer {
         server.add_service(background_service("fleet-placement", fleet_placement::Service(placer)));
     }
-    server.add_service(background_service("tunnel-dialer", tunnel_dialer::Service(tunnel_dialer)));
+    if let Some(dialer) = tunnel_dialer {
+        server.add_service(background_service("tunnel-dialer", tunnel_dialer::Service(dialer)));
+    }
     server.add_service(admin_svc);
     server.add_service(background_service(
         "discovery",

@@ -134,14 +134,27 @@ impl TunnelDialer {
         let previous = std::fs::read_to_string(&slot_file).ok().and_then(|s| s.trim().parse::<usize>().ok());
         let slot = previous.map_or(0, |p| (p + 1) % WORKER_SLOTS);
         std::fs::write(&slot_file, slot.to_string()).map_err(|e| format!("recording the tunnel key slot: {e}"))?;
-        let dialer = Self::build(&worker_key_path(worker_dir, slot), None, Vec::new())?;
+        // Loaded, never made: the manager makes the slot keys and advertises
+        // their ids. A key it did not make is one no node lets in, so without
+        // it the worker goes through the manager's bridge instead.
+        let path = worker_key_path(worker_dir, slot);
+        let secret = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?
+            .trim()
+            .parse::<SecretKey>()
+            .map_err(|e| format!("{} is not an iroh secret key: {e}", path.display()))?;
+        let dialer = Self::with_secret(secret, None, Vec::new());
         tracing::info!(slot, dialer = %dialer.id(), "worker tunnel dialer ready");
         Ok(dialer)
     }
 
     fn build(key_path: &Path, registry: Option<Arc<Registry>>, worker_ids: Vec<String>) -> Result<Arc<Self>, String> {
         let secret = crate::plugins::tunnel::load_or_create_key(key_path)?;
-        Ok(Arc::new(Self {
+        Ok(Self::with_secret(secret, registry, worker_ids))
+    }
+
+    fn with_secret(secret: SecretKey, registry: Option<Arc<Registry>>, worker_ids: Vec<String>) -> Arc<Self> {
+        Arc::new(Self {
             secret,
             registry,
             worker_ids,
@@ -151,7 +164,7 @@ impl TunnelDialer {
             connections: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             direct: Mutex::new(HashMap::new()),
-        }))
+        })
     }
 
     /// A dialer on an endpoint the test bound, reaching `direct` nodes by
@@ -412,16 +425,14 @@ pub fn verify_proof(node_id: &str, message: &[u8], signature: &str) -> Result<()
         .map_err(|_| "proof.sig was not made by node_id's key".to_string())
 }
 
-/// Runs [`TunnelDialer::sync`] on a tick, and binds the endpoint up front so
-/// the first request does not wait for it.
+/// Runs [`TunnelDialer::sync`] on a tick. The endpoint is bound only when a
+/// tunnel is first dialed, so an app-lb that serves none opens no socket and
+/// never contacts a relay.
 pub struct Service(pub Arc<TunnelDialer>);
 
 #[async_trait]
 impl BackgroundService for Service {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        if let Err(e) = self.0.endpoint().await {
-            tracing::error!(error = %e, "tunnel dialer offline; tunnels will not be served");
-        }
         let mut tick = tokio::time::interval(TICK);
         loop {
             tokio::select! {
@@ -574,6 +585,31 @@ mod tests {
         let again = dialer.address_for(&node_id, None, Some("e2")).unwrap();
         assert_eq!(ask(again).await.expect("the new incarnation is dialed, not waited for"), "new");
         drop(old);
+    }
+
+    /// An app-lb that serves no tunnel opens no iroh endpoint: no socket, no
+    /// relay, no discovery.
+    #[tokio::test]
+    async fn the_dialer_binds_nothing_until_a_tunnel_is_dialed() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new(dir.path().join("state.json")));
+        let dialer = TunnelDialer::open_with_workers(&dir.path().join("m.key"), registry, &dir.path().join("w")).unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let service = Service(dialer.clone());
+        let running = tokio::spawn(async move { service.start(rx).await });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tx.send(true).unwrap();
+        running.await.unwrap();
+        assert!(!dialer.endpoint.initialized(), "an endpoint was bound with no tunnel to dial");
+    }
+
+    /// A worker's key is the manager's to make: one it made itself would be
+    /// an id no node was told to let in.
+    #[test]
+    fn a_worker_does_not_make_its_own_key() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(TunnelDialer::open_for_worker(dir.path()).is_err());
+        assert!(!dir.path().join("tunnel-w0.key").exists() && !dir.path().join("tunnel-w1.key").exists());
     }
 
     #[test]
