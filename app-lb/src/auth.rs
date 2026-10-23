@@ -890,7 +890,7 @@ impl Authenticator {
         }
 
         let nonce = random_token();
-        let verifier = random_token();
+        let verifier = pkce_verifier();
         let flow = Flow {
             nonce: nonce.clone(),
             return_to: safe_return_path(return_to),
@@ -1161,7 +1161,7 @@ impl Authenticator {
             );
         }
         let nonce = random_token();
-        let verifier = random_token();
+        let verifier = pkce_verifier();
         let flow = Flow {
             nonce: nonce.clone(),
             return_to: safe_return_path(return_to),
@@ -1823,6 +1823,15 @@ fn random_token() -> String {
     b64().encode(bytes)
 }
 
+/// A PKCE code verifier: 32 random bytes, 43 base64url characters. RFC 7636
+/// §4.1 requires 43 to 128, and an issuer that checks (the Heyo auth API
+/// does) refuses a shorter one as `invalid_grant` at the exchange.
+fn pkce_verifier() -> String {
+    let mut bytes = [0u8; 32];
+    openssl::rand::rand_bytes(&mut bytes).expect("entropy for a PKCE verifier");
+    b64().encode(bytes)
+}
+
 /// S256: the provider gets the hash, the cookie keeps the verifier.
 fn pkce_challenge(verifier: &str) -> String {
     let digest = openssl::hash::hash(
@@ -2461,6 +2470,10 @@ mod tests {
             let flow = Flow::decode(&a.verify(&cookie_values(&flow_cookies, FLOW_COOKIE)[0]).unwrap()).unwrap();
             assert_eq!(q["state"], flow.nonce);
             assert_eq!(q["code_challenge"], pkce_challenge(&flow.verifier));
+            // RFC 7636 §4.1: 43 to 128 unreserved characters, or the Heyo
+            // auth API refuses the exchange as `invalid_grant`.
+            assert!((43..=128).contains(&flow.verifier.len()), "verifier is {} chars", flow.verifier.len());
+            assert!(flow.verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)));
 
             // The issuer comes back with a code; the gate redeems it with the verifier.
             let query = format!("code=c-1&state={}", flow.nonce);
