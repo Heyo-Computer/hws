@@ -1577,6 +1577,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }]));
         let backend = Arc::new(crate::deployment::VmBackend::new(
@@ -1609,6 +1610,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }
     }
@@ -1619,6 +1621,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some(p.into()),
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }
     }
@@ -1629,6 +1632,7 @@ mod tests {
             host_suffix: Some(s.into()),
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }
     }
@@ -1733,6 +1737,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }],
         ));
@@ -1769,6 +1774,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }],
         ));
@@ -1791,6 +1797,7 @@ mod tests {
                 host_suffix: Some("example.com".into()),
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }],
         ));
@@ -1801,6 +1808,7 @@ mod tests {
                 host_suffix: Some("example.com".into()),
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }],
         ));
@@ -1830,6 +1838,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }],
             vec![suffix("apps.example.com")],

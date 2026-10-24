@@ -1207,6 +1207,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         let registry = registry_with(vec![route("pinned.example.com")]);
@@ -1240,6 +1241,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
             RouteRule {
@@ -1247,6 +1249,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
             // A different domain: not covered, so it still gets its own.
@@ -1255,6 +1258,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
         ]);
@@ -1279,6 +1283,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
             RouteRule {
@@ -1286,6 +1291,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
         ]);
@@ -1309,6 +1315,7 @@ mod tests {
             host_suffix: Some("sb.example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }]);
         let manager = manager_with_wildcards(&dir, registry, vec!["sb.example.com".into()]);
@@ -1329,6 +1336,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         let manager = manager(
@@ -1352,6 +1360,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
             RouteRule {
@@ -1359,6 +1368,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
             // Wildcards need DNS-01; must not appear.
@@ -1367,6 +1377,7 @@ mod tests {
                 host_suffix: Some("apps.example.com".into()),
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
             // Path-only routes have no hostname to certify.
@@ -1375,6 +1386,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/api".into()),
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             },
         ]));
@@ -1393,6 +1405,7 @@ mod tests {
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }]));
 

@@ -2328,6 +2328,7 @@ A rule may set any combination of three fields:
 | `host_suffix` | a domain and its subdomains | anchored at a label boundary |
 | `path_prefix` | a leading path segment, e.g. `/api` | prefix, not exact |
 | `strip_prefix` | `true` or `false` | removes this rule's path prefix before proxying; defaults to `false` |
+| `upstream_host` | a hostname, optionally `:port` | the `Host` the upstream receives instead of the client's; the original goes on as `X-Forwarded-Host` |
 | `redirect` | `{"to": URL, …}` | answers the matched request with a redirect instead of serving it — see [Redirecting a route](#redirecting-a-route) |
 
 - **`host`** — exact hostname match, e.g. `{"host": "demo.local"}` matches only
@@ -2341,6 +2342,14 @@ A rule may set any combination of three fields:
   a raw string prefix, not a path-segment match). The upstream sees the full
   original path by default. Set `"strip_prefix": true` when the upstream serves
   that route at `/`; `/api/x?full=1` is then forwarded as `/x?full=1`.
+- **`upstream_host`** — the `Host` header the upstream receives for this rule,
+  for a backend that routes on its own hostname but is mounted under another
+  site's path. `{"host": "app.example.com", "path_prefix": "/cloud",
+  "strip_prefix": true, "upstream_host": "cloud.example.com"}` serves
+  `app.example.com/cloud/x` from the backend as `cloud.example.com/x`, with
+  `X-Forwarded-Host: app.example.com`. A fleet hop forwards the client's host;
+  the host that serves the request applies the rewrite. Not allowed on a
+  redirecting rule.
 
 Fields combine within a rule. `{"host": "demo.local", "path_prefix": "/api"}`
 matches only requests that are *both* for `demo.local` *and* under `/api`. Use
