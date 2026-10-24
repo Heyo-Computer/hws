@@ -297,6 +297,7 @@ A request reaches a deployment when **any** of its rules matches. Within one rul
 | `host_suffix` | The domain and all its subdomains, anchored at a label boundary (`apps.example.com` matches `a.apps.example.com` but not `notapps.example.com`). |
 | `path_prefix` | Raw string prefix of the path (`/api` also matches `/apidocs`). |
 | `strip_prefix` | `true` removes `path_prefix` before forwarding. Defaults to `false`. |
+| `upstream_host` | The `Host` the upstream receives instead of the client's, e.g. `cloud.example.com`. The original goes on as `X-Forwarded-Host`. |
 
 Across all deployments, the single most specific rule wins: an exact `host` beats any `host_suffix`, which beats any path-only rule. Within a tier, the longer suffix or prefix wins, and a host plus path outranks the same host alone. Exact ties go to the lexicographically lower deployment id. An empty rule `{}` is rejected, and a request that matches nothing gets a 404.
 

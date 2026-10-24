@@ -1070,6 +1070,13 @@
         "strip_prefix": {
           "description": "Remove `path_prefix` before forwarding to the upstream. Off by default,\npreserving the original pass-through behavior for existing specs.",
           "type": "boolean"
+        },
+        "upstream_host": {
+          "description": "The `Host` the upstream receives for requests this rule matches, in\nplace of the one the client sent, e.g. `api.example.com` or\n`api.example.com:8443`. For a backend that decides what to do by its own\nhostname, mounted under another site's path: the client's host still\nchooses the route, and arrives upstream as `X-Forwarded-Host`.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

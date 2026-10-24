@@ -284,6 +284,7 @@ pub struct RouteRule {
     pub host_suffix: Option<String>,
     pub path_prefix: Option<String>,
     pub strip_prefix: bool,
+    pub upstream_host: Option<String>,
     pub redirect: Option<RouteRedirect>,
 }
 

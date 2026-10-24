@@ -681,6 +681,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }],
             vm: Some(VmSpec {

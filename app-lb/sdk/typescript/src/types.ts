@@ -18,6 +18,8 @@ export interface RouteRule {
   host_suffix?: string;
   path_prefix?: string;
   strip_prefix?: boolean;
+  /** The `Host` the upstream receives instead of the client's. */
+  upstream_host?: string;
   /** Answer matched requests with a redirect instead of serving them. */
   redirect?: RouteRedirect;
 }

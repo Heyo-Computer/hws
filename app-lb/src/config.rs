@@ -393,6 +393,13 @@ pub struct RouteRule {
     /// preserving the original pass-through behavior for existing specs.
     #[serde(default, skip_serializing_if = "is_false")]
     pub strip_prefix: bool,
+    /// The `Host` the upstream receives for requests this rule matches, in
+    /// place of the one the client sent, e.g. `api.example.com` or
+    /// `api.example.com:8443`. For a backend that decides what to do by its own
+    /// hostname, mounted under another site's path: the client's host still
+    /// chooses the route, and arrives upstream as `X-Forwarded-Host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_host: Option<String>,
     /// Answer every request this rule matches with a redirect instead of
     /// serving it, so one deployment can capture a host (an old subdomain, a
     /// vanity name) and send it elsewhere while its other routes serve as usual.
@@ -524,6 +531,26 @@ fn host_in_domain(host: &str, suffix: &str) -> bool {
 
 fn default_target_concurrency() -> u32 {
     10
+}
+
+/// A `Host` value app-lb may send upstream: a DNS name or IPv4 address, with an
+/// optional port. Nothing a header could smuggle — no scheme, path, userinfo or
+/// whitespace.
+fn valid_upstream_host(value: &str) -> bool {
+    let (name, port) = match value.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (value, None),
+    };
+    let name_ok = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    name_ok && port.is_none_or(|p| p.parse::<u16>().is_ok_and(|p| p != 0))
 }
 
 fn is_false(value: &bool) -> bool {
@@ -4183,6 +4210,9 @@ pub enum SpecError {
     NoRoutes,
     EmptyRoute,
     StripPrefixWithoutPath,
+    /// `route.upstream_host` is not a bare hostname (with an optional port), or
+    /// sits on a rule that redirects and so never reaches an upstream.
+    InvalidUpstreamHost(String),
     InvalidRedirect(String),
     /// A sign-in gate on a deployment with no routes. The gate only ever runs
     /// on a proxied request, and an unrouted deployment receives none.
@@ -4553,6 +4583,7 @@ impl std::fmt::Display for SpecError {
                 f,
                 "route.strip_prefix requires route.path_prefix"
             ),
+            Self::InvalidUpstreamHost(why) => write!(f, "route.upstream_host: {why}"),
             Self::InvalidRedirect(why) => write!(f, "route.redirect: {why}"),
             Self::UnsupportedDriver(d) => write!(
                 f,
@@ -5421,6 +5452,18 @@ impl DeploymentSpec {
         for route in &self.routes {
             if let Some(redirect) = &route.redirect {
                 redirect.validate(route).map_err(SpecError::InvalidRedirect)?;
+            }
+            if let Some(host) = &route.upstream_host {
+                if route.redirect.is_some() {
+                    return Err(SpecError::InvalidUpstreamHost(
+                        "a redirecting route never reaches an upstream".into(),
+                    ));
+                }
+                if !valid_upstream_host(host) {
+                    return Err(SpecError::InvalidUpstreamHost(format!(
+                        "{host:?} must be a hostname, optionally with a port, e.g. `api.example.com`"
+                    )));
+                }
             }
         }
         // A cloud URL is a bind on a VM's port. A static deployment's
@@ -6472,6 +6515,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }],
             vm: Some(VmSpec {
@@ -6552,6 +6596,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: Some("/legacy".into()),
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }],
             vm: None,
@@ -7379,6 +7424,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some("/app".into()),
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }];
         s.auth = Some(auth_gate());
@@ -7809,6 +7855,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }]).unwrap();
 
@@ -7831,6 +7878,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         }]).unwrap();
     }
@@ -7849,6 +7897,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }]),
             Err(SpecError::OauthWithoutGoogle)
@@ -7864,6 +7913,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }]),
             Err(SpecError::NoAuthProvider)
@@ -7879,6 +7929,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }]),
             Err(SpecError::EmptyClientId)
@@ -7894,6 +7945,7 @@ mod tests {
                 host_suffix: None,
                 path_prefix: None,
                 strip_prefix: false,
+                upstream_host: None,
                 redirect: None,
             }]),
             Err(SpecError::EmptyAllowList)
@@ -8212,6 +8264,33 @@ mod tests {
         s.routes[0].path_prefix = None;
         s.routes[0].host = Some("example.com".to_string());
         assert_eq!(s.validate(), Err(SpecError::StripPrefixWithoutPath));
+    }
+
+    #[test]
+    fn upstream_host_must_be_a_bare_host_on_a_forwarding_route() {
+        let mut s = static_spec(&["127.0.0.1:9000"]);
+        for good in ["cloud.example.com", "cloud.example.com:8443", "localhost", "10.0.0.1:80"] {
+            s.routes[0].upstream_host = Some(good.to_string());
+            assert_eq!(s.validate(), Ok(()), "{good:?} should be accepted");
+        }
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""upstream_host":"10.0.0.1:80""#), "{json}");
+
+        for bad in [
+            "", "https://cloud.example.com", "cloud.example.com/api", "user@cloud.example.com",
+            "cloud.example.com:0", "cloud.example.com:99999", "cloud example.com",
+            "cloud.example.com\r\nx: y", "-cloud.example.com", "cloud..example.com",
+        ] {
+            s.routes[0].upstream_host = Some(bad.to_string());
+            assert!(
+                matches!(s.validate(), Err(SpecError::InvalidUpstreamHost(_))),
+                "{bad:?} should be rejected"
+            );
+        }
+
+        s.routes[0].upstream_host = Some("cloud.example.com".into());
+        s.routes[0].redirect = Some(RouteRedirect { to: "https://elsewhere.example".into(), status: 301, keep_path: true });
+        assert!(matches!(s.validate(), Err(SpecError::InvalidUpstreamHost(_))));
     }
 
     #[test]
@@ -8534,6 +8613,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         assert!(r.matches(Some("demo.local"), "/"));
@@ -8549,6 +8629,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some("/api".into()),
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         assert!(r.matches(Some("demo.local"), "/api/v1"));
@@ -8563,6 +8644,7 @@ mod tests {
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         // Apex and any depth of subdomain.
@@ -8585,6 +8667,7 @@ mod tests {
             host_suffix: Some(".example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         assert!(r.matches(Some("a.example.com"), "/"));
@@ -8598,6 +8681,7 @@ mod tests {
             host_suffix: Some("example.com".into()),
             path_prefix: Some("/api".into()),
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         assert!(r.matches(Some("a.example.com"), "/api/v1"));
@@ -8612,6 +8696,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         let wild = RouteRule {
@@ -8619,6 +8704,7 @@ mod tests {
             host_suffix: Some("example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         let long_wild = RouteRule {
@@ -8626,6 +8712,7 @@ mod tests {
             host_suffix: Some("apps.example.com".into()),
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         let path_only = RouteRule {
@@ -8633,6 +8720,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some("/some/long/path".into()),
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         assert!(exact.specificity() > long_wild.specificity());
@@ -8648,6 +8736,7 @@ mod tests {
             host_suffix: Some(".".into()),
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         assert!(!dot.is_empty(), "a suffix field is set");
@@ -8661,6 +8750,7 @@ mod tests {
             host_suffix: None,
             path_prefix: None,
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         let long_path = RouteRule {
@@ -8668,6 +8758,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some("/a/very/long/prefix".into()),
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         let short_path = RouteRule {
@@ -8675,6 +8766,7 @@ mod tests {
             host_suffix: None,
             path_prefix: Some("/a".into()),
             strip_prefix: false,
+            upstream_host: None,
             redirect: None,
         };
         assert!(host_only.specificity() > long_path.specificity());

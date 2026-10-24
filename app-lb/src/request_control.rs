@@ -229,6 +229,9 @@ pub struct RequestState {
     regional_assignment: Option<Assignment>,
     identity: Option<Identity>,
     route_prefix: Option<String>,
+    /// The matched route's `upstream_host`, and the host the client asked for,
+    /// which travels on as `X-Forwarded-Host`.
+    upstream_host: Option<(String, Option<String>)>,
     gateway_token: Option<String>,
     /// The upstream `Cookie` header once `APP_LB_STRIP_COOKIES` has been
     /// applied: `None` leaves the request's own header alone, `Some(None)`
@@ -313,6 +316,14 @@ impl RequestState {
         }
         if let Some(prefix) = self.route_prefix.as_deref() {
             out.push(HeaderModification::RewriteUri(strip_uri_prefix(uri, prefix)));
+        }
+        // After the hop branch above, deliberately: a peer routes by the host
+        // the client sent, so only the host that serves the request rewrites it.
+        if let Some((upstream, original)) = &self.upstream_host {
+            out.push(HeaderModification::Set(http::header::HOST, value(upstream, "upstream host")?));
+            if let Some(original) = original {
+                out.push(HeaderModification::Set(http::HeaderName::from_static("x-forwarded-host"), value(original, "forwarded host")?));
+            }
         }
         // A tunnel's remote app-lb sees the dialer, not the visitor: tell it
         // who this host judged the visitor to be. Whatever the client sent
@@ -647,6 +658,8 @@ impl RequestControl {
             return RequestDecision::Respond(ResponseData::plain(503, "deployment is under maintenance\n"));
         }
         state.route_prefix = matched_strip_prefix(&deployment, host.as_deref(), &path);
+        state.upstream_host = matched_upstream_host(&deployment, host.as_deref(), &path)
+            .map(|upstream| (upstream, host.clone()));
         state.cookie_rewrite = strip_cookies(&head.headers, &self.strip_cookies);
         if let Some(mut gate) = deployment.spec.auth.clone() {
             if let Some(name) = gate.provider_ref.as_deref() {
@@ -750,6 +763,12 @@ fn owned_request_info(head: &RequestHead, host: &str, path: &str, fronts_admin_a
 
 fn matched_strip_prefix(deployment: &Deployment, host: Option<&str>, path: &str) -> Option<String> {
     deployment.spec.routes.iter().filter(|r| r.strip_prefix && r.matches(host, path)).max_by_key(|r| r.specificity()).and_then(|r| r.path_prefix.clone())
+}
+
+/// The `upstream_host` of the rule this request matched, chosen as routing chose
+/// the deployment: the most specific match.
+fn matched_upstream_host(deployment: &Deployment, host: Option<&str>, path: &str) -> Option<String> {
+    deployment.spec.routes.iter().filter(|r| r.matches(host, path)).max_by_key(|r| r.specificity())?.upstream_host.clone()
 }
 
 /// The status and `Location` when the rule this request matched redirects. The
@@ -1071,6 +1090,37 @@ mod tests {
             modifications.as_slice(),
             [HeaderModification::RewriteUri(value)] if value == "/v1/read?name=a%2Fb"
         ));
+    }
+
+    #[test]
+    fn forwarding_plan_sends_the_upstream_host_and_keeps_the_original() {
+        let mut state = RequestState::default();
+        state.upstream_host = Some(("cloud.example.com".into(), Some("preview.example.com".into())));
+        let modifications = state.forwarding_modifications(&"/health".parse().unwrap()).unwrap();
+        let set = |name: &http::HeaderName| modifications.iter().find_map(|m| match m {
+            HeaderModification::Set(n, v) if n == name => Some(v.to_str().unwrap().to_string()),
+            _ => None,
+        });
+        assert_eq!(set(&http::header::HOST).as_deref(), Some("cloud.example.com"));
+        assert_eq!(set(&http::HeaderName::from_static("x-forwarded-host")).as_deref(), Some("preview.example.com"));
+
+        // Without the option nothing touches the client's Host.
+        let plain = RequestState::default().forwarding_modifications(&"/health".parse().unwrap()).unwrap();
+        assert!(!plain.iter().any(|m| matches!(m, HeaderModification::Set(n, _) if n == http::header::HOST)));
+    }
+
+    #[test]
+    fn upstream_host_comes_from_the_most_specific_matching_route() {
+        let spec: crate::config::DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "cloud", "upstreams": ["127.0.0.1:9000"],
+            "routes": [
+                {"host": "cloud.example.com"},
+                {"host": "app.example.com", "path_prefix": "/cloud", "strip_prefix": true, "upstream_host": "cloud.example.com"}
+            ]
+        })).unwrap();
+        let deployment = Deployment::new(spec);
+        assert_eq!(matched_upstream_host(&deployment, Some("app.example.com"), "/cloud/health").as_deref(), Some("cloud.example.com"));
+        assert_eq!(matched_upstream_host(&deployment, Some("cloud.example.com"), "/health"), None);
     }
 
     #[test]
