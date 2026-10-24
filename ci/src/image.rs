@@ -118,6 +118,7 @@ pub async fn prepare_remote(options: impl Into<crate::runners::Connection>, requ
         })?;
     validate_source_id(&status.source_id)?;
     let source_id = status.source_id.clone();
+    let mut reads = StatusReads::new();
     loop {
         if status.source_id != source_id {
             return Err(ImageError::Protocol(format!("runner changed sourceId from {source_id:?} to {:?} while polling", status.source_id)));
@@ -128,13 +129,20 @@ pub async fn prepare_remote(options: impl Into<crate::runners::Connection>, requ
             "preparing" => {}
             other => return Err(ImageError::Protocol(format!("unknown source preparation status {other:?}"))),
         }
-        if started.elapsed() >= deadline { return Err(ImageError::SourceTimeout(deadline)); }
-        tokio::time::sleep(poll).await;
-        status = client.request(Method::GET, &format!("/sources/{source_id}"), None::<&()>, RequestOptions { timeout: Some(Duration::from_secs(30)), query: vec![] }).await
-            .map_err(|source| match source {
-                heyo_sdk::HeyoError::NotFound(_) => ImageError::SourceExpired,
-                source => ImageError::Daemon { what: "polling verified source preparation", source },
-            })?;
+        loop {
+            if started.elapsed() >= deadline { return Err(ImageError::SourceTimeout(deadline)); }
+            tokio::time::sleep(poll).await;
+            match client.request(Method::GET, &format!("/sources/{source_id}"), None::<&()>, RequestOptions { timeout: Some(STATUS_READ_TIMEOUT), query: vec![] }).await {
+                Ok(next) => { reads.ok(); status = next; break; }
+                // As for image builds: a read is safe to repeat, and one slow
+                // answer is not a failed preparation.
+                Err(source) if reads.retry(&source) => {
+                    tracing::debug!(source_id = %source_id, error = %source, "retrying source preparation status read");
+                }
+                Err(heyo_sdk::HeyoError::NotFound(_)) => return Err(ImageError::SourceExpired),
+                Err(source) => return Err(ImageError::Daemon { what: "polling verified source preparation", source }),
+            }
+        }
     }
 }
 
@@ -150,6 +158,40 @@ fn validate_source_id(value: &str) -> Result<(), ImageError> {
 
 fn poll_interval() -> Duration {
     if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(3) }
+}
+
+/// One status read. The daemon answers these from memory, so a read that takes
+/// longer than this is a slow link or a busy host, not a slow build: give up on
+/// it quickly and ask again rather than hold the job on it.
+const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long status reads may keep failing transiently before the runner is
+/// treated as gone. One slow or dropped read never fails a job; a runner that
+/// has not answered for this long does, rather than at the job's deadline.
+fn status_unreachable_after() -> Duration {
+    if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(120) }
+}
+
+/// Tracks the last good status read, so transient failures are retried until
+/// the runner has been silent for [`status_unreachable_after`].
+struct StatusReads {
+    last_ok: std::time::Instant,
+}
+
+impl StatusReads {
+    fn new() -> Self {
+        Self { last_ok: std::time::Instant::now() }
+    }
+
+    fn ok(&mut self) {
+        self.last_ok = std::time::Instant::now();
+    }
+
+    /// Whether to retry after `error`: only a transient failure, and only while
+    /// the runner has answered recently.
+    fn retry(&self, error: &heyo_sdk::HeyoError) -> bool {
+        transient_build_read(error) && self.last_ok.elapsed() < status_unreachable_after()
+    }
 }
 
 fn validate_prepared(status: PrepareStatus, request: &PrepareRequest) -> Result<PreparedSource, ImageError> {
@@ -334,6 +376,7 @@ where
     }
 
     let started = std::time::Instant::now();
+    let mut reads = StatusReads::new();
     loop {
         tokio::time::sleep(poll).await;
         renew().await;
@@ -344,17 +387,21 @@ where
                 &path,
                 None::<&()>,
                 RequestOptions {
-                    timeout: Some(Duration::from_secs(30)),
+                    timeout: Some(STATUS_READ_TIMEOUT),
                     query: vec![],
                 },
             )
             .await;
         let status: BuildStatus = match result {
-            Ok(status) => status,
+            Ok(status) => {
+                reads.ok();
+                status
+            }
             // Reads are safe to retry. Never turn an uncertain read into a
             // POST, source replay, or VM acquisition. Auth/protocol errors and
-            // explicit source expiry still fail closed.
-            Err(source) if transient_build_read(&source) => {
+            // explicit source expiry still fail closed, and so does a runner
+            // that has stopped answering altogether.
+            Err(source) if reads.retry(&source) => {
                 let _ = writeln!(log, "[ci] retrying image status read: {source}");
                 continue;
             }
@@ -1035,6 +1082,48 @@ mod tests {
         assert_eq!(prepared.source_id, "source_1");
         assert_eq!(prepared.image.unwrap().name, "ci-img-aabbccddee11");
         assert!(weak.upgrade().is_none(), "completed preparation leaked its connection");
+    }
+
+    #[tokio::test]
+    async fn prepare_poll_retries_transient_reads() {
+        use axum::{Json, Router, extract::State, response::IntoResponse, routing::{get, post}};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/sources/prepare", post(|| async { Json(serde_json::json!({"sourceId":"source_1", "status":"preparing"})) }))
+            .route("/sources/source_1", get(|State(n): State<Arc<AtomicUsize>>| async move {
+                match n.fetch_add(1, Ordering::SeqCst) {
+                    0 => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    1 => axum::http::StatusCode::BAD_GATEWAY.into_response(),
+                    _ => Json(ready_source("source_1")).into_response(),
+                }
+            }))
+            .with_state(reads.clone());
+        let prepared = prepare_remote(http_options(app).await, &prepare_request(), Duration::from_secs(2)).await.unwrap();
+        assert_eq!(prepared.source_id, "source_1");
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "two transient reads were retried, not fatal");
+    }
+
+    #[tokio::test]
+    async fn status_polls_give_up_on_a_runner_that_stops_answering() {
+        use axum::{Json, Router, routing::{get, post}};
+        // Only failures after the first read: the runner has gone silent, and
+        // the poll gives up after the unreachable window, not at the deadline.
+        let prepare = Router::new()
+            .route("/sources/prepare", post(|| async { Json(serde_json::json!({"sourceId":"source_1", "status":"preparing"})) }))
+            .route("/sources/source_1", get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }));
+        let started = std::time::Instant::now();
+        let result = prepare_remote(http_options(prepare).await, &prepare_request(), Duration::from_secs(10)).await;
+        assert!(matches!(result, Err(ImageError::Daemon { .. })), "{:?}", result.err().map(|e| e.to_string()));
+        assert!(started.elapsed() < Duration::from_secs(5), "gave up at the deadline, not the unreachable window");
+
+        let build = Router::new().route("/sources/source_1/image", post(|| async {
+            Json(serde_json::json!({"status":"building","name":"image"}))
+        }).get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }));
+        let started = std::time::Instant::now();
+        let result = build_remote(http_options(build).await, "source_1", "image", Duration::from_secs(10), || async {}).await;
+        assert!(matches!(result, Err(ImageError::Daemon { .. })), "{:?}", result.err().map(|e| e.to_string()));
+        assert!(started.elapsed() < Duration::from_secs(5), "gave up at the deadline, not the unreachable window");
     }
 
     #[tokio::test]
