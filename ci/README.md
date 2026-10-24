@@ -3016,9 +3016,13 @@ CI_TEST_STREAM_PREFIXES=citest cargo test -- --ignored delete_leftover
 
 ### Interrupted source/image preparation
 
-Image status GETs retry transport failures, 408/429 and 5xx within the original
-build budget, renewing the catalog claim between reads. A failed read does not
-issue another POST or acquire a VM. The budget also bounds the initial POST,
+Source-preparation and image status GETs time out after 5 seconds, since the
+daemon answers them from memory. They retry transport failures, 408/429 and 5xx
+until the runner has gone 120 seconds without a good answer, and then fail the
+job as unreachable. One slow or dropped read never fails a job, and a runner
+that has gone away fails it within two minutes rather than at the deadline.
+Image reads renew the catalog claim between reads. A failed read does not
+issue another POST or acquire a VM. The build budget also bounds the initial POST,
 restart POSTs and claim renewal; expiration stops the waiter, not remote work.
 
 Authenticated rerun attempts now reconcile one narrow subset of detached
