@@ -1,5 +1,7 @@
 # heyo-mcp
 
+[heyo.computer](https://heyo.computer)
+
 An MCP server over heyo: **sandboxes** — boot a microVM, run commands in it
 (short ones, or long ones detached), get files in and out — and the services
 that answer operational questions about a fleet, [app-lb](../app-lb)
