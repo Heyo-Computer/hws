@@ -177,6 +177,25 @@ impl From<heyo_sdk::HeyoError> for VmError {
     }
 }
 
+impl VmError {
+    /// Whether the request certainly never reached the daemon: the connection
+    /// itself could not be made, so nothing was created.
+    ///
+    /// The SDK flattens transport failures into `Api { status: 0 }` and tags
+    /// the phase reqwest failed in, `[connect]` among them. Only that tag
+    /// counts. A timeout or a body that stopped arriving may have landed a
+    /// create the daemon then finished, and must stay ambiguous.
+    pub fn never_reached_the_daemon(&self) -> bool {
+        let Self::Sdk(heyo_sdk::HeyoError::Api { status: 0, message, .. }) = self else {
+            return false;
+        };
+        message
+            .split_once(" [")
+            .and_then(|(_, rest)| rest.split_once("]:"))
+            .is_some_and(|(tags, _)| tags.split(',').any(|t| t == "connect"))
+    }
+}
+
 /// A daemon-side proxy bind of a VM port and the deployment it belongs to,
 /// as the SDK types them.
 pub use heyo_sdk::{ProxyBind, ProxyDeployment};
@@ -1470,6 +1489,27 @@ mod tests {
         let mut i = info("sb-1", SandboxStatus::Stopped, None);
         i.port_mappings = vec![heyo_sdk::PortMapping { host: 41080, container: 8080 }];
         assert!(matches!(routable_addr(&i, 8080), Err(VmError::NotRunning { .. })));
+    }
+
+    /// Only a failure to connect proves nothing was sent. A timeout, a dropped
+    /// body or a daemon that answered with an error may each have created a VM.
+    #[test]
+    fn only_a_connect_failure_never_reached_the_daemon() {
+        let api = |status: u16, message: &str| {
+            VmError::Sdk(heyo_sdk::HeyoError::Api { status, message: message.into(), body: None })
+        };
+        let refused = "network error calling /sandbox-deploy [connect]: error sending request";
+        assert!(api(0, refused).never_reached_the_daemon());
+        assert!(api(0, "network error calling /sandbox-deploy [timeout,connect]: deadline").never_reached_the_daemon());
+        for ambiguous in [
+            api(0, "network error calling /sandbox-deploy [timeout]: operation timed out"),
+            api(0, "network error calling /sandbox-deploy [body]: connection reset"),
+            api(0, "network error calling /sandbox-deploy: broken pipe"),
+            api(500, refused),
+            VmError::Runtime(refused.into()),
+        ] {
+            assert!(!ambiguous.never_reached_the_daemon(), "{ambiguous}");
+        }
     }
 
     #[test]

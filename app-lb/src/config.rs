@@ -5287,6 +5287,19 @@ impl DeploymentSpec {
                       VM already boots from its own copy-on-write overlay of the image",
             });
         }
+        // A retained replica is resumed with the daemon's `start`, which for a
+        // libvirt guest answers only once it has booted — over two minutes for a
+        // cloud image, measured — and lists it as stopped until then. app-lb's
+        // daemon calls give up after 30s, so every resume would read as a
+        // failure, and after three the retained VM is destroyed with its disk.
+        if self.scaling.idle_action == IdleAction::Retain {
+            return Err(SpecError::NotForLibvirt {
+                field: "scaling.idle_action: retain",
+                why: "the daemon's libvirt start blocks until the guest has booted and reports \
+                      it stopped meanwhile, so app-lb cannot resume a retained libvirt VM \
+                      without timing out and, after three attempts, destroying it",
+            });
+        }
         // The probe dials the VM's address with the health port swapped in
         // (`health::probe`). For a libvirt VM that address is a host port
         // forwarded to `vm.port`, so any other port would probe whatever
@@ -8087,6 +8100,14 @@ mod tests {
     /// the field named, rather than accepted and silently ignored.
     #[test]
     fn libvirt_refuses_what_it_cannot_honour() {
+        let mut retained = spec();
+        retained.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        retained.scaling.idle_action = IdleAction::Retain;
+        assert!(matches!(
+            retained.validate(),
+            Err(SpecError::NotForLibvirt { field: "scaling.idle_action: retain", .. })
+        ));
+
         let mut shared = spec();
         shared.vm.as_mut().unwrap().driver = Driver::Libvirt;
         shared.vm.as_mut().unwrap().rootfs = RootfsMode::Shared;

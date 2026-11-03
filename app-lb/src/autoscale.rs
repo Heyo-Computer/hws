@@ -575,6 +575,13 @@ impl Autoscaler {
         if listing.total_outage() {
             return;
         }
+        // Kept for the per-deployment loop below, which skips the pools of a
+        // runtime that did not answer (see `FleetListing::listed`).
+        let outcome = crate::runtime::FleetListing {
+            sandboxes: Vec::new(),
+            heyvm: listing.heyvm.clone(),
+            lxc: listing.lxc.clone(),
+        };
         let listing = vm::Listing::from_infos(listing.sandboxes);
 
         // Fetch host + per-VM resource usage alongside the fleet list. It is a
@@ -611,6 +618,9 @@ impl Autoscaler {
         let mut busy = Vec::new();
         for d in &managed {
             if !self.is_live(d) {
+                continue;
+            }
+            if !outcome.listed(d.spec.driver()) {
                 continue;
             }
             self.recover_allocations(d, &fleet).await;
@@ -1469,6 +1479,7 @@ impl Autoscaler {
         });
         self.registry.persist_one(&d.spec.id).map_err(|_| vm::VmError::Runtime("cannot persist allocation intent".into()))?;
         let attempt_name = name.clone();
+        let correlated = prepared.is_some();
         let result = match prepared {
             Some(prepared) => self.vms().submit_allocation(&prepared).await.map(|r| (r.sandbox_id.clone(), Some(r))),
             None => self.runtime.create(d.spec.vm_spec(), name, seed, owner, secret_env).await.map(|id| (id,None)),
@@ -1489,8 +1500,14 @@ impl Autoscaler {
                 Ok(id)
             }
             Err(error) => {
+                // Settled failures only: nothing was created, so the attempt is
+                // dropped rather than left to block every later scale-up. A
+                // create that could not even connect is one of them — a daemon
+                // restarting under the tick must not wedge the pool for good.
+                // A correlated allocation keeps its own receipt-based recovery.
                 if matches!(error, vm::VmError::SecretUnresolved {..} | vm::VmError::MountNotPulled {..}
-                    | vm::VmError::WrongRuntime {..} | vm::VmError::RuntimeUnavailable {..}) {
+                    | vm::VmError::WrongRuntime {..} | vm::VmError::RuntimeUnavailable {..})
+                    || (!correlated && error.never_reached_the_daemon()) {
                     d.mutate_state(|s| { s.create_attempts.remove(attempt); s.allocation_history_complete=history_was_complete; });
                     let _ = self.registry.persist_one(&d.spec.id);
                     self.settle_in_successor(d, |attempts| {
@@ -2721,12 +2738,16 @@ fn at_rest(
     {
         return false;
     }
-    // A TTL past its halfway mark needs a renewal call, which is an await. A
-    // backend the fleet snapshot doesn't mention is *not* at rest either: it
-    // vanished between the snapshot and now, which `reconcile_one` must see.
+    // A TTL past its halfway mark needs a renewal call, which is an await —
+    // except a TTL of zero, which `renew_ttls` never renews. A backend the
+    // fleet snapshot doesn't mention is *not* at rest either: it vanished
+    // between the snapshot and now, which `reconcile_one` must see.
+    let spec_ttl = d.spec.vm_spec().ttl_seconds;
     backends.iter().all(|b| {
         fleet.get(&b.sandbox_id).is_some_and(|info| {
-            info.uptime_secs < info.ttl_seconds.unwrap_or(d.spec.vm_spec().ttl_seconds) / 2
+            spec_ttl == 0
+                || info.ttl_seconds == Some(0)
+                || info.uptime_secs < info.ttl_seconds.unwrap_or(spec_ttl) / 2
         })
     })
 }
@@ -3853,6 +3874,24 @@ mod tests {
             assert!(!at_rest(&d, &fleet, &no_extras()));
         }
 
+        /// TTL zero never expires and is never renewed, so however long the VM
+        /// has run there is no renewal due — whether the VM or the spec says so.
+        #[test]
+        fn a_permanent_vm_is_at_rest_however_long_it_has_run() {
+            let (d, mut fleet) = settled();
+            let entry = fleet.get_mut("sb-1").unwrap();
+            entry.ttl_seconds = Some(0);
+            entry.uptime_secs = 10_000_000;
+            assert!(at_rest(&d, &fleet, &no_extras()));
+
+            let mut permanent = d.spec.clone();
+            permanent.vm.as_mut().unwrap().ttl_seconds = 0;
+            let d = Arc::new(Deployment::new(permanent));
+            d.set_backends(vec![Arc::new(VmBackend::new("sb-1".into(), "10.0.0.1:8080".parse().unwrap()))]);
+            fleet.get_mut("sb-1").unwrap().ttl_seconds = None;
+            assert!(at_rest(&d, &fleet, &no_extras()));
+        }
+
         /// A backend the daemon no longer reports has just disappeared. Reading
         /// that as "nothing to do" would leave a dead VM in the routing pool.
         #[test]
@@ -4538,5 +4577,23 @@ mod tests {
         scaler.renew_ttls(&d, &old(None)).await;
         assert_eq!(renewals.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    /// Live on a dev host (2026-11-03): heyvmd went down under the tick, a
+    /// scale-up's create could not connect, and the attempt stayed persisted
+    /// with no sandbox id. `scale_up` refuses while one exists, so the pool
+    /// never refilled — not even after an app-lb restart. A create that never
+    /// reached the daemon created nothing, and must not block the next one.
+    #[tokio::test]
+    async fn a_create_that_could_not_connect_does_not_wedge_the_pool() {
+        // Port 1: nothing listens, so the connection is refused outright.
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", spec());
+        let d = registry.get("demo").unwrap();
+        let error = scaler
+            .allocate_replica(&d, "applb-demo-000000000001".into(), None, None, &vm::VmOwner::default())
+            .await
+            .unwrap_err();
+        assert!(error.never_reached_the_daemon(), "{error}");
+        assert!(d.state().create_attempts.is_empty(), "the refused attempt is dropped");
     }
 }

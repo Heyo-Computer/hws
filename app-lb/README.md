@@ -202,9 +202,11 @@ an older daemon reports none, and the VM is given up on as unroutable). The daem
 out a new host port when it reattaches a VM, so app-lb re-reads it from every listing and
 moves the backend with it. Because the address is a forward of `vm.port` only, a libvirt
 spec must serve health on `vm.port`. Its mounts must be read-only, since they are live 9p
-shares of the host tree. `vm.workspace` and `rootfs: shared` are refused. With
-`idle_action: retain` the VM is stopped and its disk overlay kept, because that overlay is
-the VM's whole state. `firecracker_containerd` is rejected at registration. The one other
+shares of the host tree. `vm.workspace`, `rootfs: shared` and `idle_action: retain` are
+refused: the daemon's libvirt `start` answers only once the guest has booted (minutes, for a
+cloud image) and lists the VM as stopped until then, so a retained replica could not be
+resumed within app-lb's daemon timeout. A libvirt VM's disk overlay is its whole state, so
+app-lb never discards it. `firecracker_containerd` is rejected at registration. The one other
 accepted driver is `lxc`: an Incus system container from an OCI image, which app-lb
 creates through Incus itself (`APP_LB_LXC_*`), not through heyvm.
 
