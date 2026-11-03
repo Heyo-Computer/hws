@@ -8,8 +8,10 @@
 //!    `Paused`, and `ColdStored` all come back `Ok`. Against a local daemon a
 //!    broken VM surfaces as `Stopped`, never `Failed`. Always check the status.
 //! 2. `guest_ip` is only populated for tap-networked Firecracker/KVM on a local
-//!    daemon. It is the only address we can route to, so its absence is a hard
-//!    error, not something to retry.
+//!    daemon. A libvirt guest has none, and is reached through the host port
+//!    the daemon forwards to it (`port_mappings`). A VM with neither is
+//!    unroutable, which is a hard error, not something to retry — see
+//!    [`routable_addr`].
 //! 3. `SandboxCreateOptions` cannot express guest mounts, so [`VmManager::create`]
 //!    posts the create body itself rather than calling `Sandbox::create`. The
 //!    body is still the SDK's own serialization of that struct — only the
@@ -62,10 +64,12 @@ pub enum VmError {
         status: SandboxStatus,
         reason: Option<String>,
     },
-    /// No `guest_ip`: the VM is unroutable by us. Happens for non-tap backends
-    /// or a remote daemon.
+    /// Neither a `guest_ip` nor a host port forwarded to `port`: the VM is
+    /// unroutable by us. Happens for a remote daemon, a libvirt VM whose create
+    /// did not ask for the port, or a daemon too old to report its forwards.
     NoGuestIp {
         sandbox_id: String,
+        port: u16,
     },
     /// `guest_ip` was not parseable as an IP address.
     BadGuestIp {
@@ -122,10 +126,11 @@ impl std::fmt::Display for VmError {
                 }
                 Ok(())
             }
-            Self::NoGuestIp { sandbox_id } => write!(
+            Self::NoGuestIp { sandbox_id, port } => write!(
                 f,
-                "sandbox {sandbox_id} has no guest_ip; the daemon only exposes one for \
-                 tap-networked firecracker/kvm backends running locally"
+                "sandbox {sandbox_id} has no guest_ip and no host port forwarded to guest port \
+                 {port}; the daemon exposes the first for tap-networked firecracker/kvm backends \
+                 and reports the second (port_mappings, heyvm 0.54+) for libvirt"
             ),
             Self::BadGuestIp { sandbox_id, value } => {
                 write!(
@@ -1125,7 +1130,15 @@ impl Listing {
 /// Extract the routable address, rejecting anything we could not proxy to.
 ///
 /// This is where the two SDK traps are enforced together: a VM is only routable
-/// if it is *actually* `Running` and *actually* has a `guest_ip`.
+/// if it is *actually* `Running` and *actually* has an address.
+///
+/// The address is the `guest_ip` when the daemon reports one (tap-networked
+/// Firecracker/KVM). A libvirt guest has none: it sits on QEMU user-mode
+/// networking and is reached through the host port the daemon forwards to
+/// `port`, which the listing reports as `port_mappings`. That port is on the
+/// daemon's host, which is this host — the same assumption a `guest_ip` makes.
+/// It can change when the daemon reattaches the VM, so callers re-resolve it
+/// from each listing rather than keeping the first answer.
 pub fn routable_addr(info: &SandboxInfo, port: u16) -> Result<SocketAddr, VmError> {
     if info.status != SandboxStatus::Running {
         return Err(VmError::NotRunning {
@@ -1135,15 +1148,28 @@ pub fn routable_addr(info: &SandboxInfo, port: u16) -> Result<SocketAddr, VmErro
         });
     }
     let Some(raw) = info.guest_ip.as_deref().filter(|s| !s.is_empty()) else {
-        return Err(VmError::NoGuestIp {
-            sandbox_id: info.id.clone(),
-        });
+        return match forwarded_port(info, port) {
+            Some(host) => Ok(SocketAddr::new(IpAddr::from([127, 0, 0, 1]), host)),
+            None => Err(VmError::NoGuestIp {
+                sandbox_id: info.id.clone(),
+                port,
+            }),
+        };
     };
     let ip: IpAddr = raw.parse().map_err(|_| VmError::BadGuestIp {
         sandbox_id: info.id.clone(),
         value: raw.to_string(),
     })?;
     Ok(SocketAddr::new(ip, port))
+}
+
+/// The host port the daemon forwards to guest `port`, if it reports one.
+/// Zero is the daemon's "allocate one" placeholder, never a real forward.
+fn forwarded_port(info: &SandboxInfo, port: u16) -> Option<u16> {
+    info.port_mappings
+        .iter()
+        .find(|m| m.container == port && m.host != 0)
+        .map(|m| m.host)
 }
 
 /// Whether a status means the VM will never serve and should be reaped, as
@@ -1323,6 +1349,7 @@ mod tests {
             status_changed_at: String::new(),
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
+            port_mappings: Vec::new(),
             metadata: None,
             account_id: None,
             created_at: None,
@@ -1403,6 +1430,46 @@ mod tests {
             routable_addr(&i, 8080),
             Err(VmError::NoGuestIp { .. })
         ));
+    }
+
+    /// A libvirt guest has no `guest_ip`; it is reached on this host through
+    /// the port the daemon forwards to the guest port asked for — and only
+    /// that one, so a forward of some other guest port is no route.
+    #[test]
+    fn routable_addr_dials_the_forwarded_host_port_without_a_guest_ip() {
+        let mut i = info("sb-1", SandboxStatus::Running, None);
+        i.port_mappings = vec![
+            heyo_sdk::PortMapping { host: 41022, container: 22 },
+            heyo_sdk::PortMapping { host: 41080, container: 8080 },
+        ];
+        assert_eq!(
+            routable_addr(&i, 8080).unwrap(),
+            "127.0.0.1:41080".parse::<SocketAddr>().unwrap()
+        );
+        assert!(matches!(
+            routable_addr(&i, 9090),
+            Err(VmError::NoGuestIp { port: 9090, .. })
+        ));
+
+        // A guest IP, when there is one, still wins over a forward.
+        i.guest_ip = Some("172.16.0.2".into());
+        assert_eq!(
+            routable_addr(&i, 8080).unwrap(),
+            "172.16.0.2:8080".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    /// `host: 0` is the daemon's "allocate one" placeholder, not a port to dial,
+    /// and a forward is no reason to route to a VM that is not running.
+    #[test]
+    fn routable_addr_ignores_placeholder_forwards_and_stopped_vms() {
+        let mut i = info("sb-1", SandboxStatus::Running, None);
+        i.port_mappings = vec![heyo_sdk::PortMapping { host: 0, container: 8080 }];
+        assert!(matches!(routable_addr(&i, 8080), Err(VmError::NoGuestIp { .. })));
+
+        let mut i = info("sb-1", SandboxStatus::Stopped, None);
+        i.port_mappings = vec![heyo_sdk::PortMapping { host: 41080, container: 8080 }];
+        assert!(matches!(routable_addr(&i, 8080), Err(VmError::NotRunning { .. })));
     }
 
     #[test]

@@ -193,12 +193,20 @@ built above and `ORCHESTRATOR_TEST_DATABASE_URL` to a disposable test database.
 Public transition-admission APIs remain gated; do not edit shared DB rows to enable
 this feature. These local checks do not establish live multi-region acceptance.
 
-Of the heyvm drivers, only Firecracker and KVM are supported. This is not a limitation of taste: app-lb routes
-directly to `SandboxInfo.guest_ip`, which the daemon only populates for tap-networked
-Firecracker/KVM backends on a local daemon. A Libvirt VM would boot fine and then be
-unroutable, so the driver is rejected at registration. The one other accepted driver is
-`lxc`: an Incus system container from an OCI image, which app-lb creates through Incus
-itself (`APP_LB_LXC_*`), not through heyvm.
+Of the heyvm drivers, Firecracker, KVM and libvirt are supported. app-lb routes directly
+to `SandboxInfo.guest_ip`, which the daemon populates for tap-networked Firecracker/KVM
+backends on a local daemon. A libvirt guest has no guest IP: it runs on QEMU user-mode
+networking, and app-lb reaches it at `127.0.0.1:<host port>` through the port the daemon
+forwards to `vm.port`, which the daemon reports as `port_mappings` (heyvm 0.54 or newer;
+an older daemon reports none, and the VM is given up on as unroutable). The daemon may hand
+out a new host port when it reattaches a VM, so app-lb re-reads it from every listing and
+moves the backend with it. Because the address is a forward of `vm.port` only, a libvirt
+spec must serve health on `vm.port`. Its mounts must be read-only, since they are live 9p
+shares of the host tree. `vm.workspace` and `rootfs: shared` are refused. With
+`idle_action: retain` the VM is stopped and its disk overlay kept, because that overlay is
+the VM's whole state. `firecracker_containerd` is rejected at registration. The one other
+accepted driver is `lxc`: an Incus system container from an OCI image, which app-lb
+creates through Incus itself (`APP_LB_LXC_*`), not through heyvm.
 
 ## Requirements
 
@@ -4191,7 +4199,9 @@ appear as rows in each deployment's VM table with their age and status — so a 
 is visible without reading logs at all.
 
 `ttl_seconds` is a backstop: VMs expire on their own if app-lb dies without reaping them. It
-is renewed while app-lb is alive, and VMs from a previous run are re-adopted on startup
+is renewed while app-lb is alive, except at `0`, the daemon's "never expires": a zero-TTL
+spec is never renewed, and neither is a VM that already runs without a TTL, since renewing
+it would give it a deadline. VMs from a previous run are re-adopted on startup
 (matched by their `applb-<deployment>-<nonce>` name). VMs app-lb did not create are never
 touched.
 

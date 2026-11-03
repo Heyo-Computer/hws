@@ -533,14 +533,13 @@
       ]
     },
     "Driver": {
-      "description": "Which runtime boots a deployment's replicas.\n\napp-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every\ndriver is a heyvm one: `lxc` is a system container app-lb creates on this\nhost through Incus, and the SDK has no name for it. The spellings are\ndeliberately identical to the SDK's, so a spec written against either\ndeserializes the same and the wire fixtures are unchanged.\n\n`Libvirt` and `FirecrackerContainerd` exist here only so that a spec naming\none still *deserializes* and is then refused by\n[`DeploymentSpec::validate`] with an explanation. Dropping the variants\nwould turn a good error message into an opaque serde failure.",
+      "description": "Which runtime boots a deployment's replicas.\n\napp-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every\ndriver is a heyvm one: `lxc` is a system container app-lb creates on this\nhost through Incus, and the SDK has no name for it. The spellings are\ndeliberately identical to the SDK's, so a spec written against either\ndeserializes the same and the wire fixtures are unchanged.\n\n`Libvirt` is a heyvm driver whose guest has no routable IP: it is reached\nthrough the host ports QEMU forwards to it, which the daemon reports as\n`port_mappings` (see [`crate::vm::routable_addr`]).\n\n`FirecrackerContainerd` exists here only so that a spec naming it still\n*deserializes* and is then refused by [`DeploymentSpec::validate`] with an\nexplanation. Dropping the variant would turn a good error message into an\nopaque serde failure.",
       "oneOf": [
         {
           "type": "string",
           "enum": [
             "firecracker",
             "kvm",
-            "libvirt",
             "firecracker_containerd"
           ]
         },
@@ -548,6 +547,11 @@
           "description": "A system container under Incus, booted from an OCI image. Not a heyvm\ndriver: app-lb talks to Incus itself, so [`Driver::heyvm`] is `None`.",
           "type": "string",
           "const": "lxc"
+        },
+        {
+          "description": "A QEMU VM under libvirt, on user-mode (SLIRP) networking. Reached\nthrough host ports the daemon forwards rather than a guest IP, so it\nneeds a daemon on this host, like every other heyvm driver here.",
+          "type": "string",
+          "const": "libvirt"
         }
       ]
     },
@@ -1386,7 +1390,7 @@
           "minimum": 0
         },
         "driver": {
-          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system\ncontainer from an OCI image). `libvirt` and `firecracker_containerd`\nare rejected at registration.",
+          "description": "`firecracker` or `kvm` (a heyvm microVM), `libvirt` (a heyvm QEMU VM,\nreached through forwarded host ports) or `lxc` (an Incus system\ncontainer from an OCI image). `firecracker_containerd` is rejected at\nregistration.",
           "$ref": "#/$defs/Driver"
         },
         "env_from": {

@@ -67,6 +67,26 @@ impl VmBackend {
         Self::with_peer(sandbox_id, address.clone(), address, false, String::new())
     }
 
+    /// The same VM at a new address: a libvirt guest whose forwarded host port
+    /// moved when the daemon reattached it (see [`crate::vm::routable_addr`]).
+    ///
+    /// Keeps what the pool knows about the VM — health, drain, last activity,
+    /// serving uptime, usage, cloud bind — so a moved port is not a new
+    /// replica. In-flight requests stay counted on the old backend, which is
+    /// right: they were dialed at the old address.
+    pub fn readdressed(&self, addr: SocketAddr) -> Self {
+        let mut moved = Self::new(self.sandbox_id.clone(), addr);
+        moved.ready_at = self.ready_at;
+        moved.draining.store(self.is_draining(), Ordering::Relaxed);
+        moved.healthy.store(self.is_healthy(), Ordering::Relaxed);
+        moved.last_active.store(self.last_active(), Ordering::Relaxed);
+        if let Some((cpu, mem)) = self.usage() {
+            moved.set_usage(cpu, mem);
+        }
+        moved.set_bind(self.bind());
+        moved
+    }
+
     /// A backend for a static proxy_pass upstream, addressed by a `host:port`
     /// string (which pingora resolves per connection). The address doubles as the
     /// backend's display id, since there is no sandbox.
