@@ -1302,12 +1302,22 @@ impl Autoscaler {
     /// The TTL exists so VMs self-destruct if this LB dies without reaping them.
     /// While we *are* alive, renew it past the halfway mark so a healthy VM
     /// under steady traffic doesn't get culled out from under us.
+    ///
+    /// A TTL of zero is the daemon's "never expires", so there is nothing to
+    /// renew: not for a spec that asks for it, and not for a VM that already
+    /// runs without one — renewing that would *give* it a deadline.
     async fn renew_ttls(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
         let ttl = d.spec.vm_spec().ttl_seconds;
+        if ttl == 0 {
+            return;
+        }
         for b in d.backends().iter() {
             let Some(info) = fleet.get(&b.sandbox_id) else {
                 continue;
             };
+            if info.ttl_seconds == Some(0) {
+                continue;
+            }
             let remaining = info.ttl_seconds.unwrap_or(ttl);
             if info.uptime_secs < remaining / 2 {
                 continue;
@@ -1318,10 +1328,16 @@ impl Autoscaler {
         }
     }
 
-    /// Drop backends the daemon no longer reports as running.
+    /// Drop backends the daemon no longer reports as running, and re-address
+    /// the ones whose address moved.
     ///
     /// This is what catches a VM killed out-of-band: it disappears from the
-    /// fleet list, and we stop routing to it.
+    /// fleet list, and we stop routing to it. A libvirt guest's address is a
+    /// host port the daemon forwards, and it changes when the daemon reattaches
+    /// the VM while it keeps running — the VM is the same replica, so it stays
+    /// in the pool at its new address (see [`VmBackend::readdressed`]). A
+    /// draining backend keeps its old one: it is leaving, and its in-flight
+    /// count is what its drain waits on.
     fn prune(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
         let backends = d.backends();
         let kept: Vec<_> = backends
@@ -1351,7 +1367,33 @@ impl Autoscaler {
             .cloned()
             .collect();
 
-        if kept.len() != backends.len() {
+        let port = d.spec.vm_spec().port;
+        let mut moved = false;
+        let kept: Vec<_> = kept
+            .into_iter()
+            .map(|b| {
+                let addr = fleet
+                    .get(&b.sandbox_id)
+                    .and_then(|info| vm::routable_addr(info, port).ok())
+                    .filter(|addr| !b.is_draining() && addr.to_string() != b.address);
+                match addr {
+                    Some(addr) => {
+                        tracing::info!(
+                            deployment = %d.spec.id,
+                            sandbox = %b.sandbox_id,
+                            from = %b.address,
+                            to = %addr,
+                            "re-addressing backend: the daemon moved its forwarded port",
+                        );
+                        moved = true;
+                        Arc::new(b.readdressed(addr))
+                    }
+                    None => b,
+                }
+            })
+            .collect();
+
+        if moved || kept.len() != backends.len() {
             d.set_backends(kept);
         }
     }
@@ -2286,9 +2328,14 @@ impl Autoscaler {
     /// Best-effort: a failure leaves the copy where it was, which is exactly
     /// what happened before this existed, and the resume path does not care
     /// either way.
+    ///
+    /// Never for libvirt. Its disk is a copy-on-write overlay of the image,
+    /// which is the VM's whole state: there is no separate data disk for it to
+    /// fall back on, and nothing rebuilds the overlay on resume.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
         if d.spec.scaling.idle_action == IdleAction::Suspend { return; }
         if self.workspaces.source_retained(sandbox_id) { return; }
+        if d.spec.vm_spec().driver == crate::config::Driver::Libvirt { return; }
         let (removed, failed) = crate::disks::discard_rootfs(self.vms(), sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
@@ -4347,6 +4394,7 @@ mod tests {
             status_changed_at: String::new(),
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
+            port_mappings: Vec::new(),
             metadata: None,
             account_id: None,
             created_at: None,
@@ -5206,6 +5254,9 @@ mod tests {
             killed: Mutex<Vec<String>>,
             execs: Mutex<Vec<String>>,
             health_port: std::sync::atomic::AtomicU16,
+            /// List sandboxes the way the daemon lists a libvirt guest: no
+            /// `guest_ip`, a forwarded host port instead.
+            libvirt: std::sync::atomic::AtomicBool,
         }
 
         impl Fake {
@@ -5228,11 +5279,18 @@ mod tests {
             fake.health_port.store(port, Ordering::SeqCst);
             let app = Router::new()
                 .route("/deployed-sandboxes", get(|State(f): State<Arc<Fake>>| async move {
+                    let libvirt = f.libvirt.load(Ordering::SeqCst);
+                    let port = f.health_port.load(Ordering::SeqCst);
                     let rows: Vec<serde_json::Value> = f.vms.lock().unwrap().iter().map(|(id, name, up)| serde_json::json!({
                         "id": id, "name": name,
                         "status": if *up { "running" } else { "provisioning" },
                         "image": "img",
-                        "guest_ip": if *up { Some("127.0.0.1") } else { None },
+                        "guest_ip": if *up && !libvirt { Some("127.0.0.1") } else { None },
+                        "port_mappings": if *up && libvirt {
+                            serde_json::json!([{"host": port, "container": port}])
+                        } else {
+                            serde_json::json!([])
+                        },
                         "uptime_secs": 0, "ttl_seconds": 100000, "is_deployed": true,
                         "status_changed_at": "", "urls": []
                     })).collect();
@@ -5478,6 +5536,53 @@ mod tests {
             assert_eq!(fake.terminated.lock().unwrap().clone(), vec!["sb-2".to_string()]);
         }
 
+        /// A libvirt pool is an ordinary VM pool to the rollout engine: the
+        /// replicas it boots are reached through the daemon's forwarded host
+        /// port instead of a guest IP, but each one is stamped with the
+        /// revision it booted from, and the replaced ones leave through the
+        /// same graceful terminate.
+        #[tokio::test]
+        async fn a_libvirt_pool_records_revisions_and_rolls_like_any_other() {
+            let (url, fake) = daemon().await;
+            fake.libvirt.store(true, Ordering::SeqCst);
+            fake.vms.lock().unwrap().push(("old0".into(), vm::replica_name("demo", 1), true));
+            let mut s = pool(&fake, 1);
+            s.vm.as_mut().unwrap().driver = Driver::Libvirt;
+            let (scaler, registry) = autoscaler_against(&url, s);
+            scaler.adopt_existing().await;
+            let d = registry.get("demo").unwrap();
+            assert_eq!(d.backends().len(), 1);
+            assert_eq!(
+                d.backends()[0].address,
+                format!("127.0.0.1:{}", fake.health_port.load(Ordering::SeqCst)),
+                "routed through the forwarded host port",
+            );
+
+            let next = edited(&d.spec, "v2");
+            assert!(crate::registry::rolls_in_place(&d.spec, &next), "a plain libvirt pool rolls in place");
+            registry.roll(next, false).unwrap();
+            for _ in 0..40 {
+                scaler.reconcile().await;
+                settle().await;
+                if !progress(&registry).is_active() {
+                    break;
+                }
+            }
+            let d = registry.get("demo").unwrap();
+            assert_eq!(progress(&registry).phase, RolloutPhase::Complete);
+            assert_eq!(d.backends().len(), 1);
+            let fresh = &d.backends()[0];
+            assert_ne!(fresh.sandbox_id, "old0");
+            assert_eq!(fresh.revision().as_deref(), Some(d.current_revision().as_str()));
+            assert_eq!(
+                d.state().revisions.get(&fresh.sandbox_id),
+                Some(&d.current_revision()),
+                "the create recorded the libvirt replica's revision",
+            );
+            settle().await;
+            assert_eq!(fake.terminated.lock().unwrap().clone(), vec!["old0".to_string()]);
+        }
+
         #[tokio::test]
         async fn deleting_drains_before_stopping() {
             let (scaler, registry, fake, old) = seeded(1).await;
@@ -5494,5 +5599,97 @@ mod tests {
             assert_eq!(fake.terminated.lock().unwrap().clone(), old);
             assert!(d.backends().is_empty());
         }
+    }
+
+    /// A libvirt guest's address is a host port the daemon forwards, and the
+    /// daemon hands out a new one when it reattaches the VM. The replica is the
+    /// same, so it stays in the pool at the new port with everything the pool
+    /// knew about it — and a draining one stays put, since its drain is
+    /// counting requests dialed at the old port.
+    #[test]
+    fn prune_readdresses_a_libvirt_backend_whose_forwarded_port_moved() {
+        let mut s = spec();
+        s.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        let port = s.vm.as_ref().unwrap().port;
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", s);
+        let d = registry.get("demo").unwrap();
+
+        let first = VmBackend::new("sb-1".into(), "127.0.0.1:41080".parse().unwrap());
+        first.set_bind(Some("abc123".into()));
+        first.set_healthy(false);
+        first.set_revision(Some("rev-a".into()));
+        d.set_backends(vec![Arc::new(first)]);
+
+        let mut listed = info(heyo_sdk::SandboxStatus::Running, None);
+        listed.port_mappings = vec![heyo_sdk::PortMapping { host: 41999, container: port }];
+        let fleet = HashMap::from([("sb-1".to_string(), listed.clone())]);
+
+        scaler.prune(&d, &fleet);
+        let backends = d.backends();
+        assert_eq!(backends.len(), 1, "a moved port is not a dead VM");
+        assert_eq!(backends[0].address, "127.0.0.1:41999");
+        assert_eq!(backends[0].bind().as_deref(), Some("abc123"));
+        assert!(!backends[0].is_healthy(), "health carries over; the reprobe decides");
+        assert_eq!(backends[0].revision().as_deref(), Some("rev-a"), "a moved port is not a new revision");
+
+        // Unchanged: same Arc, nothing republished.
+        let before = Arc::as_ptr(&d.backends()[0]);
+        scaler.prune(&d, &fleet);
+        assert_eq!(Arc::as_ptr(&d.backends()[0]), before);
+
+        // Draining: keeps the address its in-flight requests were dialed at.
+        d.backends()[0].set_draining(true);
+        listed.port_mappings[0].host = 42000;
+        scaler.prune(&d, &HashMap::from([("sb-1".to_string(), listed)]));
+        assert_eq!(d.backends()[0].address, "127.0.0.1:41999");
+    }
+
+    /// TTL zero is the daemon's "never expires". Renewing would turn a
+    /// permanent VM into one with a deadline, so neither a zero-TTL spec nor a
+    /// VM that already runs without a TTL is ever renewed — while an ordinary
+    /// one past its halfway mark still is.
+    #[tokio::test]
+    async fn a_permanent_vm_is_never_given_a_ttl() {
+        use std::sync::atomic::AtomicUsize;
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let count = renewals.clone();
+        let daemon = axum::Router::new().route(
+            "/deployed-sandboxes/:id/ttl",
+            axum::routing::any(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, daemon).await.unwrap() });
+
+        let old = |ttl: Option<u64>| {
+            let mut i = info(heyo_sdk::SandboxStatus::Running, Some("127.0.0.1"));
+            i.uptime_secs = 10_000;
+            i.ttl_seconds = ttl;
+            HashMap::from([("sb-1".to_string(), i)])
+        };
+
+        // A spec with a TTL, and a VM that runs without one: left alone.
+        let (scaler, registry) = autoscaler_against(&url, spec());
+        let d = registry.get("demo").unwrap();
+        d.set_backends(vec![Arc::new(VmBackend::new("sb-1".into(), "127.0.0.1:9".parse().unwrap()))]);
+        scaler.renew_ttls(&d, &old(Some(0))).await;
+        assert_eq!(renewals.load(Ordering::SeqCst), 0);
+        // The same spec, and a VM with a TTL past halfway: renewed.
+        scaler.renew_ttls(&d, &old(Some(3600))).await;
+        assert_eq!(renewals.load(Ordering::SeqCst), 1, "the ordinary path still renews");
+
+        // A zero-TTL spec renews nothing, whatever the VM says.
+        let mut permanent = spec();
+        permanent.vm.as_mut().unwrap().ttl_seconds = 0;
+        let (scaler, registry) = autoscaler_against(&url, permanent);
+        let d = registry.get("demo").unwrap();
+        d.set_backends(vec![Arc::new(VmBackend::new("sb-1".into(), "127.0.0.1:9".parse().unwrap()))]);
+        scaler.renew_ttls(&d, &old(Some(3600))).await;
+        scaler.renew_ttls(&d, &old(None)).await;
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

@@ -1393,6 +1393,13 @@ fn state_key(id: &str) -> String {
 /// * `vm.workspace` and `idle_action: suspend` — their teardown captures
 ///   single-writer state before the next replica may boot, which that path
 ///   already sequences (a workspace fence, a stateful capture).
+///
+/// A libvirt pool rolls like any other under the same rule. Its replicas each
+/// own a disk overlay, so a rolled replica is a new VM (new id, new subdomain)
+/// and the old one's overlay goes with it — exactly what the rebuild path does
+/// to it too, minus the capacity gap. A libvirt pool whose disk is meant to
+/// outlive an idle period is excluded by the same `idle_action: suspend` rule,
+/// and `vm.workspace` is refused for libvirt at validation.
 pub fn rolls_in_place(old: &DeploymentSpec, new: &DeploymentSpec) -> bool {
     use crate::config::IdleAction;
     let plain = |s: &DeploymentSpec| {
@@ -2734,5 +2741,25 @@ mod tests {
         assert_eq!(d.backends().len(), 1, "backends rebuilt from upstreams on load");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Libvirt pools follow the same rule as Firecracker ones: a plain pool
+    /// rolls, a suspend pool (whose disk overlay is the VM's state) and a
+    /// change of driver do not.
+    #[test]
+    fn libvirt_pools_roll_in_place_only_when_plain() {
+        use crate::config::IdleAction;
+        let mut fc = spec("demo", vec![]);
+        fc.vm.as_mut().unwrap().driver = Driver::Firecracker;
+        let mut lv = fc.clone();
+        lv.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        let mut lv2 = lv.clone();
+        lv2.vm.as_mut().unwrap().port += 1;
+        assert!(rolls_in_place(&lv, &lv2));
+        assert!(!rolls_in_place(&fc, &lv), "a driver change rebuilds");
+        let mut suspended = lv2.clone();
+        suspended.scaling.idle_action = IdleAction::Suspend;
+        assert!(!rolls_in_place(&lv, &suspended));
+        assert!(!rolls_in_place(&suspended, &suspended));
     }
 }
