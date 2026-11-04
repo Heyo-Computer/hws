@@ -1192,8 +1192,16 @@ curl -u admin:pw localhost:9090/deployments/crm/adoptions
 curl -u admin:pw -X DELETE localhost:9090/deployments/crm/adoptions/sb-1a2b3c4d
 ```
 
+**Order matters.** Register the deployment with `min_replicas: 0` (and `max_replicas` the
+number of VMs it will hold), so it boots nothing of its own before the adoption; adopt; then
+raise `min_replicas` with `PATCH /deployments/:id/scaling`. An adopted VM counts toward it, so
+no replacement is ever booted for it. The reverse holds for a release: the released VM no
+longer fills a slot, so lower `min_replicas` first, or the pool boots a replacement — the
+release response says so when it will.
+
 `expect` fences against a reused id: the daemon must still report that name (and driver and
-creation time, when given) for the id. Every check is reported on its own, by a dry run or by
+creation time, when given — compared to the second, since a daemon restart reloads it with
+less precision) for the id. Every check is reported on its own, by a dry run or by
 the `409` that refuses: the deployment is a managed heyvm pool, not `spread` across a fleet,
 with no `vm.workspace`, no `ingress.cloud` and no rollout or retirement in progress; the VM is on this host's daemon
 (running or stopped), is not named like an app-lb replica and is not adopted elsewhere; its

@@ -8392,7 +8392,7 @@ fn adoption_checks(
         mismatch.push(format!("backend_type is {:?}, expected {want:?}", info.backend_type));
     }
     if let Some(want) = &expect.created_at
-        && info.created_at.as_deref() != Some(want.as_str())
+        && !same_instant(info.created_at.as_deref(), want)
     {
         mismatch.push(format!("created_at is {:?}, expected {want:?}", info.created_at));
     }
@@ -8466,6 +8466,20 @@ fn adoption_checks(
     AdoptionReport { ok, dry_run: request.dry_run, checks, warnings, adoption: None }
 }
 
+/// Whether the daemon's `created_at` is the instant `want` names.
+///
+/// Compared to the second, not as text: the daemon reloads a sandbox's
+/// creation time with less precision after it restarts
+/// (`…:11.587258009+00:00` becomes `…:11+00:00`), and that is no reason to
+/// refuse the machine the caller looked at.
+fn same_instant(listed: Option<&str>, want: &str) -> bool {
+    let Some(listed) = listed else { return false };
+    match (chrono::DateTime::parse_from_rfc3339(listed), chrono::DateTime::parse_from_rfc3339(want)) {
+        (Ok(a), Ok(b)) => a.timestamp() == b.timestamp(),
+        _ => listed == want,
+    }
+}
+
 /// `DELETE /deployments/:id/adoptions/:sandbox_id` — forget an adoption and
 /// hand the VM back exactly as it is. Never calls the daemon.
 async fn release_vm(
@@ -8496,13 +8510,23 @@ async fn release_vm(
     d.set_backends(keep);
     state.autoscaler.vms().unprotect(&sandbox_id);
     tracing::info!(deployment = %id, sandbox = %sandbox_id, "released adopted VM untouched");
+    // The released VM no longer fills a slot. A pool held at a minimum by it
+    // boots a replacement on the next tick, which the caller should hear now.
+    let live = d.backends().len() + d.pending().len() + d.state().adopted.len();
+    let min = d.spec.scaling.min_replicas as usize;
+    let warning = (live < min).then(|| {
+        format!(
+            "the pool is now below min_replicas {min}; app-lb will boot a replacement — lower \
+             min_replicas before releasing to avoid that"
+        )
+    });
     state.feed.announce(
         &d.spec,
         crate::feed::FeedEventKind::Updated,
         format!("released adopted VM {} ({}) untouched", adoption.sandbox_id, adoption.name),
         now_secs(),
     );
-    Json(serde_json::json!({ "released": adoption })).into_response()
+    Json(serde_json::json!({ "released": adoption, "warning": warning })).into_response()
 }
 
 fn recovery_authorized(caller: &Caller, spec: &DeploymentSpec) -> bool {
@@ -11971,6 +11995,7 @@ mod tests {
 
                 let (status, released) = call(&restarted, "DELETE", "/deployments/legacy/adoptions/sb-cafe0001", json!({}), true).await;
                 assert_eq!(status, StatusCode::OK, "{released}");
+                assert!(released["warning"].as_str().is_some_and(|w| w.contains("min_replicas 1")), "{released}");
                 assert!(!restarted.state.autoscaler.vms().is_protected("sb-cafe0001"));
                 assert!(restarted.registry.get("legacy").unwrap().state().adopted.is_empty());
                 assert_eq!(
@@ -11981,6 +12006,16 @@ mod tests {
 
                 assert_eq!(f.mutations.load(Ordering::SeqCst), 0, "no create, stop, DELETE or storage mutation");
                 assert_eq!(restarted.mutations.load(Ordering::SeqCst), 0);
+            }
+
+            #[test]
+            fn created_at_is_compared_as_an_instant() {
+                let precise = "2026-11-04T18:53:11.587258009+00:00";
+                assert!(same_instant(Some(precise), "2026-11-04T18:53:11+00:00"), "the daemon's reload truncates");
+                assert!(same_instant(Some("2026-11-04T19:53:11+01:00"), precise));
+                assert!(!same_instant(Some(precise), "2026-11-04T18:53:12+00:00"));
+                assert!(!same_instant(None, precise));
+                assert!(same_instant(Some("not a time"), "not a time"));
             }
 
             /// `?release=true` hands every adoption back untouched and deregisters.
