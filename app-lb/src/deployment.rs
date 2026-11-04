@@ -388,8 +388,36 @@ pub struct UpstreamDrain {
     pub started_at: u64,
 }
 
+/// A sandbox this deployment took over in place rather than created.
+///
+/// The VM was made by something else — `heyvm create --cloud`, a cloud
+/// deployment, a person — and keeps everything it had: its id, name, disk,
+/// TTL, daemon-side binds and so its public URL. app-lb only routes to it and
+/// counts it as one of the pool's replicas. Ownership of an adopted VM is this
+/// record, never its name, which app-lb does not choose and never changes.
+///
+/// Every adoption is *protected*: no path in app-lb may destroy, stop, purge,
+/// re-TTL or rebind the VM (enforced at the daemon boundary, see
+/// [`crate::vm::VmManager::is_protected`]). Releasing one removes the record
+/// and touches nothing on the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Adoption {
+    pub sandbox_id: String,
+    /// The name the VM had when it was adopted, as the fence against a reused
+    /// id: the daemon must still report this name for this id.
+    pub name: String,
+    /// The daemon's driver name (`libvirt`, `firecracker`, …).
+    pub backend_type: String,
+    /// LB-clock Unix seconds.
+    pub adopted_at: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeploymentState {
+    /// Sandboxes this deployment adopted in place. Host state: an adoption
+    /// names a VM on this host's daemon, so it is never shared with a fleet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adopted: Vec<Adoption>,
     /// Irreversible controller freeze; neither reload nor ordinary updates clear it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retirement: Option<crate::retirement::Operation>,
@@ -525,6 +553,11 @@ impl Deployment {
 
     pub fn state(&self) -> Arc<DeploymentState> {
         self.state.load_full()
+    }
+
+    /// Whether `sandbox_id` is one this deployment adopted in place.
+    pub fn is_adopted(&self, sandbox_id: &str) -> bool {
+        self.state().adopted.iter().any(|a| a.sandbox_id == sandbox_id)
     }
 
     pub fn set_state(&self, state: DeploymentState) {

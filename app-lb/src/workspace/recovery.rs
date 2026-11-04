@@ -241,9 +241,9 @@ mod tests {
             exports: AtomicUsize::new(0), unexpected: AtomicUsize::new(0), tmp_state: root.join("workspaces/demo/.state.json.tmp"), bundle });
         let app = Router::new()
             .route("/deployed-sandboxes", get(|State(s): State<Arc<Daemon>>| async move {
-                axum::Json(if s.active.load(Ordering::SeqCst) { serde_json::json!([{"id":"sb-retained","name":"applb-demo-deadbeef","status":"running","status_changed_at":""}]) } else { serde_json::json!([]) })
+                axum::Json(if s.active.load(Ordering::SeqCst) { serde_json::json!([{"id":"sb-retained","name":"applb-demo-0000deadbeef","status":"running","status_changed_at":""}]) } else { serde_json::json!([]) })
             }))
-            .route("/sandboxes/inactive", get(|| async { axum::Json(serde_json::json!({"sandboxes":[{"id":"sb-retained","name":"applb-demo-deadbeef","status":"stopped"}],"next_cursor":null})) }))
+            .route("/sandboxes/inactive", get(|| async { axum::Json(serde_json::json!({"sandboxes":[{"id":"sb-retained","name":"applb-demo-0000deadbeef","status":"stopped"}],"next_cursor":null})) }))
             .route("/sandboxes/:id/mounts/export", get(|State(s): State<Arc<Daemon>>| async move {
                 s.exports.fetch_add(1, Ordering::SeqCst);
                 if s.export_failure.load(Ordering::SeqCst) { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }

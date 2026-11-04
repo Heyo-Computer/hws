@@ -621,6 +621,7 @@ heyctl plugins enable artifacts
 | Route | Purpose |
 | --- | --- |
 | `GET /whoami` | What the presented credential is. |
+| `GET`/`POST /deployments/:id/adoptions`, `DELETE .../adoptions/:sandbox_id` | Adopt a VM app-lb did not create, in place; list adoptions; release one untouched. Unconfined admin only (see the app-lb README, *Adopting a VM in place*). |
 | `GET`/`POST /deployments/:id/retirement` | Retirement status and action. |
 | `POST /deployments/:id/workspace/recoveries`, `GET .../:operation_id` | Workspace recovery. |
 | `POST /deployments/:id/regional-probe`, `.../regional-active-probe`, `.../route-handoff`, `.../route-handoff/commit` | Regional gateway protocol (see [multi-region](multi-region.md)). |

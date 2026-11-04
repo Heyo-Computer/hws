@@ -1173,6 +1173,54 @@ VM of a `max_replicas: 1` deployment leaves a brief capacity gap until the
 replacement boots (a request arriving in that window eats a cold start).
 Unknown deployment or VM id is a `404`.
 
+### Adopting a VM in place
+
+A VM app-lb did not create — made with `heyvm create --cloud`, by a cloud deployment, by
+hand — can join a deployment's pool **where it is**: same sandbox id, name, disk, TTL and
+daemon-side binds, so its existing URL keeps working. Nothing about the VM changes; app-lb
+records it on the deployment, routes to it and counts it as a replica.
+
+```sh
+# Check everything, change nothing.
+curl -u admin:pw -X POST localhost:9090/deployments/crm/adoptions -d '{
+  "sandbox_id": "sb-1a2b3c4d",
+  "expect": {"name": "customer-crm", "backend_type": "libvirt"},
+  "dry_run": true}'
+# The same without dry_run adopts (201). The record is persisted with the deployment.
+curl -u admin:pw localhost:9090/deployments/crm/adoptions
+# Release: forget the adoption, hand the VM back exactly as it is. Never calls the daemon.
+curl -u admin:pw -X DELETE localhost:9090/deployments/crm/adoptions/sb-1a2b3c4d
+```
+
+**Order matters.** Register the deployment with `min_replicas: 0` (and `max_replicas` the
+number of VMs it will hold), so it boots nothing of its own before the adoption; adopt; then
+raise `min_replicas` with `PATCH /deployments/:id/scaling`. An adopted VM counts toward it, so
+no replacement is ever booted for it. The reverse holds for a release: the released VM no
+longer fills a slot, so lower `min_replicas` first, or the pool boots a replacement — the
+release response says so when it will.
+
+`expect` fences against a reused id: the daemon must still report that name (and driver and
+creation time, when given — compared to the second, since a daemon restart reloads it with
+less precision) for the id. Every check is reported on its own, by a dry run or by
+the `409` that refuses: the deployment is a managed heyvm pool, not `spread` across a fleet,
+with no `vm.workspace`, no `ingress.cloud` and no rollout or retirement in progress; the VM is on this host's daemon
+(running or stopped), is not named like an app-lb replica and is not adopted elsewhere; its
+driver is the deployment's; a routed deployment can reach its `vm.port`; and it fits under
+`max_replicas`. A VM with a daemon TTL is adopted with a warning: app-lb neither renews nor
+clears it. The routes are never ungated, and only an unconfined admin may use them — the
+operator credential, an unscoped admin token or a fleet grant — because an adoption reaches a
+VM that no namespace owns yet.
+
+**An adopted VM is protected.** Every call that could end it — destroy, stop, purge,
+TTL change, bind or unbind — is refused at the daemon boundary, whatever path makes it. The
+pool never drains, evicts, recycles or renews it, and never boots a stand-in for it: stopped
+by its owner, it still fills its slot, and it rejoins the pool once it runs and answers its
+health check. So, while a deployment holds adoptions, these are refused with `409`:
+`stop`, `restart`, evicting the adopted VM, a rollout, retirement, a `PUT`/`POST` that changes
+the `vm` template or turns on `ingress.cloud` (a second URL beside the one the VM keeps), and
+`DELETE /deployments/:id` — unless it says `?release=true`, which releases every adoption
+untouched and then deregisters.
+
 ## Running things inside a VM
 
 Two endpoints reach into a deployment's VM without going through the proxy.
@@ -4204,8 +4252,10 @@ is visible without reading logs at all.
 is renewed while app-lb is alive, except at `0`, the daemon's "never expires": a zero-TTL
 spec is never renewed, and neither is a VM that already runs without a TTL, since renewing
 it would give it a deadline. VMs from a previous run are re-adopted on startup
-(matched by their `applb-<deployment>-<nonce>` name). VMs app-lb did not create are never
-touched.
+(matched by their `applb-<deployment>-<nonce>` name, and only when the nonce is one app-lb
+mints: 12+ lowercase hex, or a rollout candidate's `r` and 72+ hex — so a cloud sandbox
+someone named `applb-web-1` is never claimed by deployment `web`). VMs app-lb did not create
+are never touched, unless adopted (see [Adopting a VM in place](#adopting-a-vm-in-place)).
 
 A VM whose name points at a deployment this LB's state does **not** hold is stopped, never
 destroyed: its disk stays, `/disks` lists it, and the disk sweep reclaims it after
