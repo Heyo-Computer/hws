@@ -534,6 +534,20 @@ impl Registry {
         self.deployments().get(id).cloned()
     }
 
+    /// Every sandbox a deployment on this host has adopted in place — the set
+    /// the daemon boundary refuses to destroy (`VmManager::set_protected`).
+    pub fn adopted_ids(&self) -> HashSet<String> {
+        self.deployments()
+            .values()
+            .flat_map(|d| d.state().adopted.iter().map(|a| a.sandbox_id.clone()).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// The deployment that adopted `sandbox_id`, if one did.
+    pub fn adopter_of(&self, sandbox_id: &str) -> Option<Arc<Deployment>> {
+        self.deployments().values().find(|d| d.is_adopted(sandbox_id)).cloned()
+    }
+
     pub fn retirement_frozen(&self, id: &str) -> bool {
         self.get(id).is_some_and(|d| d.state().retirement.is_some())
     }
@@ -765,6 +779,9 @@ impl Registry {
         }
         if let Some(previous) = &previous {
             deployment.mutate_state(|s| {
+                // An adoption outlives every edit: the VM is somebody's, and a
+                // spec change is no reason to forget that app-lb holds it.
+                s.adopted = previous.state().adopted.clone();
                 s.rollouts = previous.state().rollouts.clone();
                 s.create_attempts = previous.state().create_attempts.clone();
                 s.allocation_history_complete = previous.state().allocation_history_complete;
@@ -898,7 +915,9 @@ impl Registry {
     /// it was serving (the old deployment's), so the autoscaler can tell old
     /// from new. `restart` bumps the restart generation, which changes the
     /// revision even when the template did not — how a restart, or a rebuild
-    /// that reuses an image name, rolls an unchanged spec.
+    /// that reuses an image name, rolls an unchanged spec. Adopted VMs are the
+    /// exception: they are stamped with the *new* revision, so the rollout
+    /// replaces only replicas app-lb created and never drains an adopted one.
     ///
     /// Only valid where [`rolls_in_place`] holds; the caller decides.
     ///
@@ -910,7 +929,14 @@ impl Registry {
         }
         let old_revision = old.current_revision();
         let mut stamped = Vec::new();
+        let mut adopted = Vec::new();
         for b in old.backends().iter() {
+            // An adopted VM is not a replica of either template and is never
+            // replaced: it takes the new revision below, so it is never stale.
+            if old.is_adopted(&b.sandbox_id) {
+                adopted.push(b.clone());
+                continue;
+            }
             match b.revision() {
                 Some(r) => stamped.push((b.sandbox_id.clone(), r)),
                 None => {
@@ -946,6 +972,14 @@ impl Registry {
             }
         });
         let revision = new.current_revision();
+        for b in &adopted {
+            b.set_revision(Some(revision.clone()));
+        }
+        new.mutate_state(|s| {
+            for b in &adopted {
+                s.revisions.insert(b.sandbox_id.clone(), revision.clone());
+            }
+        });
         let strategy = new.spec.effective_rollout().strategy;
         new.mutate_state(|s| {
             s.rollout_progress = Some(crate::deployment::RolloutProgress::new(revision, strategy, now));
