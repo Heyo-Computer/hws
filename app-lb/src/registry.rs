@@ -530,6 +530,20 @@ impl Registry {
         self.deployments().get(id).cloned()
     }
 
+    /// Every sandbox a deployment on this host has adopted in place — the set
+    /// the daemon boundary refuses to destroy (`VmManager::set_protected`).
+    pub fn adopted_ids(&self) -> HashSet<String> {
+        self.deployments()
+            .values()
+            .flat_map(|d| d.state().adopted.iter().map(|a| a.sandbox_id.clone()).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// The deployment that adopted `sandbox_id`, if one did.
+    pub fn adopter_of(&self, sandbox_id: &str) -> Option<Arc<Deployment>> {
+        self.deployments().values().find(|d| d.is_adopted(sandbox_id)).cloned()
+    }
+
     pub fn retirement_frozen(&self, id: &str) -> bool {
         self.get(id).is_some_and(|d| d.state().retirement.is_some())
     }
@@ -761,6 +775,9 @@ impl Registry {
         }
         if let Some(previous) = &previous {
             deployment.mutate_state(|s| {
+                // An adoption outlives every edit: the VM is somebody's, and a
+                // spec change is no reason to forget that app-lb holds it.
+                s.adopted = previous.state().adopted.clone();
                 s.rollouts = previous.state().rollouts.clone();
                 s.create_attempts = previous.state().create_attempts.clone();
                 s.allocation_history_complete = previous.state().allocation_history_complete;

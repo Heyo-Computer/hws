@@ -4695,6 +4695,9 @@ async fn register(
     if old.as_ref().is_some_and(|d| crate::rollout::reserved(d)) {
         return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
     }
+    if let Some(why) = old.as_ref().and_then(|d| adoption_conflict(d, &spec)) {
+        return err(StatusCode::CONFLICT, why).into_response();
+    }
     if state.autoscaler.workspaces().recovery_active(&id) {
         return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
     }
@@ -4821,6 +4824,9 @@ async fn update(
     };
     if crate::rollout::reserved(&old) {
         return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
+    if let Some(why) = adoption_conflict(&old, &spec) {
+        return err(StatusCode::CONFLICT, why).into_response();
     }
     if let Some(refused) = refuse_unclaimable(&state, caller.as_ref().map(|c| &c.0), &spec) {
         return refused;
@@ -5091,6 +5097,9 @@ async fn stop_deployment(
     body: Option<Json<LifecycleRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
+    if let Some(refused) = refuse_adopted_lifecycle(&state, &id, "stopped") {
+        return refused;
+    }
     if let Err(response) = yield_operations(&state, &id, req.force) {
         return response;
     }
@@ -5256,6 +5265,9 @@ async fn restart_deployment(
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
     let wait = lifecycle_wait(&req);
+    if let Some(refused) = refuse_adopted_lifecycle(&state, &id, "restarted") {
+        return refused;
+    }
     if let Err(response) = yield_operations(&state, &id, req.force) {
         return response;
     }
@@ -5993,6 +6005,9 @@ async fn retire_deployment(State(state):State<AdminState>,axum::Extension(caller
     Json(request):Json<crate::retirement::Request>) -> Response {
     let Some(d)=state.registry.get(&id) else {return StatusCode::NOT_FOUND.into_response()};
     if !recovery_authorized(&caller,&d.spec) {return forbidden("authenticated namespace admin required");}
+    if !d.state().adopted.is_empty() {
+        return err(StatusCode::CONFLICT,"retirement destroys the pool, and an adopted VM is never destroyed; release the adoptions first").into_response();
+    }
     let _retirement=state.registry.retirement_gate.write().await;
     let _rollout=state.autoscaler.rollout_guard().await;
     let _change=state.registry.change_guard().await;
@@ -6150,8 +6165,30 @@ async fn remove_deployment_record(
     }
 }
 
-async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
+/// `DELETE /deployments/:id[?release=true]`.
+#[derive(Deserialize, Default)]
+struct DeregisterParams {
+    /// Release the deployment's adopted VMs — hand them back untouched — and
+    /// deregister. Without it, a deployment holding adoptions is refused.
+    #[serde(default)]
+    release: bool,
+}
+
+async fn deregister(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    params: Option<Query<DeregisterParams>>,
+) -> impl IntoResponse {
+    let release = params.is_some_and(|Query(p)| p.release);
     let change = state.registry.change_guard().await;
+    if !release && state.registry.get(&id).is_some_and(|d| !d.state().adopted.is_empty()) {
+        return err(
+            StatusCode::CONFLICT,
+            "the deployment holds adopted VMs; release them (DELETE /deployments/:id/adoptions/:sandbox_id), \
+             or deregister with ?release=true to hand them all back untouched",
+        )
+        .into_response();
+    }
     if state.registry.get(&id).is_some_and(|d| d.state().create_attempts.iter().any(|a| a.allocation.is_some())) {
         return err(StatusCode::CONFLICT, "correlated allocation receipts must be retained").into_response();
     }
@@ -6170,6 +6207,12 @@ async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> 
     drop(change);
     // Removed from routing first, so the teardown can't race new requests in.
     state.autoscaler.teardown(&d).await;
+    // Released: nothing on the daemon is touched, and the next tick's protected
+    // set no longer names them.
+    for adoption in &d.state().adopted {
+        state.autoscaler.vms().unprotect(&adoption.sandbox_id);
+        tracing::info!(deployment = %id, sandbox = %adoption.sandbox_id, "released adopted VM as its deployment goes away");
+    }
     // Its counters fold into the global rollup and its entry goes; a fleet whose
     // ids churn would otherwise accumulate one per sandbox that ever existed.
     state.metrics.retire(&id);
@@ -6239,6 +6282,11 @@ async fn evict_vm(
         EvictOutcome::NotFound => err(
             StatusCode::NOT_FOUND,
             format!("no VM {sandbox_id:?} in deployment {id:?}"),
+        )
+        .into_response(),
+        EvictOutcome::Adopted => err(
+            StatusCode::CONFLICT,
+            format!("VM {sandbox_id:?} is adopted; app-lb never destroys an adopted VM (release it instead)"),
         )
         .into_response(),
         EvictOutcome::KillFailed(e) => {
@@ -8075,6 +8123,9 @@ async fn start_rollout(State(state): State<AdminState>, Path(id): Path<String>, 
     let _lifecycle = state.autoscaler.rollout_guard().await;
     let _change = state.registry.change_guard().await;
     let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    if !d.state().adopted.is_empty() {
+        return err(StatusCode::CONFLICT, "a rollout replaces the pool, and an adopted VM is never replaced; release the adoptions first").into_response();
+    }
     match state.jobs.with_rollout_slot(&id, || state.rollouts.admit(&d, request)) {
         Ok(o) => (StatusCode::ACCEPTED, Json(o.view())).into_response(),
         Err(e) => err(StatusCode::CONFLICT, e).into_response(),
@@ -8087,6 +8138,371 @@ async fn get_rollout(State(state): State<AdminState>, Path((id, operation)): Pat
         Some(o) => Json(o.view()).into_response(),
         None => err(StatusCode::NOT_FOUND, "rollout not found").into_response(),
     }
+}
+
+// -- adoptions ---------------------------------------------------------------
+//
+// Taking over, in place, a VM something else created: `heyvm create --cloud`,
+// a cloud deployment, a person. The VM keeps its id, name, disk, TTL and binds
+// (and so its URL); app-lb records it on a deployment, routes to it and counts
+// it as a replica, and refuses at the daemon boundary to destroy, stop, purge,
+// re-TTL or rebind it. Releasing one forgets the record and touches nothing.
+
+/// Who may adopt and release: an unconfined admin — the operator credential,
+/// an unscoped admin token or a fleet grant. Never an ungated build, and never
+/// a namespace-confined caller: an adoption reaches a VM no namespace owns yet.
+fn adoption_authorized(caller: &Caller) -> bool {
+    !matches!(caller, Caller::Ungated)
+        && !caller.confined()
+        && caller.satisfies(crate::tokens::AdminScope::Admin)
+}
+
+/// Why `next` cannot replace `old`'s spec while `old` holds adoptions.
+///
+/// The adopted VMs were not built from this spec and cannot be rebuilt from
+/// the next one, so the VM template is frozen; and a cloud ingress would bind
+/// them a second, deployment URL beside the one they already have.
+fn adoption_conflict(old: &Deployment, next: &DeploymentSpec) -> Option<&'static str> {
+    if old.state().adopted.is_empty() {
+        return None;
+    }
+    if old.spec.vm != next.vm {
+        return Some(
+            "the vm template cannot change while the deployment holds adopted VMs: they were \
+             not built from it and are never rebuilt; release them first",
+        );
+    }
+    if crate::config::IngressSpec::wants_cloud(next.ingress.as_ref()) {
+        return Some(
+            "ingress.cloud would bind adopted VMs a second URL beside the one they keep; \
+             release them first",
+        );
+    }
+    None
+}
+
+/// Stop and restart go through a stop of the pool, which ends in a kill or a
+/// suspend — neither of which an adopted VM may undergo.
+fn refuse_adopted_lifecycle(state: &AdminState, id: &str, verb: &str) -> Option<Response> {
+    state.registry.get(id).filter(|d| !d.state().adopted.is_empty()).map(|_| {
+        err(
+            StatusCode::CONFLICT,
+            format!(
+                "the deployment holds adopted VMs, which app-lb never stops or destroys, so it \
+                 cannot be {verb}; stop the VM through its owner, or release the adoptions first"
+            ),
+        )
+        .into_response()
+    })
+}
+
+/// `POST /deployments/:id/adoptions`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptionRequest {
+    sandbox_id: String,
+    /// What the daemon must report for `sandbox_id`, so an id reused by
+    /// another VM since the caller looked is not the one adopted.
+    expect: AdoptionExpect,
+    /// Check everything and report, change nothing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptionExpect {
+    name: String,
+    #[serde(default)]
+    backend_type: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdoptionCheck {
+    check: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdoptionReport {
+    ok: bool,
+    dry_run: bool,
+    checks: Vec<AdoptionCheck>,
+    /// True but worth knowing: these do not block the adoption.
+    warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adoption: Option<crate::deployment::Adoption>,
+}
+
+/// One adopted VM as `GET /deployments/:id/adoptions` shows it.
+#[derive(Debug, Serialize)]
+struct AdoptionView {
+    #[serde(flatten)]
+    adoption: crate::deployment::Adoption,
+    /// Serving: in the pool and taking traffic.
+    in_pool: bool,
+}
+
+async fn list_adoptions(
+    State(state): State<AdminState>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>,
+) -> Response {
+    if !adoption_authorized(&caller) {
+        return forbidden("adoption needs an unconfined admin credential");
+    }
+    let Some(d) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    let backends = d.backends();
+    let views: Vec<_> = d
+        .state()
+        .adopted
+        .iter()
+        .map(|a| AdoptionView {
+            in_pool: backends.iter().any(|b| b.sandbox_id == a.sandbox_id),
+            adoption: a.clone(),
+        })
+        .collect();
+    Json(views).into_response()
+}
+
+async fn adopt_vm(
+    State(state): State<AdminState>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>,
+    Json(request): Json<AdoptionRequest>,
+) -> Response {
+    if !adoption_authorized(&caller) {
+        return forbidden("adoption needs an unconfined admin credential");
+    }
+    if !crate::disks::valid_sandbox_id(&request.sandbox_id) {
+        return err(StatusCode::BAD_REQUEST, "invalid sandbox id").into_response();
+    }
+    let _change = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    let vms = state.autoscaler.vms();
+
+    // Running sandboxes are listed; stopped ones only by the inactive walk.
+    let listed = match vms.list().await {
+        Ok(list) => list.into_iter().find(|i| i.id == request.sandbox_id),
+        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("could not list the daemon's sandboxes: {e}")).into_response(),
+    };
+    let found = match listed {
+        Some(info) => Some(info),
+        None => match vms.list_inactive().await {
+            Ok(list) => list.into_iter().find(|i| i.id == request.sandbox_id),
+            Err(e) => return err(StatusCode::BAD_GATEWAY, format!("could not list the daemon's stopped sandboxes: {e}")).into_response(),
+        },
+    };
+
+    let report = adoption_checks(&state.registry, &d, &request, found.as_ref());
+    if !report.ok || request.dry_run {
+        let status = if report.ok { StatusCode::OK } else { StatusCode::CONFLICT };
+        return (status, Json(report)).into_response();
+    }
+    let info = found.expect("a passing report found the sandbox");
+    let adoption = crate::deployment::Adoption {
+        sandbox_id: info.id.clone(),
+        name: info.name.clone(),
+        backend_type: info.backend_type.clone().unwrap_or_default(),
+        adopted_at: now_secs(),
+    };
+    // Protected before the record exists, so there is no moment at which a
+    // sweep or a tick could see the VM as ours and unguarded.
+    vms.protect(&adoption.sandbox_id);
+    d.mutate_state(|s| s.adopted.push(adoption.clone()));
+    if let Err(e) = state.registry.persist_one(&id) {
+        d.mutate_state(|s| s.adopted.retain(|a| a.sandbox_id != adoption.sandbox_id));
+        vms.unprotect(&adoption.sandbox_id);
+        tracing::error!(deployment = %id, error = %e, "failed to persist an adoption; rolled back");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not persist the adoption; nothing was adopted").into_response();
+    }
+    tracing::info!(deployment = %id, sandbox = %adoption.sandbox_id, name = %adoption.name, "adopted VM in place");
+    state.feed.announce(
+        &d.spec,
+        crate::feed::FeedEventKind::Updated,
+        format!("adopted VM {} ({}) in place", adoption.sandbox_id, adoption.name),
+        now_secs(),
+    );
+    d.scale_signal.notify_one();
+    (StatusCode::CREATED, Json(AdoptionReport { adoption: Some(adoption), ..report })).into_response()
+}
+
+/// Everything an adoption has to be true of, each reported on its own so a
+/// dry run says exactly what would refuse it.
+fn adoption_checks(
+    registry: &Registry,
+    d: &Deployment,
+    request: &AdoptionRequest,
+    found: Option<&heyo_sdk::SandboxInfo>,
+) -> AdoptionReport {
+    let mut checks = Vec::new();
+    let mut warnings = Vec::new();
+    let mut check = |check: &'static str, ok: bool, detail: String| checks.push(AdoptionCheck { check, ok, detail });
+
+    let driver = d.spec.driver();
+    check(
+        "managed",
+        driver.is_some_and(|dr| dr.heyvm().is_some()),
+        "the deployment must be a managed pool on a heyvm driver".into(),
+    );
+    let state = d.state();
+    check(
+        "settled",
+        state.retirement.is_none() && !crate::rollout::reserved(d),
+        "no retirement or rollout may hold the deployment".into(),
+    );
+    let vm = d.spec.vm.as_ref();
+    check(
+        "no_workspace",
+        vm.is_none_or(|vm| vm.workspace.is_none()),
+        "a workspace deployment captures and replaces its VM; adopted VMs are never replaced".into(),
+    );
+    check(
+        "not_spread",
+        d.spec.placement.as_ref().is_none_or(|p| p.mode != crate::config::PlacementMode::Spread),
+        "an adoption names a VM on this host; a spread deployment runs replicas across the fleet".into(),
+    );
+    check(
+        "no_cloud_ingress",
+        !crate::config::IngressSpec::wants_cloud(d.spec.ingress.as_ref()),
+        "ingress.cloud would bind the VM a second URL beside the one it keeps".into(),
+    );
+
+    let Some(info) = found else {
+        check("found", false, format!("the daemon has no sandbox {:?}, running or stopped", request.sandbox_id));
+        return AdoptionReport { ok: false, dry_run: request.dry_run, checks, warnings, adoption: None };
+    };
+    check("found", true, format!("{} is {:?} on this host's daemon", info.id, info.status));
+
+    let expect = &request.expect;
+    let mut mismatch = Vec::new();
+    if info.name != expect.name {
+        mismatch.push(format!("name is {:?}, expected {:?}", info.name, expect.name));
+    }
+    if let Some(want) = &expect.backend_type
+        && info.backend_type.as_deref() != Some(want.as_str())
+    {
+        mismatch.push(format!("backend_type is {:?}, expected {want:?}", info.backend_type));
+    }
+    if let Some(want) = &expect.created_at
+        && info.created_at.as_deref() != Some(want.as_str())
+    {
+        mismatch.push(format!("created_at is {:?}, expected {want:?}", info.created_at));
+    }
+    let detail = if mismatch.is_empty() { "the daemon reports what was expected".into() } else { mismatch.join("; ") };
+    check("expect", mismatch.is_empty(), detail);
+
+    check(
+        "foreign",
+        crate::vm::owner_of(&info.name).is_none(),
+        "a VM named like an app-lb replica is already a deployment's by its name".into(),
+    );
+    let adopter = registry.adopter_of(&info.id);
+    check(
+        "unadopted",
+        adopter.is_none(),
+        match &adopter {
+            Some(other) => format!("already adopted by deployment {:?}", other.spec.id),
+            None => "no deployment holds it".into(),
+        },
+    );
+
+    let want = driver.map(|dr| dr.as_str());
+    check(
+        "driver",
+        info.backend_type.as_deref().is_some_and(|b| Some(b) == want),
+        format!("the VM runs on {:?}, the deployment on {:?}", info.backend_type, want),
+    );
+
+    if let Some(vm) = vm {
+        if d.spec.routes.is_empty() {
+            check("route", true, "exec-only: reached through the daemon by id".into());
+        } else if info.status == heyo_sdk::SandboxStatus::Running {
+            let routable = crate::vm::routable_addr(info, vm.port);
+            check(
+                "route",
+                routable.is_ok(),
+                match routable {
+                    Ok(addr) => format!("guest port {} is reachable at {addr}", vm.port),
+                    Err(e) => e.to_string(),
+                },
+            );
+        } else {
+            check("route", true, "stopped: routed once it runs".into());
+        }
+        if info.status != heyo_sdk::SandboxStatus::Running {
+            warnings.push(format!(
+                "{} is {:?}; it joins the pool when its owner starts it, and app-lb will not start it",
+                info.id, info.status
+            ));
+        }
+
+        let others = d.backends().iter().filter(|b| !d.is_adopted(&b.sandbox_id)).count()
+            + d.pending().len()
+            + state.adopted.len();
+        let max = d.spec.scaling.max_replicas as usize;
+        check(
+            "capacity",
+            others < max,
+            format!("{others} replica(s) already against max_replicas {max}"),
+        );
+    }
+
+    match info.ttl_seconds {
+        Some(ttl) if ttl > 0 => warnings.push(format!(
+            "the VM carries a daemon TTL of {ttl}s, which app-lb leaves alone: it neither renews nor clears it"
+        )),
+        _ => {}
+    }
+
+    let ok = checks.iter().all(|c| c.ok);
+    AdoptionReport { ok, dry_run: request.dry_run, checks, warnings, adoption: None }
+}
+
+/// `DELETE /deployments/:id/adoptions/:sandbox_id` — forget an adoption and
+/// hand the VM back exactly as it is. Never calls the daemon.
+async fn release_vm(
+    State(state): State<AdminState>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Path((id, sandbox_id)): Path<(String, String)>,
+) -> Response {
+    if !adoption_authorized(&caller) {
+        return forbidden("adoption needs an unconfined admin credential");
+    }
+    let _change = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    let Some(adoption) = d.state().adopted.iter().find(|a| a.sandbox_id == sandbox_id).cloned() else {
+        return err(StatusCode::NOT_FOUND, format!("deployment {id:?} has not adopted {sandbox_id:?}")).into_response();
+    };
+    let previous = (*d.state()).clone();
+    d.mutate_state(|s| s.adopted.retain(|a| a.sandbox_id != sandbox_id));
+    if let Err(e) = state.registry.persist_one(&id) {
+        d.set_state(previous);
+        tracing::error!(deployment = %id, error = %e, "failed to persist a release; still adopted");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not persist the release; the VM is still adopted").into_response();
+    }
+    // Out of routing, then unguarded: the order that never routes to a VM
+    // app-lb no longer holds, and never leaves a held one unguarded.
+    let keep: Vec<_> = d.backends().iter().filter(|b| b.sandbox_id != sandbox_id).cloned().collect();
+    d.set_backends(keep);
+    state.autoscaler.vms().unprotect(&sandbox_id);
+    tracing::info!(deployment = %id, sandbox = %sandbox_id, "released adopted VM untouched");
+    state.feed.announce(
+        &d.spec,
+        crate::feed::FeedEventKind::Updated,
+        format!("released adopted VM {} ({}) untouched", adoption.sandbox_id, adoption.name),
+        now_secs(),
+    );
+    Json(serde_json::json!({ "released": adoption })).into_response()
 }
 
 fn recovery_authorized(caller: &Caller, spec: &DeploymentSpec) -> bool {
@@ -8617,6 +9033,8 @@ fn router(state: AdminState) -> Router {
 
     // Unlike legacy CRUD, explicit data recovery is never available ungated.
     let recovery = Router::new()
+        .route("/deployments/:id/adoptions", get(list_adoptions).post(adopt_vm))
+        .route("/deployments/:id/adoptions/:sandbox_id", delete(release_vm))
         .route("/deployments/:id/retirement", get(retirement_status).post(retire_deployment))
         .route("/deployments/:id/workspace/recoveries", post(recover_workspace))
         .route("/deployments/:id/workspace/recoveries/:operation_id", get(get_workspace_recovery))
@@ -11445,6 +11863,147 @@ mod tests {
                 assert_eq!(status, StatusCode::BAD_REQUEST);
                 let (status, _) = ask(Some(Caller::Operator), Some("../x")).await;
                 assert_eq!(status, StatusCode::BAD_REQUEST);
+            }
+        }
+
+        mod adoption_tests {
+            use super::*;
+            use serde_json::{Value, json};
+
+            fn auth(f: &mut Fixture) {
+                f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
+                f.state.gate_admin = true;
+            }
+
+            async fn call(f: &Fixture, method: &str, path: &str, body: Value, credential: bool) -> (StatusCode, Value) {
+                let mut req = Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, "application/json");
+                if credential {
+                    req = req.header(header::AUTHORIZATION, "Basic b3BlcmF0b3I6cGFzc3dvcmQ=");
+                }
+                let mut app = router(f.state.clone());
+                std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+                let response = app.call(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+            }
+
+            /// A libvirt pool of one, exec-only, and a customer VM it has not
+            /// adopted yet: stopped, so it is found through the inactive walk.
+            fn legacy(f: &Fixture) -> Value {
+                let spec: DeploymentSpec = serde_json::from_value(json!({
+                    "id": "legacy", "routes": [],
+                    "vm": {"driver": "libvirt", "port": 8080, "ttl_seconds": 0},
+                    "scaling": {"min_replicas": 1, "max_replicas": 1}
+                })).unwrap();
+                f.registry.upsert(spec);
+                f.registry.persist_one("legacy").unwrap();
+                f.inactive.lock().unwrap().push(json!({
+                    "id": "sb-cafe0001", "name": "customer-crm", "status": "stopped", "image": "",
+                    "backend_type": "libvirt", "created_at": "2026-10-01T00:00:00Z", "ttl_seconds": 0
+                }));
+                json!({"sandbox_id": "sb-cafe0001", "expect": {"name": "customer-crm", "backend_type": "libvirt"}})
+            }
+
+            /// Adopting and releasing are bookkeeping: across a dry run, the
+            /// adoption, every refused operation, a full reconcile, both sweeps,
+            /// a reload from disk and the release, the daemon is never asked to
+            /// change anything.
+            #[tokio::test]
+            async fn adoption_and_release_never_touch_the_daemon() {
+                let mut f = fixture_with_backend(true, Router::new(), None).await;
+                auth(&mut f);
+                let body = legacy(&f);
+                let path = "/deployments/legacy/adoptions";
+
+                assert_eq!(call(&f, "POST", path, body.clone(), false).await.0, StatusCode::UNAUTHORIZED);
+
+                let mut dry = body.clone();
+                dry["dry_run"] = json!(true);
+                let (status, report) = call(&f, "POST", path, dry, true).await;
+                assert_eq!(status, StatusCode::OK, "{report}");
+                assert_eq!(report["ok"], true, "{report}");
+                assert!(report["warnings"].to_string().contains("will not start it"), "{report}");
+                assert!(f.registry.get("legacy").unwrap().state().adopted.is_empty(), "a dry run adopts nothing");
+
+                let mut wrong = body.clone();
+                wrong["expect"]["name"] = json!("customer-crm-2");
+                let (status, report) = call(&f, "POST", path, wrong, true).await;
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(report["checks"].as_array().unwrap().iter().any(|c| c["check"] == "expect" && c["ok"] == false));
+
+                let (status, report) = call(&f, "POST", path, body.clone(), true).await;
+                assert_eq!(status, StatusCode::CREATED, "{report}");
+                assert_eq!(report["adoption"]["name"], "customer-crm");
+                assert!(f.state.autoscaler.vms().is_protected("sb-cafe0001"));
+                let (status, again) = call(&f, "POST", path, body.clone(), true).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{again}");
+
+                let (_, listed) = call(&f, "GET", path, json!({}), true).await;
+                assert_eq!(listed[0]["sandbox_id"], "sb-cafe0001");
+                assert_eq!(listed[0]["in_pool"], false);
+
+                // Everything that would end it is refused while it is adopted.
+                for (method, uri) in [
+                    ("POST", "/deployments/legacy/stop"),
+                    ("POST", "/deployments/legacy/restart"),
+                    ("DELETE", "/deployments/legacy/vms/sb-cafe0001"),
+                    ("DELETE", "/deployments/legacy"),
+                ] {
+                    assert_eq!(call(&f, method, uri, json!({}), true).await.0, StatusCode::CONFLICT, "{method} {uri}");
+                }
+                let mut rebuilt = serde_json::to_value(&f.registry.get("legacy").unwrap().spec).unwrap();
+                rebuilt["vm"]["size_class"] = json!("large");
+                assert_eq!(call(&f, "PUT", "/deployments/legacy", rebuilt, true).await.0, StatusCode::CONFLICT);
+
+                f.state.autoscaler.adopt_existing().await;
+                f.state.autoscaler.reconcile().await;
+                f.state.autoscaler.sweep_suspended().await;
+                assert!(f.registry.get("legacy").unwrap().is_adopted("sb-cafe0001"));
+
+                // The record is durable, and a restart protects it before anything runs.
+                let mut restarted = fixture_with_backend(true, Router::new(), Some(f.root.clone())).await;
+                auth(&mut restarted);
+                assert!(restarted.registry.get("legacy").unwrap().is_adopted("sb-cafe0001"));
+                assert!(!restarted.state.autoscaler.vms().is_protected("sb-cafe0001"));
+                restarted.state.autoscaler.adopt_existing().await;
+                assert!(restarted.state.autoscaler.vms().is_protected("sb-cafe0001"));
+
+                let (status, released) = call(&restarted, "DELETE", "/deployments/legacy/adoptions/sb-cafe0001", json!({}), true).await;
+                assert_eq!(status, StatusCode::OK, "{released}");
+                assert!(!restarted.state.autoscaler.vms().is_protected("sb-cafe0001"));
+                assert!(restarted.registry.get("legacy").unwrap().state().adopted.is_empty());
+                assert_eq!(
+                    call(&restarted, "DELETE", "/deployments/legacy/adoptions/sb-cafe0001", json!({}), true).await.0,
+                    StatusCode::NOT_FOUND
+                );
+                assert_eq!(call(&restarted, "DELETE", "/deployments/legacy", json!({}), true).await.0, StatusCode::NO_CONTENT);
+
+                assert_eq!(f.mutations.load(Ordering::SeqCst), 0, "no create, stop, DELETE or storage mutation");
+                assert_eq!(restarted.mutations.load(Ordering::SeqCst), 0);
+            }
+
+            /// `?release=true` hands every adoption back untouched and deregisters.
+            #[tokio::test]
+            async fn deregistering_with_release_hands_the_vms_back() {
+                let mut f = fixture_with_backend(true, Router::new(), None).await;
+                auth(&mut f);
+                let body = legacy(&f);
+                assert_eq!(call(&f, "POST", "/deployments/legacy/adoptions", body, true).await.0, StatusCode::CREATED);
+                assert_eq!(call(&f, "DELETE", "/deployments/legacy?release=true", json!({}), true).await.0, StatusCode::NO_CONTENT);
+                assert!(f.registry.get("legacy").is_none());
+                assert!(!f.state.autoscaler.vms().is_protected("sb-cafe0001"));
+                assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+            }
+
+            /// An adoption reaches a VM no namespace owns yet, so the routes are
+            /// never open: a build with no credential gate refuses them outright.
+            #[tokio::test]
+            async fn an_ungated_build_never_adopts() {
+                let f = fixture_with_backend(true, Router::new(), None).await;
+                let body = legacy(&f);
+                assert_eq!(call(&f, "POST", "/deployments/legacy/adoptions", body, false).await.0, StatusCode::FORBIDDEN);
+                assert!(f.registry.get("legacy").unwrap().state().adopted.is_empty());
             }
         }
 

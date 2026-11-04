@@ -26,7 +26,8 @@ use heyo_sdk::{
     LogsQuery, PurgeOutcome, PurgeParts, Sandbox, SandboxInfo, SandboxStatus,
     ShellOptions, ShellSession, StorageInventory, TreeInfo, UploadStream,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,12 +48,25 @@ pub fn replica_name(deployment_id: &str, nonce: u64) -> String {
 }
 
 /// Which deployment a sandbox belongs to, or `None` if it isn't ours.
+///
+/// Only names app-lb itself produces count, nonce and all. Every path that
+/// treats a sandbox as a deployment's — startup adoption, the untracked sweep,
+/// the stopped-VM sweep — may destroy it, and on a host shared with the cloud
+/// anyone can name a sandbox `applb-web-1`. A name is ours only when its last
+/// segment is a [`replica_name`] nonce (12+ lowercase hex) or a rollout
+/// candidate's (`r` and 72+ lowercase hex: a 64-hex digest and an index).
 pub fn owner_of(sandbox_name: &str) -> Option<&str> {
     let rest = sandbox_name.strip_prefix(OWNER_PREFIX)?.strip_prefix('-')?;
     // Trailing `-<nonce>` is ours; everything before it is the deployment id,
     // which may itself contain dashes.
-    let (id, _nonce) = rest.rsplit_once('-')?;
-    (!id.is_empty()).then_some(id)
+    let (id, nonce) = rest.rsplit_once('-')?;
+    (!id.is_empty() && is_owner_nonce(nonce)).then_some(id)
+}
+
+fn is_owner_nonce(nonce: &str) -> bool {
+    let hex = |s: &str| s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (nonce.len() >= 12 && hex(nonce))
+        || nonce.strip_prefix('r').is_some_and(|digest| digest.len() >= 72 && hex(digest))
 }
 
 #[derive(Debug)]
@@ -109,6 +123,13 @@ pub enum VmError {
     /// error is that runtime's own type and nothing here can act on it beyond
     /// reporting it.
     Runtime(String),
+    /// The sandbox is adopted and protected: app-lb took it over in place, and
+    /// may route to it but never destroy, stop, purge, re-TTL or rebind it.
+    /// Refused here, before the daemon is asked, so no caller can get it wrong.
+    Protected {
+        sandbox_id: String,
+        action: &'static str,
+    },
 }
 
 impl std::fmt::Display for VmError {
@@ -147,6 +168,11 @@ impl std::fmt::Display for VmError {
                 "no {driver} runtime on this host: {detail}"
             ),
             Self::Runtime(detail) => write!(f, "{detail}"),
+            Self::Protected { sandbox_id, action } => write!(
+                f,
+                "sandbox {sandbox_id} is adopted and protected; app-lb will not {action} it \
+                 (release the adoption first)"
+            ),
             Self::WrongRuntime { driver } => write!(
                 f,
                 "driver {driver} is not a heyvm driver; this sandbox cannot be created \
@@ -449,6 +475,23 @@ pub struct VmManager {
     /// fails the *create*, and therefore travels the create-failure path that
     /// already counts, reports and backs off — instead of needing a second one.
     mounts: MountStore,
+    /// Sandboxes adopted in place (see [`crate::deployment::Adoption`]). Every
+    /// destructive call checks this before it reaches the daemon: an adopted VM
+    /// is somebody's running machine, and no autoscaler, sweep, rollout or
+    /// purge path may destroy it, whatever it believes. Shared by every clone,
+    /// and kept in step with the registry by the autoscaler.
+    protected: Arc<std::sync::RwLock<Protected>>,
+}
+
+/// The sandboxes [`VmManager`] refuses to destroy, from two sources so neither
+/// can open a gap in the other: `synced` is the registry's adoptions, replaced
+/// wholesale each tick; `pinned` is what the adoption API protected directly,
+/// ahead of its record, and only a release clears. A tick that read the
+/// registry a moment before an adoption landed therefore cannot unprotect it.
+#[derive(Debug, Default)]
+struct Protected {
+    synced: HashSet<String>,
+    pinned: HashSet<String>,
 }
 
 /// `HeyoClient` is not `Debug`, and which daemon was reached is the half of
@@ -502,7 +545,40 @@ impl VmManager {
             client,
             transport,
             mounts,
+            protected: Arc::default(),
         })
+    }
+
+    /// Replace the protected set with exactly `ids` — the adoptions every
+    /// deployment on this host records.
+    pub fn set_protected(&self, ids: HashSet<String>) {
+        self.protected.write().unwrap_or_else(|e| e.into_inner()).synced = ids;
+    }
+
+    /// Protect one sandbox now, ahead of the record that will say so. Held
+    /// until [`unprotect`](Self::unprotect), whatever the registry says.
+    pub fn protect(&self, sandbox_id: &str) {
+        self.protected.write().unwrap_or_else(|e| e.into_inner()).pinned.insert(sandbox_id.to_string());
+    }
+
+    /// Stop protecting one sandbox, once its adoption is released.
+    pub fn unprotect(&self, sandbox_id: &str) {
+        let mut protected = self.protected.write().unwrap_or_else(|e| e.into_inner());
+        protected.pinned.remove(sandbox_id);
+        protected.synced.remove(sandbox_id);
+    }
+
+    pub fn is_protected(&self, sandbox_id: &str) -> bool {
+        let protected = self.protected.read().unwrap_or_else(|e| e.into_inner());
+        protected.synced.contains(sandbox_id) || protected.pinned.contains(sandbox_id)
+    }
+
+    fn refuse_if_protected(&self, sandbox_id: &str, action: &'static str) -> Result<(), VmError> {
+        if self.is_protected(sandbox_id) {
+            tracing::warn!(sandbox = %sandbox_id, action, "refused: the sandbox is adopted and protected");
+            return Err(VmError::Protected { sandbox_id: sandbox_id.to_string(), action });
+        }
+        Ok(())
     }
 
     /// The daemon client itself, for routes `heyo_sdk` has no typed wrapper
@@ -787,6 +863,7 @@ impl VmManager {
     /// `DELETE /storage/sandboxes/:id?parts=`: remove a stopped sandbox's
     /// disks on the daemon. A sandbox with nothing on disk is a no-op.
     pub async fn purge_disks(&self, sandbox_id: &str, parts: PurgeParts) -> Result<PurgeOutcome, VmError> {
+        self.refuse_if_protected(sandbox_id, "purge the disks of")?;
         Ok(self.daemon.purge_disks(sandbox_id, parts).await?)
     }
 
@@ -897,6 +974,7 @@ impl VmManager {
         public: bool,
         deployment: &ProxyDeployment,
     ) -> Result<String, VmError> {
+        self.refuse_if_protected(sandbox_id, "bind a port of")?;
         if let Some(existing) = self
             .binds(sandbox_id)
             .await?
@@ -922,11 +1000,13 @@ impl VmManager {
     /// Withdraw a bind. A bind (or VM) the daemon has already forgotten
     /// counts as withdrawn.
     pub async fn unbind(&self, sandbox_id: &str, subdomain: &str) -> Result<(), VmError> {
+        self.refuse_if_protected(sandbox_id, "unbind a port of")?;
         Ok(self.daemon.unbind(sandbox_id, subdomain).await?)
     }
 
     /// Destroy a VM. A VM the daemon has already forgotten counts as killed.
     pub async fn kill(&self, sandbox_id: &str) -> Result<(), VmError> {
+        self.refuse_if_protected(sandbox_id, "destroy")?;
         match self.connect(sandbox_id.to_string()) {
             Ok(sandbox) => match sandbox.kill().await {
                 Ok(()) => Ok(()),
@@ -939,6 +1019,7 @@ impl VmManager {
 
     /// Keep a VM's TTL backstop from expiring under a long-lived deployment.
     pub async fn renew_ttl(&self, sandbox_id: &str, ttl_seconds: u64) -> Result<(), VmError> {
+        self.refuse_if_protected(sandbox_id, "change the TTL of")?;
         let sandbox = self.connect(sandbox_id.to_string())?;
         match sandbox.set_ttl(ttl_seconds).await {
             Ok(()) => Ok(()),
@@ -1033,6 +1114,7 @@ impl VmManager {
     /// [`list_inactive`](Self::list_inactive) — or the VM is leaked, still
     /// holding its disk, with nothing left to reap it.
     pub async fn suspend(&self, sandbox_id: &str) -> Result<(), VmError> {
+        self.refuse_if_protected(sandbox_id, "stop")?;
         let sandbox = self.connect(sandbox_id.to_string())?;
         match sandbox.stop().await {
             Ok(()) => Ok(()),
@@ -1087,7 +1169,7 @@ impl VmManager {
         for _ in 0..MAX_PAGES {
             let page = self.daemon.list_inactive(PAGE, cursor.as_deref()).await?;
             let empty = page.sandboxes.is_empty();
-            out.extend(page.sandboxes.into_iter().map(InactiveSandbox::into_info));
+            out.extend(page.sandboxes.into_iter().map(inactive_info));
             match page.next_cursor {
                 // A cursor that repeats itself would loop forever.
                 Some(next) if !empty && Some(&next) != cursor.as_ref() => cursor = Some(next),
@@ -1108,8 +1190,23 @@ impl crate::retirement::Backend for VmManager {
         self.retirement_request(target,None).await
     }
     async fn retire(&self,operation:&str,target:&crate::retirement::Target)->Result<serde_json::Value,String> {
+        self.refuse_if_protected(&target.backend_sandbox_id, "retire").map_err(|e| e.to_string())?;
         self.retirement_request(target,Some(operation)).await
     }
+}
+
+/// A stopped sandbox as a [`SandboxInfo`], keeping its driver.
+///
+/// The daemon's inactive rows carry `backend_type`, but the SDK's
+/// [`InactiveSandbox`] has no field for it and keeps it in `extra`, which
+/// `into_info` drops. Adopting a stopped VM checks its driver, so it is kept.
+fn inactive_info(sandbox: InactiveSandbox) -> SandboxInfo {
+    let backend_type = sandbox.extra.get("backend_type").and_then(|v| v.as_str()).map(str::to_string);
+    let mut info = sandbox.into_info();
+    if info.backend_type.is_none() {
+        info.backend_type = backend_type;
+    }
+    info
 }
 
 /// `GET /deployed-sandboxes`, as the autoscaler consumes it: the SDK's
@@ -1491,6 +1588,42 @@ mod tests {
         assert!(matches!(routable_addr(&i, 8080), Err(VmError::NotRunning { .. })));
     }
 
+    /// The daemon boundary refuses every destructive call for an adopted VM
+    /// before it sends anything — so this manager points at a port nothing
+    /// listens on, and a refusal that reached for the network would say so.
+    #[tokio::test]
+    async fn a_protected_sandbox_is_refused_before_the_daemon_is_asked() {
+        let vms = VmManager::new(
+            Some("http://127.0.0.1:1".into()),
+            None,
+            MountStore::new(std::path::PathBuf::from("/nonexistent/app-lb-mounts"), 0),
+        )
+        .unwrap();
+        let protected = |r: Result<(), VmError>| matches!(r, Err(VmError::Protected { .. }));
+        vms.protect("sb-adopted");
+        assert!(protected(vms.kill("sb-adopted").await));
+        assert!(protected(vms.suspend("sb-adopted").await));
+        assert!(protected(vms.renew_ttl("sb-adopted", 3600).await));
+        assert!(protected(vms.unbind("sb-adopted", "abc123").await));
+        assert!(protected(vms.purge_disks("sb-adopted", PurgeParts::All).await.map(|_| ())));
+        let deployment = ProxyDeployment { namespace: "default".into(), id: "web".into() };
+        assert!(protected(vms.bind("sb-adopted", 8080, true, &deployment).await.map(|_| ())));
+        let err = vms.kill("sb-adopted").await.unwrap_err();
+        assert!(err.to_string().contains("release"), "{err}");
+
+        // Anything else still goes to the daemon (and here finds nothing).
+        assert!(vms.kill("sb-other").await.unwrap_err().never_reached_the_daemon());
+
+        // A registry sync cannot drop what the API pinned; a release does.
+        vms.set_protected(HashSet::new());
+        assert!(vms.is_protected("sb-adopted"));
+        vms.set_protected(HashSet::from(["sb-synced".to_string()]));
+        assert!(vms.is_protected("sb-synced"));
+        vms.unprotect("sb-adopted");
+        vms.unprotect("sb-synced");
+        assert!(!vms.is_protected("sb-adopted") && !vms.is_protected("sb-synced"));
+    }
+
     /// Only a failure to connect proves nothing was sent. A timeout, a dropped
     /// body or a daemon that answered with an error may each have created a VM.
     #[test]
@@ -1554,6 +1687,22 @@ mod tests {
         assert_eq!(owner_of("applb-"), None);
         // No nonce segment => not one of ours.
         assert_eq!(owner_of("applb-demo"), None);
+    }
+
+    /// Anyone can name a cloud sandbox `applb-web-1`. Only a nonce app-lb
+    /// itself mints makes a name ours, so such a VM is never claimed — and so
+    /// never destroyed — by deployment `web`.
+    #[test]
+    fn only_a_minted_nonce_makes_a_name_ours() {
+        for foreign in ["applb-web-1", "applb-web-01", "applb-web-deadbeef", "applb-web-old",
+            "applb-web-0000000000AB", "applb-web-r1-0", "applb-web-r123", "applb-web-candidate"] {
+            assert_eq!(owner_of(foreign), None, "{foreign}");
+        }
+        assert_eq!(owner_of(&replica_name("web", 0)), Some("web"));
+        assert_eq!(owner_of(&replica_name("web", u64::MAX)), Some("web"));
+        let digest = "a".repeat(64);
+        assert_eq!(owner_of(&format!("applb-web-r{digest}{:08x}", 3)), Some("web"));
+        assert_eq!(owner_of(&format!("applb-web-r{digest}{:016x}", 3)), Some("web"));
     }
 
     #[test]

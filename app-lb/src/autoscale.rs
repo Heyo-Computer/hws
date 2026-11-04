@@ -510,6 +510,11 @@ impl Autoscaler {
     pub(crate) async fn reconcile(&self) {
         let _retirement = self.registry.retirement_gate.read().await;
         let _rollout = self.rollout_gate.read().await;
+        // Before anything this tick can kill: the daemon boundary refuses to
+        // destroy what any deployment here has adopted. The adoption API also
+        // protects a VM directly, ahead of its record, so this only ever
+        // catches up — it never opens a window.
+        self.vms().set_protected(self.registry.adopted_ids());
         let deployments = self.registry.deployments();
         // Sites are excluded outright rather than partitioned: they have no VMs
         // to reconcile *and* no upstreams to probe, so there is nothing for this
@@ -590,7 +595,7 @@ impl Autoscaler {
         let usage = self.sample_usage().await;
 
         self.metrics
-            .record_host_sandboxes(host_sandboxes(&listing, &usage));
+            .record_host_sandboxes(host_sandboxes(&listing, &usage, &self.registry.adopted_ids()));
         let fleet = vm::index_by_id(listing.sandboxes);
 
         if managed.is_empty() {
@@ -795,11 +800,16 @@ impl Autoscaler {
         // list to decide this deployment had work at all.
         self.reprobe_unhealthy_managed(d, fleet).await;
         self.promote_pending(d, fleet).await;
+        self.reconcile_adopted(d, fleet).await;
 
         let desired = d.desired_replicas();
         let ready = d.backends().len();
         let pending = d.pending().len();
-        let live = ready + pending;
+        // An adopted VM that is not serving right now — stopped by its owner,
+        // or failing its health check — still fills its slot. It is the
+        // replica; booting a stand-in beside it would be a second machine.
+        let adopted_out = adopted_out_of_pool(d);
+        let live = ready + pending + adopted_out;
 
         if live < desired as usize {
             // `debug`, not a per-tick warning: the embargo was announced once,
@@ -1014,7 +1024,8 @@ impl Autoscaler {
             let Some(info) = fleet.get(&b.sandbox_id) else {
                 continue;
             };
-            if info.ttl_seconds == Some(0) {
+            // An adopted VM keeps whatever TTL it came with.
+            if info.ttl_seconds == Some(0) || d.is_adopted(&b.sandbox_id) {
                 continue;
             }
             let remaining = info.ttl_seconds.unwrap_or(ttl);
@@ -1024,6 +1035,62 @@ impl Autoscaler {
             if let Err(e) = self.vms().renew_ttl(&b.sandbox_id, ttl).await {
                 tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to renew TTL");
             }
+        }
+    }
+
+    /// Bring adopted VMs into the pool once they can serve.
+    ///
+    /// Adopted VMs never go through `pending`: that path's deadline ends in a
+    /// kill, and an adopted VM may have been running for months or be stopped
+    /// by its owner. Instead each tick looks at the ones not in the pool. A VM
+    /// the daemon runs under the adopted name, at a routable address, that
+    /// passes the health check joins; anything else waits, untouched, for a
+    /// later tick. `prune` takes one out again when the daemon stops listing it.
+    async fn reconcile_adopted(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
+        let state = d.state();
+        if state.adopted.is_empty() {
+            return;
+        }
+        let port = d.spec.vm_spec().port;
+        let exec_only = d.spec.routes.is_empty();
+        let backends = d.backends();
+        let mut joined = Vec::new();
+        for a in &state.adopted {
+            if backends.iter().any(|b| b.sandbox_id == a.sandbox_id) {
+                continue;
+            }
+            let Some(info) = fleet.get(&a.sandbox_id) else {
+                continue;
+            };
+            // The fence against a reused id: the record names one machine.
+            if info.name != a.name {
+                tracing::debug!(
+                    deployment = %d.spec.id,
+                    sandbox = %a.sandbox_id,
+                    adopted = %a.name,
+                    listed = %info.name,
+                    "not routing to an adopted id the daemon now lists under another name",
+                );
+                continue;
+            }
+            let addr = match vm::routable_addr(info, port) {
+                Ok(addr) if exec_only || health::probe(addr, &d.spec.health).await => addr,
+                Ok(_) => continue,
+                // Exec and shell reach a VM by id through the daemon, so an
+                // exec-only deployment needs no address to use its VM.
+                Err(vm::VmError::NoGuestIp { .. }) if exec_only && info.status == heyo_sdk::SandboxStatus::Running => {
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 0))
+                }
+                Err(_) => continue,
+            };
+            tracing::info!(deployment = %d.spec.id, sandbox = %a.sandbox_id, %addr, "adopted VM joined the pool");
+            joined.push(Arc::new(VmBackend::new(a.sandbox_id.clone(), addr)));
+        }
+        if !joined.is_empty() {
+            let mut all = (*d.backends()).clone();
+            all.extend(joined);
+            d.set_backends(all);
+            d.ready_signal.notify_waiters();
         }
     }
 
@@ -1725,7 +1792,8 @@ impl Autoscaler {
         let backends = d.backends();
         let mut candidates: Vec<_> = backends
             .iter()
-            .filter(|b| !b.is_draining())
+            // An adopted VM is never drained: draining ends in a kill.
+            .filter(|b| !b.is_draining() && !d.is_adopted(&b.sandbox_id))
             .cloned()
             .collect();
         // Prefer idle VMs so draining finishes quickly.
@@ -2260,6 +2328,7 @@ impl Autoscaler {
     pub async fn adopt_existing(&self) {
         let _retirement = self.registry.retirement_gate.read().await;
         let _rollout = self.rollout_gate.read().await;
+        self.vms().set_protected(self.registry.adopted_ids());
         let fleet = match self.vms().list().await {
             Ok(list) => list,
             Err(e) => {
@@ -2387,6 +2456,11 @@ impl Autoscaler {
         }
         let workspace = Self::has_workspace(d);
         for b in d.backends().iter() {
+            // Released by the caller before a deregister; skipped here too, so
+            // no teardown path can ever reach the daemon for one.
+            if d.is_adopted(&b.sandbox_id) {
+                continue;
+            }
             b.set_draining(true);
             self.unbind(d, b).await;
             self.kill_or_capture(d, &b.sandbox_id, "VM").await;
@@ -2447,6 +2521,9 @@ impl Autoscaler {
     /// either mode. After eviction the autoscaler is nudged, so a replacement
     /// boots immediately if the scaling policy still wants the capacity.
     pub async fn evict(&self, d: &Arc<Deployment>, sandbox_id: &str, force: bool) -> EvictOutcome {
+        if d.is_adopted(sandbox_id) {
+            return EvictOutcome::Adopted;
+        }
         // A ready backend.
         if let Some(b) = d
             .backends()
@@ -2541,6 +2618,8 @@ pub enum EvictOutcome {
     NotFound,
     /// The VM was found but the daemon refused to kill it.
     KillFailed(String),
+    /// The VM is adopted: app-lb took it over in place and never destroys it.
+    Adopted,
 }
 
 #[async_trait]
@@ -2646,11 +2725,13 @@ fn hold_missing(missing_since: Option<u64>, now: u64) -> Option<u64> {
 fn host_sandboxes(
     listing: &vm::Listing,
     usage: &HashMap<String, vm::SandboxUsage>,
+    adopted: &std::collections::HashSet<String>,
 ) -> Vec<crate::metrics::HostSandboxView> {
     let mut out: Vec<_> = listing
         .sandboxes
         .iter()
-        .filter(|info| vm::owner_of(&info.name).is_none())
+        // An adopted VM is a deployment's now, and shows up as one of its VMs.
+        .filter(|info| vm::owner_of(&info.name).is_none() && !adopted.contains(&info.id))
         .map(|info| {
             let detail = listing.details.get(&info.id);
             let sample = usage.get(&info.id);
@@ -2671,6 +2752,16 @@ fn host_sandboxes(
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.sandbox_id.cmp(&b.sandbox_id)));
     out
+}
+
+/// How many of `d`'s adopted VMs are not in its pool right now.
+fn adopted_out_of_pool(d: &Deployment) -> usize {
+    let backends = d.backends();
+    d.state()
+        .adopted
+        .iter()
+        .filter(|a| !backends.iter().any(|b| b.sandbox_id == a.sandbox_id))
+        .count()
 }
 
 /// `vm.workspace.snapshot_interval_secs`, when `d` has a workspace and sets one.
@@ -2720,7 +2811,14 @@ fn at_rest(
     if !d.pending().is_empty() || backends.iter().any(|b| b.is_draining() || !b.is_healthy()) {
         return false;
     }
-    if backends.len() != d.desired_replicas() as usize {
+    if backends.len() + adopted_out_of_pool(d) != d.desired_replicas() as usize {
+        return false;
+    }
+    // An adopted VM the daemon runs but the pool does not hold yet: only
+    // `reconcile_one` brings it in.
+    if d.state().adopted.iter().any(|a| {
+        fleet.contains_key(&a.sandbox_id) && !backends.iter().any(|b| b.sandbox_id == a.sandbox_id)
+    }) {
         return false;
     }
     // A scheduled workspace snapshot is due: only `reconcile_one` starts one.
@@ -4595,5 +4693,132 @@ mod tests {
             .unwrap_err();
         assert!(error.never_reached_the_daemon(), "{error}");
         assert!(d.state().create_attempts.is_empty(), "the refused attempt is dropped");
+    }
+
+    mod adoptions {
+        use super::*;
+        use crate::deployment::Adoption;
+
+        fn adopted(id: &str, name: &str) -> Adoption {
+            Adoption { sandbox_id: id.into(), name: name.into(), backend_type: "libvirt".into(), adopted_at: 1 }
+        }
+
+        /// A libvirt pool of one that adopted `sb-cust`, named `customer-crm`.
+        fn pool(daemon: &str) -> (Autoscaler, Arc<Deployment>) {
+            let mut s = spec();
+            s.vm.as_mut().unwrap().driver = Driver::Libvirt;
+            s.vm.as_mut().unwrap().ttl_seconds = 0;
+            s.scaling.min_replicas = 1;
+            s.scaling.max_replicas = 1;
+            let (scaler, registry) = autoscaler_against(daemon, s);
+            let d = registry.get("demo").unwrap();
+            d.mutate_state(|s| s.adopted.push(adopted("sb-cust", "customer-crm")));
+            (scaler, d)
+        }
+
+        fn listed(name: &str, guest_port: u16, host_port: u16) -> SandboxInfo {
+            let mut i = info(heyo_sdk::SandboxStatus::Running, None);
+            i.id = "sb-cust".into();
+            i.name = name.into();
+            i.port_mappings = vec![heyo_sdk::PortMapping { host: host_port, container: guest_port }];
+            i
+        }
+
+        /// The adopted VM is somebody's running machine: it joins the pool at
+        /// its forwarded port once it answers, never through `pending` (whose
+        /// deadline ends in a kill) — and not at all when the daemon now lists
+        /// that id under another name.
+        #[tokio::test]
+        async fn a_running_adopted_vm_joins_the_pool_once_it_answers() {
+            use axum::routing::get;
+            let guest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let host_port = guest.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                axum::serve(guest, axum::Router::new().route("/", get(|| async { "ok" }))).await.unwrap()
+            });
+            let (scaler, d) = pool("http://127.0.0.1:1");
+            let port = d.spec.vm_spec().port;
+
+            let reused = HashMap::from([("sb-cust".to_string(), listed("someone-else", port, host_port))]);
+            scaler.reconcile_adopted(&d, &reused).await;
+            assert!(d.backends().is_empty(), "a reused id is not the adopted machine");
+
+            let fleet = HashMap::from([("sb-cust".to_string(), listed("customer-crm", port, host_port))]);
+            scaler.reconcile_adopted(&d, &fleet).await;
+            let backends = d.backends();
+            assert_eq!(backends.len(), 1);
+            assert_eq!(backends[0].address, format!("127.0.0.1:{host_port}"));
+            assert!(d.pending().is_empty(), "never through pending");
+
+            // Already in the pool: left alone.
+            scaler.reconcile_adopted(&d, &fleet).await;
+            assert_eq!(d.backends().len(), 1);
+            server.abort();
+        }
+
+        /// Stopped by its owner, the adopted VM still fills its slot: no
+        /// stand-in is booted beside it, and the fast path does not hide it.
+        #[test]
+        fn a_stopped_adopted_vm_still_fills_its_slot() {
+            let (_scaler, d) = pool("http://127.0.0.1:1");
+            assert_eq!(adopted_out_of_pool(&d), 1);
+            assert!(at_rest(&d, &HashMap::new(), &HashMap::new()), "out of the pool and not running: nothing to do");
+
+            // Running again but not yet in the pool: work for `reconcile_one`.
+            let fleet = HashMap::from([("sb-cust".to_string(), listed("customer-crm", 8080, 41080))]);
+            assert!(!at_rest(&d, &fleet, &HashMap::new()));
+
+            d.set_backends(vec![Arc::new(VmBackend::new("sb-cust".into(), "127.0.0.1:41080".parse().unwrap()))]);
+            assert_eq!(adopted_out_of_pool(&d), 0);
+        }
+
+        /// Nothing the pool does on its own ever ends an adopted VM: it is not
+        /// drained, evicted, renewed or torn down. (The daemon boundary would
+        /// refuse each of these anyway; the pool does not even ask.)
+        #[tokio::test]
+        async fn the_pool_never_reaches_for_an_adopted_vm() {
+            use std::sync::atomic::AtomicUsize;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let daemon = axum::Router::new().fallback(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { axum::http::StatusCode::NOT_FOUND }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, daemon).await.unwrap() });
+
+            let (scaler, d) = pool(&url);
+            let mut s = d.spec.clone();
+            s.vm.as_mut().unwrap().ttl_seconds = 3600;
+            let d = scaler.registry.upsert(s);
+            assert!(d.is_adopted("sb-cust"), "an edit keeps the adoption");
+            let backend = Arc::new(VmBackend::new("sb-cust".into(), "127.0.0.1:41080".parse().unwrap()));
+            d.set_backends(vec![backend.clone()]);
+
+            scaler.scale_down(&d, 1).await;
+            assert!(!backend.is_draining(), "an adopted VM is never drained");
+            assert!(matches!(scaler.evict(&d, "sb-cust", true).await, EvictOutcome::Adopted));
+            let mut old = listed("customer-crm", 8080, 41080);
+            old.uptime_secs = 10_000;
+            old.ttl_seconds = Some(3600);
+            scaler.renew_ttls(&d, &HashMap::from([("sb-cust".to_string(), old)])).await;
+            scaler.teardown(&d).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "no daemon call for an adopted VM");
+            server.abort();
+        }
+
+        /// An adopted VM is a deployment's, and stops being listed as one of the
+        /// host's unmanaged sandboxes.
+        #[test]
+        fn an_adopted_vm_is_not_a_host_sandbox() {
+            let mut i = info(heyo_sdk::SandboxStatus::Running, None);
+            i.id = "sb-cust".into();
+            i.name = "customer-crm".into();
+            let listing = vm::Listing::from_infos(vec![i]);
+            assert_eq!(host_sandboxes(&listing, &HashMap::new(), &Default::default()).len(), 1);
+            let adopted = std::collections::HashSet::from(["sb-cust".to_string()]);
+            assert!(host_sandboxes(&listing, &HashMap::new(), &adopted).is_empty());
+        }
     }
 }
