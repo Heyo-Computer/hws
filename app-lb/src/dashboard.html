@@ -382,6 +382,23 @@ button.cellbtn:hover .tag, button.cellbtn:focus-visible .tag { outline: 1px soli
 .wl-tools { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 10px; font-size: 12px; color: var(--text-2); }
 .wl-tools input { max-width: 220px; }
 table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
+/* The namespace directory: an admin's first screen. Each row is a door into
+   one namespace's own view (?namespace=), so the fleet-wide lists of every
+   deployment, secret and token are not all on one page. */
+body.ns-home [data-ns-detail] { display: none !important; }
+#nsdir-title { flex-wrap: wrap; row-gap: 6px; }
+#nsdir-tools input[type=search] { max-width: 320px; flex: 1 1 220px; }
+#nsdir-tools label { display: inline-flex; gap: 6px; align-items: center; margin: 0; }
+table.nsdir td.name a { font-weight: 600; text-decoration: none; color: var(--accent); }
+table.nsdir td.name a:hover { text-decoration: underline; }
+table.nsdir td.name .sub { white-space: normal; max-width: 42ch; }
+table.nsdir tr.attn td.name { box-shadow: inset 3px 0 0 var(--critical); }
+table.nsdir td.health .chips { flex-wrap: wrap; white-space: normal; }
+table.nsdir td.rowactions { text-align: right; }
+table.nsdir td.rowactions a.btn { display: inline-block; text-decoration: none; }
+#ns-crumb { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+#ns-crumb h2 { margin: 0; font-size: 16px; font-weight: 650; }
+#ns-crumb .sub { color: var(--muted); font-size: 12px; }
 </style>
 <!-- The theme used to be read from localStorage by a blocking script here.
      It is now stamped on <html> by the server from a cookie, which is both
@@ -429,6 +446,9 @@ table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
 
   <div class="card" id="ns-banner" hidden role="status"></div>
 
+  <!-- Where an admin is: back to the directory, and which namespace this is. -->
+  <nav class="card" id="ns-crumb" hidden aria-label="Namespace"></nav>
+
   <!-- First steps for a namespace user, filled from GET /onboarding: a token
        for Claude Code, the hosted MCP server, and a first deployment. -->
   <section class="card" id="get-started" hidden aria-labelledby="gs-title"></section>
@@ -436,16 +456,36 @@ table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
   <!-- `data-control-plane`: the cross-server view, shown only on the control
        plane's default page. A single server's page (`?view=local`, or any
        app-lb with no gateways configured) is that server alone. -->
+  <!-- The directory of namespaces, for a caller who can see more than one:
+       search, see which need attention, open one. Shown on the control plane
+       and on a single server's page alike; hidden once a namespace is open. -->
+  <section id="ns-home" hidden aria-labelledby="nsdir-title">
+    <div class="section-title" id="nsdir-title">
+      Namespaces <span class="count" id="nsdir-count"></span>
+      <span class="spacer"></span>
+      <a class="out" id="nsdir-all" href="/dashboard?all=1" title="Every deployment in every namespace, on one page">All deployments →</a>
+      <button class="btn mini" id="nsdir-new" data-admin-only hidden>New namespace</button>
+    </div>
+    <div class="card">
+      <div class="wl-tools" id="nsdir-tools">
+        <input id="nsdir-filter" type="search" placeholder="search namespaces" autocomplete="off" spellcheck="false" aria-label="Search namespaces">
+        <label><input type="checkbox" id="nsdir-attn"> needs attention only</label>
+        <span class="wl-scope" id="nsdir-scope" style="margin:0"></span>
+      </div>
+      <div id="nsdir" aria-live="polite">Loading namespaces…</div>
+    </div>
+  </section>
+
   <section aria-labelledby="servers-title" data-control-plane>
     <div class="section-title" id="servers-title">Servers <span class="count" id="servers-count"></span></div>
     <div class="card" id="servers" aria-live="polite">Loading servers…</div>
   </section>
 
-  <section aria-labelledby="workloads-title" data-control-plane>
+  <section aria-labelledby="workloads-title" id="workloads-section" data-control-plane data-ns-detail>
     <div class="section-title" id="workloads-title">Workloads <span class="count" id="workloads-count"></span></div>
     <div class="card" id="workloads" aria-live="polite">Loading workloads across servers…</div>
-    <div class="card" id="server-detail" hidden aria-live="polite"></div>
   </section>
+  <div class="card" id="server-detail" hidden aria-live="polite"></div>
 
   <section aria-labelledby="services-title" data-control-plane>
     <div class="section-title" id="services-title">Global applications <span class="count" id="services-count"></span></div>
@@ -508,12 +548,12 @@ table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
   </div>
   <div class="card" id="security"></div>
 
-  <div class="section-title">
+  <div class="section-title" data-ns-detail>
     Deployments <span class="count" id="deps-count"></span>
   </div>
   <!-- A fleet of sandboxes is thousands of deployments; the filter and pager
        are how the table stays usable, and how the poll stays small. -->
-  <div class="dep-controls" id="dep-controls">
+  <div class="dep-controls" id="dep-controls" data-ns-detail>
     <input id="dep-filter" type="search" placeholder="filter by id prefix" autocomplete="off" spellcheck="false">
     <!-- One control, three surfaces: it narrows the deployment list, the
          metrics behind it and the security feed together, because "show me
@@ -526,7 +566,7 @@ table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
     <button class="btn mini" id="dep-prev" type="button">Prev</button>
     <button class="btn mini" id="dep-next" type="button">Next</button>
   </div>
-  <div id="deployments"></div>
+  <div id="deployments" data-ns-detail></div>
 
   <!-- Below Deployments and above the configuration sections: these are live
        load on the host, so they belong with what is happening now, but app-lb
@@ -543,21 +583,21 @@ table.wl td.where .chips { flex-wrap: wrap; white-space: normal; }
   </div>
   <div class="card" id="certs" data-fleet-only></div>
 
-  <div class="section-title" data-admin-only>
+  <div class="section-title" data-admin-only data-ns-detail>
     Secrets <span class="count" id="secrets-count"></span>
     <span class="spacer"></span>
     <button class="btn mini" id="secret-new">New secret</button>
   </div>
-  <div class="card" id="secrets" data-admin-only></div>
+  <div class="card" id="secrets" data-admin-only data-ns-detail></div>
 
   <!-- Above App-tokens on purpose: a namespace is the wall a token is scoped
        against, so the list of walls should be read before the list of keys. -->
-  <div class="section-title" data-fleet-only>
+  <div class="section-title" data-fleet-only data-ns-detail>
     Namespaces <span class="count" id="ns-count"></span>
     <span class="spacer"></span>
     <button class="btn mini" id="ns-new">New namespace</button>
   </div>
-  <div class="card" id="namespaces" data-fleet-only></div>
+  <div class="card" id="namespaces" data-fleet-only data-ns-detail></div>
 
   <!-- Not fleet-only: a namespace admin mints and revokes its own namespace's
        tokens here, and the server lists only those. -->
@@ -611,6 +651,23 @@ const pinnedNamespace = NS_RE.test(pageParams.get("namespace") || "") ? pagePara
 const HOME_URL = "{{HOME_URL}}";
 // A namespace's view: no fleet sections, no servers, no host.
 const namespaceView = !!pinnedNamespace || CALLER_CONFINED;
+// `?all=1` is the flat page every deployment used to share: one list across
+// all namespaces. Without it, a caller who can see more than one namespace
+// starts at the directory and opens one at a time.
+const showAll = pageParams.get("all") === "1";
+// Whether this caller has a directory to go back to from a namespace: anyone
+// who is not confined to exactly that one.
+const canLeaveNamespace = !!pinnedNamespace && !CALLER_NAMESPACE;
+// Decided for real once `GET /namespaces` answers (see `setNsHome`): a fleet
+// with only `default` in it has nothing to choose between, so it keeps the
+// flat page. Assumed on until then, so the page does not open on the wall of
+// rows it is about to hide.
+let nsHomeActive = !pinnedNamespace && !showAll;
+document.body.classList.toggle("ns-home", nsHomeActive);
+document.getElementById("ns-home").hidden = !nsHomeActive;
+// An admin inside one namespace on a control plane: where it runs across the
+// servers is the workloads rollup narrowed to it, above this server's detail.
+const nsAcrossServers = canLeaveNamespace && MULTI_SERVER && !CALLER_CONFINED;
 const localView = pageParams.get("view") === "local" || namespaceView || !MULTI_SERVER;
 // The tokens table's "servers" column only means something across a fleet.
 const SHOW_SERVERS = MULTI_SERVER && !namespaceView;
@@ -628,6 +685,10 @@ if (pinnedNamespace) {
 }
 // One server's page never shows the cross-server sections, and never polls them.
 document.querySelectorAll("[data-control-plane]").forEach(el => el.hidden = localView);
+if (nsAcrossServers) {
+  document.getElementById("workloads-section").hidden = false;
+  document.getElementById("workloads-title").firstChild.textContent = "Across servers ";
+}
 document.getElementById("local-view").hidden = !localView;
 // A fleet-only link stays hidden in a namespace's view even though that view
 // is a local one.
@@ -1613,7 +1674,7 @@ function openNewNamespace() {
 
 $("ns-new").addEventListener("click", openNewNamespace);
 
-$("namespaces").addEventListener("click", async (e) => {
+async function onNamespaceAction(e) {
   const b = e.target.closest("[data-nsact]");
   if (!b) return;
   const name = b.dataset.ns;
@@ -1622,9 +1683,180 @@ $("namespaces").addEventListener("click", async (e) => {
   if (!res.ok) return toast(errMsg(res), true);
   toast(`namespace/${name} deleted`);
   pollSlow();
+}
+$("namespaces").addEventListener("click", onNamespaceAction);
+$("nsdir").addEventListener("click", onNamespaceAction);
+
+// ---- Namespace directory ------------------------------------------------
+//
+// The admin's front page: one row per namespace with how its deployments are
+// doing, a search box, and a door into each (`?namespace=`), where the
+// deployments, metrics, security alerts, secrets and tokens are that
+// namespace's alone. Health comes from the cross-server rollup on a control
+// plane (every server's pools) and from `GET /namespaces?stats=true` on a
+// single server (this server's pools).
+let nsDirList = null;     // last GET /namespaces, for the directory and crumb
+let nsDirFilter = "";
+let nsDirAttention = false;
+const NSDIR_CAP = 200;    // rows rendered at once; the search narrows the rest
+const NS_STATES = ["down", "degraded", "draining", "starting", "healthy", "idle"];
+const NS_ATTENTION = new Set(["down", "degraded", "draining"]);
+
+function nsHref(ns) {
+  return ns ? "/dashboard?namespace=" + encodeURIComponent(ns) : "/dashboard";
+}
+
+// The directory is worth a page only when there is a choice to make: more
+// than one namespace, or one that is not `default`.
+function setNsHome(list) {
+  if (pinnedNamespace || showAll) return;
+  const names = new Set(list.map(n => n.namespace));
+  if (lastWorkloads && lastWorkloads.ok) lastWorkloads.data.rows.forEach(r => names.add(r.namespace));
+  const want = names.size > 1 || (names.size === 1 && !names.has("default"));
+  if (want === nsHomeActive) return;
+  nsHomeActive = want;
+  document.body.classList.toggle("ns-home", want);
+  $("ns-home").hidden = !want;
+  if (!want) poll();   // the deployment table is back; fill it now
+}
+
+async function pollNsDirectory() {
+  const res = await api("GET", "namespaces").catch(() => ({ ok: false }));
+  if (!res.ok) return;
+  nsDirList = res.data || [];
+  setNsHome(nsDirList);
+  renderNsDirectory();
+}
+
+// One summary per namespace: { deployments, ready, desired, in_flight, health }.
+function nsSummaries() {
+  const out = new Map();
+  const blank = () => ({ deployments: 0, ready: 0, desired: 0, in_flight: 0, health: {} });
+  const fleetRows = !localView && lastWorkloads && lastWorkloads.ok ? lastWorkloads.data.rows : null;
+  for (const n of nsDirList || []) {
+    const s = blank();
+    s.declared = n.declared;
+    s.description = n.description;
+    s.deployments = n.deployments;
+    if (!fleetRows && n.stats) {
+      Object.assign(s, { ready: n.stats.ready, desired: n.stats.desired, in_flight: n.stats.in_flight, health: { ...n.stats.health } });
+    }
+    out.set(n.namespace, s);
+  }
+  if (fleetRows) {
+    // The rollup is the truth across servers: its counts replace this
+    // server's, and a namespace only another server holds still gets a row.
+    const seen = new Set();
+    for (const r of fleetRows) {
+      if (!out.has(r.namespace)) out.set(r.namespace, blank());
+      const s = out.get(r.namespace);
+      if (!seen.has(r.namespace)) { seen.add(r.namespace); s.deployments = 0; }
+      s.deployments += 1;
+      s.ready += r.totals.ready;
+      s.desired += r.totals.desired || 0;
+      s.in_flight += r.totals.in_flight;
+      s.health[r.health] = (s.health[r.health] || 0) + 1;
+    }
+  }
+  return out;
+}
+
+const needsAttention = (s) => Object.keys(s.health).some(h => NS_ATTENTION.has(h) && s.health[h]);
+
+function renderNsDirectory() {
+  if (!nsHomeActive || !nsDirList) return;
+  const all = [...nsSummaries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const needle = nsDirFilter.trim().toLowerCase();
+  const attn = all.filter(([, s]) => needsAttention(s)).length;
+  const shown = all.filter(([name, s]) =>
+    (!needle || name.toLowerCase().includes(needle) || (s.description || "").toLowerCase().includes(needle))
+    && (!nsDirAttention || needsAttention(s)));
+  $("nsdir-count").textContent = all.length ? `${all.length}` : "";
+  $("nsdir-scope").textContent = (needle || nsDirAttention ? `${shown.length} of ${all.length} · ` : "")
+    + (attn ? `${attn} need${attn === 1 ? "s" : ""} attention` : "all serving");
+  // Creating one is fleet-wide; a caller confined to namespaces would be refused.
+  $("nsdir-new").hidden = CALLER_CONFINED;
+  if (!all.length) {
+    $("nsdir").innerHTML = `<div class="empty">No namespaces yet.</div>`;
+    return;
+  }
+  const rows = shown.slice(0, NSDIR_CAP).map(([name, s]) => {
+    const chips = NS_STATES.filter(h => s.health[h])
+      .map(h => healthTag(h, `${s.health[h]} ${h}`)).join("");
+    const kind = s.declared === false
+      ? ` <span class="tag idle" title="Exists only because deployments name it">implied</span>` : "";
+    const del = s.declared && !s.deployments && !CALLER_CONFINED
+      ? `<button class="btn mini danger" data-nsact="delete" data-ns="${esc(name)}" data-admin-only>Delete</button> ` : "";
+    return `<tr class="${needsAttention(s) ? "attn" : ""}">
+      <td class="name"><a href="${esc(nsHref(name))}">${esc(name)}</a>${kind}
+        ${s.description ? `<div class="sub">${esc(s.description)}</div>` : ""}</td>
+      <td>${fmt(s.deployments)}</td>
+      <td class="health"><div class="chips">${chips || `<span class="sub">nothing deployed</span>`}</div></td>
+      <td>${s.deployments ? readyOf(s.ready, s.desired) : "—"}</td>
+      <td>${s.deployments ? fmt(s.in_flight) : "—"}</td>
+      <td class="rowactions">${del}<a class="btn mini" href="${esc(nsHref(name))}">Open →</a></td>
+    </tr>`;
+  }).join("");
+  const more = shown.length > NSDIR_CAP
+    ? `<div class="note">Showing the first ${NSDIR_CAP} of ${fmt(shown.length)} — search to narrow.</div>` : "";
+  $("nsdir").innerHTML = `<div class="wl-scroll"><table class="wl nsdir">
+      <thead><tr><th>namespace</th><th>deployments</th><th>health</th><th>ready / desired</th><th>in-flight</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6" class="empty">No namespace matches “${esc(nsDirFilter.trim())}”.</td></tr>`}</tbody>
+    </table></div>${more}
+    <div class="note">${localView ? "Health from this server's pools." : "Health from every server's pools, as each reports them."}
+      Open a namespace for its deployments, traffic, security alerts, secrets and tokens.</div>`;
+}
+
+$("nsdir-filter").addEventListener("input", (e) => { nsDirFilter = e.target.value; renderNsDirectory(); });
+$("nsdir-filter").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  // Enter on a search that leaves one namespace opens it.
+  const links = $("nsdir").querySelectorAll("td.name a");
+  if (links.length === 1) location.href = links[0].href;
 });
+$("nsdir-attn").addEventListener("change", (e) => { nsDirAttention = e.target.checked; renderNsDirectory(); });
+$("nsdir-new").addEventListener("click", () => openNewNamespace());
+
+// Inside a namespace: the way back to the directory, and what this one is.
+// In the flat `?all=1` page: the way back to the directory.
+function renderNsCrumb() {
+  const crumb = $("ns-crumb");
+  if (showAll && !pinnedNamespace) {
+    crumb.innerHTML = `<a href="/dashboard">← Namespaces</a><span class="sub">Every deployment across all namespaces.</span>`;
+    crumb.hidden = false;
+    return;
+  }
+  if (!canLeaveNamespace) { crumb.hidden = true; return; }
+  const n = (nsDirList || []).find(x => x.namespace === pinnedNamespace);
+  const bits = [];
+  if (n) {
+    bits.push(n.declared ? `<span class="tag ok">declared</span>`
+      : `<span class="tag idle" title="Exists only because deployments name it">implied</span>`);
+    bits.push(`<span class="sub">${fmt(n.deployments)} deployment${n.deployments === 1 ? "" : "s"}${localView && MULTI_SERVER ? " on this server" : ""}</span>`);
+    if (n.description) bits.push(`<span class="sub">${esc(n.description)}</span>`);
+  }
+  crumb.innerHTML = `<a href="/dashboard">← All namespaces</a><h2>${esc(pinnedNamespace)}</h2>${bits.join("")}`;
+  crumb.hidden = false;
+}
+renderNsCrumb();
 
 // ---- App-tokens ---------------------------------------------------------
+
+// The token list follows the page: inside a namespace, that namespace's
+// tokens; on the directory, the ones confined to no namespace, with a line
+// saying where the rest are. The server narrows only for a confined caller,
+// so for an admin this is the narrowing.
+function renderScopedTokens(all) {
+  if (pinnedNamespace) { renderTokens(all.filter(t => t.namespace === pinnedNamespace)); return; }
+  if (!nsHomeActive) { renderTokens(all); return; }
+  const own = all.filter(t => !t.namespace);
+  renderTokens(own);
+  const elsewhere = all.length - own.length;
+  if (elsewhere) {
+    $("tokens").insertAdjacentHTML("beforeend",
+      `<div class="note">${fmt(elsewhere)} namespace token${elsewhere === 1 ? " is" : "s are"} listed inside ${elsewhere === 1 ? "its namespace" : "their namespaces"}.</div>`);
+  }
+}
 
 const ADMIN_TAG = { admin: "down", view: "boot", none: "idle" };
 
@@ -2762,7 +2994,8 @@ function renderServices(result) {
 // a namespace narrows the rollup; clicking a server opens its drill-down,
 // fetched through this origin from `/fleet/gateways/:id/metrics`.
 const HEALTH_TAG = { healthy: "ok", degraded: "slow", starting: "boot", draining: "drain", down: "down", idle: "idle" };
-let fleetNs = NS_RE.test(pageParams.get("fleet_namespace") || "") ? pageParams.get("fleet_namespace") : "";
+let fleetNs = pinnedNamespace
+  || (NS_RE.test(pageParams.get("fleet_namespace") || "") && !nsHomeActive ? pageParams.get("fleet_namespace") : "");
 let serverDetail = null; // { id, ns, offset } while the drill-down is open
 let wlFilter = "";        // client-side id/host filter; the rollup is already in hand
 let lastWorkloads = null; // the last rollup, re-rendered as the filter is typed
@@ -2777,6 +3010,9 @@ function healthTag(health, text, title) {
 }
 
 function setFleetNs(ns) {
+  // With a directory to open namespaces from, picking one is going into it,
+  // and "all namespaces" is going back to the directory.
+  if (pinnedNamespace || nsHomeActive) { location.href = nsHref(ns); return; }
   fleetNs = ns;
   const params = new URLSearchParams(location.search);
   if (ns) params.set("fleet_namespace", ns); else params.delete("fleet_namespace");
@@ -2861,12 +3097,13 @@ function renderWorkloads(result) {
     return;
   }
   if (!result.data.configured) {
-    if (redirectToLocal()) return;
+    if (!pinnedNamespace && redirectToLocal()) return;
     $("servers").textContent = "No servers are configured for this control plane.";
     target.textContent = "No servers are configured for this control plane.";
     return;
   }
   lastWorkloads = result;
+  if (nsHomeActive) renderNsDirectory();
   const { gateways, rows, totals } = result.data;
   fleetServers = gateways;
   fleetDeploymentIds = rows.map(r => r.id);
@@ -3003,7 +3240,9 @@ async function pollSlow() {
       pollWorkloads(),
       pollServices(),
       document.body.dataset.tier === "view" ? null : pollFleetTokens(),
+      pollNsDirectory(),
     ]);
+    else if (nsAcrossServers) pollWorkloads();
     if (!localView) {
       $("updated").textContent = "checked " + new Date().toLocaleTimeString();
       $("livedot").hidden = true;
@@ -3025,19 +3264,23 @@ async function pollSlow() {
       api("GET", depNamespace
         ? "security?namespace=" + encodeURIComponent(depNamespace)
         : "security"),
-      api("GET", "namespaces"),
+      api("GET", "namespaces?stats=true"),
     ]);
     // Each renders independently: gating them all on one failing endpoint would
     // blank the sections that are working.
     if (certs.ok) renderCerts(certs.data || []);
     if (secrets.ok) renderSecrets(secrets.data || []);
-    if (tokens.ok) renderTokens(tokens.data || []);
+    if (tokens.ok) renderScopedTokens(tokens.data || []);
     if (security.ok) renderSecurity(security.data || { enabled: false, alerts: [] });
     // Before the pager, so a namespace that disappeared while selected is
     // noticed on the same tick that reports what is left.
     if (namespaces.ok) {
       renderNamespaces(namespaces.data || []);
       renderNamespaces_card(namespaces.data || []);
+      nsDirList = namespaces.data || [];
+      setNsHome(nsDirList);
+      renderNsDirectory();
+      renderNsCrumb();
     }
     if (jobs.ok) {
       const list = jobs.data || [];
@@ -3146,7 +3389,10 @@ function renderGetStarted() {
   if (!pinnedNamespace || !info) { card.hidden = true; return; }
   $("gs-open").hidden = false;
   fitNav();
-  const show = gsWanted || (!gsHidden && (info.deployments === 0 || pageParams.get("onboarding") === "1"));
+  // An unconfined admin looking into an empty namespace is visiting, not
+  // onboarding: the card waits for the nav link rather than opening itself.
+  const auto = CALLER_CONFINED && info.deployments === 0;
+  const show = gsWanted || (!gsHidden && (auto || pageParams.get("onboarding") === "1"));
   card.hidden = !show;
   if (!show || interacting) return;
 

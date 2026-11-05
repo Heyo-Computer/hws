@@ -1773,6 +1773,11 @@ async fn metrics_snapshot(
     //
     // "The whole registry" still means the whole *visible* registry: a scoped
     // token must not learn the size of the fleet from a total it can't itemise.
+    //
+    // A namespace is the one filter the rollup does follow. It is not a search
+    // but which room the page is about — the dashboard opened on one namespace
+    // shows that namespace's totals, not the host's.
+    let in_namespace = |d: &crate::deployment::Deployment| q.namespace.as_ref().is_none_or(|ns| &d.spec.namespace == ns);
     let mut fleet = FleetPool {
         deployments: 0,
         ready: 0,
@@ -1780,7 +1785,7 @@ async fn metrics_snapshot(
         pending: 0,
         total_in_flight: 0,
     };
-    for d in deployments.values().filter(|d| in_scope(&d.spec.id)) {
+    for d in deployments.values().filter(|d| in_scope(&d.spec.id) && in_namespace(d)) {
         let pool = pool_status_of(d);
         fleet.deployments += 1;
         fleet.ready += pool.ready;
@@ -1874,12 +1879,23 @@ async fn metrics_snapshot(
     // server, and how many, is the platform's business. A deployment-list
     // token without a namespace keeps them, as before.
     let confined_caller = caller.as_ref().is_some_and(|c| c.0.confined());
-    let (global, tracked) = match scope {
-        None => (
+    let (global, tracked) = match (scope, q.namespace.as_ref()) {
+        (None, None) => (
             state.metrics.global_snapshot(),
             state.metrics.tracked_deployments(),
         ),
-        Some(ids) => {
+        // One namespace: its live deployments' counters, within what the
+        // caller may see. Retired deployments' counters are the host's.
+        (_, Some(_)) => {
+            let mut merged = crate::metrics::DeploymentMetricsSnapshot::empty();
+            let mut n = 0;
+            for d in deployments.values().filter(|d| in_scope(&d.spec.id) && in_namespace(d)) {
+                merged.merge(&state.metrics.deployment_snapshot(&d.spec.id));
+                n += 1;
+            }
+            (merged, n)
+        }
+        (Some(ids), None) => {
             let mut merged = crate::metrics::DeploymentMetricsSnapshot::empty();
             for id in ids {
                 merged.merge(&state.metrics.deployment_snapshot(id));
@@ -3166,6 +3182,73 @@ struct NamespaceEntry {
     hosts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     created_at: Option<u64>,
+    /// Pool gauges summed over the deployments counted in `deployments`, only
+    /// when asked for with `?stats=true` — the dashboard's namespace directory
+    /// reads it so an operator can see which room needs attention before
+    /// opening it. This server's own pools, never another gateway's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<NamespaceStats>,
+}
+
+#[derive(Deserialize, Default)]
+struct NamespacesQuery {
+    #[serde(default)]
+    stats: bool,
+}
+
+/// What [`NamespaceEntry::stats`] carries: backends and requests in flight,
+/// and how many deployments sit in each serving state.
+#[derive(Serialize, Default, Clone, Debug, PartialEq, Eq)]
+struct NamespaceStats {
+    desired: u64,
+    ready: usize,
+    pending: usize,
+    draining: usize,
+    in_flight: usize,
+    /// Deployments by serving state (`healthy`, `degraded`, `starting`,
+    /// `draining`, `down`, `idle`); a state nothing is in is left out.
+    health: BTreeMap<&'static str, usize>,
+}
+
+impl NamespaceStats {
+    fn add(&mut self, d: &crate::deployment::Deployment) {
+        let backends = d.backends();
+        let ready = backends.len();
+        let draining = backends.iter().filter(|b| b.is_draining()).count();
+        let pending = d.pending().len();
+        let desired = d.desired_replicas();
+        self.desired += u64::from(desired);
+        self.ready += ready;
+        self.pending += pending;
+        self.draining += draining;
+        self.in_flight += d.total_in_flight();
+        let state = serving_state(deployment_kind(d), ready, draining, pending, desired as usize);
+        *self.health.entry(state).or_insert(0) += 1;
+    }
+}
+
+/// Serving state from pool gauges alone — the rule `fleet::pool_health`
+/// applies to a remote gateway's pools, so the namespace directory and the
+/// cross-server rollup agree on what "degraded" means.
+fn serving_state(kind: &str, ready: usize, draining: usize, pending: usize, desired: usize) -> &'static str {
+    if kind == "site" {
+        return "healthy";
+    }
+    let serving = ready.saturating_sub(draining);
+    if desired == 0 && serving == 0 {
+        return if pending > 0 { "starting" } else { "idle" };
+    }
+    if serving >= desired {
+        "healthy"
+    } else if serving > 0 {
+        "degraded"
+    } else if pending > 0 {
+        "starting"
+    } else if draining > 0 {
+        "draining"
+    } else {
+        "down"
+    }
 }
 
 /// The namespaces a caller carries a key to, whether or not anything is in them.
@@ -3313,15 +3396,21 @@ async fn onboarding(
 async fn namespaces(
     State(state): State<AdminState>,
     caller: Option<axum::Extension<Caller>>,
+    q: Option<Query<NamespacesQuery>>,
 ) -> impl IntoResponse {
     let caller = caller.as_ref().map(|c| &c.0);
+    let want_stats = q.is_some_and(|q| q.stats);
 
     // BTreeMap so the order is the namespace order and not the registry's.
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stats: BTreeMap<String, NamespaceStats> = BTreeMap::new();
     for d in state.registry.deployments().values() {
         let ns = &d.spec.namespace;
         if caller.is_none_or(|c| c.may_view(&d.spec.id, ns)) {
             *counts.entry(ns.clone()).or_insert(0) += 1;
+            if want_stats {
+                stats.entry(ns.clone()).or_default().add(d);
+            }
         }
     }
 
@@ -3354,6 +3443,7 @@ async fn namespaces(
                     description: declared.as_ref().and_then(|d| d.description.clone()),
                     hosts: declared.as_ref().map(|d| d.hosts.clone()).unwrap_or_default(),
                     created_at: declared.as_ref().map(|d| d.created_at),
+                    stats: want_stats.then(|| stats.remove(&namespace).unwrap_or_default()),
                     namespace,
                 }
             })
@@ -11718,6 +11808,55 @@ mod tests {
             let (status, _, v) = send(&f, "GET", "/whoami", "").await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(v["fleet_store"]["available"], false, "{v}");
+        }
+
+        /// `?stats=true` adds each namespace's pool summary for the dashboard's
+        /// directory; without it the response is unchanged.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn namespace_stats_are_opt_in_and_summed_per_namespace() {
+            let f = fixture(true).await;
+            for (id, ns) in [("a1", "team-a"), ("a2", "team-a"), ("b1", "team-b")] {
+                let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+                    "id": id, "namespace": ns,
+                    "routes": [{"host": format!("{id}.example")}],
+                    "upstreams": ["127.0.0.1:1"],
+                })).unwrap();
+                f.registry.upsert(spec);
+            }
+            let (status, _, plain) = send(&f, "GET", "/namespaces", "").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(plain.as_array().unwrap().iter().all(|n| n.get("stats").is_none()), "{plain}");
+
+            let (status, _, v) = send(&f, "GET", "/namespaces?stats=true", "").await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let entry = |ns: &str| v.as_array().unwrap().iter().find(|n| n["namespace"] == ns).cloned().unwrap();
+            let a = entry("team-a");
+            assert_eq!(a["deployments"], 2);
+            let health: u64 = a["stats"]["health"].as_object().unwrap().values().map(|n| n.as_u64().unwrap()).sum();
+            assert_eq!(health, 2, "every deployment lands in exactly one state: {a}");
+            assert_eq!(entry("team-b")["deployments"], 1);
+
+            // The dashboard opened on one namespace reads that namespace's
+            // totals; an id-prefix search still leaves them alone.
+            let (_, _, m) = send(&f, "GET", "/metrics?namespace=team-a", "").await;
+            assert_eq!(m["fleet"]["deployments"], 2, "{}", m["fleet"]);
+            assert_eq!(m["tracked_deployments"], 2);
+            let (_, _, all) = send(&f, "GET", "/metrics", "").await;
+            let (_, _, m) = send(&f, "GET", "/metrics?prefix=a", "").await;
+            assert_eq!(m["fleet"], all["fleet"]);
+            assert!(all["fleet"]["deployments"].as_u64().unwrap() >= 3);
+        }
+
+        #[test]
+        fn serving_state_matches_the_fleet_rollup_rule() {
+            assert_eq!(serving_state("site", 0, 0, 0, 0), "healthy");
+            assert_eq!(serving_state("vm", 0, 0, 0, 0), "idle");
+            assert_eq!(serving_state("vm", 0, 0, 1, 0), "starting");
+            assert_eq!(serving_state("vm", 2, 0, 0, 2), "healthy");
+            assert_eq!(serving_state("vm", 2, 1, 0, 2), "degraded");
+            assert_eq!(serving_state("vm", 0, 0, 1, 2), "starting");
+            assert_eq!(serving_state("vm", 1, 1, 0, 2), "draining");
+            assert_eq!(serving_state("vm", 0, 0, 0, 2), "down");
         }
 
         /// A deployment is registered on the host that runs it. Until hosts
