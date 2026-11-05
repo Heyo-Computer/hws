@@ -527,6 +527,11 @@ SQLite for app state and transactional data.
 
 ```sh
 heyvm images --help
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" images list
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" images list --libvirt
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" images list --kvm
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" images list --firecracker
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" images supported
 heyvm mvm --help
 heyvm mvm build --help
 heyvm test-firecracker
@@ -538,6 +543,56 @@ heyvm prune --help
 Use `heyvm mvm` only for Firecracker/rootfs image work. For ordinary preview,
 stage, or production app work, a cloud Ubuntu image plus setup hooks is usually
 simpler until the setup is worth publishing as a reusable image.
+
+Always list images against the target environment explicitly. Do not infer that
+preview, stage, and production expose the same catalog just because they share a
+database or backend host. Treat image readiness as environment plus backend
+specific until `images list --<backend>` and a smoke VM prove it.
+
+Current public cloud image families observed on preview/production include:
+
+- `ubuntu:24.04`, `debian:12`, `alpine:3.23`: built-in supported images for
+  `libvirt` and `firecracker`.
+- `python-v3.12.3`, `bun`: published `libvirt` qcow2 images.
+- `agents-v1`, `ubuntu`, `debian`, `kvm-bun`: published `kvm` ext4 images.
+- `nginx-firecracker`: published `firecracker` ext4 image.
+- `ubuntu-24.04-node`, `ubuntu-24.04-rust`, `ubuntu-24.04-elixir`,
+  `ubuntu-24.04`: local `apple_virt` macOS images, not Linux cloud images.
+
+For app work on preview or production, prefer `--backend libvirt --image
+ubuntu:24.04` unless there is a tested published image for that backend. For
+fast repeatable fishing app VMs, create separate image roles:
+
+- App/runtime image: Ubuntu 24.04 plus Node 22, git, ca-certificates, jq, and
+  the app's stable system packages. Keep source code in the workspace/archive,
+  not baked into the base image unless the image is versioned for a release.
+- Collector/browser image: Ubuntu 24.04 plus Node 22, Chrome, Xvfb, fluxbox,
+  x11vnc/noVNC, websockify, and OpenClaw. Bake tools only; never bake Facebook
+  credentials, cookies, raw private-group exports, or member-identifying data.
+- Firecracker runtime image: use `heyvm mvm build` and a small rootfs only when
+  the app can run without systemd and without a browser collector. Include SSH,
+  an `/init.sh`, exposed ports, and the `HEYVM_READY` marker.
+
+When a setup hook becomes stable and slow enough to justify reuse, provision a
+sandbox once, publish it as a private image if appropriate, then verify it:
+
+```sh
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" images publish <sandbox-id> \
+  --name <image-name> \
+  --description "<short purpose>" \
+  --private
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" images list --libvirt
+heyvm --cloud-url "$HEYO_PREVIEW_CLOUD" --auth-url "$HEYO_PREVIEW_AUTH" create --cloud \
+  --name <smoke-name> \
+  --backend libvirt \
+  --region US \
+  --image <image-name> \
+  --port 3000
+```
+
+If an image published in one environment is needed in another, list it in the
+destination environment before using it. If it is missing, publish/import it
+there or use setup hooks until the image promotion path is explicit.
 
 ## Operational Rules
 
