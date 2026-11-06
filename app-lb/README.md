@@ -4322,6 +4322,28 @@ service that predates `namespaces[]` still works: the caller's own account is
 used, with a warning, which is right for a user in one account and wrong for a
 user in several.
 
+### Namespace owners
+
+app-lb keys a namespace's deployments, secrets, tokens and feed by its name
+alone, and the auth service can hand a freed name — a namespace or account
+deleted there — to another account. So app-lb records the owner too:
+
+- The first federated request that reaches a namespace with no recorded owner
+  records the account the auth service names for it (`owner_account` on the
+  namespace object, declaring the namespace if nothing had). `default` is
+  never claimed.
+- From then on a federated grant whose owner for that name is different, or
+  missing, does not reach it: the namespace is dropped from the grant (a 403,
+  and a `federated grant refused for a namespace recorded as another account's`
+  warning in the log). The dashboard handoff applies the same rule.
+- `fleet:admin` grants, the operator credential and app-tokens are unaffected.
+  A namespace's tokens were minted inside its wall and stay there.
+- A re-declare (`POST /namespaces`) never changes the owner. An operator sets
+  or clears it with `PUT /namespaces/{name}/owner` and
+  `{"owner_account": "<account id>"}` or `{"owner_account": null}` — clearing
+  it releases the name to the next account the auth service names, so empty
+  the namespace first. The dashboard's namespace list shows each owner.
+
 ### Opening the dashboard for one namespace
 
 `/login`'s password form admits platform administrators only. A namespace

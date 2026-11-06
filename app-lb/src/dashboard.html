@@ -468,7 +468,7 @@ table.nsdir td.rowactions a.btn { display: inline-block; text-decoration: none; 
     </div>
     <div class="card">
       <div class="wl-tools" id="nsdir-tools">
-        <input id="nsdir-filter" type="search" placeholder="search namespaces" autocomplete="off" spellcheck="false" aria-label="Search namespaces">
+        <input id="nsdir-filter" type="search" placeholder="search by name, description or owner" autocomplete="off" spellcheck="false" aria-label="Search namespaces">
         <label><input type="checkbox" id="nsdir-attn"> needs attention only</label>
         <span class="wl-scope" id="nsdir-scope" style="margin:0"></span>
       </div>
@@ -1737,6 +1737,7 @@ function nsSummaries() {
     const s = blank();
     s.declared = n.declared;
     s.description = n.description;
+    s.owner = n.owner_account || "";
     s.deployments = n.deployments;
     if (!fleetRows && n.stats) {
       Object.assign(s, { ready: n.stats.ready, desired: n.stats.desired, in_flight: n.stats.in_flight, health: { ...n.stats.health } });
@@ -1761,6 +1762,14 @@ function nsSummaries() {
   return out;
 }
 
+// An account id is a UUID: the first block is enough to tell two apart at a
+// glance, and the whole of it is a hover away for whoever needs to search for it.
+function ownerCell(account) {
+  if (!account) return `<span class="sub" title="No sign-in has reached it yet, and no operator has set one">unclaimed</span>`;
+  const short = account.length > 13 ? account.slice(0, 8) + "…" : account;
+  return `<span class="mono" title="${esc(account)}">${esc(short)}</span>`;
+}
+
 const needsAttention = (s) => Object.keys(s.health).some(h => NS_ATTENTION.has(h) && s.health[h]);
 
 function renderNsDirectory() {
@@ -1769,7 +1778,8 @@ function renderNsDirectory() {
   const needle = nsDirFilter.trim().toLowerCase();
   const attn = all.filter(([, s]) => needsAttention(s)).length;
   const shown = all.filter(([name, s]) =>
-    (!needle || name.toLowerCase().includes(needle) || (s.description || "").toLowerCase().includes(needle))
+    (!needle || name.toLowerCase().includes(needle) || (s.description || "").toLowerCase().includes(needle)
+      || (s.owner || "").toLowerCase().includes(needle))
     && (!nsDirAttention || needsAttention(s)));
   $("nsdir-count").textContent = all.length ? `${all.length}` : "";
   $("nsdir-scope").textContent = (needle || nsDirAttention ? `${shown.length} of ${all.length} · ` : "")
@@ -1790,6 +1800,7 @@ function renderNsDirectory() {
     return `<tr class="${needsAttention(s) ? "attn" : ""}">
       <td class="name"><a href="${esc(nsHref(name))}">${esc(name)}</a>${kind}
         ${s.description ? `<div class="sub">${esc(s.description)}</div>` : ""}</td>
+      <td>${name === "default" ? `<span class="sub" title="default is everyone's and is never claimed">—</span>` : ownerCell(s.owner)}</td>
       <td>${fmt(s.deployments)}</td>
       <td class="health"><div class="chips">${chips || `<span class="sub">nothing deployed</span>`}</div></td>
       <td>${s.deployments ? readyOf(s.ready, s.desired) : "—"}</td>
@@ -1800,8 +1811,8 @@ function renderNsDirectory() {
   const more = shown.length > NSDIR_CAP
     ? `<div class="note">Showing the first ${NSDIR_CAP} of ${fmt(shown.length)} — search to narrow.</div>` : "";
   $("nsdir").innerHTML = `<div class="wl-scroll"><table class="wl nsdir">
-      <thead><tr><th>namespace</th><th>deployments</th><th>health</th><th>ready / desired</th><th>in-flight</th><th></th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="6" class="empty">No namespace matches “${esc(nsDirFilter.trim())}”.</td></tr>`}</tbody>
+      <thead><tr><th>namespace</th><th>owner</th><th>deployments</th><th>health</th><th>ready / desired</th><th>in-flight</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7" class="empty">No namespace matches “${esc(nsDirFilter.trim())}”.</td></tr>`}</tbody>
     </table></div>${more}
     <div class="note">${localView ? "Health from this server's pools." : "Health from every server's pools, as each reports them."}
       Open a namespace for its deployments, traffic, security alerts, secrets and tokens.</div>`;
@@ -1832,6 +1843,12 @@ function renderNsCrumb() {
   if (n) {
     bits.push(n.declared ? `<span class="tag ok">declared</span>`
       : `<span class="tag idle" title="Exists only because deployments name it">implied</span>`);
+    // Only an unconfined admin is shown whose it is: a customer knows.
+    if (!CALLER_CONFINED) {
+      bits.push(n.owner_account
+        ? `<span class="sub">owner <span class="mono" title="Heyo account id">${esc(n.owner_account)}</span></span>`
+        : `<span class="sub" title="No sign-in has reached it yet, and no operator has set one">no owner recorded</span>`);
+    }
     bits.push(`<span class="sub">${fmt(n.deployments)} deployment${n.deployments === 1 ? "" : "s"}${localView && MULTI_SERVER ? " on this server" : ""}</span>`);
     if (n.description) bits.push(`<span class="sub">${esc(n.description)}</span>`);
   }
