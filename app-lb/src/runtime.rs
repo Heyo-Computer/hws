@@ -229,6 +229,21 @@ impl FleetListing {
     pub fn total_outage(&self) -> bool {
         self.heyvm.is_err() && !matches!(self.lxc, Some(Ok(())))
     }
+
+    /// Whether the runtime that boots `driver` answered this tick.
+    ///
+    /// A partial fleet is only a fleet for the runtimes that produced it. A
+    /// deployment whose runtime did not answer has *no* VMs in this listing,
+    /// which is not the same as having lost them: reconciling it would drop
+    /// every backend as gone and boot replacements for VMs that are still
+    /// running. Its tick is skipped instead, as a total outage's is.
+    pub fn listed(&self, driver: Option<Driver>) -> bool {
+        if driver.is_some_and(Driver::is_lxc) {
+            matches!(self.lxc, Some(Ok(())))
+        } else {
+            self.heyvm.is_ok()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +279,35 @@ mod tests {
         assert!(runtime.lxc.is_none());
         // ...and the heyvm half is untouched, which is what a microVM fleet needs.
         assert_eq!(runtime.heyvm().transport(), "http://127.0.0.1:1");
+    }
+
+    /// Live on a host with both runtimes (2026-11-03): heyvmd restarted while
+    /// Incus answered, so the tick went ahead on a listing with no microVMs in
+    /// it, dropped a running libvirt replica as gone and tried to boot a
+    /// replacement. A deployment is only reconciled against a runtime that
+    /// answered.
+    #[test]
+    fn a_deployment_is_listed_only_when_its_own_runtime_answered() {
+        let outcome = |heyvm: Result<(), String>, lxc: Option<Result<(), String>>| FleetListing {
+            sandboxes: Vec::new(),
+            heyvm,
+            lxc,
+        };
+        let heyvm_down = outcome(Err("connect".into()), Some(Ok(())));
+        assert!(!heyvm_down.total_outage(), "incus answered, so the tick goes on");
+        for driver in [Some(Driver::Firecracker), Some(Driver::Kvm), Some(Driver::Libvirt), None] {
+            assert!(!heyvm_down.listed(driver), "{driver:?} must sit this tick out");
+        }
+        assert!(heyvm_down.listed(Some(Driver::Lxc)));
+
+        let incus_down = outcome(Ok(()), Some(Err("socket".into())));
+        assert!(!incus_down.listed(Some(Driver::Lxc)));
+        assert!(incus_down.listed(Some(Driver::Libvirt)));
+
+        // No Incus on the host at all: lxc pools have nothing to reconcile against.
+        let no_incus = outcome(Ok(()), None);
+        assert!(no_incus.listed(Some(Driver::Firecracker)));
+        assert!(!no_incus.listed(Some(Driver::Lxc)));
     }
 
     /// Explicitly off beats present. An operator who sets this has a reason, and

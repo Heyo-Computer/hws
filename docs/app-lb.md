@@ -311,7 +311,7 @@ When a base domain is configured (`APP_LB_DEPLOY_BASE_DOMAIN`, or the first `APP
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `driver` | `firecracker` | `firecracker` or `kvm` (heyvm microVMs), or `lxc` (Incus system container from an OCI image). `libvirt` and `firecracker_containerd` are rejected. |
+| `driver` | `firecracker` | `firecracker` or `kvm` (heyvm microVMs), `libvirt` (a heyvm QEMU VM, reached on this host through the port the daemon forwards to `port`; needs heyvm 0.54+, read-only mounts, health on `port`, no `workspace`, `rootfs: shared` or `idle_action: retain`), or `lxc` (Incus system container from an OCI image). `firecracker_containerd` is rejected. |
 | `image` | daemon default (`ubuntu:24.04`) | Image name in the daemon catalog. For `lxc`, a required OCI reference. |
 | `rootfs` | `copy` | `copy` boots each replica from a private copy of the image (heyvm copies it on every cold boot; a full copy on ext4). `shared` attaches the image itself read-only, so nothing is copied: the image must supply its own writable layer (the hub's base images do), and what must persist lives on the data disk or the workspace. Needs a heyvm with per-sandbox `rootfs_mode`; an older one ignores it and copies. Refused for `lxc`. |
 | `port` | required | Guest port traffic is proxied to. |
@@ -328,7 +328,7 @@ When a base domain is configured (`APP_LB_DEPLOY_BASE_DOMAIN`, or the first `APP
 | `workspace` | | A writable directory owned by the deployment, captured when a replica retires and seeded into the next one. |
 | `workspace_archive` | | Seed `/workspace` on every replica from a cloud-held archive (`archive_id` resolved to `s3_key` by the cloud). |
 | `correlated_creates` | `false` | Use durable daemon creation receipts for autoscaler creates (needs a daemon credential and a daemon that supports it). |
-| `ttl_seconds` | `3600` | Backstop TTL. It is renewed while app-lb runs, so VMs expire on their own if app-lb dies. |
+| `ttl_seconds` | `3600` | Backstop TTL. It is renewed while app-lb runs, so VMs expire on their own if app-lb dies. `0` means the VMs never expire, and app-lb never sets a TTL on a VM that runs without one. |
 | `image_download_url`, `image_size_bytes`, `image_sha256` | | Catalog download hints filled in by the cloud. Leave them unset when writing a spec by hand. |
 
 Changing anything in `vm` is a template change and recycles the pool. `build`, `artifact`, `ingress`, `routes`, `scaling` and `health` edits do not.

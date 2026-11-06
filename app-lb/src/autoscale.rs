@@ -575,6 +575,13 @@ impl Autoscaler {
         if listing.total_outage() {
             return;
         }
+        // Kept for the per-deployment loop below, which skips the pools of a
+        // runtime that did not answer (see `FleetListing::listed`).
+        let outcome = crate::runtime::FleetListing {
+            sandboxes: Vec::new(),
+            heyvm: listing.heyvm.clone(),
+            lxc: listing.lxc.clone(),
+        };
         let listing = vm::Listing::from_infos(listing.sandboxes);
 
         // Fetch host + per-VM resource usage alongside the fleet list. It is a
@@ -611,6 +618,9 @@ impl Autoscaler {
         let mut busy = Vec::new();
         for d in &managed {
             if !self.is_live(d) {
+                continue;
+            }
+            if !outcome.listed(d.spec.driver()) {
                 continue;
             }
             self.recover_allocations(d, &fleet).await;
@@ -991,12 +1001,22 @@ impl Autoscaler {
     /// The TTL exists so VMs self-destruct if this LB dies without reaping them.
     /// While we *are* alive, renew it past the halfway mark so a healthy VM
     /// under steady traffic doesn't get culled out from under us.
+    ///
+    /// A TTL of zero is the daemon's "never expires", so there is nothing to
+    /// renew: not for a spec that asks for it, and not for a VM that already
+    /// runs without one — renewing that would *give* it a deadline.
     async fn renew_ttls(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
         let ttl = d.spec.vm_spec().ttl_seconds;
+        if ttl == 0 {
+            return;
+        }
         for b in d.backends().iter() {
             let Some(info) = fleet.get(&b.sandbox_id) else {
                 continue;
             };
+            if info.ttl_seconds == Some(0) {
+                continue;
+            }
             let remaining = info.ttl_seconds.unwrap_or(ttl);
             if info.uptime_secs < remaining / 2 {
                 continue;
@@ -1007,10 +1027,16 @@ impl Autoscaler {
         }
     }
 
-    /// Drop backends the daemon no longer reports as running.
+    /// Drop backends the daemon no longer reports as running, and re-address
+    /// the ones whose address moved.
     ///
     /// This is what catches a VM killed out-of-band: it disappears from the
-    /// fleet list, and we stop routing to it.
+    /// fleet list, and we stop routing to it. A libvirt guest's address is a
+    /// host port the daemon forwards, and it changes when the daemon reattaches
+    /// the VM while it keeps running — the VM is the same replica, so it stays
+    /// in the pool at its new address (see [`VmBackend::readdressed`]). A
+    /// draining backend keeps its old one: it is leaving, and its in-flight
+    /// count is what its drain waits on.
     fn prune(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
         let backends = d.backends();
         let kept: Vec<_> = backends
@@ -1040,7 +1066,33 @@ impl Autoscaler {
             .cloned()
             .collect();
 
-        if kept.len() != backends.len() {
+        let port = d.spec.vm_spec().port;
+        let mut moved = false;
+        let kept: Vec<_> = kept
+            .into_iter()
+            .map(|b| {
+                let addr = fleet
+                    .get(&b.sandbox_id)
+                    .and_then(|info| vm::routable_addr(info, port).ok())
+                    .filter(|addr| !b.is_draining() && addr.to_string() != b.address);
+                match addr {
+                    Some(addr) => {
+                        tracing::info!(
+                            deployment = %d.spec.id,
+                            sandbox = %b.sandbox_id,
+                            from = %b.address,
+                            to = %addr,
+                            "re-addressing backend: the daemon moved its forwarded port",
+                        );
+                        moved = true;
+                        Arc::new(b.readdressed(addr))
+                    }
+                    None => b,
+                }
+            })
+            .collect();
+
+        if moved || kept.len() != backends.len() {
             d.set_backends(kept);
         }
     }
@@ -1427,6 +1479,7 @@ impl Autoscaler {
         });
         self.registry.persist_one(&d.spec.id).map_err(|_| vm::VmError::Runtime("cannot persist allocation intent".into()))?;
         let attempt_name = name.clone();
+        let correlated = prepared.is_some();
         let result = match prepared {
             Some(prepared) => self.vms().submit_allocation(&prepared).await.map(|r| (r.sandbox_id.clone(), Some(r))),
             None => self.runtime.create(d.spec.vm_spec(), name, seed, owner, secret_env).await.map(|id| (id,None)),
@@ -1447,8 +1500,14 @@ impl Autoscaler {
                 Ok(id)
             }
             Err(error) => {
+                // Settled failures only: nothing was created, so the attempt is
+                // dropped rather than left to block every later scale-up. A
+                // create that could not even connect is one of them — a daemon
+                // restarting under the tick must not wedge the pool for good.
+                // A correlated allocation keeps its own receipt-based recovery.
                 if matches!(error, vm::VmError::SecretUnresolved {..} | vm::VmError::MountNotPulled {..}
-                    | vm::VmError::WrongRuntime {..} | vm::VmError::RuntimeUnavailable {..}) {
+                    | vm::VmError::WrongRuntime {..} | vm::VmError::RuntimeUnavailable {..})
+                    || (!correlated && error.never_reached_the_daemon()) {
                     d.mutate_state(|s| { s.create_attempts.remove(attempt); s.allocation_history_complete=history_was_complete; });
                     let _ = self.registry.persist_one(&d.spec.id);
                     self.settle_in_successor(d, |attempts| {
@@ -1800,8 +1859,13 @@ impl Autoscaler {
     /// Best-effort: a failure leaves the copy where it was, which is exactly
     /// what happened before this existed, and the resume path does not care
     /// either way.
+    ///
+    /// Never for libvirt. Its disk is a copy-on-write overlay of the image,
+    /// which is the VM's whole state: there is no separate data disk for it to
+    /// fall back on, and nothing rebuilds the overlay on resume.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
         if self.workspaces.source_retained(sandbox_id) { return; }
+        if d.spec.vm_spec().driver == crate::config::Driver::Libvirt { return; }
         let (removed, failed) = crate::disks::discard_rootfs(self.vms(), sandbox_id).await;
         if !removed.is_empty() {
             tracing::info!(
@@ -2674,12 +2738,16 @@ fn at_rest(
     {
         return false;
     }
-    // A TTL past its halfway mark needs a renewal call, which is an await. A
-    // backend the fleet snapshot doesn't mention is *not* at rest either: it
-    // vanished between the snapshot and now, which `reconcile_one` must see.
+    // A TTL past its halfway mark needs a renewal call, which is an await —
+    // except a TTL of zero, which `renew_ttls` never renews. A backend the
+    // fleet snapshot doesn't mention is *not* at rest either: it vanished
+    // between the snapshot and now, which `reconcile_one` must see.
+    let spec_ttl = d.spec.vm_spec().ttl_seconds;
     backends.iter().all(|b| {
         fleet.get(&b.sandbox_id).is_some_and(|info| {
-            info.uptime_secs < info.ttl_seconds.unwrap_or(d.spec.vm_spec().ttl_seconds) / 2
+            spec_ttl == 0
+                || info.ttl_seconds == Some(0)
+                || info.uptime_secs < info.ttl_seconds.unwrap_or(spec_ttl) / 2
         })
     })
 }
@@ -3676,6 +3744,7 @@ mod tests {
             status_changed_at: String::new(),
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
+            port_mappings: Vec::new(),
             metadata: None,
             account_id: None,
             created_at: None,
@@ -3803,6 +3872,24 @@ mod tests {
             entry.ttl_seconds = Some(3600);
             entry.uptime_secs = 1800;
             assert!(!at_rest(&d, &fleet, &no_extras()));
+        }
+
+        /// TTL zero never expires and is never renewed, so however long the VM
+        /// has run there is no renewal due — whether the VM or the spec says so.
+        #[test]
+        fn a_permanent_vm_is_at_rest_however_long_it_has_run() {
+            let (d, mut fleet) = settled();
+            let entry = fleet.get_mut("sb-1").unwrap();
+            entry.ttl_seconds = Some(0);
+            entry.uptime_secs = 10_000_000;
+            assert!(at_rest(&d, &fleet, &no_extras()));
+
+            let mut permanent = d.spec.clone();
+            permanent.vm.as_mut().unwrap().ttl_seconds = 0;
+            let d = Arc::new(Deployment::new(permanent));
+            d.set_backends(vec![Arc::new(VmBackend::new("sb-1".into(), "10.0.0.1:8080".parse().unwrap()))]);
+            fleet.get_mut("sb-1").unwrap().ttl_seconds = None;
+            assert!(at_rest(&d, &fleet, &no_extras()));
         }
 
         /// A backend the daemon no longer reports has just disappeared. Reading
@@ -4400,5 +4487,113 @@ mod tests {
         mode.store(3, Ordering::SeqCst);
         assert!(scaler.has_owned_resources("demo").await.is_err(), "unavailable inventory is not empty");
         server.abort();
+    }
+
+    /// A libvirt guest's address is a host port the daemon forwards, and the
+    /// daemon hands out a new one when it reattaches the VM. The replica is the
+    /// same, so it stays in the pool at the new port with everything the pool
+    /// knew about it — and a draining one stays put, since its drain is
+    /// counting requests dialed at the old port.
+    #[test]
+    fn prune_readdresses_a_libvirt_backend_whose_forwarded_port_moved() {
+        let mut s = spec();
+        s.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        let port = s.vm.as_ref().unwrap().port;
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", s);
+        let d = registry.get("demo").unwrap();
+
+        let first = VmBackend::new("sb-1".into(), "127.0.0.1:41080".parse().unwrap());
+        first.set_bind(Some("abc123".into()));
+        first.set_healthy(false);
+        d.set_backends(vec![Arc::new(first)]);
+
+        let mut listed = info(heyo_sdk::SandboxStatus::Running, None);
+        listed.port_mappings = vec![heyo_sdk::PortMapping { host: 41999, container: port }];
+        let fleet = HashMap::from([("sb-1".to_string(), listed.clone())]);
+
+        scaler.prune(&d, &fleet);
+        let backends = d.backends();
+        assert_eq!(backends.len(), 1, "a moved port is not a dead VM");
+        assert_eq!(backends[0].address, "127.0.0.1:41999");
+        assert_eq!(backends[0].bind().as_deref(), Some("abc123"));
+        assert!(!backends[0].is_healthy(), "health carries over; the reprobe decides");
+
+        // Unchanged: same Arc, nothing republished.
+        let before = Arc::as_ptr(&d.backends()[0]);
+        scaler.prune(&d, &fleet);
+        assert_eq!(Arc::as_ptr(&d.backends()[0]), before);
+
+        // Draining: keeps the address its in-flight requests were dialed at.
+        d.backends()[0].set_draining(true);
+        listed.port_mappings[0].host = 42000;
+        scaler.prune(&d, &HashMap::from([("sb-1".to_string(), listed)]));
+        assert_eq!(d.backends()[0].address, "127.0.0.1:41999");
+    }
+
+    /// TTL zero is the daemon's "never expires". Renewing would turn a
+    /// permanent VM into one with a deadline, so neither a zero-TTL spec nor a
+    /// VM that already runs without a TTL is ever renewed — while an ordinary
+    /// one past its halfway mark still is.
+    #[tokio::test]
+    async fn a_permanent_vm_is_never_given_a_ttl() {
+        use std::sync::atomic::AtomicUsize;
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let count = renewals.clone();
+        let daemon = axum::Router::new().route(
+            "/deployed-sandboxes/:id/ttl",
+            axum::routing::any(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, daemon).await.unwrap() });
+
+        let old = |ttl: Option<u64>| {
+            let mut i = info(heyo_sdk::SandboxStatus::Running, Some("127.0.0.1"));
+            i.uptime_secs = 10_000;
+            i.ttl_seconds = ttl;
+            HashMap::from([("sb-1".to_string(), i)])
+        };
+
+        // A spec with a TTL, and a VM that runs without one: left alone.
+        let (scaler, registry) = autoscaler_against(&url, spec());
+        let d = registry.get("demo").unwrap();
+        d.set_backends(vec![Arc::new(VmBackend::new("sb-1".into(), "127.0.0.1:9".parse().unwrap()))]);
+        scaler.renew_ttls(&d, &old(Some(0))).await;
+        assert_eq!(renewals.load(Ordering::SeqCst), 0);
+        // The same spec, and a VM with a TTL past halfway: renewed.
+        scaler.renew_ttls(&d, &old(Some(3600))).await;
+        assert_eq!(renewals.load(Ordering::SeqCst), 1, "the ordinary path still renews");
+
+        // A zero-TTL spec renews nothing, whatever the VM says.
+        let mut permanent = spec();
+        permanent.vm.as_mut().unwrap().ttl_seconds = 0;
+        let (scaler, registry) = autoscaler_against(&url, permanent);
+        let d = registry.get("demo").unwrap();
+        d.set_backends(vec![Arc::new(VmBackend::new("sb-1".into(), "127.0.0.1:9".parse().unwrap()))]);
+        scaler.renew_ttls(&d, &old(Some(3600))).await;
+        scaler.renew_ttls(&d, &old(None)).await;
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// Live on a dev host (2026-11-03): heyvmd went down under the tick, a
+    /// scale-up's create could not connect, and the attempt stayed persisted
+    /// with no sandbox id. `scale_up` refuses while one exists, so the pool
+    /// never refilled — not even after an app-lb restart. A create that never
+    /// reached the daemon created nothing, and must not block the next one.
+    #[tokio::test]
+    async fn a_create_that_could_not_connect_does_not_wedge_the_pool() {
+        // Port 1: nothing listens, so the connection is refused outright.
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", spec());
+        let d = registry.get("demo").unwrap();
+        let error = scaler
+            .allocate_replica(&d, "applb-demo-000000000001".into(), None, None, &vm::VmOwner::default())
+            .await
+            .unwrap_err();
+        assert!(error.never_reached_the_daemon(), "{error}");
+        assert!(d.state().create_attempts.is_empty(), "the refused attempt is dropped");
     }
 }

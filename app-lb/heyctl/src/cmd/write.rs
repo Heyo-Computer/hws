@@ -71,8 +71,8 @@ pub struct CreateDeploymentArgs {
     /// Guest port traffic is proxied to. Required for a managed deployment.
     #[arg(long, value_name = "PORT", help_heading = "VM pool")]
     pub port: Option<u16>,
-    /// Hypervisor driver. libvirt is rejected: app-lb routes to the guest IP,
-    /// which only tap-networked firecracker/kvm expose.
+    /// Hypervisor driver: firecracker, kvm, libvirt (reached through the host
+    /// port the daemon forwards to --port) or lxc.
     #[arg(long, value_name = "DRIVER", default_value = "firecracker", help_heading = "VM pool")]
     pub driver: String,
     /// Command the guest runs at boot.

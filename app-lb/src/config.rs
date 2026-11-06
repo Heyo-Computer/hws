@@ -611,10 +611,14 @@ pub enum IdleAction {
 /// deliberately identical to the SDK's, so a spec written against either
 /// deserializes the same and the wire fixtures are unchanged.
 ///
-/// `Libvirt` and `FirecrackerContainerd` exist here only so that a spec naming
-/// one still *deserializes* and is then refused by
-/// [`DeploymentSpec::validate`] with an explanation. Dropping the variants
-/// would turn a good error message into an opaque serde failure.
+/// `Libvirt` is a heyvm driver whose guest has no routable IP: it is reached
+/// through the host ports QEMU forwards to it, which the daemon reports as
+/// `port_mappings` (see [`crate::vm::routable_addr`]).
+///
+/// `FirecrackerContainerd` exists here only so that a spec naming it still
+/// *deserializes* and is then refused by [`DeploymentSpec::validate`] with an
+/// explanation. Dropping the variant would turn a good error message into an
+/// opaque serde failure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Driver {
@@ -624,6 +628,9 @@ pub enum Driver {
     /// A system container under Incus, booted from an OCI image. Not a heyvm
     /// driver: app-lb talks to Incus itself, so [`Driver::heyvm`] is `None`.
     Lxc,
+    /// A QEMU VM under libvirt, on user-mode (SLIRP) networking. Reached
+    /// through host ports the daemon forwards rather than a guest IP, so it
+    /// needs a daemon on this host, like every other heyvm driver here.
     Libvirt,
     #[serde(rename = "firecracker_containerd")]
     FirecrackerContainerd,
@@ -637,7 +644,8 @@ impl Driver {
         match self {
             Self::Firecracker => Some(SandboxDriver::Firecracker),
             Self::Kvm => Some(SandboxDriver::Kvm),
-            Self::Lxc | Self::Libvirt | Self::FirecrackerContainerd => None,
+            Self::Libvirt => Some(SandboxDriver::Libvirt),
+            Self::Lxc | Self::FirecrackerContainerd => None,
         }
     }
 
@@ -899,9 +907,10 @@ enum SandboxSizeSchema {
 /// `VmSpec`s to decide whether the VMs must be rebuilt.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct VmSpec {
-    /// `firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system
-    /// container from an OCI image). `libvirt` and `firecracker_containerd`
-    /// are rejected at registration.
+    /// `firecracker` or `kvm` (a heyvm microVM), `libvirt` (a heyvm QEMU VM,
+    /// reached through forwarded host ports) or `lxc` (an Incus system
+    /// container from an OCI image). `firecracker_containerd` is rejected at
+    /// registration.
     pub driver: Driver,
     /// Require durable heyvmd operation receipts for autoscaler allocations.
     /// Requires an internal daemon credential and /sandbox-creations support;
@@ -1274,6 +1283,9 @@ impl MountSpec {
         }
         if !self.read_only && driver == Driver::Kvm {
             return Err(SpecError::WritableMountOnKvm(self.guest_path().to_string()));
+        }
+        if !self.read_only && driver == Driver::Libvirt {
+            return Err(SpecError::WritableMountOnLibvirt(self.guest_path().to_string()));
         }
         Ok(())
     }
@@ -4433,6 +4445,16 @@ pub enum SpecError {
     /// A writable mount on the `kvm` driver, which would sync the guest's writes
     /// back into the shared tree. See [`MountSpec::read_only`].
     WritableMountOnKvm(String),
+    /// A writable mount on `libvirt`, whose mounts are live 9p shares of the
+    /// daemon's tree directory: a guest write lands in the content-addressed
+    /// tree every replica boots from.
+    WritableMountOnLibvirt(String),
+    /// A libvirt spec asked for something only another driver does. Carries
+    /// the field and why, because each refusal has a different reason.
+    NotForLibvirt {
+        field: &'static str,
+        why: &'static str,
+    },
     /// A secret reference somewhere in the spec is malformed. Carries the field
     /// it came from: four blocks can hold one, and "a secret ref is unusable"
     /// with no idea which is not an error message anyone can act on.
@@ -4593,8 +4615,8 @@ impl std::fmt::Display for SpecError {
             Self::InvalidRedirect(why) => write!(f, "route.redirect: {why}"),
             Self::UnsupportedDriver(d) => write!(
                 f,
-                "driver {d} is not supported: app-lb routes directly to the guest IP, \
-                 which the daemon only exposes for tap-networked firecracker/kvm backends"
+                "driver {d} is not supported: app-lb routes to a guest IP or to a host port \
+                 the daemon forwards to the guest, and the daemon exposes neither for {d}"
             ),
             Self::NotForLxc(field) => write!(
                 f,
@@ -5027,6 +5049,16 @@ impl std::fmt::Display for SpecError {
                 "the digest pinned on mount {path:?} must be 64 lowercase hex characters, \
                  got {digest:?}. Omit it to let a pull resolve `ref` and fill it in"
             ),
+            Self::WritableMountOnLibvirt(p) => write!(
+                f,
+                "mount {p:?} is read_only: false on the libvirt driver, which shares the \
+                 host tree into the guest over 9p — so a guest write lands in the \
+                 content-addressed copy every other replica boots from. Keep the mount \
+                 read-only, or use the firecracker driver, where each VM's copy is its own"
+            ),
+            Self::NotForLibvirt { field, why } => {
+                write!(f, "{field} is not supported on driver libvirt: {why}")
+            }
             Self::WritableMountOnKvm(p) => write!(
                 f,
                 "mount {p:?} is read_only: false on the kvm driver, which syncs a writable \
@@ -5244,6 +5276,48 @@ impl DeploymentSpec {
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    /// The rules that only apply to a libvirt VM.
+    ///
+    /// A libvirt guest is on user-mode networking: app-lb reaches it through
+    /// the host port the daemon forwards to `vm.port`, not through a guest IP.
+    /// Each refusal below is a field that would otherwise be accepted and then
+    /// quietly not do what it says. Writable mounts are refused with the other
+    /// mount rules, and `vm.workspace` by its own validation.
+    fn validate_libvirt(&self, vm: &VmSpec) -> Result<(), SpecError> {
+        if vm.rootfs == RootfsMode::Shared {
+            return Err(SpecError::NotForLibvirt {
+                field: "vm.rootfs: shared",
+                why: "the daemon shares a read-only rootfs for firecracker only, and a libvirt \
+                      VM already boots from its own copy-on-write overlay of the image",
+            });
+        }
+        // A retained replica is resumed with the daemon's `start`, which for a
+        // libvirt guest answers only once it has booted — over two minutes for a
+        // cloud image, measured — and lists it as stopped until then. app-lb's
+        // daemon calls give up after 30s, so every resume would read as a
+        // failure, and after three the retained VM is destroyed with its disk.
+        if self.scaling.idle_action == IdleAction::Retain {
+            return Err(SpecError::NotForLibvirt {
+                field: "scaling.idle_action: retain",
+                why: "the daemon's libvirt start blocks until the guest has booted and reports \
+                      it stopped meanwhile, so app-lb cannot resume a retained libvirt VM \
+                      without timing out and, after three attempts, destroying it",
+            });
+        }
+        // The probe dials the VM's address with the health port swapped in
+        // (`health::probe`). For a libvirt VM that address is a host port
+        // forwarded to `vm.port`, so any other port would probe whatever
+        // happens to listen on the host there.
+        if self.health.port.is_some_and(|p| p != vm.port) {
+            return Err(SpecError::NotForLibvirt {
+                field: "health.port",
+                why: "a libvirt guest is reached through the host port forwarded to vm.port, \
+                      so health has to be served on vm.port",
+            });
+        }
+        Ok(())
     }
 
     /// The rules that only apply to a container.
@@ -5602,7 +5676,8 @@ impl DeploymentSpec {
             match vm.driver {
                 Driver::Firecracker | Driver::Kvm => {}
                 Driver::Lxc => self.validate_lxc(vm)?,
-                d @ (Driver::Libvirt | Driver::FirecrackerContainerd) => {
+                Driver::Libvirt => self.validate_libvirt(vm)?,
+                d @ Driver::FirecrackerContainerd => {
                     return Err(SpecError::UnsupportedDriver(d));
                 }
             }
@@ -8041,14 +8116,59 @@ mod tests {
         assert!(s.validate().is_ok());
     }
 
+    /// libvirt is reached through forwarded host ports, so a plain managed
+    /// spec registers — and boots through heyvm, not Incus.
     #[test]
-    fn rejects_libvirt_because_it_has_no_guest_ip() {
+    fn accepts_libvirt_as_a_heyvm_driver() {
         let mut s = spec();
         s.vm.as_mut().unwrap().driver = Driver::Libvirt;
-        assert_eq!(
-            s.validate(),
-            Err(SpecError::UnsupportedDriver(Driver::Libvirt))
-        );
+        s.validate().expect("a plain libvirt spec registers");
+        assert_eq!(Driver::Libvirt.heyvm(), Some(SandboxDriver::Libvirt));
+    }
+
+    /// Each field a libvirt VM cannot honour is refused at registration, with
+    /// the field named, rather than accepted and silently ignored.
+    #[test]
+    fn libvirt_refuses_what_it_cannot_honour() {
+        let mut retained = spec();
+        retained.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        retained.scaling.idle_action = IdleAction::Retain;
+        assert!(matches!(
+            retained.validate(),
+            Err(SpecError::NotForLibvirt { field: "scaling.idle_action: retain", .. })
+        ));
+
+        let mut shared = spec();
+        shared.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        shared.vm.as_mut().unwrap().rootfs = RootfsMode::Shared;
+        assert!(matches!(
+            shared.validate(),
+            Err(SpecError::NotForLibvirt { field: "vm.rootfs: shared", .. })
+        ));
+
+        let mut other_health = spec();
+        let port = other_health.vm.as_ref().unwrap().port;
+        other_health.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        other_health.health.port = Some(port + 1);
+        let err = other_health.validate().unwrap_err();
+        assert!(matches!(err, SpecError::NotForLibvirt { field: "health.port", .. }));
+        assert!(err.to_string().contains("vm.port"), "{err}");
+        // The same port, spelled out, is fine.
+        other_health.health.port = Some(port);
+        other_health.validate().unwrap();
+
+        let writable = MountSpec {
+            read_only: false,
+            ..a_mount("/scratch")
+        };
+        let mut on_libvirt = spec_with_mounts(vec![writable]);
+        on_libvirt.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        let err = on_libvirt.validate().unwrap_err();
+        assert_eq!(err, SpecError::WritableMountOnLibvirt("/scratch".into()));
+        assert!(err.to_string().contains("9p"), "{err}");
+        let mut ro_on_libvirt = spec_with_mounts(vec![a_mount("/data")]);
+        ro_on_libvirt.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        ro_on_libvirt.validate().unwrap();
     }
 
     /// The whole reason `Driver` is app-lb's own enum and not the SDK's: it has
@@ -8084,13 +8204,10 @@ mod tests {
     /// pointing at a byte offset.
     #[test]
     fn an_unbootable_driver_is_refused_by_validate_not_by_serde() {
-        for (json, expected) in [
-            ("libvirt", SpecError::UnsupportedDriver(Driver::Libvirt)),
-            (
-                "firecracker_containerd",
-                SpecError::UnsupportedDriver(Driver::FirecrackerContainerd),
-            ),
-        ] {
+        for (json, expected) in [(
+            "firecracker_containerd",
+            SpecError::UnsupportedDriver(Driver::FirecrackerContainerd),
+        )] {
             let mut s = spec();
             s.vm.as_mut().unwrap().driver = serde_json::from_str(&format!("\"{json}\"")).unwrap();
             assert_eq!(s.validate(), Err(expected), "driver {json}");
@@ -9135,6 +9252,10 @@ mod tests {
             let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
             s.vm.as_mut().unwrap().driver = Driver::Kvm;
             assert!(matches!(s.validate(), Err(SpecError::WorkspaceDriver(_))));
+
+            let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
+            s.vm.as_mut().unwrap().driver = Driver::Libvirt;
+            assert!(matches!(s.validate(), Err(SpecError::WorkspaceDriver(Driver::Libvirt))));
         }
 
         #[test]
@@ -9749,8 +9870,8 @@ mod tests {
             // and still six.
             let sizes = enum_values(&defs["SandboxSize"]);
             assert_eq!(sizes.len(), 6, "the size classes moved: {sizes:?}");
-            // `libvirt` and `firecracker_containerd` deserialize and are then
-            // refused, so the schema lists them — it describes what parses. The
+            // `firecracker_containerd` deserializes and is then refused, so the
+            // schema lists it — it describes what parses. The
             // caveat has to travel with them, and it does, because the doc
             // comments say so and doc comments are what a generated schema is
             // made of. That is the whole argument for generating this file.
@@ -9762,8 +9883,8 @@ mod tests {
                 .as_str()
                 .expect("the driver field is documented");
             assert!(
-                caveat.contains("libvirt") && caveat.contains("rejected"),
-                "the driver field no longer warns that two of its values are refused: {caveat}",
+                caveat.contains("firecracker_containerd") && caveat.contains("rejected"),
+                "the driver field no longer warns that one of its values is refused: {caveat}",
             );
         }
     }

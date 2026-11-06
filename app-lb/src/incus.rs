@@ -852,6 +852,7 @@ fn to_sandbox_info(i: &Instance, nic: Option<&str>) -> SandboxInfo {
             .cloned()
             .unwrap_or_default(),
         guest_ip,
+        port_mappings: Vec::new(),
         backend_type: Some(Driver::Lxc.as_str().to_string()),
         account_id: i.config.get(&format!("{OWNER_PREFIX}.account")).cloned(),
         created_at: i.created_at.clone(),
