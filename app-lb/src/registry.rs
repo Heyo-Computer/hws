@@ -212,6 +212,11 @@ impl RouteTable {
     }
 
     pub fn resolve(&self, host: Option<&str>, path: &str) -> Option<&str> {
+        self.resolve_entry(host, path).map(|(_, id)| &**id)
+    }
+
+    /// [`resolve`](Self::resolve), keeping the rule that matched.
+    fn resolve_entry(&self, host: Option<&str>, path: &str) -> Option<&RouteEntry> {
         if let Some(host) = host {
             // `matches` compares hostnames case-insensitively, so the key has to
             // be folded too. Borrowed unless the request actually carries upper
@@ -223,15 +228,12 @@ impl RouteTable {
                 Cow::Borrowed(host)
             };
             if let Some(bucket) = self.exact.get(key.as_ref())
-                && let Some((_, id)) = bucket.iter().find(|(rule, _)| rule.matches(Some(host), path))
+                && let Some(entry) = bucket.iter().find(|(rule, _)| rule.matches(Some(host), path))
             {
-                return Some(id);
+                return Some(entry);
             }
         }
-        self.rest
-            .iter()
-            .find(|(rule, _)| rule.matches(host, path))
-            .map(|(_, id)| &**id)
+        self.rest.iter().find(|(rule, _)| rule.matches(host, path))
     }
 }
 
@@ -698,6 +700,21 @@ impl Registry {
             routes.resolve(host, path)?.to_string()
         };
         self.get(&id)
+    }
+
+    /// [`route`](Self::route), with the rule that matched, for callers that
+    /// bypass the proxy and so must honour the rule's rewrites themselves.
+    pub fn route_rule(
+        &self,
+        host: Option<&str>,
+        path: &str,
+    ) -> Option<(crate::config::RouteRule, Arc<Deployment>)> {
+        let (rule, id) = {
+            let routes = self.routes.load();
+            let (rule, id) = routes.resolve_entry(host, path)?;
+            (rule.clone(), id.clone())
+        };
+        Some((rule, self.get(&id)?))
     }
 
     /// Register or replace a deployment.
