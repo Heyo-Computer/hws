@@ -131,6 +131,10 @@ pub(super) async fn handoff(State(state): State<AdminState>, axum::Form(input): 
         return handoff_page(StatusCode::UNAUTHORIZED, "Session expired",
             "Your Heyo session could not be verified. Open the dashboard again from Heyo.", None, home);
     };
+    // Held to the recorded owners exactly as the admin API will hold every
+    // request this session makes, so a refused namespace is refused here
+    // rather than opening a dashboard that cannot load anything.
+    let grant = super::bind_grant(&state.namespaces, grant);
     if !grant_opens(&grant, ns) {
         return handoff_page(StatusCode::FORBIDDEN, "No access",
             "Your Heyo account cannot reach this namespace.", None, home);

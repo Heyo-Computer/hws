@@ -887,6 +887,86 @@ struct Presented<'a> {
     federated: Option<Arc<crate::federated::Grant>>,
 }
 
+/// Hold a federated grant to the owners this app-lb has recorded.
+///
+/// The auth service names each namespace in a grant together with the account
+/// that owns it. app-lb keys everything by the name alone, so a name the auth
+/// service freed and handed to another account would otherwise open whatever
+/// the first owner left here — deployments, secrets, tokens, logs. For every
+/// namespace in the grant:
+///
+/// - an owner is recorded and the auth service names the same one: kept;
+/// - an owner is recorded and the auth service names another, or none: the
+///   namespace is dropped from the grant, and the refusal logged;
+/// - no owner is recorded and the auth service names one: kept, and that
+///   owner recorded, which is how a namespace is claimed;
+/// - neither: kept. An auth service that predates `namespaces[]` names no
+///   owners, and there is nothing to hold it to.
+///
+/// A `fleet:admin` grant is not confined to namespaces and passes untouched.
+/// `default` is never claimed: it is everyone's.
+pub(crate) fn bind_grant(
+    store: &crate::namespaces::NamespaceStore,
+    grant: Arc<crate::federated::Grant>,
+) -> Arc<crate::federated::Grant> {
+    if grant.fleet {
+        return grant;
+    }
+    let mut dropped: Vec<&str> = Vec::new();
+    for ns in grant.namespaces.keys() {
+        let recorded = store.get(ns).and_then(|s| s.owner_account.clone());
+        let named = grant.accounts.get(ns);
+        match (recorded.as_deref(), named) {
+            (Some(r), Some(n)) if r == n => {}
+            (Some(r), named) => {
+                tracing::warn!(
+                    namespace = %ns,
+                    recorded_owner = %r,
+                    named_owner = ?named,
+                    user = %grant.subject.user_id,
+                    "federated grant refused for a namespace recorded as another account's",
+                );
+                dropped.push(ns);
+            }
+            (None, Some(n)) if ns != crate::config::DEFAULT_NAMESPACE => claim_namespace(store, ns, n),
+            (None, _) => {}
+        }
+    }
+    if dropped.is_empty() {
+        return grant;
+    }
+    let keep = |ns: &String| !dropped.contains(&ns.as_str());
+    Arc::new(crate::federated::Grant {
+        subject: grant.subject.clone(),
+        namespaces: grant.namespaces.iter().filter(|(ns, _)| keep(ns)).map(|(k, v)| (k.clone(), *v)).collect(),
+        accounts: grant.accounts.iter().filter(|(ns, _)| keep(ns)).map(|(k, v)| (k.clone(), v.clone())).collect(),
+        fleet: false,
+    })
+}
+
+/// Record `account` as the owner of `ns`, declaring the namespace if nothing
+/// had. A failed write is logged and retried on the caller's next request: the
+/// grant is still the auth service's word, so it is not refused for it.
+fn claim_namespace(store: &crate::namespaces::NamespaceStore, ns: &str, account: &str) {
+    if !crate::config::is_valid_namespace(ns) || !crate::config::is_valid_owner_account(account) {
+        return;
+    }
+    let spec = match store.get(ns) {
+        Some(existing) => crate::config::NamespaceSpec { owner_account: Some(account.to_string()), ..(*existing).clone() },
+        None => crate::config::NamespaceSpec {
+            name: ns.to_string(),
+            description: None,
+            created_at: now_secs(),
+            hosts: Vec::new(),
+            owner_account: Some(account.to_string()),
+        },
+    };
+    match store.upsert(spec) {
+        Ok(_) => tracing::info!(namespace = %ns, owner = %account, "namespace owner recorded"),
+        Err(e) => tracing::warn!(namespace = %ns, error = %e, "could not record the namespace owner; will retry"),
+    }
+}
+
 /// Decide whether a request gets through, and as whom.
 ///
 /// Three credentials are accepted, in this order of precedence:
@@ -1120,7 +1200,7 @@ async fn authorize(
             if !raw.starts_with(crate::federated::LOCAL_TOKEN_PREFIX)
                 && state.tokens.verify(raw, now).is_none() =>
         {
-            f.resolve(raw).await
+            f.resolve(raw).await.map(|g| bind_grant(&state.namespaces, g))
         }
         _ => None,
     };
@@ -3182,6 +3262,9 @@ struct NamespaceEntry {
     hosts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     created_at: Option<u64>,
+    /// The account recorded as owning it (see `NamespaceSpec::owner_account`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_account: Option<String>,
     /// Pool gauges summed over the deployments counted in `deployments`, only
     /// when asked for with `?stats=true` — the dashboard's namespace directory
     /// reads it so an operator can see which room needs attention before
@@ -3443,6 +3526,7 @@ async fn namespaces(
                     description: declared.as_ref().and_then(|d| d.description.clone()),
                     hosts: declared.as_ref().map(|d| d.hosts.clone()).unwrap_or_default(),
                     created_at: declared.as_ref().map(|d| d.created_at),
+                    owner_account: declared.as_ref().and_then(|d| d.owner_account.clone()),
                     stats: want_stats.then(|| stats.remove(&namespace).unwrap_or_default()),
                     namespace,
                 }
@@ -3498,6 +3582,13 @@ async fn create_namespace(
         Some(existing) => existing.created_at,
         None => now_secs(),
     };
+    // The owner likewise: a re-declare keeps it, and only the operator may
+    // name one up front. Changing or clearing it is `PUT …/owner`, on purpose
+    // a separate act, so editing a description can never release a namespace.
+    let existing_owner = state.namespaces.get(&spec.name).and_then(|e| e.owner_account.clone());
+    if existing_owner.is_some() || !operator {
+        spec.owner_account = existing_owner;
+    }
     let existed = state.namespaces.contains(&spec.name);
     match state.namespaces.upsert(spec) {
         Ok(ns) => {
@@ -3507,6 +3598,61 @@ async fn create_namespace(
                 Json(ns),
             )
                 .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "namespace write failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "could not persist the namespace").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NamespaceOwnerBody {
+    /// `null` clears it, releasing the namespace to the next account the auth
+    /// service names for it.
+    owner_account: Option<String>,
+}
+
+/// `PUT /namespaces/:name/owner` — set or clear the account recorded as
+/// owning a namespace.
+///
+/// Fleet-scoped admin only. This is how an operator transfers a namespace, or
+/// releases one whose name the auth service has legitimately given to a new
+/// account *after* cleaning out what the old one left. Declares the namespace
+/// when nothing had, so an occupied but undeclared one can be pinned before
+/// anyone signs in to it.
+async fn set_namespace_owner(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    caller: Option<axum::Extension<Caller>>,
+    Json(body): Json<NamespaceOwnerBody>,
+) -> Response {
+    if let Some(c) = caller.as_ref().map(|c| &c.0)
+        && !c.covers_fleet()
+    {
+        return err(
+            StatusCode::FORBIDDEN,
+            "a namespace's owner is set fleet-wide, so it needs a fleet-scoped admin credential",
+        )
+        .into_response();
+    }
+    let spec = match state.namespaces.get(&name) {
+        Some(existing) => crate::config::NamespaceSpec { owner_account: body.owner_account, ..(*existing).clone() },
+        None => crate::config::NamespaceSpec {
+            name: name.clone(),
+            description: None,
+            created_at: now_secs(),
+            hosts: Vec::new(),
+            owner_account: body.owner_account,
+        },
+    };
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    match state.namespaces.upsert(spec) {
+        Ok(ns) => {
+            tracing::info!(namespace = %ns.name, owner = ?ns.owner_account, "namespace owner set by an operator");
+            Json(ns).into_response()
         }
         Err(e) => {
             tracing::error!(error = %e, "namespace write failed");
@@ -8627,6 +8773,7 @@ fn router(state: AdminState) -> Router {
         // matches on path, not method.
         .route("/namespaces", post(create_namespace))
         .route("/namespaces/:name", delete(delete_namespace))
+        .route("/namespaces/:name/owner", put(set_namespace_owner))
         .route(
             "/namespaces/:name/tunnels/:tunnel",
             put(register_tunnel).delete(release_namespace_tunnel),
@@ -11847,6 +11994,35 @@ mod tests {
             assert!(all["fleet"]["deployments"].as_u64().unwrap() >= 3);
         }
 
+        /// The owner survives a re-declare, is listed, and changes only
+        /// through its own route.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_namespace_owner_is_set_only_through_its_route() {
+            let f = fixture(true).await;
+            let (status, _, v) = send(&f, "PUT", "/namespaces/team-o/owner", r#"{"owner_account":"acc-1"}"#).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["owner_account"], "acc-1");
+
+            // Editing the description keeps the owner, whatever the body says.
+            let (status, _, v) = send(&f, "POST", "/namespaces",
+                r#"{"name":"team-o","description":"renamed","owner_account":"acc-2"}"#).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["owner_account"], "acc-1");
+            assert_eq!(v["description"], "renamed");
+
+            let (_, _, list) = send(&f, "GET", "/namespaces", "").await;
+            let entry = list.as_array().unwrap().iter().find(|n| n["namespace"] == "team-o").unwrap();
+            assert_eq!(entry["owner_account"], "acc-1");
+
+            let (status, _, _) = send(&f, "PUT", "/namespaces/team-o/owner", r#"{"owner_account":"not an id"}"#).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, _, v) = send(&f, "PUT", "/namespaces/team-o/owner", r#"{"owner_account":null}"#).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert!(v.get("owner_account").is_none(), "{v}");
+            let (status, _, _) = send(&f, "PUT", "/namespaces/default/owner", r#"{"owner_account":"acc-1"}"#).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "default is everyone's");
+        }
+
         #[test]
         fn serving_state_matches_the_fleet_rollup_rule() {
             assert_eq!(serving_state("site", 0, 0, 0, 0), "healthy");
@@ -13823,6 +13999,63 @@ mod tests {
                     .collect(),
                 fleet,
             })
+        }
+
+        /// A name the auth service hands to a second account must not open
+        /// what the first left here: the first sign-in records the owner, and
+        /// a grant naming another owner loses that namespace.
+        #[test]
+        fn grants_are_held_to_the_recorded_namespace_owner() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = crate::namespaces::NamespaceStore::new(dir.path());
+            let owner = |ns: &str| store.get(ns).and_then(|s| s.owner_account.clone());
+
+            // First sign-in: `team-a` is claimed for the account auth named.
+            let first = grant(&[("team-a", AdminScope::Admin)], false);
+            let bound = bind_grant(&store, first.clone());
+            assert!(Arc::ptr_eq(&bound, &first), "nothing dropped, the grant is reused");
+            assert_eq!(owner("team-a").as_deref(), Some("acc-team-a"));
+
+            // The same owner again: kept.
+            assert!(bind_grant(&store, first).namespaces.contains_key("team-a"));
+
+            // The name reissued to another account: refused there, kept elsewhere.
+            let other = |named: bool| {
+                let both = [("team-a", "acc-b"), ("team-b", "acc-b")];
+                Arc::new(crate::federated::Grant {
+                    subject: serde_json::from_value(serde_json::json!({"userId": "u2", "accountId": "acc-b"})).unwrap(),
+                    namespaces: both.iter().map(|(n, _)| (n.to_string(), AdminScope::Admin)).collect(),
+                    accounts: if named { both.iter().map(|(n, a)| (n.to_string(), a.to_string())).collect() } else { Default::default() },
+                    fleet: false,
+                })
+            };
+            let bound = bind_grant(&store, other(true));
+            assert!(!bound.namespaces.contains_key("team-a"));
+            assert!(!bound.accounts.contains_key("team-a"));
+            assert!(bound.namespaces.contains_key("team-b"));
+            assert_eq!(owner("team-a").as_deref(), Some("acc-team-a"), "a refusal never re-claims");
+            assert_eq!(owner("team-b").as_deref(), Some("acc-b"));
+
+            // An auth service that names no owner cannot vouch for a recorded one.
+            let bound = bind_grant(&store, other(false));
+            assert!(!bound.namespaces.contains_key("team-a"));
+            assert!(!bound.namespaces.contains_key("team-b"), "team-b is recorded now too");
+            assert!(bind_grant(&store, grant(&[], false)).namespaces.is_empty());
+            // Nothing recorded and no owner named: kept, and nothing claimed.
+            let unnamed = Arc::new(crate::federated::Grant {
+                subject: serde_json::from_value(serde_json::json!({"userId": "u3"})).unwrap(),
+                namespaces: [("team-c".to_string(), AdminScope::View)].into(),
+                accounts: Default::default(),
+                fleet: false,
+            });
+            assert!(bind_grant(&store, unnamed).namespaces.contains_key("team-c"));
+            assert!(store.get("team-c").is_none());
+
+            // `default` is never claimed, and a fleet grant is never narrowed.
+            bind_grant(&store, grant(&[("default", AdminScope::Admin)], false));
+            assert!(store.get("default").is_none());
+            let fleet = grant(&[("team-a", AdminScope::Admin)], true);
+            assert!(Arc::ptr_eq(&bind_grant(&store, fleet.clone()), &fleet));
         }
 
         #[test]

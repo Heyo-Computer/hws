@@ -4184,6 +4184,8 @@ pub enum SpecError {
     ReservedNamespace,
     /// A namespace description long enough to be a document.
     DescriptionTooLong,
+    /// A namespace owner that is not an account id.
+    BadOwnerAccount,
     /// A namespace outside the id alphabet; it appears in URLs and filenames.
     BadNamespace(String),
     /// A `tunnel` deployment that is not one, with why.
@@ -4472,6 +4474,10 @@ impl std::fmt::Display for SpecError {
             Self::DescriptionTooLong => {
                 write!(f, "a namespace description must be 400 characters or fewer")
             }
+            Self::BadOwnerAccount => write!(
+                f,
+                "a namespace's owner_account must be an account id: 1–128 letters, digits, '-', '_' or '.'"
+            ),
             Self::InvalidTunnel(why) => write!(f, "invalid tunnel deployment: {why}"),
             Self::BadHostPattern(p) => write!(
                 f,
@@ -5780,6 +5786,27 @@ pub struct NamespaceSpec {
     /// token claims, falls back to [`default_tunnel_hosts`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
+    /// The Heyo account that owns this namespace, as the auth service named it
+    /// the first time one of that account's users reached it here.
+    ///
+    /// app-lb keys everything in a namespace by its name alone, and a name the
+    /// auth service frees (a namespace or account deleted) can be registered
+    /// again by another account. Recording the owner is what keeps the second
+    /// account out of what the first one left behind: once set, a federated
+    /// grant whose owner for this name differs loses the namespace (see
+    /// `admin::bind_grant`). Set by that first sign-in or by the operator
+    /// (`PUT /namespaces/:name/owner`); a re-declare never changes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_account: Option<String>,
+}
+
+/// Whether `account` can be a namespace's recorded owner: an account id as
+/// the auth service issues them (a UUID today), in an alphabet that is safe in
+/// a log line and a page without escaping.
+pub fn is_valid_owner_account(account: &str) -> bool {
+    !account.is_empty()
+        && account.len() <= 128
+        && account.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// The most host patterns one namespace may declare.
@@ -5846,6 +5873,9 @@ impl NamespaceSpec {
         }
         if self.hosts.len() > MAX_NAMESPACE_HOSTS {
             return Err(SpecError::BadHostPattern(format!("{} patterns", self.hosts.len())));
+        }
+        if self.owner_account.as_deref().is_some_and(|a| !is_valid_owner_account(a)) {
+            return Err(SpecError::BadOwnerAccount);
         }
         if let Some(bad) = self.hosts.iter().find(|p| !valid_host_pattern(p)) {
             return Err(SpecError::BadHostPattern(bad.clone()));
@@ -6146,7 +6176,7 @@ mod tests {
         use super::*;
 
         fn ns(name: &str) -> NamespaceSpec {
-            NamespaceSpec { name: name.into(), description: None, created_at: 0, hosts: vec![] }
+            NamespaceSpec { name: name.into(), description: None, created_at: 0, hosts: vec![], owner_account: None }
         }
 
         #[test]

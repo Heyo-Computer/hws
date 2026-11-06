@@ -2213,6 +2213,10 @@ pub struct NamespaceEntry {
     pub description: Option<String>,
     /// Present only when `declared`.
     pub created_at: Option<u64>,
+    /// The Heyo account recorded as owning it: set by the first sign-in from
+    /// that account, or by an operator with `PUT /namespaces/:name/owner`.
+    /// A federated grant naming a different owner does not reach it.
+    pub owner_account: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }
