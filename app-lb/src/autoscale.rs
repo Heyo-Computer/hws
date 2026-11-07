@@ -216,7 +216,8 @@ impl Autoscaler {
     pub async fn create_candidate(&self, spec: &crate::config::DeploymentSpec, name: &str) -> Result<String, String> {
         let _permit = self.creates.acquire().await;
         let env = self.secret_env(spec.vm_spec()).map_err(|e| e.to_string())?;
-        self.runtime.create(spec.vm_spec(), name.to_string(), None, &vm::VmOwner::of(spec), env).await.map_err(|e| e.to_string())
+        self.runtime.create(spec.vm_spec(), name.to_string(), None, &vm::VmOwner::of(spec), env,
+            spec.scaling.idle_action == IdleAction::Suspend).await.map_err(|e| e.to_string())
     }
 
     fn secret_env(&self, spec: &crate::config::VmSpec) -> Result<HashMap<String, String>, vm::VmError> {
@@ -459,6 +460,7 @@ impl Autoscaler {
                 || self.workspaces.recovery_active(&d.spec.id)
                 || tracked.contains(id.as_str())
                 || state.suspended.contains(id)
+                || state.suspending.contains(id)
                 || vm::is_terminal(&info.status)
             {
                 continue;
@@ -774,6 +776,11 @@ impl Autoscaler {
             self.reprobe_unhealthy_managed(d, fleet).await;
             return;
         }
+
+        for id in d.state().suspending.clone() {
+            self.finish_stateful_suspend(d, &id).await;
+        }
+        if !d.state().suspending.is_empty() { return; }
 
         // Before anything counts capacity: a VM the daemon is running for this
         // deployment but that nothing here tracks is still capacity, and still
@@ -1153,6 +1160,13 @@ impl Autoscaler {
             };
 
             if let Some(addr) = addr {
+                if d.spec.scaling.idle_action == IdleAction::Suspend {
+                    if let Err(error) = self.vms().require_stateful(&p.sandbox_id).await {
+                        tracing::error!(sandbox = %p.sandbox_id, %error, "stateful lifecycle not ready");
+                        still_pending.push(p.clone());
+                        continue;
+                    }
+                }
                 let now_ms = crate::obs::now_millis().max(0) as u64;
                 let created_ms = p.created_at_ms();
                 // When the daemon says the sandbox turned Running, if it says:
@@ -1175,6 +1189,9 @@ impl Autoscaler {
                 self.metrics.record_cold_start(&d.spec.id, age);
                 promoted_ids.push(p.sandbox_id.clone());
                 self.resume_failures.lock().unwrap().remove(&p.sandbox_id);
+                if d.spec.scaling.idle_action == IdleAction::Suspend {
+                    self.forget_suspended(d, &p.sandbox_id);
+                }
                 promoted.push(Arc::new(VmBackend::new(p.sandbox_id.clone(), addr)));
                 continue;
             }
@@ -1400,6 +1417,7 @@ impl Autoscaler {
             }
             if !d.backends().iter().any(|b| b.sandbox_id == id)
                 && !d.pending().iter().any(|p| p.sandbox_id == id)
+                && !d.state().suspending.contains(&id)
                 && !d.state().suspended.contains(&id) {
                 let mut pending = (*d.pending()).clone();
                 pending.push(PendingVm::new(id));
@@ -1412,8 +1430,9 @@ impl Autoscaler {
         seed: Option<&vm::WorkspaceSeed>, seed_digest: Option<String>, owner: &vm::VmOwner,
     ) -> Result<String, vm::VmError> {
         let secret_env = self.secret_env(d.spec.vm_spec())?;
+        let stateful = d.spec.scaling.idle_action == IdleAction::Suspend;
         let prepared = if d.spec.vm_spec().correlated_creates {
-            let request = self.vms().prepare_create(d.spec.vm_spec(), name.clone(), seed, owner, secret_env.clone()).await?;
+            let request = self.vms().prepare_create(d.spec.vm_spec(), name.clone(), seed, owner, secret_env.clone(), stateful).await?;
             Some(self.vms().prepare_allocation(&request, &format!("{}:{}:{}", d.spec.namespace, d.spec.id, d.state().rollout_revision))?)
         } else { None };
         let attempt = d.state().create_attempts.len();
@@ -1429,7 +1448,7 @@ impl Autoscaler {
         let attempt_name = name.clone();
         let result = match prepared {
             Some(prepared) => self.vms().submit_allocation(&prepared).await.map(|r| (r.sandbox_id.clone(), Some(r))),
-            None => self.runtime.create(d.spec.vm_spec(), name, seed, owner, secret_env).await.map(|id| (id,None)),
+            None => self.runtime.create(d.spec.vm_spec(), name, seed, owner, secret_env, stateful).await.map(|id| (id,None)),
         };
         match result {
             Ok((id, receipt)) => {
@@ -1511,7 +1530,7 @@ impl Autoscaler {
             // Each create is a slow await, so re-check between boots: an admin
             // request can have deregistered this deployment since the last one,
             // and every further VM would be born abandoned.
-            if !self.is_live(d) {
+            if !self.is_live(d) || !d.state().suspending.is_empty() {
                 tracing::info!(
                     deployment = %d.spec.id,
                     "deployment is no longer registered; stopping scale-up",
@@ -1536,7 +1555,10 @@ impl Autoscaler {
             // while one sits stopped would strand that VM's `/workspace` disk
             // and hand the caller an empty sandbox in its place.
             if let Some(sandbox_id) = self.take_suspended(d) {
-                match self.vms().resume(&sandbox_id).await {
+                let result = if d.spec.scaling.idle_action == IdleAction::Suspend {
+                    self.vms().resume_stateful(&sandbox_id).await
+                } else { self.vms().resume(&sandbox_id).await };
+                match result {
                     Ok(_) => {
                         tracing::info!(
                             deployment = %d.spec.id,
@@ -1549,6 +1571,7 @@ impl Autoscaler {
                         // deployment's retained state, so if the boot never
                         // finishes the give-up path must not reclaim it.
                         pending.push(PendingVm::resumed(sandbox_id));
+                        if d.spec.scaling.idle_action == IdleAction::Suspend { break; }
                         continue;
                     }
                     Err(e) => {
@@ -1560,7 +1583,10 @@ impl Autoscaler {
                         );
                         // Gone from the daemon: nothing to resume or retry, and
                         // nothing to kill. Forget it and boot a new one now.
-                        if daemon_lost(&e) {
+                        if d.spec.scaling.idle_action == IdleAction::Suspend {
+                            self.park_failed_resume(d, &sandbox_id, false).await;
+                            break;
+                        } else if daemon_lost(&e) {
                             self.resume_failures.lock().unwrap().remove(&sandbox_id);
                             tracing::warn!(
                                 deployment = %d.spec.id,
@@ -1720,6 +1746,13 @@ impl Autoscaler {
             // Normally already withdrawn by `reconcile_ingress` the tick the
             // drain began; this is for a VM drained and reaped in one tick.
             self.unbind(d, &b).await;
+            if d.spec.scaling.idle_action == IdleAction::Suspend {
+                d.mutate_state(|s| {
+                    if !s.suspending.contains(&b.sandbox_id) { s.suspending.push(b.sandbox_id.clone()); }
+                });
+                self.finish_stateful_suspend(d, &b.sandbox_id).await;
+                continue;
+            }
             if Self::has_workspace(d) {
                 // Stopped and queued for capture. What happens afterwards —
                 // kept suspended for `retain`, or destroyed — is the worker's
@@ -1787,6 +1820,30 @@ impl Autoscaler {
         self.remember_suspended(d, suspended);
     }
 
+    async fn finish_stateful_suspend(&self, d: &Arc<Deployment>, id: &str) {
+        let Some(_change) = self.registry.try_change_guard() else { return; };
+        if !self.is_live(d) { return; }
+        // Persist intent before touching the runtime. Replaying capture after
+        // a lost response is idempotent; cold-creating a replacement is not.
+        let result = match self.registry.persist_one(&d.spec.id) {
+            Ok(()) => self.vms().suspend_stateful(id).await,
+            Err(error) => Err(vm::VmError::Runtime(error.to_string())),
+        };
+        if let Err(error) = result {
+            tracing::error!(sandbox = %id, %error, "stateful capture remains pending; no destructive fallback");
+            return;
+        }
+        d.mutate_state(|s| {
+            if !s.suspended.iter().any(|v| v == id) { s.suspended.push(id.into()); }
+            s.suspending.retain(|v| v != id);
+        });
+        if let Err(error) = self.registry.persist_one(&d.spec.id) {
+            // Keep the in-memory fence too, until publication is retried.
+            d.mutate_state(|s| s.suspending.push(id.into()));
+            tracing::error!(sandbox = %id, %error, "could not publish stateful capture");
+        }
+    }
+
     /// Drop the rootfs copy of a replica the autoscaler just suspended.
     ///
     /// Autoscale replicas only: this runs on `applb-*` sandboxes retired by
@@ -1801,6 +1858,7 @@ impl Autoscaler {
     /// what happened before this existed, and the resume path does not care
     /// either way.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
+        if d.spec.scaling.idle_action == IdleAction::Suspend { return; }
         if self.workspaces.source_retained(sandbox_id) { return; }
         let (removed, failed) = crate::disks::discard_rootfs(self.vms(), sandbox_id).await;
         if !removed.is_empty() {
@@ -1896,6 +1954,19 @@ impl Autoscaler {
         sandbox_id: &str,
         running: bool,
     ) -> bool {
+        if d.spec.scaling.idle_action == IdleAction::Suspend {
+            // A bad health check or missing daemon record must never turn into
+            // a fresh guest over the customer's memory state. Retry with the
+            // ordinary boot backoff, and require explicit deletion to give up.
+            if running {
+                if let Err(error) = self.vms().suspend_stateful(sandbox_id).await {
+                    tracing::error!(%sandbox_id, %error, "failed resume remains owned for recovery");
+                }
+            }
+            d.note_boot_failure(now_secs());
+            self.remember_suspended(d, vec![sandbox_id.to_string()]);
+            return true;
+        }
         let attempts = {
             let mut failures = self.resume_failures.lock().unwrap();
             let n = failures.entry(sandbox_id.to_string()).or_insert(0);
@@ -1988,6 +2059,15 @@ impl Autoscaler {
     /// is that a failed resume has already been forgotten, which is why
     /// `scale_up` kills it rather than leaving it stopped and untracked.
     fn take_suspended(&self, d: &Arc<Deployment>) -> Option<String> {
+        if d.spec.scaling.idle_action == IdleAction::Suspend {
+            // Keep the durable identity through resume and readiness. A
+            // controller crash must not forget an in-flight memory restore.
+            return d.state().suspended.iter().find(|id| {
+                !d.pending().iter().any(|p| &p.sandbox_id == *id)
+                    && !d.backends().iter().any(|b| &b.sandbox_id == *id)
+                    && !d.state().suspending.contains(id)
+            }).cloned();
+        }
         let mut taken = None;
         let changed = d.mutate_state(|s| {
             if let Some(index) = s.suspended.iter().position(|id| !self.workspaces.recovery_pinned(id)) {
@@ -2098,7 +2178,7 @@ impl Autoscaler {
             }
             if d.is_some_and(|d| crate::rollout::protected_ids(&d.state()).any(|id| id == &info.id)
                 || d.state().rollouts.iter().any(|o| info.name.starts_with(&o.prefix))) { continue; }
-            if d.is_some_and(|d| d.state().suspended.contains(&info.id)) {
+            if d.is_some_and(|d| d.state().suspended.contains(&info.id) || d.state().suspending.contains(&info.id)) {
                 continue; // claimed: nothing to decide
             }
             // A stopped VM of a workspace deployment is either waiting for its
@@ -2108,7 +2188,7 @@ impl Autoscaler {
             {
                 continue;
             }
-            if d.is_some_and(|d| d.spec.is_managed() && d.spec.scaling.idle_action == IdleAction::Retain)
+            if d.is_some_and(|d| d.spec.is_managed() && d.spec.scaling.idle_action.retains_vm())
             {
                 match reclaimable.iter_mut().find(|(o, _)| o == owner) {
                     Some((_, ids)) => ids.push(info.id.clone()),
@@ -2124,7 +2204,9 @@ impl Autoscaler {
                 continue;
             };
             let budget = reclaim_budget(d);
-            let take = ids.len().min(budget);
+            // Never destroy an unrecorded memory snapshot because the current
+            // ceiling is smaller (including a manually stopped pool).
+            let take = if d.spec.scaling.idle_action == IdleAction::Suspend { ids.len() } else { ids.len().min(budget) };
             let (keep, surplus) = ids.split_at(take);
             if !keep.is_empty() {
                 tracing::info!(
@@ -2171,6 +2253,7 @@ impl Autoscaler {
             .map(|i| i.id.as_str())
             .collect();
         for d in deployments.values() {
+            if d.spec.scaling.idle_action == IdleAction::Suspend { continue; }
             let stale: Vec<String> = d
                 .state()
                 .suspended
@@ -2252,7 +2335,7 @@ impl Autoscaler {
             // sandbox appears in the fleet list at all is backend-dependent:
             // mvm-ctrl re-adds every persisted *KVM* sandbox to `GET /sandboxes`
             // on each call, while a stopped *Firecracker* one is simply missing.
-            if d.state().suspended.contains(&info.id) {
+            if d.state().suspended.contains(&info.id) || d.state().suspending.contains(&info.id) {
                 tracing::info!(
                     deployment = %owner,
                     sandbox = %info.id,
@@ -2261,7 +2344,9 @@ impl Autoscaler {
                 continue;
             }
             match vm::routable_addr(info, d.spec.vm_spec().port) {
-                Ok(addr) if health::probe(addr, &d.spec.health).await => {
+                Ok(addr) if health::probe(addr, &d.spec.health).await
+                    && (d.spec.scaling.idle_action != IdleAction::Suspend
+                        || self.vms().require_stateful(&info.id).await.is_ok()) => {
                     tracing::info!(
                         deployment = %owner,
                         sandbox = %info.id,
@@ -2272,6 +2357,9 @@ impl Autoscaler {
                         .entry(owner.to_string())
                         .or_default()
                         .push(Arc::new(VmBackend::new(info.id.clone(), addr)));
+                }
+                _ if d.spec.scaling.idle_action == IdleAction::Suspend => {
+                    self.remember_suspended(d, vec![info.id.clone()]);
                 }
                 _ if !d.state().rollouts.is_empty() => {}, // uncertain service generation: retain
                 _ => orphans.push(info.id.clone()),
@@ -2342,7 +2430,7 @@ impl Autoscaler {
         // Suspended sandboxes are not in either list and are absent from the
         // daemon's fleet list, so nothing else would ever find them. Teardown is
         // the last moment this deployment's record of them exists.
-        for sandbox_id in &d.state().suspended {
+        for sandbox_id in d.state().suspended.iter().chain(d.state().suspending.iter()) {
             tracing::info!(
                 deployment = %d.spec.id,
                 sandbox = %sandbox_id,
@@ -2362,7 +2450,7 @@ impl Autoscaler {
         }
         d.set_backends(Vec::new());
         d.set_pending(Vec::new());
-        d.mutate_state(|s| s.suspended.clear());
+        d.mutate_state(|s| { s.suspended.clear(); s.suspending.clear(); });
     }
 
     /// Evict a single VM from a deployment's pool.
@@ -2653,6 +2741,7 @@ fn at_rest(
     owned_running: &HashMap<&str, usize>,
 ) -> bool {
     let backends = d.backends();
+    if !d.state().suspending.is_empty() { return false; }
     if !d.pending().is_empty() || backends.iter().any(|b| b.is_draining() || !b.is_healthy()) {
         return false;
     }
@@ -4230,6 +4319,111 @@ mod tests {
                 "a running VM must not be recorded as suspended"
             );
             server.abort();
+        }
+    }
+
+    mod stateful_lifecycle {
+        use super::*;
+        use axum::{Json, Router, extract::State, routing::{get, post}};
+        use std::sync::{Mutex, atomic::AtomicBool};
+
+        #[derive(Default)]
+        struct Guest {
+            suspended: AtomicBool,
+            fail_capture: AtomicBool,
+            healthy: AtomicBool,
+            destructive: Mutex<Vec<String>>,
+        }
+
+        fn info(g: &Guest) -> serde_json::Value {
+            serde_json::json!({"id":"sb-1", "name":"applb-demo-01", "image":"fastcar",
+                "status": if g.suspended.load(Ordering::SeqCst) {"stopped"} else {"running"},
+                "uptime_secs":0, "guest_ip":"127.0.0.1", "is_deployed":true, "urls":[], "status_changed_at":""})
+        }
+
+        #[tokio::test]
+        async fn capture_failure_recovery_and_resume_keep_the_same_guest_until_healthy() {
+            let guest = Arc::new(Guest::default());
+            guest.fail_capture.store(true, Ordering::SeqCst);
+            let app = Router::new()
+                .route("/sandboxes/sb-1/lifecycle", get(|State(g): State<Arc<Guest>>| async move {
+                    Json(serde_json::json!({"policy":{"enabled":true,"auto_resume":false,
+                        "idle_timeout_seconds":null,"keep_running":false},"suspended":g.suspended.load(Ordering::SeqCst)}))
+                }))
+                .route("/sandboxes/sb-1/suspend", post(|State(g): State<Arc<Guest>>| async move {
+                    if g.fail_capture.load(Ordering::SeqCst) { return axum::http::StatusCode::CONFLICT; }
+                    g.suspended.store(true, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }))
+                .route("/sandbox/sb-1/start", post(|State(g): State<Arc<Guest>>| async move {
+                    g.suspended.store(false, Ordering::SeqCst);
+                    Json(info(&g))
+                }))
+                .route("/deployed-sandboxes/sb-1", get(|State(g): State<Arc<Guest>>| async move { Json(info(&g)) }))
+                .route("/health", get(|State(g): State<Arc<Guest>>| async move {
+                    if g.healthy.load(Ordering::SeqCst) { axum::http::StatusCode::OK } else { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+                }))
+                .fallback(|State(g): State<Arc<Guest>>, request: axum::http::Request<axum::body::Body>| async move {
+                    g.destructive.lock().unwrap().push(format!("{} {}", request.method(), request.uri()));
+                    axum::http::StatusCode::NOT_FOUND
+                }).with_state(guest.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut s = spec();
+            s.scaling.idle_action = IdleAction::Suspend;
+            s.vm.as_mut().unwrap().port = addr.port();
+            s.health.path = Some("/health".into());
+            let (mut scaler, registry) = autoscaler_against(&format!("http://{addr}"), s);
+            let d = registry.get("demo").unwrap();
+            let request = scaler.vms().prepare_create(d.spec.vm_spec(), "new".into(), None,
+                &vm::VmOwner::default(), HashMap::new(), true).await.unwrap();
+            assert_eq!(request.extra["lifecycle"]["enabled"], true);
+            assert_eq!(request.extra["lifecycle"]["auto_resume"], false);
+            let b = Arc::new(VmBackend::new("sb-1".into(), addr));
+            b.set_draining(true);
+            d.set_backends(vec![b]);
+            scaler.reap_drained(&d).await;
+            assert_eq!(d.state().suspending, ["sb-1"]);
+            assert!(d.state().suspended.is_empty());
+            scaler.scale_up(&d, 1).await;
+            assert!(d.pending().is_empty(), "uncertain capture must not create a replacement");
+            assert!(!at_rest(&d, &HashMap::new(), &HashMap::new()));
+
+            // Load a fresh registry from disk, as after controller restart.
+            let reloaded = Arc::new(Registry::new(registry.state_dir().parent().unwrap().join("state.json")));
+            assert_eq!(reloaded.load().unwrap(), 1);
+            scaler.registry = reloaded.clone();
+            let d = reloaded.get("demo").unwrap();
+            assert_eq!(d.state().suspending, ["sb-1"]);
+            guest.fail_capture.store(false, Ordering::SeqCst);
+            scaler.finish_stateful_suspend(&d, "sb-1").await;
+            assert!(d.state().suspending.is_empty());
+            assert_eq!(d.state().suspended, ["sb-1"]);
+            scaler.scale_up(&d, 1).await;
+            assert_eq!(d.pending()[0].sandbox_id, "sb-1");
+            assert!(d.backends().is_empty(), "Running alone is not ready");
+            let fleet = vm::index_by_id(vec![serde_json::from_value(info(&guest)).unwrap()]);
+            scaler.promote_pending(&d, &fleet).await;
+            assert!(d.backends().is_empty(), "failed guest health must not route");
+            guest.healthy.store(true, Ordering::SeqCst);
+            scaler.promote_pending(&d, &fleet).await;
+            assert_eq!(d.backends()[0].sandbox_id, "sb-1");
+            assert!(d.state().suspended.is_empty());
+            assert!(guest.destructive.lock().unwrap().is_empty(), "no stop, delete, rootfs discard or cold create");
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn unavailable_stateful_runtime_never_exhausts_into_deletion() {
+            let mut s = spec();
+            s.scaling.idle_action = IdleAction::Suspend;
+            let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", s);
+            let d = registry.get("demo").unwrap();
+            for _ in 0..=MAX_RESUME_ATTEMPTS {
+                assert!(scaler.park_failed_resume(&d, "sb-1", false).await);
+            }
+            assert_eq!(d.state().suspended, ["sb-1"]);
         }
     }
 

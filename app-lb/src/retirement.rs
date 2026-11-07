@@ -102,6 +102,7 @@ pub fn freeze(registry:&Registry,d:&Arc<Deployment>,request:Request)->Result<Ope
     let inventory:BTreeSet<String>=d.backends().iter().map(|b|b.sandbox_id.clone())
         .chain(d.pending().iter().map(|p|p.sandbox_id.clone()))
         .chain(d.state().suspended.iter().cloned())
+        .chain(d.state().suspending.iter().cloned())
         .chain(d.state().create_attempts.iter().filter_map(|a|a.sandbox_id.clone())).collect();
     let unresolved=if inventory!=approved {Some("approved targets differ from exact controller inventory".into())} else {None};
     let op=Operation {request,spec:d.spec.clone(),inventory:inventory.into_iter().collect(),

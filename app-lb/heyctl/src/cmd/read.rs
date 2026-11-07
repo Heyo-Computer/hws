@@ -1457,6 +1457,7 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
             "When idle",
             match s.idle_action.as_str() {
                 "retain" => "retain — stop the VM, keeping its /workspace disk".to_string(),
+                "suspend" => "suspend — preserve RAM and disks on this host".to_string(),
                 // Empty when talking to an app-lb that predates the field.
                 "destroy" | "" => "destroy — kill the VM and its disks".to_string(),
                 other => other.to_string(),

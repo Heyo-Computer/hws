@@ -150,6 +150,13 @@ enum Command {
     #[command(visible_alias = "autoscale")]
     Scale(cmd::write::ScaleArgs),
 
+    /// Drain and hold a VM pool at zero, using its configured idle action.
+    /// Use --idle-action suspend at creation to preserve RAM and disks.
+    Stop(cmd::write::LifecycleArgs),
+
+    /// Wake a stopped pool; retained guests resume before new VMs are created.
+    Start(cmd::write::LifecycleArgs),
+
     /// Recycle a deployment's VMs, one eviction at a time.
     Restart(cmd::write::RestartArgs),
 
@@ -377,6 +384,8 @@ fn run(cli: &Cli) -> Result<()> {
             }
         }
         Command::Scale(args) => cmd::write::scale(&Ctx::new(g)?, args),
+        Command::Stop(args) => cmd::write::lifecycle(&Ctx::new(g)?, args, false),
+        Command::Start(args) => cmd::write::lifecycle(&Ctx::new(g)?, args, true),
         Command::Restart(args) => cmd::write::restart(&Ctx::new(g)?, args),
         Command::Cordon(args) => cmd::write::cordon(&Ctx::new(g)?, args),
         Command::Drain(args) => cmd::write::drain(&Ctx::new(g)?, args),
@@ -407,6 +416,11 @@ mod tests {
         // Catches duplicated flags, bad aliases and broken `requires`/
         // `conflicts_with` references, which clap only validates at runtime.
         Cli::command().debug_assert();
+        for verb in ["stop", "start"] {
+            Cli::try_parse_from(["heyctl", verb, "agent", "--wait-secs", "0"]).unwrap();
+            assert!(Cli::try_parse_from(["heyctl", verb, "agent", "--wait-secs", "301"]).is_err());
+        }
+        Cli::try_parse_from(["heyctl", "scale", "agent", "--idle-action", "suspend"]).unwrap();
     }
 
     #[test]

@@ -92,7 +92,7 @@ const KNOWN = {
     OutputPage: ["offset", "bytes", "next_offset", "total_bytes", "encoding", "data"],
     FileRead: ["sandbox_id", "path", "size", "offset", "bytes", "next_offset", "encoding", "content"],
     FileWritten: ["sandbox_id", "path", "wrote", "size"],
-    LifecycleOutcome: ["state", "retained", "sandbox_id", "warning"],
+    LifecycleOutcome: ["state", "retained", "idle_action", "sandbox_id", "warning"],
     Capacity: ["host", "disk_free_bytes", "disk_total_bytes", "deployments", "running_vms", "booting_vms", "stopped_vms"],
     Transfer: ["id", "deployment", "direction", "path", "extract", "strip_components", "state", "created_at", "expires_at", "max_bytes", "size", "sha256", "sandbox_id", "error", "upload_url", "download_url"],
     EvictOutcome: ["sandbox_id", "outcome"],

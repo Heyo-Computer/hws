@@ -1117,7 +1117,7 @@ pub struct ScalingPolicy {
     pub cold_start_timeout_secs: u64,
     pub drain_timeout_secs: u64,
     pub boot_timeout_secs: u64,
-    /// `destroy` or `retain` — what becomes of a VM the autoscaler retires.
+    /// `destroy`, `retain` (disk only), or `suspend` (RAM and disks).
     /// A `String` rather than an enum so a value this build has not heard of
     /// displays as-is instead of failing the whole read.
     pub idle_action: String,
@@ -1976,7 +1976,7 @@ pub struct Operation {
 }
 
 /// What `POST /deployments/:id/{stop,start,restart}` answered.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct LifecycleOutcome {
     /// `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came
@@ -1984,6 +1984,8 @@ pub struct LifecycleOutcome {
     pub state: String,
     /// Whether a stopped VM keeps its data disk (`idle_action: retain`).
     pub retained: bool,
+    /// Empty on older servers; `suspend` preserves RAM as well as disks.
+    pub idle_action: String,
     /// The VM now serving, once one is.
     pub sandbox_id: Option<String>,
     pub warning: Option<String>,

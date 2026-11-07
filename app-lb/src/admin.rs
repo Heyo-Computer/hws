@@ -5078,6 +5078,9 @@ async fn update(
 
     // The owner is not part of the template, so a stamp never recycles a pool.
     let rebuild = old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams;
+    if !rebuild && stateful_policy_change_holds(&old, spec.scaling.idle_action) {
+        return err(StatusCode::CONFLICT, "stateful lifecycle is a boot-time contract; create a new deployment instead of changing it on an existing VM pool").into_response();
+    }
     let workspace_replacement = if rebuild {
         match state.autoscaler.fence_workspace_replacement(&old).await {
             Ok(fence) => fence,
@@ -5230,6 +5233,9 @@ fn patch_scaling(
 
     let mut spec = old.spec.clone();
     spec.scaling = f(&old.spec.scaling)?;
+    if stateful_policy_change_holds(&old, spec.scaling.idle_action) {
+        return Err(err(StatusCode::CONFLICT, "stateful lifecycle is a boot-time contract; create a new deployment instead of changing it on an existing VM pool").into_response());
+    }
     // Catches min > max, zero target_concurrency, etc.
     if let Err(e) = spec.validate() {
         return Err(err(StatusCode::BAD_REQUEST, e.to_string()).into_response());
@@ -5243,6 +5249,15 @@ fn patch_scaling(
     }
     deployment.scale_signal.notify_one();
     Ok(deployment)
+}
+
+fn stateful_policy_change_holds(d: &crate::deployment::Deployment, next: crate::config::IdleAction) -> bool {
+    use crate::config::IdleAction;
+    let previous = d.spec.scaling.idle_action;
+    previous != next && (previous == IdleAction::Suspend || next == IdleAction::Suspend)
+        && (!d.backends().is_empty() || !d.pending().is_empty()
+            || !d.state().suspended.is_empty() || !d.state().suspending.is_empty()
+            || !d.state().create_attempts.is_empty())
 }
 
 // --- stop, start, restart -------------------------------------------------
@@ -5305,6 +5320,8 @@ struct LifecycleResponse {
     state: &'static str,
     /// Whether the stopped VM keeps its data disk (`idle_action: retain`).
     retained: bool,
+    /// Distinguish disk-only retention from memory-preserving suspension.
+    idle_action: crate::config::IdleAction,
     /// The VM now serving, once one is.
     #[serde(skip_serializing_if = "Option::is_none")]
     sandbox_id: Option<String>,
@@ -5377,12 +5394,13 @@ async fn stop_pool(
         }
     }
     drop(change);
-    let retained = deployment.spec.scaling.idle_action == crate::config::IdleAction::Retain;
+    let retained = deployment.spec.scaling.idle_action.retains_vm();
     let settled = wait_until(wait, || {
         state.registry.get(id).is_none_or(|d| {
             let state = d.state();
             d.backends().is_empty()
                 && d.pending().is_empty()
+                && state.suspending.is_empty()
                 && (!retained || serving.iter().all(|s| state.suspended.contains(s)))
         })
     })
@@ -5390,6 +5408,7 @@ async fn stop_pool(
     let body = LifecycleResponse {
         state: if settled { "stopped" } else { "stopping" },
         retained,
+        idle_action: deployment.spec.scaling.idle_action,
         sandbox_id: None,
         warning: (!retained).then(|| {
             "idle_action is destroy: the stopped VM and its /workspace disk are gone; set \
@@ -5448,7 +5467,7 @@ async fn start_pool(
     }
     drop(change);
 
-    let retained = deployment.spec.scaling.idle_action == crate::config::IdleAction::Retain;
+    let retained = deployment.spec.scaling.idle_action.retains_vm();
     // The waiter is the demand that wakes a scale-to-zero pool, so it must
     // outlive this response: dropped when `wait` ran out, it took the demand
     // with it and nothing booted. Detached, it holds on until a VM is ready
@@ -5472,6 +5491,7 @@ async fn start_pool(
             "starting"
         },
         retained,
+        idle_action: deployment.spec.scaling.idle_action,
         sandbox_id: ready.map(|b| b.sandbox_id.clone()),
         warning: None,
     };
@@ -10012,6 +10032,12 @@ mod tests {
                             let command = body["command"].as_str().unwrap().replace(
                                 "/var/tmp/heyo-ops",
                                 &root.join("ops").display().to_string(),
+                            ).replace(
+                                // A checkout mounted at /workspace selects
+                                // the guest's persistent directory and cwd.
+                                // Neither should refer to the real checkout.
+                                "/workspace",
+                                &root.display().to_string(),
                             );
                             let mut cmd = std::process::Command::new("sh");
                             cmd.arg("-c").arg(&command);
@@ -10426,6 +10452,30 @@ mod tests {
                     }))
                     .unwrap(),
                 );
+            }
+
+            #[tokio::test]
+            async fn stateful_stop_reports_pending_capture_and_refuses_a_lossy_policy_edit() {
+                let f = fixture(true).await;
+                sandbox(&f);
+                let mut spec = f.registry.get("sb").unwrap().spec.clone();
+                spec.scaling.idle_action = crate::config::IdleAction::Suspend;
+                let d = f.registry.update(spec).unwrap();
+                d.mutate_state(|s| s.suspending.push("sb-1".into()));
+                let (status, body) = call(&f, "POST", "/deployments/sb/stop", json!({"wait_secs":0})).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+                assert_eq!(body["state"], "stopping");
+                assert_eq!(body["idle_action"], "suspend");
+                let (status, _) = call(&f, "PATCH", "/deployments/sb/scaling", json!({"idle_action":"retain"})).await;
+                assert_eq!(status, StatusCode::CONFLICT);
+                f.registry.get("sb").unwrap().mutate_state(|s| {
+                    s.suspending.clear();
+                    s.suspended.push("sb-1".into());
+                });
+                let (status, body) = call(&f, "POST", "/deployments/sb/stop", json!({"wait_secs":0})).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["state"], "stopped");
+                assert_eq!(body["retained"], true);
             }
 
             #[tokio::test]

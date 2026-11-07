@@ -1151,6 +1151,7 @@ fn the_small_responses_are_stable() {
         &LifecycleResponse {
             state: "stopped",
             retained: true,
+            idle_action: crate::config::IdleAction::Retain,
             sandbox_id: None,
             warning: None,
         },
@@ -1161,6 +1162,7 @@ fn the_small_responses_are_stable() {
         &LifecycleResponse {
             state: "running",
             retained: true,
+            idle_action: crate::config::IdleAction::Suspend,
             sandbox_id: Some("applb-sandbox-a1b2c3".into()),
             warning: None,
         },

@@ -933,6 +933,7 @@ fn lifecycle_and_capacity_parse_with_nothing_left_over() {
         let o: LifecycleOutcome = serde_json::from_str(&fixture(name)).unwrap();
         assert!(o.extra.is_empty(), "{name}: unread fields {:?}", o.extra);
         assert!(o.retained);
+        assert_eq!(o.idle_action, if name == "lifecycle-stopped" { "retain" } else { "suspend" });
     }
     let c: Capacity = serde_json::from_str(&fixture("capacity")).unwrap();
     assert!(c.extra.is_empty(), "unread fields {:?}", c.extra);

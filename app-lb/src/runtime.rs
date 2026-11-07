@@ -130,6 +130,7 @@ impl Runtime {
         workspace: Option<&WorkspaceSeed>,
         owner: &VmOwner,
         secret_env: HashMap<String, String>,
+        stateful: bool,
     ) -> Result<String, VmError> {
         match spec.driver {
             Driver::Lxc => self
@@ -139,7 +140,7 @@ impl Runtime {
                 .map_err(|e| VmError::Runtime(e.to_string())),
             _ => self
                 .heyvm
-                .create(spec, name, workspace, owner, secret_env)
+                .create(spec, name, workspace, owner, secret_env, stateful)
                 .await
                 .map(|sandbox| sandbox.sandbox_id().to_string()),
         }
@@ -313,6 +314,7 @@ mod tests {
                 None,
                 &VmOwner::default(),
                 HashMap::new(),
+                false,
             )
             .await
             .unwrap_err();

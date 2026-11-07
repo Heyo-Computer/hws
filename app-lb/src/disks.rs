@@ -731,6 +731,7 @@ impl DiskStore {
         let mut claimed: HashSet<String> = HashSet::new();
         for d in deployments.values() {
             claimed.extend(d.state().suspended.iter().cloned());
+            claimed.extend(d.state().suspending.iter().cloned());
             claimed.extend(crate::rollout::protected_ids(&d.state()).cloned());
             claimed.extend(known.values().filter(|info| d.state().rollouts.iter().any(|o| info.name.starts_with(&o.prefix))).map(|info| info.id.clone()));
         }
