@@ -443,7 +443,7 @@ Reads over app-lb's topology, plus the operations that move VMs and disks.
 | `applb_metrics` | read-only | app-lb's live metrics: per-deployment pool counters, request stats, and create/boot outcomes. |
 | `applb_disks` | read-only | Disk inventory and usage. |
 | `applb_certs` | read-only | TLS certificates app-lb holds, with their hostname, issuer and expiry. |
-| `applb_security_events` | read-only | app-lb's SIEM findings: authentication abuse, attack signatures and traffic anomalies, newest first, plus any block rules in force and the guard's counters. |
+| `applb_security_events` | read-only | app-lb's SIEM findings: authentication abuse, attack signatures, traffic anomalies and automated clients, newest first, plus any block rules in force and the guard's counters. |
 | `applb_drain_upstream` | **destructive** | Take one upstream of a STATIC (`upstreams`) deployment out of rotation. |
 | `applb_uncordon_upstream` |  | Put a drained upstream back into rotation. |
 | `applb_evict_vm` | **destructive** | Removes one VM from a deployment's pool and destroys it. |

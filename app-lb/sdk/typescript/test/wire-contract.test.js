@@ -69,10 +69,14 @@ const KNOWN = {
     ArchiveRecord: ["uri", "at", "bytes"],
     ArchiveView: ["id", "sandbox_id", "uri", "started_at", "finished_at", "status", "bytes", "expected_bytes", "error", "purged"],
     SecuritySummary: ["open", "urgent", "dropped", "clients_at_capacity", "rules", "blocked"],
-    SecurityResponse: ["generated_at", "enabled", "window_secs", "alerts", "totals", "rules", "guard", "stats"],
+    SecurityResponse: ["generated_at", "enabled", "window_secs", "alerts", "totals", "rules", "guard", "stats", "bots"],
     // `ecs` is a free-form ECS map by design, so it has no declaration to check
     // against — app-lb may add fields there without this being a contract change.
-    SecurityAlert: ["id", "ts", "last_ts", "rule", "severity", "title", "client", "deployment", "path", "technique", "count", "ecs", "response"],
+    SecurityAlert: ["id", "ts", "last_ts", "rule", "severity", "title", "client", "deployment", "path", "technique", "count", "ecs", "bot", "response"],
+    BotTag: ["agent", "operator", "class", "verification"],
+    BotTrafficView: ["window_secs", "rows", "ranges", "verifying", "at_capacity"],
+    BotTrafficRow: ["agent", "operator", "class", "verification", "deployment", "requests", "total", "sources", "first_ts", "last_ts", "action"],
+    RangeStatus: ["url", "operator", "agents", "loaded", "prefixes", "fetched_at", "error"],
     AlertResponse: ["investigate", "actions", "caveat"],
     SuggestedAction: ["kind", "label", "effect", "rule"],
     RuleSpec: ["action", "match", "expires_in_secs", "note"],
@@ -195,6 +199,7 @@ const NESTED = {
   security: "SecuritySummary", totals: "SeverityTotals", stats: "SiemStats",
   archived: "ArchiveRecord",
   response: "AlertResponse", guard: "GuardStats",
+  bots: "BotTrafficView", bot: "BotTag", action: "SuggestedAction",
   // `rule` is a bare string on an alert and a whole RuleSpec on a suggested
   // action; `check` only recurses into objects, so one entry serves both.
   rule: "RuleSpec", match: "RuleMatch",
@@ -208,6 +213,7 @@ const ELEMENTS = {
   pending_vms: "PendingVmView", host_sandboxes: "HostSandboxView", buckets: "Bucket", env_from: "SecretEnv",
   disks: "DiskInfo", archives: "ArchiveView", parts: "DiskPart",
   actions: "SuggestedAction", rules: "RuleView",
+  rows: "BotTrafficRow", ranges: "RangeStatus",
   workflows: "WorkflowSpec",
   databases: "PostgresDatabase",
   // `mounts` is a MountSpec on a VmSpec and a MountOutcome on a JobRecord — the

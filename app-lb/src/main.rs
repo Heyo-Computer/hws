@@ -18,6 +18,7 @@ mod artifact;
 mod auth;
 mod auth_providers;
 mod autoscale;
+mod bots;
 mod cli;
 mod config;
 mod deployment;

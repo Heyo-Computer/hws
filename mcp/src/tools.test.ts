@@ -456,7 +456,7 @@ test("fleet_overview turns a confined caller away before app-obs is asked", asyn
 });
 
 test("applb_security_events passes the /security query filters through unchanged", async () => {
-  // The five filters `/security` accepts are the tool's whole input, and the
+  // The six filters `/security` accepts are the tool's whole input, and the
   // tool's job is to forward them verbatim — it must not invent a default for
   // `namespace` (managed mode narrows server-side) nor drop an omitted one
   // into the query string. What the caller sends is what app-lb gets.
@@ -471,6 +471,7 @@ test("applb_security_events passes the /security query filters through unchanged
       rule: "auth.brute-force",
       deployment: "web",
       namespace: "team-a",
+      class: "ai-crawler",
       limit: 20,
     });
     assert.match(out, /"enabled": true/);
@@ -482,6 +483,7 @@ test("applb_security_events passes the /security query filters through unchanged
     // 'auth.brute-force' has a '+', not a literal '-' in URLSearchParams.
     assert.ok(security.includes("deployment=web"));
     assert.ok(security.includes("namespace=team-a"));
+    assert.ok(security.includes("class=ai-crawler"));
     assert.ok(security.includes("limit=20"));
   } finally {
     stub.restore();

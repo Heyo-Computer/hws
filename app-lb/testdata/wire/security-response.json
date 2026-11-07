@@ -67,6 +67,65 @@
       }
     },
     {
+      "id": 43,
+      "ts": 1722399700000,
+      "last_ts": 1722399990000,
+      "rule": "bot.ai-crawler",
+      "severity": "info",
+      "title": "GPTBot (OpenAI) is crawling demo",
+      "deployment": "demo",
+      "count": 312,
+      "ecs": {
+        "event.action": "http-request",
+        "event.category": "web",
+        "event.outcome": "success",
+        "heyo.bot.class": "ai-crawler",
+        "heyo.bot.operator": "OpenAI",
+        "heyo.bot.verification": "verified",
+        "http.request.method": "GET",
+        "http.response.status_code": 200,
+        "observer.name": "app-lb",
+        "source.ip": "20.171.207.5",
+        "tags": [
+          "access",
+          "bot",
+          "external"
+        ],
+        "url.domain": "demo.example.com",
+        "url.path": "/docs",
+        "user_agent.name": "GPTBot"
+      },
+      "bot": {
+        "agent": "GPTBot",
+        "operator": "OpenAI",
+        "class": "ai-crawler",
+        "verification": "verified"
+      },
+      "response": {
+        "investigate": [
+          "An AI lab's crawler is collecting this deployment's pages, for training or for an AI search index.",
+          "Well-behaved crawlers honour robots.txt — a Disallow for the agent's token is the polite opt-out and keeps working wherever it is served.",
+          "Blocking here is the enforced one: it refuses the request whatever robots.txt says."
+        ],
+        "actions": [
+          {
+            "kind": "block-agent",
+            "label": "Block GPTBot on demo",
+            "effect": "Refuses every request to demo whose User-Agent contains \"GPTBot\" with a 403 for 30 days. Other deployments, and clients that do not send the token, are unaffected.",
+            "rule": {
+              "action": "block",
+              "match": {
+                "deployment": "demo",
+                "user_agent_contains": "GPTBot"
+              },
+              "expires_in_secs": 2592000,
+              "note": "bot.ai-crawler alert #43"
+            }
+          }
+        ]
+      }
+    },
+    {
       "id": 42,
       "ts": 1722399980000,
       "last_ts": 1722399999000,
@@ -206,5 +265,62 @@
     "suppressed": 4118,
     "tracked_clients": 118,
     "clients_at_capacity": false
+  },
+  "bots": {
+    "window_secs": 3600,
+    "rows": [
+      {
+        "deployment": "demo",
+        "agent": "GPTBot",
+        "operator": "OpenAI",
+        "class": "ai-crawler",
+        "verification": "verified",
+        "requests": 312,
+        "total": 4120,
+        "sources": 7,
+        "first_ts": 1722300000000,
+        "last_ts": 1722399990000,
+        "action": {
+          "kind": "block-agent",
+          "label": "Block GPTBot on demo",
+          "effect": "Refuses every request to demo whose User-Agent contains \"GPTBot\" with a 403 for 30 days.",
+          "rule": {
+            "action": "block",
+            "match": {
+              "deployment": "demo",
+              "user_agent_contains": "GPTBot"
+            },
+            "expires_in_secs": 2592000,
+            "note": "bot traffic, GPTBot"
+          }
+        }
+      },
+      {
+        "deployment": "demo",
+        "agent": "GPTBot",
+        "operator": "OpenAI",
+        "class": "ai-crawler",
+        "verification": "spoofed",
+        "requests": 9,
+        "total": 9,
+        "sources": 1,
+        "first_ts": 1722399900000,
+        "last_ts": 1722399960000
+      }
+    ],
+    "ranges": [
+      {
+        "url": "https://openai.com/gptbot.json",
+        "operator": "OpenAI",
+        "agents": [
+          "GPTBot"
+        ],
+        "loaded": true,
+        "prefixes": 21,
+        "fetched_at": 1722390000000
+      }
+    ],
+    "verifying": true,
+    "at_capacity": false
   }
 }

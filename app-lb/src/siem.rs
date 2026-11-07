@@ -89,6 +89,7 @@ use usiem::events::ip::SiemIp;
 use usiem::events::schema::{FieldSchema, FieldType};
 use usiem::events::SiemLog;
 
+use crate::bots::{AGENTS, Agent, BotClass, Classifier, RangeBook, Verification};
 use crate::obs::{self, Access, LogSink, Record};
 
 /// The `source` every alert record carries into app-obs, beside the existing
@@ -108,6 +109,10 @@ const MAX_ALERT_PATH: usize = 512;
 /// Ceiling on a query-parameter *name* recorded in an alert. Names are short;
 /// anything longer is someone probing the alert store itself.
 const MAX_PARAM_NAME: usize = 64;
+
+/// Ceiling on the `User-Agent` handed to the bot classifier — the same 512
+/// bytes the guard scans.
+const MAX_USER_AGENT: usize = 512;
 
 /// Buckets per detection window. Twelve is a five-second resolution on the
 /// default sixty-second window — fine enough that a burst is not smeared across
@@ -143,6 +148,17 @@ pub struct SiemConfig {
     pub scan_query: bool,
     /// Ship alerts to app-obs as `source="security"` records.
     pub ship: bool,
+    /// Classify automated clients by `User-Agent` (`APP_LB_BOTS`).
+    pub bots: bool,
+    /// Fetch operators' published crawler ranges to verify claims
+    /// (`APP_LB_BOTS_RANGES`). Off means no outbound requests, and every claim
+    /// stays `claimed` or `unverifiable`.
+    pub bot_ranges: bool,
+    /// Seconds between range refreshes.
+    pub bot_refresh: u64,
+    /// Seconds the bot-traffic table counts over. Longer than the detection
+    /// window on purpose: "who crawled this in the last hour" is the question.
+    pub bot_window: i64,
 }
 
 impl SiemConfig {
@@ -159,6 +175,10 @@ impl SiemConfig {
             max_alerts_per_min: obs::env_usize("APP_LB_SIEM_MAX_ALERTS_PER_MIN", 60) as u32,
             scan_query: obs::env_flag("APP_LB_SIEM_SCAN_QUERY", true),
             ship: obs::env_flag("APP_LB_SIEM_SHIP", true),
+            bots: obs::env_flag("APP_LB_BOTS", true),
+            bot_ranges: obs::env_flag("APP_LB_BOTS_RANGES", true),
+            bot_refresh: obs::env_usize("APP_LB_BOTS_REFRESH_SECS", 86_400).max(60) as u64,
+            bot_window: obs::env_usize("APP_LB_BOTS_WINDOW_SECS", 3_600).max(60) as i64,
         }
     }
 }
@@ -202,6 +222,9 @@ pub struct AccessObs {
     /// path-only detector is blind to them, and this is the narrowest way to see
     /// them that keeps the credential in an OAuth callback out of the log store.
     pub scan_query: Option<Box<str>>,
+    /// Clipped to [`MAX_USER_AGENT`]. Read by the bot classifier and **never
+    /// stored**: an alert carries the catalog name it matched, not this text.
+    pub user_agent: Option<Box<str>>,
     pub status: Option<u16>,
     pub duration_nanos: u64,
     pub bytes: u64,
@@ -316,7 +339,12 @@ impl SecuritySink {
     /// still needs to move the same [`Access`] afterwards. `Access` is not
     /// `Clone`, so if anyone ever reorders those two calls it stops compiling —
     /// which is the good outcome.
-    pub fn observe_access(&self, access: &Access<'_>, query: Option<&str>) {
+    pub fn observe_access(
+        &self,
+        access: &Access<'_>,
+        query: Option<&str>,
+        user_agent: Option<&str>,
+    ) {
         let obs = AccessObs {
             ts: obs::now_millis(),
             client: access.client.as_deref().and_then(|c| c.parse().ok()),
@@ -328,6 +356,9 @@ impl SecuritySink {
                 (true, Some(q)) if !q.is_empty() => Some(Box::from(clip(q, MAX_SCAN_PATH))),
                 _ => None,
             },
+            user_agent: user_agent
+                .filter(|ua| !ua.is_empty())
+                .map(|ua| Box::from(clip(ua, MAX_USER_AGENT))),
             status: access.status,
             duration_nanos: access.duration.as_nanos().min(u64::MAX as u128) as u64,
             bytes: access.bytes as u64,
@@ -553,6 +584,180 @@ impl Windows {
     }
 }
 
+// -- automated traffic -----------------------------------------------------
+
+/// Cap on rows in the bot-traffic table. The key space is already bounded —
+/// catalog entries × deployments × four verification states, none of it an
+/// attacker-chosen string — but a table without a cap is a promise, not a
+/// bound.
+const MAX_BOT_ROWS: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BotKey {
+    deployment: Option<Box<str>>,
+    agent: usize,
+    verification: Verification,
+}
+
+#[derive(Debug, Default, Clone)]
+struct BotRow {
+    recent: RingCounter,
+    total: u64,
+    /// Distinct sources, as a sketch over [`ClientKey`]s: a rough "how many
+    /// addresses", not a list of them.
+    sources: u64,
+    first_ts: i64,
+    last_ts: i64,
+}
+
+/// Who is crawling what: requests per (deployment, agent, verification).
+pub struct BotBoard {
+    rows: Mutex<(HashMap<BotKey, BotRow>, bool)>,
+    window: i64,
+}
+
+impl BotBoard {
+    fn new(window: i64) -> Self {
+        Self {
+            rows: Mutex::new((HashMap::new(), false)),
+            window,
+        }
+    }
+
+    /// Count one request. Returns whether this is the first sighting of the
+    /// key — the moment a `bot.*` sighting alert is worth raising.
+    fn record(&self, key: BotKey, client: Option<IpAddr>, now: i64) -> bool {
+        let mut guard = self.rows.lock().expect("bot board lock");
+        let (rows, at_capacity) = &mut *guard;
+        if !rows.contains_key(&key) && rows.len() >= MAX_BOT_ROWS {
+            let horizon = self.window * 1000;
+            rows.retain(|_, r| now - r.last_ts < horizon);
+            if rows.len() >= MAX_BOT_ROWS {
+                *at_capacity = true;
+                return false;
+            }
+        }
+        let new = !rows.contains_key(&key);
+        let row = rows.entry(key).or_default();
+        row.recent.record(now, self.window);
+        row.total += 1;
+        if let Some(ip) = client {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ClientKey::of(ip).hash(&mut h);
+            row.sources |= 1u64 << (h.finish() % 64);
+        }
+        if row.first_ts == 0 {
+            row.first_ts = now;
+        }
+        row.last_ts = now;
+        new
+    }
+
+    fn prune(&self, now: i64) {
+        let horizon = self.window * 1000;
+        let mut guard = self.rows.lock().expect("bot board lock");
+        guard.0.retain(|_, r| now - r.last_ts < horizon);
+        if guard.0.len() < MAX_BOT_ROWS {
+            guard.1 = false;
+        }
+    }
+
+    fn rows(&self, now: i64) -> (Vec<BotTrafficRow>, bool) {
+        let mut guard = self.rows.lock().expect("bot board lock");
+        let (rows, at_capacity) = &mut *guard;
+        let mut out: Vec<BotTrafficRow> = rows
+            .iter_mut()
+            .map(|(k, r)| {
+                r.recent.advance(now, self.window);
+                let agent = &AGENTS[k.agent];
+                let action = match (k.deployment.as_deref(), agent.guard_token()) {
+                    // A spoofer is a set of addresses, not a token: the
+                    // `bot.spoofed` alert carries the per-address block.
+                    (Some(d), Some(token)) if k.verification != Verification::Spoofed => Some(
+                        block_agent(agent, token, d, format!("bot traffic, {}", agent.name)),
+                    ),
+                    _ => None,
+                };
+                BotTrafficRow {
+                    deployment: k.deployment.as_deref().map(str::to_string),
+                    bot: BotTag::of(agent, k.verification),
+                    requests: r.recent.total() as u64,
+                    total: r.total,
+                    sources: r.sources.count_ones(),
+                    first_ts: r.first_ts,
+                    last_ts: r.last_ts,
+                    action,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.requests.cmp(&a.requests).then(b.last_ts.cmp(&a.last_ts)));
+        (out, *at_capacity)
+    }
+}
+
+/// One row of `/security`'s `bots.rows`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BotTrafficRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<String>,
+    #[serde(flatten)]
+    pub bot: BotTag,
+    /// Requests inside the window.
+    pub requests: u64,
+    /// Requests since the row appeared.
+    pub total: u64,
+    /// Approximate distinct sources (a 64-bit sketch, so it saturates).
+    pub sources: u32,
+    pub first_ts: i64,
+    pub last_ts: i64,
+    /// "Block this agent on this deployment", ready to post.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<SuggestedAction>,
+}
+
+/// `/security`'s `bots` object.
+#[derive(Debug, Clone, Serialize)]
+pub struct BotTrafficView {
+    pub window_secs: u64,
+    /// Busiest first.
+    pub rows: Vec<BotTrafficRow>,
+    /// The published range lists and whether each has loaded.
+    pub ranges: Vec<crate::bots::RangeStatus>,
+    /// Whether range verification is switched on at all.
+    pub verifying: bool,
+    pub at_capacity: bool,
+}
+
+/// What the analyzer, the engine and `/security` share about automated traffic.
+pub struct BotState {
+    classifier: Classifier,
+    pub ranges: Arc<RangeBook>,
+    board: BotBoard,
+    verifying: bool,
+}
+
+impl BotState {
+    fn new(cfg: &SiemConfig) -> Self {
+        Self {
+            classifier: Classifier::new(),
+            ranges: Arc::new(RangeBook::default()),
+            board: BotBoard::new(cfg.bot_window),
+            verifying: cfg.bot_ranges,
+        }
+    }
+
+    pub fn view(&self, now: i64) -> BotTrafficView {
+        let (rows, at_capacity) = self.board.rows(now);
+        BotTrafficView {
+            window_secs: self.board.window as u64,
+            rows,
+            ranges: self.ranges.status(),
+            verifying: self.verifying,
+            at_capacity,
+        }
+    }
+}
+
 // -- normalization ---------------------------------------------------------
 
 /// Field names we add that `u-siem`'s dictionary has no constant for.
@@ -567,6 +772,12 @@ const F_BYTES: &str = "http.response.body.bytes";
 const F_SERVICE: &str = "service.name";
 const F_SCHEME: &str = "http.request.authorization.scheme";
 const F_EXTENSION: &str = "url.extension";
+/// ECS `user_agent.name`, set to the *catalog* name the UA matched — never
+/// `user_agent.original`, which would carry the raw header into app-obs.
+const F_UA_NAME: &str = "user_agent.name";
+const F_BOT_CLASS: &str = "heyo.bot.class";
+const F_BOT_OPERATOR: &str = "heyo.bot.operator";
+const F_BOT_VERIFICATION: &str = "heyo.bot.verification";
 
 /// `url.query` is in the dictionary and we never set it. See
 /// [`AccessObs::scan_query`].
@@ -987,6 +1198,30 @@ pub struct Alert {
     /// it can only contain fields a parser set — and no parser sets `url.query`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ecs: Option<serde_json::Value>,
+    /// The automated client this finding is about, for the `bot.*` rules.
+    /// Catalog names only — never the raw `User-Agent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot: Option<BotTag>,
+}
+
+/// Which catalog entry a request claimed to be, and whether it checked out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BotTag {
+    pub agent: &'static str,
+    pub operator: &'static str,
+    pub class: BotClass,
+    pub verification: Verification,
+}
+
+impl BotTag {
+    fn of(agent: &'static Agent, verification: Verification) -> Self {
+        Self {
+            agent: agent.name,
+            operator: agent.operator,
+            class: agent.class,
+            verification,
+        }
+    }
 }
 
 /// Project an enriched [`SiemLog`] onto JSON for storage.
@@ -1095,12 +1330,16 @@ fn path_signatures() -> &'static Signatures {
 const CLIENT_BLOCK_SECS: u64 = 3_600;
 const CLIENT_BLOCK_LONG_SECS: u64 = 86_400;
 const PATH_BLOCK_SECS: u64 = 604_800;
+/// An agent block is a policy decision rather than an incident response, so it
+/// lasts the longest — but still expires, like every block here.
+const AGENT_BLOCK_SECS: u64 = 2_592_000;
 
 fn secs_phrase(secs: u64) -> &'static str {
     match secs {
         3_600 => "1 hour",
         86_400 => "24 hours",
         604_800 => "7 days",
+        2_592_000 => "30 days",
         _ => "a while",
     }
 }
@@ -1197,6 +1436,32 @@ fn exempt_client(client: &str, note: String) -> SuggestedAction {
             // and the failure would show up as an outage in a monitor rather
             // than as anything anyone connects back to this button.
             expires_in_secs: None,
+            note: Some(note),
+        },
+    }
+}
+
+/// A block on an agent's own token, on one deployment. Matches what the client
+/// *says* it is, so it stops an honest crawler and any spoofer using its name —
+/// which is the point — and nothing that does not send the token.
+fn block_agent(agent: &Agent, token: &str, deployment: &str, note: String) -> SuggestedAction {
+    SuggestedAction {
+        kind: "block-agent",
+        label: format!("Block {} on {deployment}", agent.name),
+        effect: format!(
+            "Refuses every request to {deployment} whose User-Agent contains {token:?} \
+             with a 403 for {}. Other deployments, and clients that do not send the \
+             token, are unaffected.",
+            secs_phrase(AGENT_BLOCK_SECS)
+        ),
+        rule: crate::guard::RuleSpec {
+            action: crate::guard::RuleAction::Block,
+            match_: crate::guard::MatchSpec {
+                user_agent_contains: Some(token.to_string()),
+                deployment: Some(deployment.to_string()),
+                ..Default::default()
+            },
+            expires_in_secs: Some(AGENT_BLOCK_SECS),
             note: Some(note),
         },
     }
@@ -1336,6 +1601,55 @@ pub fn respond(alert: &Alert) -> AlertResponse {
             ]
         }
 
+        "bot.spoofed" => {
+            if let Some(c) = client {
+                actions.push(block_client(c, CLIENT_BLOCK_LONG_SECS, note.clone()));
+                if let Some(d) = alert.deployment.as_deref() {
+                    actions.push(block_client_on(c, d, CLIENT_BLOCK_LONG_SECS, note.clone()));
+                }
+            }
+            vec![
+                "The User-Agent names an operator that publishes its crawler ranges, and \
+                 this address is outside them: it is borrowing the name, usually to get \
+                 past rules that let that crawler in.",
+                "Check the range list's status on the security page — a list that loaded \
+                 long ago may predate a range the operator added since.",
+                "Treat what it requested as you would any unknown client's traffic.",
+            ]
+        }
+
+        "bot.ai-crawler" | "bot.ai-agent" => {
+            if let (Some(tag), Some(d)) = (alert.bot, alert.deployment.as_deref())
+                && let Some(agent) = crate::bots::agent(tag.agent)
+                && let Some(token) = agent.guard_token()
+            {
+                actions.push(block_agent(agent, token, d, note.clone()));
+            }
+            if alert.rule == "bot.ai-agent" {
+                caveat = Some(
+                    "This agent fetches pages because a person asked an assistant to read \
+                     them. Blocking it stops those people, not a crawler.",
+                );
+                vec![
+                    "This is user-triggered traffic: someone asked an AI assistant about \
+                     this deployment's pages.",
+                    "Decide as a policy, not as an incident — most sites want to be \
+                     readable by assistants their users rely on.",
+                    "If the claim is not verified, it may be a spoofer; a spoofed claim \
+                     raises bot.spoofed separately.",
+                ]
+            } else {
+                vec![
+                    "An AI lab's crawler is collecting this deployment's pages, for \
+                     training or for an AI search index.",
+                    "Well-behaved crawlers honour robots.txt — a Disallow for the agent's \
+                     token is the polite opt-out and keeps working wherever it is served.",
+                    "Blocking here is the enforced one: it refuses the request whatever \
+                     robots.txt says.",
+                ]
+            }
+        }
+
         _ => vec![
             "No standing runbook for this rule — read the ECS fields on the alert for the \
              request that raised it.",
@@ -1390,6 +1704,10 @@ pub struct AlertRing {
     by_severity: [AtomicU64; 5],
     /// Ceiling state: new alerts in the current minute.
     minute: Mutex<(i64, u32)>,
+    /// The same, for informational bot sightings.
+    bot_minute: Mutex<(i64, u32)>,
+    /// Automated-traffic state, when `APP_LB_BOTS` is on.
+    bots: Option<Arc<BotState>>,
 }
 
 impl AlertRing {
@@ -1404,7 +1722,14 @@ impl AlertRing {
             stats,
             by_severity: Default::default(),
             minute: Mutex::new((0, 0)),
+            bot_minute: Mutex::new((0, 0)),
+            bots: None,
         }
+    }
+
+    /// The automated-traffic table, or `None` when `APP_LB_BOTS=0`.
+    pub fn bot_traffic(&self, now: i64) -> Option<BotTrafficView> {
+        self.bots.as_ref().map(|b| b.view(now))
     }
 
     /// Fold or raise. Returns the alert only when it is genuinely new, which is
@@ -1419,6 +1744,7 @@ impl AlertRing {
             if existing.rule == alert.rule
                 && existing.client == alert.client
                 && existing.deployment == alert.deployment
+                && existing.bot.map(|b| b.agent) == alert.bot.map(|b| b.agent)
                 && now - existing.last_ts <= self.suppress * 1000
             {
                 existing.count += 1;
@@ -1431,8 +1757,18 @@ impl AlertRing {
         // Layer 2: a hard ceiling on *new* alerts. Layer 1 cannot fold a
         // distributed attack, where every source has a distinct key — this is
         // what bounds the record rate app-obs sees in that case.
+        //
+        // Sightings of AI crawlers and agents are informational and draw on a
+        // budget of their own, so a busy crawl day cannot crowd an attack out of
+        // the ring.
         {
-            let mut minute = self.minute.lock().expect("alert minute lock");
+            let sighting = alert.severity == Severity::Info && alert.rule.starts_with("bot.");
+            let budget = if sighting {
+                &self.bot_minute
+            } else {
+                &self.minute
+            };
+            let mut minute = budget.lock().expect("alert minute lock");
             let this_minute = now / 60_000;
             if minute.0 != this_minute {
                 *minute = (this_minute, 0);
@@ -1549,11 +1885,20 @@ struct Analyzer {
     /// Required by the trait signatures. Every lookup returns `None`, which is
     /// correct: app-lb ships no GeoIP or IOC feed.
     datasets: DatasetHolder,
+    /// `None` when `APP_LB_BOTS=0`.
+    bots: Option<Arc<BotState>>,
 }
 
 impl Analyzer {
+    #[cfg(test)]
     fn new(cfg: SiemConfig) -> Self {
+        let bots = cfg.bots.then(|| Arc::new(BotState::new(&cfg)));
+        Self::with_bots(cfg, bots)
+    }
+
+    fn with_bots(cfg: SiemConfig, bots: Option<Arc<BotState>>) -> Self {
         Self {
+            bots,
             windows: Windows::new(cfg.window, cfg.max_clients),
             signatures: Signatures::new(),
             access_parser: AccessParser,
@@ -1611,6 +1956,22 @@ impl Analyzer {
         if o.deployment.is_none() {
             log.add_tag("unrouted");
         }
+        // What the UA claims to be, and whether the claim checked out.
+        let bot = match (&self.bots, o.user_agent.as_deref()) {
+            (Some(b), Some(ua)) => b
+                .classifier
+                .classify(ua)
+                .map(|i| (i, b.ranges.verify(&AGENTS[i], o.client))),
+            _ => None,
+        };
+        if let Some((i, v)) = bot {
+            let a = &AGENTS[i];
+            log.add_tag("bot");
+            log.add_field(F_UA_NAME, SiemField::from_str_slice(a.name));
+            log.add_field(F_BOT_CLASS, SiemField::from_str_slice(a.class.as_str()));
+            log.add_field(F_BOT_OPERATOR, SiemField::from_str_slice(a.operator));
+            log.add_field(F_BOT_VERIFICATION, SiemField::from_str_slice(v.as_str()));
+        }
         if let Some(ip) = o.client {
             log.add_field(fd::SOURCE_IP, SiemField::IP(siem_ip(ip)));
         }
@@ -1656,7 +2017,74 @@ impl Analyzer {
                 technique: Some(sig.technique),
                 count: 1,
                 ecs: None,
+                bot: None,
             });
+        }
+
+        // Automated traffic: count it, and raise the findings worth a look.
+        if let (Some((i, v)), Some(b)) = (bot, self.bots.as_ref()) {
+            let agent = &AGENTS[i];
+            let tag = BotTag::of(agent, v);
+            b.board.record(
+                BotKey {
+                    deployment: o.deployment.clone(),
+                    agent: i,
+                    verification: v,
+                },
+                o.client,
+                now,
+            );
+            let deployment = o.deployment.as_ref().map(|d| d.to_string());
+            if v == Verification::Spoofed
+                && let Some(ip) = o.client
+            {
+                out.push(Alert {
+                    id: 0,
+                    ts: o.ts,
+                    last_ts: o.ts,
+                    rule: "bot.spoofed",
+                    severity: Severity::Medium,
+                    title: format!(
+                        "{ip} claims to be {} but is outside {}'s published ranges",
+                        agent.name, agent.operator
+                    ),
+                    client: Some(ip.to_string()),
+                    deployment,
+                    path: Some(obs::truncate(o.path.to_string(), MAX_ALERT_PATH)),
+                    technique: Some("T1036"),
+                    count: 1,
+                    ecs: None,
+                    bot: Some(tag),
+                });
+            } else if let Some(d) = deployment
+                && matches!(
+                    agent.class,
+                    BotClass::AiAgent | BotClass::AiCrawler | BotClass::AiSearch
+                )
+            {
+                let (rule, doing) = if agent.class == BotClass::AiAgent {
+                    ("bot.ai-agent", "is fetching pages for its users from")
+                } else {
+                    ("bot.ai-crawler", "is crawling")
+                };
+                // Unattributed on purpose: one crawler is many addresses, and
+                // folding by agent is what keeps it to one alert.
+                out.push(Alert {
+                    id: 0,
+                    ts: o.ts,
+                    last_ts: o.ts,
+                    rule,
+                    severity: Severity::Info,
+                    title: format!("{} ({}) {doing} {d}", agent.name, agent.operator),
+                    client: None,
+                    deployment: Some(d),
+                    path: None,
+                    technique: None,
+                    count: 1,
+                    ecs: None,
+                    bot: Some(tag),
+                });
+            }
         }
 
         // Stateful: per-source rates.
@@ -1701,6 +2129,7 @@ impl Analyzer {
                 technique: Some("T1595"),
                 count: 1,
                 ecs: None,
+                bot: None,
             });
         }
         if rate {
@@ -1717,6 +2146,7 @@ impl Analyzer {
                 technique: Some("T1498"),
                 count: 1,
                 ecs: None,
+                bot: None,
             });
         }
         (out, log)
@@ -1765,6 +2195,7 @@ impl Analyzer {
                 technique: Some("T1190"),
                 count: 1,
                 ecs: None,
+                bot: None,
             });
         }
 
@@ -1810,6 +2241,7 @@ impl Analyzer {
                 technique: Some("T1110_003"),
                 count: 1,
                 ecs: None,
+                bot: None,
             });
         } else if spray {
             out.push(Alert {
@@ -1825,6 +2257,7 @@ impl Analyzer {
                 technique: Some("T1110_003"),
                 count: 1,
                 ecs: None,
+                bot: None,
             });
         } else if brute {
             let (rule, severity, what) = match o.action {
@@ -1854,6 +2287,7 @@ impl Analyzer {
                 technique: Some("T1110"),
                 count: 1,
                 ecs: None,
+                bot: None,
             });
         }
         (out, log)
@@ -1883,6 +2317,7 @@ pub struct Engine {
     /// `None` when app-obs is not configured. Alerts still reach `/security`.
     obs: Option<LogSink>,
     lb_deployment: Arc<str>,
+    bots: Option<Arc<BotState>>,
 }
 
 #[async_trait]
@@ -1892,7 +2327,17 @@ impl BackgroundService for Engine {
             tracing::error!("siem engine started twice");
             return;
         };
-        let mut analyzer = Analyzer::new(self.cfg.clone());
+        let mut analyzer = Analyzer::with_bots(self.cfg.clone(), self.bots.clone());
+        // The one outbound dependency, and an optional one: without it every
+        // claim is reported as `claimed` rather than verified or spoofed.
+        if let Some(b) = &self.bots
+            && self.cfg.bot_ranges
+        {
+            tokio::spawn(crate::bots::refresh(
+                b.ranges.clone(),
+                Duration::from_secs(self.cfg.bot_refresh),
+            ));
+        }
         // Releases per-client state on an LB that has gone quiet, so an idle
         // process does not hold the last burst forever.
         let mut prune = tokio::time::interval(Duration::from_secs(
@@ -1919,6 +2364,9 @@ impl BackgroundService for Engine {
                 _ = prune.tick() => {
                     let now = obs::now_millis();
                     analyzer.windows.prune(now);
+                    if let Some(b) = &self.bots {
+                        b.board.prune(now);
+                    }
                     self.stats
                         .tracked_clients
                         .store(analyzer.windows.clients.len() as u64, Ordering::Relaxed);
@@ -1988,7 +2436,10 @@ pub fn from_env(obs_sink: Option<LogSink>, lb_deployment: Arc<str>) -> Option<Si
     }
     let cfg = SiemConfig::from_env();
     let stats = Arc::new(SiemStats::default());
-    let ring = Arc::new(AlertRing::new(&cfg, stats.clone()));
+    let bots = cfg.bots.then(|| Arc::new(BotState::new(&cfg)));
+    let mut ring = AlertRing::new(&cfg, stats.clone());
+    ring.bots = bots.clone();
+    let ring = Arc::new(ring);
     let (tx, rx) = mpsc::channel(cfg.queue_capacity.max(1));
 
     Some(Siem {
@@ -2005,6 +2456,7 @@ pub fn from_env(obs_sink: Option<LogSink>, lb_deployment: Arc<str>) -> Option<Si
             stats: stats.clone(),
             obs: obs_sink,
             lb_deployment,
+            bots,
         },
         stats,
     })
@@ -2028,6 +2480,10 @@ mod tests {
             max_alerts_per_min: 1000,
             scan_query: true,
             ship: true,
+            bots: true,
+            bot_ranges: false,
+            bot_refresh: 86_400,
+            bot_window: 3_600,
         }
     }
 
@@ -2040,6 +2496,7 @@ mod tests {
             path: Box::from(path),
             host: Some(Box::from("demo.local")),
             scan_query: None,
+            user_agent: None,
             status,
             duration_nanos: 1_400_000,
             bytes: 254,
@@ -2302,6 +2759,7 @@ mod tests {
                 technique: Some("T1595"),
                 count: 1,
                 ecs: None,
+                bot: None,
             };
             if ring.raise(a, now).is_some() {
                 shipped += 1;
@@ -2339,6 +2797,7 @@ mod tests {
                 technique: None,
                 count: 1,
                 ecs: None,
+                bot: None,
             },
             now,
         );
@@ -2369,6 +2828,7 @@ mod tests {
                     technique: None,
                     count: 1,
                     ecs: None,
+                    bot: None,
                 },
                 now,
             );
@@ -2448,6 +2908,7 @@ mod tests {
             technique: Some("T1110"),
             count: 9,
             ecs: None,
+            bot: None,
         };
         let r = alert_record(&a, "_lb");
         assert_eq!(r.source, SECURITY_SOURCE);
@@ -2535,6 +2996,7 @@ mod tests {
                 error: None,
             },
             None,
+            None,
         );
         match rx.try_recv() {
             Ok(Observation::Access(a)) => assert!(a.client.is_none()),
@@ -2565,6 +3027,7 @@ mod tests {
                 error: None,
             },
             Some("id=1' or '1'='1"),
+            None,
         );
         match rx.try_recv() {
             Ok(Observation::Access(a)) => assert!(
@@ -2572,6 +3035,207 @@ mod tests {
                 "the query must not be captured when scanning is off"
             ),
             _ => panic!("expected an access observation"),
+        }
+    }
+
+    // -- automated traffic -------------------------------------------------
+
+    mod bots {
+        use super::*;
+        use crate::guard::IpPrefix;
+
+        const GPTBOT: &str = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)";
+        const GPTBOT_RANGES: &str = "https://openai.com/gptbot.json";
+
+        fn from(ua: &str, client: &str) -> Observation {
+            let mut a = access("/docs", Some(200), client);
+            a.user_agent = Some(Box::from(ua));
+            Observation::Access(Box::new(a))
+        }
+
+        fn rules(alerts: &[Alert]) -> Vec<&'static str> {
+            alerts.iter().map(|a| a.rule).collect()
+        }
+
+        #[test]
+        fn a_browser_raises_nothing_and_is_not_counted() {
+            let mut an = Analyzer::new(cfg());
+            let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15";
+            assert!(an.analyze(from(ua, "198.51.100.7"), 1_000).is_empty());
+            assert!(an.bots.as_ref().unwrap().view(1_000).rows.is_empty());
+        }
+
+        #[test]
+        fn an_ai_crawler_from_many_addresses_is_one_alert_on_its_deployment() {
+            let mut an = Analyzer::new(cfg());
+            let ring = AlertRing::new(&cfg(), Arc::new(SiemStats::default()));
+            let mut shipped = 0;
+            for i in 0..50 {
+                for a in an.analyze(from(GPTBOT, &format!("20.171.207.{i}")), 1_000 + i) {
+                    assert_eq!(a.rule, "bot.ai-crawler");
+                    assert_eq!(a.severity, Severity::Info);
+                    assert!(a.client.is_none(), "one crawler is many addresses");
+                    let tag = a.bot.unwrap();
+                    assert_eq!(
+                        (tag.agent, tag.operator, tag.class),
+                        ("GPTBot", "OpenAI", BotClass::AiCrawler)
+                    );
+                    assert_eq!(
+                        tag.verification,
+                        Verification::Claimed,
+                        "ranges never loaded here"
+                    );
+                    shipped += ring.raise(a, 1_000 + i).is_some() as u32;
+                }
+            }
+            assert_eq!(shipped, 1);
+            assert_eq!(ring.recent(10)[0].count, 50);
+            let rows = an.bots.as_ref().unwrap().view(2_000).rows;
+            assert_eq!(rows.len(), 1);
+            assert_eq!((rows[0].requests, rows[0].total), (50, 50));
+            assert!(rows[0].sources > 1);
+            let action = rows[0]
+                .action
+                .as_ref()
+                .expect("a row offers the agent block");
+            assert_eq!(action.kind, "block-agent");
+            assert_eq!(
+                action.rule.match_.user_agent_contains.as_deref(),
+                Some("GPTBot")
+            );
+            assert_eq!(action.rule.match_.deployment.as_deref(), Some("demo"));
+        }
+
+        #[test]
+        fn a_user_triggered_agent_is_its_own_finding() {
+            let mut an = Analyzer::new(cfg());
+            let ua = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot";
+            assert_eq!(
+                rules(&an.analyze(from(ua, "23.98.142.180"), 1_000)),
+                ["bot.ai-agent"]
+            );
+        }
+
+        #[test]
+        fn a_search_engine_is_counted_but_not_alerted_on() {
+            let mut an = Analyzer::new(cfg());
+            let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+            assert!(an.analyze(from(ua, "66.249.64.9"), 1_000).is_empty());
+            let rows = an.bots.as_ref().unwrap().view(1_000).rows;
+            assert_eq!(rows[0].bot.class, BotClass::SearchCrawler);
+        }
+
+        #[test]
+        fn a_claim_from_outside_the_published_ranges_is_spoofed_and_inside_is_verified() {
+            let mut an = Analyzer::new(cfg());
+            an.bots.as_ref().unwrap().ranges.install(
+                GPTBOT_RANGES,
+                vec![IpPrefix::parse("20.171.207.0/24").unwrap()],
+                1,
+            );
+            let inside = an.analyze(from(GPTBOT, "20.171.207.5"), 1_000);
+            assert_eq!(rules(&inside), ["bot.ai-crawler"]);
+            assert_eq!(inside[0].bot.unwrap().verification, Verification::Verified);
+
+            let outside = an.analyze(from(GPTBOT, "198.51.100.7"), 1_001);
+            assert_eq!(
+                rules(&outside),
+                ["bot.spoofed"],
+                "a spoofer is not reported as the crawler"
+            );
+            assert_eq!(outside[0].client.as_deref(), Some("198.51.100.7"));
+            assert_eq!(outside[0].technique, Some("T1036"));
+            let ecs = outside[0].ecs.as_ref().unwrap();
+            assert_eq!(ecs["heyo.bot.verification"], "spoofed");
+            assert_eq!(ecs["user_agent.name"], "GPTBot");
+
+            let rows = an.bots.as_ref().unwrap().view(1_002).rows;
+            assert_eq!(rows.len(), 2, "verified and spoofed are separate rows");
+            let spoofed = rows
+                .iter()
+                .find(|r| r.bot.verification == Verification::Spoofed)
+                .unwrap();
+            assert!(
+                spoofed.action.is_none(),
+                "blocking the token is not the answer to a spoofer"
+            );
+        }
+
+        #[test]
+        fn the_raw_user_agent_never_reaches_an_alert_or_a_record() {
+            let mut an = Analyzer::new(cfg());
+            let ua = format!("{GPTBOT} token=hunter2-SECRET");
+            let alerts = an.analyze(from(&ua, "20.171.207.5"), 1_000);
+            assert!(!alerts.is_empty());
+            for a in &alerts {
+                let wire = serde_json::to_string(a).unwrap();
+                let record = serde_json::to_string(&alert_record(a, "lb")).unwrap();
+                assert!(
+                    !wire.contains("hunter2") && !record.contains("hunter2"),
+                    "{wire}"
+                );
+            }
+        }
+
+        #[test]
+        fn bot_sightings_cannot_crowd_an_attack_out_of_the_alert_budget() {
+            let mut c = cfg();
+            c.max_alerts_per_min = 2;
+            let ring = AlertRing::new(&c, Arc::new(SiemStats::default()));
+            let mut an = Analyzer::new(c.clone());
+            for (i, ua) in ["GPTBot/1.0", "ClaudeBot/1.0", "CCBot/2.0", "Bytespider"]
+                .iter()
+                .enumerate()
+            {
+                for a in an.analyze(from(ua, "198.51.100.1"), 1_000 + i as i64) {
+                    ring.raise(a, 1_000);
+                }
+            }
+            let attack = an.analyze(
+                Observation::Access(Box::new(access(
+                    "/../../etc/passwd",
+                    Some(404),
+                    "203.0.113.9",
+                ))),
+                1_010,
+            );
+            assert_eq!(rules(&attack), ["web.traversal"]);
+            assert!(
+                ring.raise(attack[0].clone(), 1_010).is_some(),
+                "the attack still gets an alert"
+            );
+        }
+
+        #[test]
+        fn the_traffic_table_is_bounded() {
+            let board = BotBoard::new(3_600);
+            for i in 0..MAX_BOT_ROWS {
+                let key = BotKey {
+                    deployment: Some(format!("d{i}").into()),
+                    agent: 0,
+                    verification: Verification::Claimed,
+                };
+                board.record(key, None, 1_000);
+            }
+            let extra = BotKey {
+                deployment: Some("one-too-many".into()),
+                agent: 0,
+                verification: Verification::Claimed,
+            };
+            board.record(extra, None, 1_000);
+            let (rows, at_capacity) = board.rows(1_000);
+            assert_eq!(rows.len(), MAX_BOT_ROWS);
+            assert!(at_capacity);
+            board.prune(1_000 + 3_600_000);
+            assert!(board.rows(1_000 + 3_600_000).0.is_empty());
+        }
+
+        #[test]
+        fn off_means_off() {
+            let mut c = cfg();
+            c.bots = false;
+            let mut an = Analyzer::new(c);
+            assert!(an.analyze(from(GPTBOT, "20.171.207.5"), 1_000).is_empty());
         }
     }
 
@@ -2595,6 +3259,9 @@ mod tests {
             "auth.spray",
             "auth.scope-denied",
             "auth.brute-force",
+            "bot.spoofed",
+            "bot.ai-crawler",
+            "bot.ai-agent",
         ];
 
         fn alert(rule: &'static str, client: Option<&str>, path: Option<&str>) -> Alert {
@@ -2611,7 +3278,53 @@ mod tests {
                 technique: None,
                 count: 1,
                 ecs: None,
+                bot: rule.starts_with("bot.").then(|| {
+                    BotTag::of(
+                        crate::bots::agent("GPTBot").unwrap(),
+                        Verification::Verified,
+                    )
+                }),
             }
+        }
+
+        /// An agent block is offered for a sighting, and it refuses exactly the
+        /// agent on exactly that deployment.
+        #[test]
+        fn an_ai_crawler_finding_offers_a_block_that_stops_that_crawler_there() {
+            let r = respond(&alert("bot.ai-crawler", None, None));
+            let action = r
+                .actions
+                .iter()
+                .find(|a| a.kind == "block-agent")
+                .unwrap_or_else(|| panic!("no block-agent action: {r:?}"));
+            let g = crate::guard::Guard::new("", true);
+            g.insert(action.rule.clone(), 1_000).unwrap();
+            let facts = |ua, deployment| crate::guard::RequestFacts {
+                client: "20.171.207.5".parse().ok(),
+                host: Some("demo.local"),
+                path: "/",
+                method: "GET",
+                deployment: Some(deployment),
+                user_agent: Some(ua),
+            };
+            let gptbot = "Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)";
+            assert!(matches!(
+                g.decide(&facts(gptbot, "demo"), 1_001),
+                crate::guard::Decision::Block(_)
+            ));
+            assert!(matches!(
+                g.decide(&facts(gptbot, "other"), 1_001),
+                crate::guard::Decision::Pass
+            ));
+            assert!(matches!(
+                g.decide(&facts("Mozilla/5.0 Safari/605", "demo"), 1_001),
+                crate::guard::Decision::Pass
+            ));
+            let agent = respond(&alert("bot.ai-agent", None, None));
+            assert!(
+                agent.caveat.is_some_and(|c| c.contains("person")),
+                "{agent:?}"
+            );
         }
 
         /// The load-bearing one. A button that posts a body the server refuses
