@@ -255,6 +255,15 @@ impl RequestState {
     pub fn deployment(&self) -> Option<&Arc<Deployment>> {
         self.deployment.as_ref()
     }
+    /// The client this host judged the request to come from, once `decide`
+    /// has run: a fleet hop's vouched client rather than the peer host.
+    pub fn client(&self) -> Option<std::net::IpAddr> {
+        self.client
+    }
+    #[cfg(test)]
+    pub(crate) fn set_client_for_test(&mut self, ip: std::net::IpAddr) {
+        self.client = Some(ip);
+    }
     pub fn set_deployment(&mut self, deployment: Arc<Deployment>) {
         self.deployment = Some(deployment);
     }
@@ -1046,6 +1055,7 @@ mod tests {
             let decision = f.control.decide(&head("local.example", &hop), &mut state).await;
             assert!(matches!(decision, RequestDecision::Proxy));
             assert!(state.hop_in && state.hop_out.is_none());
+            assert_eq!(state.client(), Some("203.0.113.9".parse().unwrap()), "the hop's client, not the peer host");
             let mods = names(&state.forwarding_modifications(&"/x".parse().unwrap()).unwrap());
             assert!(mods.contains(&"remove x-auth-request-email".to_string()), "{mods:?}");
             assert!(mods.contains(&"remove x-heyo-fleet-token".to_string()));
