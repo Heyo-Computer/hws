@@ -564,7 +564,10 @@ fn finish(head: &RequestHead, state: &mut RequestState, metrics: &Metrics, acces
     let method = head.method.as_str();
     let host = head.host();
     let access = Access { deployment: deployment.as_deref(), backend, method, path: head.uri.path(), host: host.as_deref(), status: completion.status, duration, bytes: completion.bytes, client: access_client(head, state).map(|ip| ip.to_string()), error: completion.error };
-    if let Some(sink) = security { sink.observe_access(&access, head.uri.query()); }
+    if let Some(sink) = security {
+        let user_agent = head.headers.get(http::header::USER_AGENT).and_then(|v| v.to_str().ok());
+        sink.observe_access(&access, head.uri.query(), user_agent);
+    }
     if let Some(sink) = access_log { sink.send_access(access); }
 }
 

@@ -1306,6 +1306,44 @@ fn security_response_is_stable() {
                         "url.path": "/wp-login.php",
                         "tags": ["access", "external"],
                     })),
+                    bot: None,
+                }
+                .into(),
+                Alert {
+                    id: 43,
+                    ts: 1_722_399_700_000,
+                    last_ts: 1_722_399_990_000,
+                    rule: "bot.ai-crawler",
+                    severity: Severity::Info,
+                    title: "GPTBot (OpenAI) is crawling demo".into(),
+                    // One crawler is many addresses: folded by agent instead.
+                    client: None,
+                    deployment: Some("demo".into()),
+                    path: None,
+                    technique: None,
+                    count: 312,
+                    ecs: Some(serde_json::json!({
+                        "event.action": "http-request",
+                        "event.category": "web",
+                        "event.outcome": "success",
+                        "heyo.bot.class": "ai-crawler",
+                        "heyo.bot.operator": "OpenAI",
+                        "heyo.bot.verification": "verified",
+                        "http.request.method": "GET",
+                        "http.response.status_code": 200,
+                        "observer.name": "app-lb",
+                        "source.ip": "20.171.207.5",
+                        "url.domain": "demo.example.com",
+                        "url.path": "/docs",
+                        "user_agent.name": "GPTBot",
+                        "tags": ["access", "bot", "external"],
+                    })),
+                    bot: Some(crate::siem::BotTag {
+                        agent: "GPTBot",
+                        operator: "OpenAI",
+                        class: crate::bots::BotClass::AiCrawler,
+                        verification: crate::bots::Verification::Verified,
+                    }),
                 }
                 .into(),
                 Alert {
@@ -1332,6 +1370,7 @@ fn security_response_is_stable() {
                         "url.path": "/metrics",
                         "tags": ["auth-failure", "external"],
                     })),
+                    bot: None,
                 }
                 .into(),
             ],
@@ -1402,8 +1441,67 @@ fn security_response_is_stable() {
                 tracked_clients: 118,
                 clients_at_capacity: false,
             }),
+            bots: Some(security_bots()),
         },
     );
+}
+
+/// The `bots` object: one verified crawler with its ready-to-post block, and
+/// one spoofer, which is offered none (its alert carries the address block).
+fn security_bots() -> crate::siem::BotTrafficView {
+    use crate::bots::{BotClass, RangeStatus, Verification};
+    use crate::siem::{BotTag, BotTrafficRow, BotTrafficView, SuggestedAction};
+    let tag = |verification| BotTag { agent: "GPTBot", operator: "OpenAI", class: BotClass::AiCrawler, verification };
+    BotTrafficView {
+        window_secs: 3_600,
+        rows: vec![
+            BotTrafficRow {
+                deployment: Some("demo".into()),
+                bot: tag(Verification::Verified),
+                requests: 312,
+                total: 4_120,
+                sources: 7,
+                first_ts: 1_722_300_000_000,
+                last_ts: 1_722_399_990_000,
+                action: Some(SuggestedAction {
+                    kind: "block-agent",
+                    label: "Block GPTBot on demo".into(),
+                    effect: "Refuses every request to demo whose User-Agent contains \"GPTBot\" with a 403 for 30 days.".into(),
+                    rule: crate::guard::RuleSpec {
+                        action: crate::guard::RuleAction::Block,
+                        match_: crate::guard::MatchSpec {
+                            user_agent_contains: Some("GPTBot".into()),
+                            deployment: Some("demo".into()),
+                            ..Default::default()
+                        },
+                        expires_in_secs: Some(2_592_000),
+                        note: Some("bot traffic, GPTBot".into()),
+                    },
+                }),
+            },
+            BotTrafficRow {
+                deployment: Some("demo".into()),
+                bot: tag(Verification::Spoofed),
+                requests: 9,
+                total: 9,
+                sources: 1,
+                first_ts: 1_722_399_900_000,
+                last_ts: 1_722_399_960_000,
+                action: None,
+            },
+        ],
+        ranges: vec![RangeStatus {
+            url: "https://openai.com/gptbot.json",
+            operator: "OpenAI",
+            agents: vec!["GPTBot"],
+            loaded: true,
+            prefixes: 21,
+            fetched_at: Some(1_722_390_000_000),
+            error: None,
+        }],
+        verifying: true,
+        at_capacity: false,
+    }
 }
 
 /// A workflow object with every optional field populated.
