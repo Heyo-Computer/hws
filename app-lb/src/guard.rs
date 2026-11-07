@@ -111,7 +111,7 @@ impl IpPrefix {
         (bits <= max).then_some(Self { addr, bits })
     }
 
-    fn contains(&self, ip: IpAddr) -> bool {
+    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
                 prefix_eq(&net.octets(), &ip.octets(), self.bits)
