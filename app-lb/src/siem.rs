@@ -89,7 +89,7 @@ use usiem::events::ip::SiemIp;
 use usiem::events::schema::{FieldSchema, FieldType};
 use usiem::events::SiemLog;
 
-use crate::bots::{Agent, BotClass, Classifier, RangeBook, Verification, AGENTS};
+use crate::bots::{AGENTS, Agent, BotClass, Classifier, RangeBook, Verification};
 use crate::obs::{self, Access, LogSink, Record};
 
 /// The `source` every alert record carries into app-obs, beside the existing
@@ -339,7 +339,12 @@ impl SecuritySink {
     /// still needs to move the same [`Access`] afterwards. `Access` is not
     /// `Clone`, so if anyone ever reorders those two calls it stops compiling —
     /// which is the good outcome.
-    pub fn observe_access(&self, access: &Access<'_>, query: Option<&str>, user_agent: Option<&str>) {
+    pub fn observe_access(
+        &self,
+        access: &Access<'_>,
+        query: Option<&str>,
+        user_agent: Option<&str>,
+    ) {
         let obs = AccessObs {
             ts: obs::now_millis(),
             client: access.client.as_deref().and_then(|c| c.parse().ok()),
@@ -613,7 +618,10 @@ pub struct BotBoard {
 
 impl BotBoard {
     fn new(window: i64) -> Self {
-        Self { rows: Mutex::new((HashMap::new(), false)), window }
+        Self {
+            rows: Mutex::new((HashMap::new(), false)),
+            window,
+        }
     }
 
     /// Count one request. Returns whether this is the first sighting of the
@@ -665,9 +673,9 @@ impl BotBoard {
                 let action = match (k.deployment.as_deref(), agent.guard_token()) {
                     // A spoofer is a set of addresses, not a token: the
                     // `bot.spoofed` alert carries the per-address block.
-                    (Some(d), Some(token)) if k.verification != Verification::Spoofed => {
-                        Some(block_agent(agent, token, d, format!("bot traffic, {}", agent.name)))
-                    }
+                    (Some(d), Some(token)) if k.verification != Verification::Spoofed => Some(
+                        block_agent(agent, token, d, format!("bot traffic, {}", agent.name)),
+                    ),
                     _ => None,
                 };
                 BotTrafficRow {
@@ -1207,7 +1215,12 @@ pub struct BotTag {
 
 impl BotTag {
     fn of(agent: &'static Agent, verification: Verification) -> Self {
-        Self { agent: agent.name, operator: agent.operator, class: agent.class, verification }
+        Self {
+            agent: agent.name,
+            operator: agent.operator,
+            class: agent.class,
+            verification,
+        }
     }
 }
 
@@ -1750,7 +1763,11 @@ impl AlertRing {
         // the ring.
         {
             let sighting = alert.severity == Severity::Info && alert.rule.starts_with("bot.");
-            let budget = if sighting { &self.bot_minute } else { &self.minute };
+            let budget = if sighting {
+                &self.bot_minute
+            } else {
+                &self.minute
+            };
             let mut minute = budget.lock().expect("alert minute lock");
             let this_minute = now / 60_000;
             if minute.0 != this_minute {
@@ -2009,7 +2026,11 @@ impl Analyzer {
             let agent = &AGENTS[i];
             let tag = BotTag::of(agent, v);
             b.board.record(
-                BotKey { deployment: o.deployment.clone(), agent: i, verification: v },
+                BotKey {
+                    deployment: o.deployment.clone(),
+                    agent: i,
+                    verification: v,
+                },
                 o.client,
                 now,
             );
@@ -2036,7 +2057,10 @@ impl Analyzer {
                     bot: Some(tag),
                 });
             } else if let Some(d) = deployment
-                && matches!(agent.class, BotClass::AiAgent | BotClass::AiCrawler | BotClass::AiSearch)
+                && matches!(
+                    agent.class,
+                    BotClass::AiAgent | BotClass::AiCrawler | BotClass::AiSearch
+                )
             {
                 let (rule, doing) = if agent.class == BotClass::AiAgent {
                     ("bot.ai-agent", "is fetching pages for its users from")
@@ -3052,8 +3076,15 @@ mod tests {
                     assert_eq!(a.severity, Severity::Info);
                     assert!(a.client.is_none(), "one crawler is many addresses");
                     let tag = a.bot.unwrap();
-                    assert_eq!((tag.agent, tag.operator, tag.class), ("GPTBot", "OpenAI", BotClass::AiCrawler));
-                    assert_eq!(tag.verification, Verification::Claimed, "ranges never loaded here");
+                    assert_eq!(
+                        (tag.agent, tag.operator, tag.class),
+                        ("GPTBot", "OpenAI", BotClass::AiCrawler)
+                    );
+                    assert_eq!(
+                        tag.verification,
+                        Verification::Claimed,
+                        "ranges never loaded here"
+                    );
                     shipped += ring.raise(a, 1_000 + i).is_some() as u32;
                 }
             }
@@ -3063,9 +3094,15 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!((rows[0].requests, rows[0].total), (50, 50));
             assert!(rows[0].sources > 1);
-            let action = rows[0].action.as_ref().expect("a row offers the agent block");
+            let action = rows[0]
+                .action
+                .as_ref()
+                .expect("a row offers the agent block");
             assert_eq!(action.kind, "block-agent");
-            assert_eq!(action.rule.match_.user_agent_contains.as_deref(), Some("GPTBot"));
+            assert_eq!(
+                action.rule.match_.user_agent_contains.as_deref(),
+                Some("GPTBot")
+            );
             assert_eq!(action.rule.match_.deployment.as_deref(), Some("demo"));
         }
 
@@ -3073,7 +3110,10 @@ mod tests {
         fn a_user_triggered_agent_is_its_own_finding() {
             let mut an = Analyzer::new(cfg());
             let ua = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot";
-            assert_eq!(rules(&an.analyze(from(ua, "23.98.142.180"), 1_000)), ["bot.ai-agent"]);
+            assert_eq!(
+                rules(&an.analyze(from(ua, "23.98.142.180"), 1_000)),
+                ["bot.ai-agent"]
+            );
         }
 
         #[test]
@@ -3098,7 +3138,11 @@ mod tests {
             assert_eq!(inside[0].bot.unwrap().verification, Verification::Verified);
 
             let outside = an.analyze(from(GPTBOT, "198.51.100.7"), 1_001);
-            assert_eq!(rules(&outside), ["bot.spoofed"], "a spoofer is not reported as the crawler");
+            assert_eq!(
+                rules(&outside),
+                ["bot.spoofed"],
+                "a spoofer is not reported as the crawler"
+            );
             assert_eq!(outside[0].client.as_deref(), Some("198.51.100.7"));
             assert_eq!(outside[0].technique, Some("T1036"));
             let ecs = outside[0].ecs.as_ref().unwrap();
@@ -3107,8 +3151,14 @@ mod tests {
 
             let rows = an.bots.as_ref().unwrap().view(1_002).rows;
             assert_eq!(rows.len(), 2, "verified and spoofed are separate rows");
-            let spoofed = rows.iter().find(|r| r.bot.verification == Verification::Spoofed).unwrap();
-            assert!(spoofed.action.is_none(), "blocking the token is not the answer to a spoofer");
+            let spoofed = rows
+                .iter()
+                .find(|r| r.bot.verification == Verification::Spoofed)
+                .unwrap();
+            assert!(
+                spoofed.action.is_none(),
+                "blocking the token is not the answer to a spoofer"
+            );
         }
 
         #[test]
@@ -3120,7 +3170,10 @@ mod tests {
             for a in &alerts {
                 let wire = serde_json::to_string(a).unwrap();
                 let record = serde_json::to_string(&alert_record(a, "lb")).unwrap();
-                assert!(!wire.contains("hunter2") && !record.contains("hunter2"), "{wire}");
+                assert!(
+                    !wire.contains("hunter2") && !record.contains("hunter2"),
+                    "{wire}"
+                );
             }
         }
 
@@ -3130,24 +3183,45 @@ mod tests {
             c.max_alerts_per_min = 2;
             let ring = AlertRing::new(&c, Arc::new(SiemStats::default()));
             let mut an = Analyzer::new(c.clone());
-            for (i, ua) in ["GPTBot/1.0", "ClaudeBot/1.0", "CCBot/2.0", "Bytespider"].iter().enumerate() {
+            for (i, ua) in ["GPTBot/1.0", "ClaudeBot/1.0", "CCBot/2.0", "Bytespider"]
+                .iter()
+                .enumerate()
+            {
                 for a in an.analyze(from(ua, "198.51.100.1"), 1_000 + i as i64) {
                     ring.raise(a, 1_000);
                 }
             }
-            let attack = an.analyze(Observation::Access(Box::new(access("/../../etc/passwd", Some(404), "203.0.113.9"))), 1_010);
+            let attack = an.analyze(
+                Observation::Access(Box::new(access(
+                    "/../../etc/passwd",
+                    Some(404),
+                    "203.0.113.9",
+                ))),
+                1_010,
+            );
             assert_eq!(rules(&attack), ["web.traversal"]);
-            assert!(ring.raise(attack[0].clone(), 1_010).is_some(), "the attack still gets an alert");
+            assert!(
+                ring.raise(attack[0].clone(), 1_010).is_some(),
+                "the attack still gets an alert"
+            );
         }
 
         #[test]
         fn the_traffic_table_is_bounded() {
             let board = BotBoard::new(3_600);
             for i in 0..MAX_BOT_ROWS {
-                let key = BotKey { deployment: Some(format!("d{i}").into()), agent: 0, verification: Verification::Claimed };
+                let key = BotKey {
+                    deployment: Some(format!("d{i}").into()),
+                    agent: 0,
+                    verification: Verification::Claimed,
+                };
                 board.record(key, None, 1_000);
             }
-            let extra = BotKey { deployment: Some("one-too-many".into()), agent: 0, verification: Verification::Claimed };
+            let extra = BotKey {
+                deployment: Some("one-too-many".into()),
+                agent: 0,
+                verification: Verification::Claimed,
+            };
             board.record(extra, None, 1_000);
             let (rows, at_capacity) = board.rows(1_000);
             assert_eq!(rows.len(), MAX_BOT_ROWS);
@@ -3205,7 +3279,10 @@ mod tests {
                 count: 1,
                 ecs: None,
                 bot: rule.starts_with("bot.").then(|| {
-                    BotTag::of(crate::bots::agent("GPTBot").unwrap(), Verification::Verified)
+                    BotTag::of(
+                        crate::bots::agent("GPTBot").unwrap(),
+                        Verification::Verified,
+                    )
                 }),
             }
         }
@@ -3215,7 +3292,11 @@ mod tests {
         #[test]
         fn an_ai_crawler_finding_offers_a_block_that_stops_that_crawler_there() {
             let r = respond(&alert("bot.ai-crawler", None, None));
-            let action = r.actions.iter().find(|a| a.kind == "block-agent").expect("{r:?}");
+            let action = r
+                .actions
+                .iter()
+                .find(|a| a.kind == "block-agent")
+                .unwrap_or_else(|| panic!("no block-agent action: {r:?}"));
             let g = crate::guard::Guard::new("", true);
             g.insert(action.rule.clone(), 1_000).unwrap();
             let facts = |ua, deployment| crate::guard::RequestFacts {
@@ -3227,11 +3308,23 @@ mod tests {
                 user_agent: Some(ua),
             };
             let gptbot = "Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)";
-            assert!(matches!(g.decide(&facts(gptbot, "demo"), 1_001), crate::guard::Decision::Block(_)));
-            assert!(matches!(g.decide(&facts(gptbot, "other"), 1_001), crate::guard::Decision::Pass));
-            assert!(matches!(g.decide(&facts("Mozilla/5.0 Safari/605", "demo"), 1_001), crate::guard::Decision::Pass));
+            assert!(matches!(
+                g.decide(&facts(gptbot, "demo"), 1_001),
+                crate::guard::Decision::Block(_)
+            ));
+            assert!(matches!(
+                g.decide(&facts(gptbot, "other"), 1_001),
+                crate::guard::Decision::Pass
+            ));
+            assert!(matches!(
+                g.decide(&facts("Mozilla/5.0 Safari/605", "demo"), 1_001),
+                crate::guard::Decision::Pass
+            ));
             let agent = respond(&alert("bot.ai-agent", None, None));
-            assert!(agent.caveat.is_some_and(|c| c.contains("person")), "{agent:?}");
+            assert!(
+                agent.caveat.is_some_and(|c| c.contains("person")),
+                "{agent:?}"
+            );
         }
 
         /// The load-bearing one. A button that posts a body the server refuses

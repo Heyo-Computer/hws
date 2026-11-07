@@ -1451,7 +1451,12 @@ fn security_response_is_stable() {
 fn security_bots() -> crate::siem::BotTrafficView {
     use crate::bots::{BotClass, RangeStatus, Verification};
     use crate::siem::{BotTag, BotTrafficRow, BotTrafficView, SuggestedAction};
-    let tag = |verification| BotTag { agent: "GPTBot", operator: "OpenAI", class: BotClass::AiCrawler, verification };
+    let tag = |verification| BotTag {
+        agent: "GPTBot",
+        operator: "OpenAI",
+        class: BotClass::AiCrawler,
+        verification,
+    };
     BotTrafficView {
         window_secs: 3_600,
         rows: vec![

@@ -85,7 +85,9 @@ impl BotClass {
     /// filter", the same way an unknown `?severity=` is.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
-        Self::ALL.into_iter().find(|c| c.as_str().eq_ignore_ascii_case(s))
+        Self::ALL
+            .into_iter()
+            .find(|c| c.as_str().eq_ignore_ascii_case(s))
     }
 }
 
@@ -166,39 +168,106 @@ macro_rules! agent {
 /// on purpose: they are read from robots.txt and never sent as a User-Agent.
 pub static AGENTS: &[Agent] = &[
     // AI agents: user-triggered fetches.
-    agent!("ChatGPT-User", "OpenAI", AiAgent, ["ChatGPT-User"], [OPENAI_CHATGPT_USER]),
+    agent!(
+        "ChatGPT-User",
+        "OpenAI",
+        AiAgent,
+        ["ChatGPT-User"],
+        [OPENAI_CHATGPT_USER]
+    ),
     agent!("Claude-User", "Anthropic", AiAgent),
-    agent!("Perplexity-User", "Perplexity", AiAgent, ["Perplexity-User"], [PERPLEXITY_USER]),
+    agent!(
+        "Perplexity-User",
+        "Perplexity",
+        AiAgent,
+        ["Perplexity-User"],
+        [PERPLEXITY_USER]
+    ),
     agent!("MistralAI-User", "Mistral AI", AiAgent),
     agent!("DuckAssistBot", "DuckDuckGo", AiAgent),
-    agent!("Meta-ExternalFetcher", "Meta", AiAgent, ["meta-externalfetcher"]),
+    agent!(
+        "Meta-ExternalFetcher",
+        "Meta",
+        AiAgent,
+        ["meta-externalfetcher"]
+    ),
     // AI search indexers.
-    agent!("OAI-SearchBot", "OpenAI", AiSearch, ["OAI-SearchBot"], [OPENAI_SEARCHBOT]),
+    agent!(
+        "OAI-SearchBot",
+        "OpenAI",
+        AiSearch,
+        ["OAI-SearchBot"],
+        [OPENAI_SEARCHBOT]
+    ),
     agent!("Claude-SearchBot", "Anthropic", AiSearch),
-    agent!("PerplexityBot", "Perplexity", AiSearch, ["PerplexityBot"], [PERPLEXITYBOT]),
+    agent!(
+        "PerplexityBot",
+        "Perplexity",
+        AiSearch,
+        ["PerplexityBot"],
+        [PERPLEXITYBOT]
+    ),
     agent!("YouBot", "You.com", AiSearch),
     // AI training crawlers.
     agent!("GPTBot", "OpenAI", AiCrawler, ["GPTBot"], [OPENAI_GPTBOT]),
     agent!("ClaudeBot", "Anthropic", AiCrawler),
-    agent!("anthropic-ai", "Anthropic", AiCrawler, ["anthropic-ai", "Claude-Web"]),
-    agent!("Google-CloudVertexBot", "Google", AiCrawler, ["Google-CloudVertexBot"], [GOOGLE_SPECIAL]),
+    agent!(
+        "anthropic-ai",
+        "Anthropic",
+        AiCrawler,
+        ["anthropic-ai", "Claude-Web"]
+    ),
+    agent!(
+        "Google-CloudVertexBot",
+        "Google",
+        AiCrawler,
+        ["Google-CloudVertexBot"],
+        [GOOGLE_SPECIAL]
+    ),
     agent!("CCBot", "Common Crawl", AiCrawler),
     agent!("Bytespider", "ByteDance", AiCrawler),
-    agent!("Meta-ExternalAgent", "Meta", AiCrawler, ["meta-externalagent"]),
+    agent!(
+        "Meta-ExternalAgent",
+        "Meta",
+        AiCrawler,
+        ["meta-externalagent"]
+    ),
     agent!("FacebookBot", "Meta", AiCrawler),
     agent!("Amazonbot", "Amazon", AiCrawler),
     agent!("Applebot", "Apple", SearchCrawler, ["Applebot"], [APPLEBOT]),
-    agent!("cohere-ai", "Cohere", AiCrawler, ["cohere-ai", "cohere-training-data-crawler"]),
+    agent!(
+        "cohere-ai",
+        "Cohere",
+        AiCrawler,
+        ["cohere-ai", "cohere-training-data-crawler"]
+    ),
     agent!("AI2Bot", "Allen Institute for AI", AiCrawler, ["AI2Bot"]),
     agent!("Diffbot", "Diffbot", AiCrawler),
     agent!("Timpibot", "Timpi", AiCrawler),
     agent!("ImagesiftBot", "ImageSift", AiCrawler),
     agent!("omgili", "Webz.io", AiCrawler, ["omgili"]),
     // Search engines.
-    agent!("Googlebot", "Google", SearchCrawler, ["Googlebot", "GoogleOther", "Google-InspectionTool"], [GOOGLEBOT]),
-    agent!("bingbot", "Microsoft", SearchCrawler, ["bingbot", "BingPreview"], [BINGBOT]),
+    agent!(
+        "Googlebot",
+        "Google",
+        SearchCrawler,
+        ["Googlebot", "GoogleOther", "Google-InspectionTool"],
+        [GOOGLEBOT]
+    ),
+    agent!(
+        "bingbot",
+        "Microsoft",
+        SearchCrawler,
+        ["bingbot", "BingPreview"],
+        [BINGBOT]
+    ),
     agent!("DuckDuckBot", "DuckDuckGo", SearchCrawler),
-    agent!("YandexBot", "Yandex", SearchCrawler, ["YandexBot", "YandexImages"]),
+    agent!(
+        "YandexBot",
+        "Yandex",
+        SearchCrawler,
+        ["YandexBot", "YandexImages"]
+    ),
     agent!("Baiduspider", "Baidu", SearchCrawler),
     agent!("PetalBot", "Huawei", SearchCrawler),
     // SEO.
@@ -217,7 +286,12 @@ pub static AGENTS: &[Agent] = &[
     // Monitoring.
     agent!("UptimeRobot", "UptimeRobot", Monitor),
     agent!("Pingdom", "SolarWinds", Monitor, ["Pingdom.com_bot"]),
-    agent!("Datadog Synthetics", "Datadog", Monitor, ["DatadogSynthetics", "Datadog/Synthetics"]),
+    agent!(
+        "Datadog Synthetics",
+        "Datadog",
+        Monitor,
+        ["DatadogSynthetics", "Datadog/Synthetics"]
+    ),
     agent!("StatusCake", "StatusCake", Monitor),
     agent!("kube-probe", "Kubernetes", Monitor, ["kube-probe/"]),
     // Scanners.
@@ -228,11 +302,21 @@ pub static AGENTS: &[Agent] = &[
     agent!("masscan", "masscan", Scanner),
     agent!("Nmap", "Nmap", Scanner, ["Nmap Scripting Engine"]),
     agent!("CensysInspect", "Censys", Scanner),
-    agent!("Expanse", "Palo Alto Networks", Scanner, ["Expanse, a Palo Alto Networks"]),
+    agent!(
+        "Expanse",
+        "Palo Alto Networks",
+        Scanner,
+        ["Expanse, a Palo Alto Networks"]
+    ),
     agent!("LeakIX", "LeakIX", Scanner, ["l9explore", "l9tcpid"]),
     // Scripted clients. After everything with a bot identity, which often
     // embeds a library name too.
-    agent!("HeadlessChrome", "headless browser", Scripted, ["HeadlessChrome/"]),
+    agent!(
+        "HeadlessChrome",
+        "headless browser",
+        Scripted,
+        ["HeadlessChrome/"]
+    ),
     agent!("curl", "curl", Scripted, ["curl/"]),
     agent!("Wget", "GNU Wget", Scripted, ["Wget/"]),
     agent!("python-requests", "Python", Scripted, ["python-requests/"]),
@@ -305,7 +389,11 @@ impl Classifier {
         if user_agent.is_empty() {
             return None;
         }
-        self.set.matches(user_agent).into_iter().map(|p| self.owner[p]).min()
+        self.set
+            .matches(user_agent)
+            .into_iter()
+            .map(|p| self.owner[p])
+            .min()
     }
 }
 
@@ -412,7 +500,8 @@ impl RangeBook {
         range_urls()
             .into_iter()
             .map(|url| {
-                let owners: Vec<&Agent> = AGENTS.iter().filter(|a| a.ranges.contains(&url)).collect();
+                let owners: Vec<&Agent> =
+                    AGENTS.iter().filter(|a| a.ranges.contains(&url)).collect();
                 let l = lists.get(url);
                 RangeStatus {
                     url,
@@ -436,7 +525,15 @@ impl RangeBook {
 /// string under a prefix-shaped key anywhere in the document. An empty result
 /// is an error: installing it would mark every claim spoofed.
 pub fn parse_ranges(body: &[u8]) -> Result<Vec<IpPrefix>, String> {
-    const KEYS: &[&str] = &["ipv4Prefix", "ipv6Prefix", "ipv4_prefix", "ipv6_prefix", "prefix", "ip_prefix", "cidr"];
+    const KEYS: &[&str] = &[
+        "ipv4Prefix",
+        "ipv6Prefix",
+        "ipv4_prefix",
+        "ipv6_prefix",
+        "prefix",
+        "ip_prefix",
+        "cidr",
+    ];
     fn walk(v: &serde_json::Value, key: Option<&str>, out: &mut Vec<IpPrefix>, bad: &mut usize) {
         match v {
             serde_json::Value::Object(m) => {
@@ -461,7 +558,8 @@ pub fn parse_ranges(body: &[u8]) -> Result<Vec<IpPrefix>, String> {
             _ => {}
         }
     }
-    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("not JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("not JSON: {e}"))?;
     let mut out = Vec::new();
     let mut bad = 0;
     walk(&v, None, &mut out, &mut bad);
@@ -476,14 +574,24 @@ pub fn parse_ranges(body: &[u8]) -> Result<Vec<IpPrefix>, String> {
 }
 
 async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<IpPrefix>, String> {
-    let resp = http.get(url).send().await.map_err(|e| format!("fetch failed: {e}"))?;
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("fetch failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    if resp.content_length().is_some_and(|n| n as usize > MAX_RANGE_BYTES) {
+    if resp
+        .content_length()
+        .is_some_and(|n| n as usize > MAX_RANGE_BYTES)
+    {
         return Err("range file too large".into());
     }
-    let body = resp.bytes().await.map_err(|e| format!("read failed: {e}"))?;
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
     if body.len() > MAX_RANGE_BYTES {
         return Err("range file too large".into());
     }
@@ -495,7 +603,11 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<IpPrefix>, Strin
 pub async fn refresh(book: Arc<RangeBook>, every: Duration) {
     let http = match reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .user_agent(concat!("app-lb/", env!("CARGO_PKG_VERSION"), " (bot range verification)"))
+        .user_agent(concat!(
+            "app-lb/",
+            env!("CARGO_PKG_VERSION"),
+            " (bot range verification)"
+        ))
         .build()
     {
         Ok(c) => c,
@@ -541,7 +653,12 @@ mod tests {
             }
             for t in a.tokens {
                 let got = c.classify(&format!("Mozilla/5.0 (compatible; {t}1.0)"));
-                assert_eq!(got, Some(i), "{t} is shadowed by {:?}", got.map(|j| AGENTS[j].name));
+                assert_eq!(
+                    got,
+                    Some(i),
+                    "{t} is shadowed by {:?}",
+                    got.map(|j| AGENTS[j].name)
+                );
             }
         }
     }
@@ -549,22 +666,61 @@ mod tests {
     #[test]
     fn real_user_agents_land_where_they_should() {
         let cases = [
-            ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)", "GPTBot"),
-            ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot", "ChatGPT-User"),
-            ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)", "ClaudeBot"),
-            ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-User/1.0; +Claude-User@anthropic.com)", "Claude-User"),
-            ("Mozilla/5.0 (compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot)", "OAI-SearchBot"),
-            ("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", "Googlebot"),
-            ("Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)", "bingbot"),
+            (
+                "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)",
+                "GPTBot",
+            ),
+            (
+                "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot",
+                "ChatGPT-User",
+            ),
+            (
+                "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+                "ClaudeBot",
+            ),
+            (
+                "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-User/1.0; +Claude-User@anthropic.com)",
+                "Claude-User",
+            ),
+            (
+                "Mozilla/5.0 (compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot)",
+                "OAI-SearchBot",
+            ),
+            (
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                "Googlebot",
+            ),
+            (
+                "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+                "bingbot",
+            ),
             ("CCBot/2.0 (https://commoncrawl.org/faq/)", "CCBot"),
-            ("meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)", "Meta-ExternalAgent"),
-            ("facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)", "facebookexternalhit"),
-            ("Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)", "Slackbot"),
+            (
+                "meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)",
+                "Meta-ExternalAgent",
+            ),
+            (
+                "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+                "facebookexternalhit",
+            ),
+            (
+                "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
+                "Slackbot",
+            ),
             ("curl/8.5.0", "curl"),
             ("python-requests/2.31.0", "python-requests"),
-            ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/120.0.0.0 Safari/537.36", "HeadlessChrome"),
-            ("Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)", "Nmap"),
-            ("Mozilla/5.0 (compatible; FooCrawler/3.1; +https://foo.example/bot)", "unidentified bot"),
+            (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/120.0.0.0 Safari/537.36",
+                "HeadlessChrome",
+            ),
+            (
+                "Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)",
+                "Nmap",
+            ),
+            (
+                "Mozilla/5.0 (compatible; FooCrawler/3.1; +https://foo.example/bot)",
+                "unidentified bot",
+            ),
         ];
         for (ua, want) in cases {
             assert_eq!(classify(ua), Some(want), "{ua}");
@@ -598,7 +754,10 @@ mod tests {
         let p = parse_ranges(google).unwrap();
         assert_eq!(p.len(), 2);
         assert!(p[1].contains("66.249.64.9".parse().unwrap()));
-        assert!(parse_ranges(br#"{"prefixes":[]}"#).is_err(), "empty must not install");
+        assert!(
+            parse_ranges(br#"{"prefixes":[]}"#).is_err(),
+            "empty must not install"
+        );
         assert!(parse_ranges(b"<html>").is_err());
         assert!(parse_ranges(br#"{"prefixes":[{"ipv4Prefix":"nope"}]}"#).is_err());
     }
@@ -609,18 +768,37 @@ mod tests {
         let gptbot = agent("GPTBot").unwrap();
         let inside: IpAddr = "20.171.207.5".parse().unwrap();
         let outside: IpAddr = "198.51.100.7".parse().unwrap();
-        assert_eq!(book.verify(gptbot, Some(outside)), Verification::Claimed, "not loaded yet");
+        assert_eq!(
+            book.verify(gptbot, Some(outside)),
+            Verification::Claimed,
+            "not loaded yet"
+        );
         book.failed(OPENAI_GPTBOT, "HTTP 503".into(), 1);
-        assert_eq!(book.verify(gptbot, Some(outside)), Verification::Claimed, "fetch failing");
-        book.install(OPENAI_GPTBOT, vec![IpPrefix::parse("20.171.207.0/24").unwrap()], 2);
+        assert_eq!(
+            book.verify(gptbot, Some(outside)),
+            Verification::Claimed,
+            "fetch failing"
+        );
+        book.install(
+            OPENAI_GPTBOT,
+            vec![IpPrefix::parse("20.171.207.0/24").unwrap()],
+            2,
+        );
         assert_eq!(book.verify(gptbot, Some(inside)), Verification::Verified);
         assert_eq!(book.verify(gptbot, Some(outside)), Verification::Spoofed);
         assert_eq!(book.verify(gptbot, None), Verification::Claimed);
         // A later failure keeps the good list in force.
         book.failed(OPENAI_GPTBOT, "timeout".into(), 3);
         assert_eq!(book.verify(gptbot, Some(outside)), Verification::Spoofed);
-        assert_eq!(book.verify(agent("ClaudeBot").unwrap(), Some(outside)), Verification::Unverifiable);
-        let st = book.status().into_iter().find(|s| s.url == OPENAI_GPTBOT).unwrap();
+        assert_eq!(
+            book.verify(agent("ClaudeBot").unwrap(), Some(outside)),
+            Verification::Unverifiable
+        );
+        let st = book
+            .status()
+            .into_iter()
+            .find(|s| s.url == OPENAI_GPTBOT)
+            .unwrap();
         assert!(st.loaded && st.prefixes == 1 && st.error.as_deref() == Some("timeout"));
     }
 
