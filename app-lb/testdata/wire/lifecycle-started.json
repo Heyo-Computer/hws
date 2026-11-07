@@ -1,5 +1,6 @@
 {
   "state": "running",
   "retained": true,
+  "idle_action": "suspend",
   "sandbox_id": "applb-sandbox-a1b2c3"
 }

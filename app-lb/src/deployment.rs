@@ -398,6 +398,10 @@ pub struct DeploymentState {
     /// the fleet list cannot be asked what we suspended.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspended: Vec<String>,
+    /// Write-ahead stateful captures. Kept until the daemon acknowledges; an
+    /// uncertain capture blocks replacement and survives controller restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspending: Vec<String>,
     /// The scaling policy `POST …/stop` replaced with a zero ceiling, for
     /// `POST …/start` to put back. Absent while the deployment is not stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]

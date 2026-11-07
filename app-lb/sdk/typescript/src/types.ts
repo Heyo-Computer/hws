@@ -41,8 +41,8 @@ export interface ScalingPolicy {
   scale_to_zero_after_secs?: number;
   cold_start_timeout_secs?: number;
   drain_timeout_secs?: number;
-  /** `destroy` kills an idle VM; `retain` stops it, keeping its data disk. */
-  idle_action?: "destroy" | "retain";
+  /** `destroy` deletes; `retain` keeps disks; `suspend` also saves RAM for same-host resume. */
+  idle_action?: "destroy" | "retain" | "suspend";
   boot_timeout_secs?: number;
 }
 
@@ -559,8 +559,10 @@ export interface DeploymentMetrics {
 export interface LifecycleOutcome {
   /** `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came back before the pool settled. */
   state: "stopped" | "stopping" | "running" | "starting";
-  /** Whether a stopped VM keeps its data disk (`idle_action: retain`). */
+  /** Whether a stopped VM keeps its disks (`retain` or `suspend`). */
   retained: boolean;
+  /** Absent on older servers; `suspend` preserves RAM as well as disks. */
+  idle_action?: "destroy" | "retain" | "suspend";
   /** The VM now serving, once one is. */
   sandbox_id?: string;
   warning?: string;
@@ -574,7 +576,7 @@ export interface Capacity {
   deployments: number;
   running_vms: number;
   booting_vms: number;
-  /** Suspended under `idle_action: retain`: holding a disk, not CPU or memory. */
+  /** Stopped or memory-suspended VMs: saved state on disk, no running guest. */
   stopped_vms: number;
 }
 

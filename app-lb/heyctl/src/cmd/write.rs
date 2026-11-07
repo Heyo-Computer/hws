@@ -219,11 +219,12 @@ pub struct ScalingFlags {
     /// frees the sandbox and its disks. `retain` stops it instead, keeping its
     /// /workspace data disk, and a later request or `exec` resumes that VM
     /// rather than booting a fresh one — the setting for an agent sandbox,
-    /// whose working directory is the point.
+    /// whose working directory is the point. `suspend` preserves memory and
+    /// disks on the same host (Firecracker with PR #684 runtime support).
     #[arg(
         long,
         value_name = "ACTION",
-        value_parser = ["destroy", "retain"],
+        value_parser = ["destroy", "retain", "suspend"],
         help_heading = "Scaling"
     )]
     pub idle_action: Option<String>,
@@ -2849,6 +2850,34 @@ pub fn uncordon(ctx: &Ctx, args: &UncordonArgs) -> Result<()> {
             "administratively accepting, but still excluded by its health probe"
         },
     );
+    Ok(())
+}
+
+// -- explicit stop / start -------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct LifecycleArgs {
+    #[arg(value_name = "RESOURCE")]
+    pub resource: String,
+    /// Wait up to this many seconds; 0 returns the in-progress state at once.
+    #[arg(long, value_name = "SECS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(0..=300))]
+    pub wait_secs: u64,
+}
+
+pub fn lifecycle(ctx: &Ctx, args: &LifecycleArgs, start: bool) -> Result<()> {
+    let id = deployment_name(&args.resource)?;
+    let outcome = if start { ctx.client.start(&id, args.wait_secs)? }
+        else { ctx.client.stop(&id, args.wait_secs)? };
+    if ctx.out.is_machine() {
+        return output::emit(&serde_json::to_value(&outcome)?, ctx.out, &[format!("deployment/{id}")]);
+    }
+    println!("deployment/{id} {}", outcome.state);
+    match outcome.idle_action.as_str() {
+        "suspend" => println!("Stateful mode: RAM and disks retained locally; not a host-loss backup."),
+        "retain" => println!("Disk-only mode: /workspace retained; memory is not preserved."),
+        _ => {}
+    }
+    if let Some(warning) = outcome.warning { eprintln!("Warning: {warning}"); }
     Ok(())
 }
 

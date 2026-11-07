@@ -601,6 +601,15 @@ pub enum IdleAction {
     /// Stop it: the sandbox stays, keeping its data disk, and a later request or
     /// `exec` resumes it instead of booting a fresh one.
     Retain,
+    /// Capture RAM and writable disks on the same host (Firecracker only).
+    /// Acknowledgment means local capture, not host-loss durability.
+    Suspend,
+}
+
+impl IdleAction {
+    pub fn retains_vm(self) -> bool {
+        matches!(self, Self::Retain | Self::Suspend)
+    }
 }
 
 /// Which runtime boots a deployment's replicas.
@@ -4201,6 +4210,7 @@ pub enum SpecError {
     IngressWithoutVm,
     /// A `placement` that names no usable host, or a mode not yet available.
     InvalidPlacement(String),
+    InvalidSuspend(String),
     /// Workflow ids are interpolated into NATS subjects and VM names unescaped.
     BadWorkflowId(String),
     EmptyWorkflowRepo,
@@ -4501,6 +4511,7 @@ impl std::fmt::Display for SpecError {
                  deployment has none"
             ),
             Self::InvalidPlacement(why) => write!(f, "{why}"),
+            Self::InvalidSuspend(why) => write!(f, "idle_action suspend: {why}"),
             Self::IngressWithoutVm => write!(
                 f,
                 "ingress.cloud binds a VM's port on the daemon, and this deployment \
@@ -5387,6 +5398,9 @@ impl DeploymentSpec {
         if self.scaling.idle_action == IdleAction::Retain {
             return Some("idle_action `retain` keeps stopped VMs on one host");
         }
+        if self.scaling.idle_action == IdleAction::Suspend {
+            return Some("idle_action `suspend` keeps memory and disks on one host");
+        }
         if self.build.is_some() {
             return Some("a vm.build image is built on one host");
         }
@@ -5430,6 +5444,17 @@ impl DeploymentSpec {
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
+        }
+        if self.scaling.idle_action == IdleAction::Suspend {
+            let Some(vm) = &self.vm else {
+                return Err(SpecError::InvalidSuspend("requires a Firecracker VM pool".into()));
+            };
+            if vm.driver != Driver::Firecracker || vm.rootfs != RootfsMode::Copy {
+                return Err(SpecError::InvalidSuspend("requires Firecracker with private writable rootfs".into()));
+            }
+            if vm.workspace.is_some() || vm.workspace_archive.is_some() {
+                return Err(SpecError::InvalidSuspend("cannot combine memory suspension with workspace capture/archive lifecycle; use disk_size_gb instead".into()));
+            }
         }
         if let Some(gateway) = &self.gateway {
             if self.vm.is_some() || self.discovery.is_some() || self.site.is_some() || self.tunnel.is_some()
@@ -8362,6 +8387,23 @@ mod tests {
 
         let round = serde_json::to_string(&s).unwrap();
         assert!(round.contains(r#""idle_action":"retain""#), "got {round}");
+
+        let s: ScalingPolicy = serde_json::from_str(r#"{"idle_action":"suspend"}"#).unwrap();
+        assert_eq!(s.idle_action, IdleAction::Suspend);
+        assert!(s.idle_action.retains_vm());
+    }
+
+    #[test]
+    fn stateful_suspend_requires_private_firecracker_and_host_placement() {
+        let mut s = spec();
+        s.scaling.idle_action = IdleAction::Suspend;
+        assert_eq!(s.validate(), Ok(()));
+        assert!(s.host_bound().is_some());
+        s.vm.as_mut().unwrap().driver = Driver::Kvm;
+        assert!(matches!(s.validate(), Err(SpecError::InvalidSuspend(_))));
+        s.vm.as_mut().unwrap().driver = Driver::Firecracker;
+        s.vm.as_mut().unwrap().rootfs = RootfsMode::Shared;
+        assert!(matches!(s.validate(), Err(SpecError::InvalidSuspend(_))));
     }
 
     mod sites {

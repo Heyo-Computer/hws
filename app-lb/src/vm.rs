@@ -650,8 +650,9 @@ impl VmManager {
         workspace: Option<&WorkspaceSeed>,
         owner: &VmOwner,
         secret_env: HashMap<String, String>,
+        stateful: bool,
     ) -> Result<Sandbox, VmError> {
-        let req = self.prepare_create(spec, name, workspace, owner, secret_env).await?;
+        let req = self.prepare_create(spec, name, workspace, owner, secret_env, stateful).await?;
         // Readiness is tracked across reconcile ticks, not by this request.
         let created = self.daemon.create(&req).await?;
         Ok(self.daemon.sandbox(&created.id))
@@ -666,6 +667,7 @@ impl VmManager {
         workspace: Option<&WorkspaceSeed>,
         owner: &VmOwner,
         secret_env: HashMap<String, String>,
+        stateful: bool,
     ) -> Result<DaemonCreateRequest, VmError> {
         // `validate` refuses these at registration, so this is unreachable in
         // practice — but it was a `debug_assert` before, which compiled out in
@@ -710,7 +712,14 @@ impl VmManager {
         }
         let mounts: Vec<DaemonMount> = resolved.into_iter().map(|m| m.mount).collect();
 
-        Ok(create_request(spec, name, open_ports, env_vars, mounts, owner))
+        let mut request = create_request(spec, name, open_ports, env_vars, mounts, owner);
+        if stateful {
+            request.extra.insert("lifecycle".into(), serde_json::json!({
+                "enabled": true, "auto_resume": false,
+                "idle_timeout_seconds": null, "keep_running": false
+            }));
+        }
+        Ok(request)
     }
 
     /// The daemon's `mounts` array for a spec: one host directory per guest
@@ -1016,6 +1025,41 @@ impl VmManager {
             Err(heyo_sdk::HeyoError::NotFound(_)) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// PR #684's memory-preserving capture. Unlike disk-only `suspend`, a
+    /// missing endpoint or sandbox is an error, never permission to stop/kill.
+    pub async fn suspend_stateful(&self, sandbox_id: &str) -> Result<(), VmError> {
+        self.require_stateful(sandbox_id).await?;
+        self.client.request::<serde_json::Value>(
+            reqwest::Method::POST, &format!("/sandboxes/{}/suspend", form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()),
+            None::<&()>, heyo_sdk::RequestOptions::default(),
+        ).await?;
+        Ok(())
+    }
+
+    /// Verify the daemon accepted the create-time policy. Older daemons ignore
+    /// unknown create fields, so successful allocation alone proves nothing.
+    pub async fn require_stateful(&self, sandbox_id: &str) -> Result<bool, VmError> {
+        let body: serde_json::Value = self.client.request(
+            reqwest::Method::GET, &format!("/sandboxes/{}/lifecycle", form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()),
+            None::<&()>, heyo_sdk::RequestOptions::default(),
+        ).await?;
+        if body["policy"]["enabled"] != true || body["policy"]["auto_resume"] != false
+            || !body["policy"]["idle_timeout_seconds"].is_null() || body["policy"]["keep_running"] != false {
+            return Err(VmError::Runtime("sandbox lacks app-lb's explicit stateful lifecycle policy; create it with a compatible PR #684 runtime".into()));
+        }
+        body["suspended"].as_bool().ok_or_else(|| VmError::Runtime("daemon omitted stateful suspension status".into()))
+    }
+
+    pub async fn resume_stateful(&self, sandbox_id: &str) -> Result<SandboxInfo, VmError> {
+        if !self.require_stateful(sandbox_id).await? {
+            // An earlier resume may have completed despite a lost response.
+            let info = self.connect(sandbox_id.into())?.info().await?;
+            if info.status == SandboxStatus::Running { return Ok(info); }
+            return Err(VmError::Runtime("stateful snapshot is missing; refusing a cold boot".into()));
+        }
+        self.resume(sandbox_id).await
     }
 
     /// Restart a suspended VM and wait for the daemon to call it `Running`.

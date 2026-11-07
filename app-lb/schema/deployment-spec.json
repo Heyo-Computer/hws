@@ -675,6 +675,11 @@
           "description": "Stop it: the sandbox stays, keeping its data disk, and a later request or\n`exec` resumes it instead of booting a fresh one.",
           "type": "string",
           "const": "retain"
+        },
+        {
+          "description": "Capture RAM and writable disks on the same host (Firecracker only).\nAcknowledgment means local capture, not host-loss durability.",
+          "type": "string",
+          "const": "suspend"
         }
       ]
     },
