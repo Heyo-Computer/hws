@@ -2009,7 +2009,7 @@ that is the state of the deployment, and it has to belong to the deployment.
 | Field | |
 | --- | --- |
 | `path` | Guest path. Defaults to `/workspace`, which is also the only path heyvmd sizes from `disk_size_gb` — elsewhere the image is 1.5× its content with a 2 GiB floor. |
-| `store` | Where snapshots go: `s3://bucket[/prefix]` (via the `aws` CLI and its own credentials; `APP_LB_DISK_ARCHIVE_ENDPOINT` applies), an `http(s)://` `art serve`, or the absolute path of a local store. |
+| `store` | Where snapshots go: `s3://bucket[/prefix]` (via the `aws` CLI and its own credentials; `APP_LB_DISK_ARCHIVE_ENDPOINT` applies), an `http(s)://` `art serve`, or the absolute path of a local store. When this LB itself routes the store's hostname to one of its managed deployments (an `art` deployment on the same host), pushes, tag reads and restores go straight to a ready replica over the private network, with the store's `Host`. The public URL is used only when no replica is ready or the replica can't be reached, or when the route rewrites requests (`redirect`, `strip_prefix`). Without this, a multi-gigabyte bundle goes out through TLS and the LB's own proxy, and a replica that stalls on disk trips the proxy's timeouts. |
 | `ref` | The tag the newest snapshot is published under in an artifact store. Defaults to `workspace-<deployment id>`. S3 keys by deployment id instead: `<prefix>/<id>/<digest>.tar.gz` plus a `latest` pointer. |
 | `auth` | A secret reference for the artifact store, like `artifact.auth`. |
 | `snapshot_interval_secs` | Recycle the replica for a snapshot at least this often (minimum `300`). Unset, a snapshot is taken only when the replica retires for another reason. See **Scheduled snapshots** below. |
