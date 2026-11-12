@@ -2550,8 +2550,18 @@ managed host heyvm service before normal host maintenance is available. It accep
 only `target`, a direct `${{ secrets.NAME }}` app-lb namespace-admin `token`, and
 the frozen validation `workflow` and `artifact` names. The coordinator must run in
 a CI-owned VM on a runner other than the target. The artifact must have been
-uploaded as a public artifact to CI's configured HTTP artifact sink and contain
+uploaded to CI's configured HTTP artifact sink and contain
 exactly one `*heyvm.tar.gz` with exactly one ELF `heyvm`.
+
+Artifacts remain private. The installer downloads through
+`CI_PUBLIC_URL/api/host-artifacts/{operation}` with an operation-scoped bearer;
+it never receives the artifact-store credential. Add `/api/host-artifacts/` to
+app-lb's `public_paths` so this route can enforce its own bearer authentication.
+CI serves only the persisted operation's size/digest-verified artifact while
+delivery is armed or polling, the deadline is unexpired, and both job and run
+are running. Completion, failure, cancellation, or timeout revokes access.
+Responses are `no-store`, and the installer refuses redirects. Existing saved
+public-download operations remain readable for receipt-only recovery.
 
 Set `CI_HOST_HEYVM_BOOTSTRAP_TARGETS`, or preferably store the same JSON at the
 operator-only HeyoSecret path `ci-controller/host-heyvm-bootstrap-targets` (the
@@ -2587,7 +2597,7 @@ repair a retained fence; reconcile the persisted operation and launcher job.
 single app-lb launcher delivery, receipt reconciliation, and explicit recovery
 contract as `ci/bootstrap-host-heyvm`. Its inputs are the same closed set:
 `target`, direct `${{ secrets.NAME }}` `token`, frozen validation `workflow`, and
-public `artifact`. Unlike the bootstrap action, it selects the exact root
+private `artifact`. Unlike the bootstrap action, it selects the exact root
 `heyvmd` ELF from the validated inner `heyvm-*-unknown-linux-gnu-x86_64.tar.gz`;
 it never installs or renames `heyvm`.
 

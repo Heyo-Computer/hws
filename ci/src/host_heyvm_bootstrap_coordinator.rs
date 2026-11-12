@@ -124,15 +124,6 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
     let stored=crate::submission::artifact(&d.store,&msg.run_id,workflow,name,None).await.map_err(anyhow::Error::msg)?;
     ensure!(stored.sink=="artifacts"&&stored.size_bytes as usize<=LIMIT,"bootstrap requires a bounded CI HTTP artifact");
     let digest=stored.digest.clone().ok_or_else(||anyhow::anyhow!("artifact digest missing"))?;
-    let store=d.config.artifacts.as_ref().ok_or_else(||anyhow::anyhow!("CI artifact HTTP sink is not configured"))?.url.trim_end_matches('/');
-    let expected_url=format!("{store}/blobs/{digest}");
-    // Retained bundles intentionally carry no public_url. Verify that the
-    // configured immutable blob endpoint is readable by the host instead.
-    let response=client()?.head(&expected_url).send().await?;
-    let size=response.headers().get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
-    ensure!(response.status().is_success() && size==Some(stored.size_bytes),
-        "host artifact must be public from the configured CI HTTP sink with its exact size");
     let bytes=d.artifacts.get(&stored).await.map_err(|e|anyhow::anyhow!(e.to_string()))?; ensure!(sha(&bytes)==digest,"artifact digest mismatch");
     ensure!(matches!(component,"heyvm"|"heyvmd"),"unsupported host component");
     if component=="heyvmd" {
@@ -142,7 +133,10 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
     }
     let (inner_path,inner_archive_sha256,heyvm_sha256)=inspect_component(&bytes,component)?;
     let id=format!("ci-heyvm-{}",sha(step.as_bytes())); let launcher=format!("heyvm-bootstrap-{}",sha(id.as_bytes())[..32].to_string());
-    let artifact=Artifact{operation_id:id.clone(),artifact_url:expected_url,artifact_sha256:digest,artifact_size:stored.size_bytes,inner_path,inner_archive_sha256,heyvm_sha256,component:(component=="heyvmd").then(||component.into())};
+    let base=d.config.public_url.trim_end_matches('/');
+    crate::cd::app_lb_endpoint(base).map_err(anyhow::Error::msg)?;
+    ensure!(base.starts_with("https://"),"host artifact delivery requires HTTPS");
+    let artifact=Artifact{operation_id:id.clone(),artifact_url:format!("{base}/api/host-artifacts/{id}"),artifact_sha256:digest,artifact_size:stored.size_bytes,inner_path,inner_archive_sha256,heyvm_sha256,download_token:Some(download_token(&d.config.webhook_secret,&id)),component:(component=="heyvmd").then(||component.into())};
     let request_hash=sha(&serde_json::to_vec(&canonical(&serde_json::to_value(&artifact)?))?); let (config_sha256,systemd_drop_in_sha256)=expected_files(&target,component);
     let req=Request{alias:alias.into(),target:target.clone(),token_secret:secret,artifact,request_sha256:request_hash,config_sha256,systemd_drop_in_sha256};
     let command=crate::host_heyvm_bootstrap::recipe(&serde_json::to_string(&BTreeMap::from([(alias.to_string(),target.clone())]))?,alias,&req.artifact)?;
@@ -162,6 +156,33 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
         .bind(&id).bind(&target.runner_hd_id).bind(value).bind(spec).bind(timeout.min(d.config.max_job_duration).as_secs() as f64).bind(launcher).execute(&mut *tx).await?;
     Store::add_service_deployment_event(&mut tx,&id).await?; tx.commit().await?;
     Ok(format!("[ci] bootstrap {id} durably fenced {}; coordinator reconciliation owns completion\n",target.runner_hd_id))
+}
+
+// Domain-separated, deterministic across retries/restarts. This grants access
+// to one persisted operation only, never to the underlying artifact store.
+fn download_token(secret: &str, id: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac=Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(b"ci-host-artifact-v1\0");
+    mac.update(id.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+pub(crate) async fn download_artifact(store:&Store,sink:&dyn crate::artifacts::ArtifactSink,secret:&str,id:&str,token:&str)->Result<Option<Vec<u8>>> {
+    use subtle::ConstantTimeEq;
+    // Authenticate before touching storage. Expiration/revocation is checked
+    // against durable operation, job and run state, not process-local state.
+    if !bool::from(download_token(secret,id).as_bytes().ct_eq(token.as_bytes())) {return Ok(None)}
+    let request:Option<Value>=sqlx::query_scalar("SELECT h.request FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=s.run_id WHERE h.id=$1 AND h.phase IN ('armed','polling') AND h.deadline>now() AND j.status='running' AND r.status='running'")
+        .bind(id).fetch_optional(store.pool()).await?;
+    let Some(request)=request else{return Ok(None)};
+    let req:Request=serde_json::from_value(request)?;
+    ensure!(req.artifact.operation_id==id && req.artifact.artifact_size<=LIMIT as u64,"invalid stored host artifact");
+    if !req.artifact.download_token.as_deref().is_some_and(|saved|bool::from(saved.as_bytes().ct_eq(token.as_bytes()))) {return Ok(None)}
+    let artifact=crate::artifacts::StoredArtifact{sink:"artifacts",digest:Some(req.artifact.artifact_sha256.clone()),size_bytes:req.artifact.artifact_size,uri:String::new(),public_url:None};
+    let bytes=sink.get(&artifact).await?;
+    ensure!(bytes.len() as u64==artifact.size_bytes && sha(&bytes)==req.artifact.artifact_sha256,"host artifact identity mismatch");
+    Ok(Some(bytes))
 }
 
 fn client()->Result<reqwest::Client>{Ok(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(20)).build()?)}
@@ -342,6 +363,73 @@ pub fn spawn(d:Arc<Dispatcher>){tokio::spawn(async move{let mut tick=tokio::time
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires disposable CI_TEST_DATABASE_URL"]
+    async fn private_artifact_grant_is_operation_scoped_and_revoked_by_lifecycle() {
+        use axum::{Router, http::{HeaderMap,StatusCode}, routing::get};
+        let base=std::env::var("CI_TEST_DATABASE_URL").unwrap();
+        let admin=sqlx::PgPool::connect(&base).await.unwrap();
+        let schema=format!("host_download_{}",uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+        let mut url=reqwest::Url::parse(&base).unwrap();
+        url.query_pairs_mut().append_pair("options",&format!("-c search_path={schema}"));
+        let dir=tempfile::tempdir().unwrap();
+        let store=Store::connect(url.as_str(),dir.path().join("logs"),Duration::from_secs(10)).await.unwrap();
+        store.migrate().await.unwrap();
+        let data=b"private release bytes";
+        let app=Router::new().route("/blobs/{digest}",get(|headers:HeaderMap|async move {
+            if headers.get("authorization").and_then(|v|v.to_str().ok())!=Some("Bearer store-only-key") {return (StatusCode::UNAUTHORIZED,Vec::new())}
+            (StatusCode::OK,b"private release bytes".to_vec())
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let sink=crate::artifacts::ArtifactsSink::new(crate::config::ArtifactsConfig{url:origin.clone(),token:Some("store-only-key".into()),guest_url:None});
+        let key="test-controller-key";
+        let token=download_token(key,"op");
+        let req=json!({"alias":"eu1","target":{
+            "repository":REPOSITORY,"app_lb_admin_url":"https://admin.test","app_lb_deployment":"host","app_lb_namespace":"default",
+            "runner_hd_id":"runner","backend_server_id":"backend","executable":"/usr/bin/heyvmd","unit":"heyvmd.service","state_dir":"/state",
+            "config_json_path":"/config","systemd_drop_in_path":"/drop","local_health_url":"http://127.0.0.1/health","target_alias":"eu1","region":"eu1"},
+            "token_secret":"HOST_TOKEN","artifact":{"operation_id":"op","artifact_url":"https://ci.test/api/host-artifacts/op","artifact_sha256":sha(data),"artifact_size":data.len(),
+                "inner_path":"dist/heyvm.tar.gz","inner_archive_sha256":"a".repeat(64),"heyvm_sha256":"b".repeat(64),"download_token":token,"component":"heyvmd"},
+            "request_sha256":"hash","config_sha256":"hash","systemd_drop_in_sha256":"hash"});
+        sqlx::raw_sql("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES('run','test','ci.yml','running');
+            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','running');
+            INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('step','job',0,'Install','ci/rollout-host-heyvmd','running');
+            INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES('op','step','run','job','daemon','hash','running','source','main');")
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_host_heyvm_bootstrap(id,runner_hd_id,request,launcher_recipe,deadline,launcher_deployment_id,phase) VALUES('op','runner',$1,'{}',now()+interval '1 hour','launcher','armed')")
+            .bind(&req).execute(store.pool()).await.unwrap();
+        assert_eq!(reqwest::get(format!("{origin}/blobs/{}",sha(data))).await.unwrap().status(),StatusCode::UNAUTHORIZED);
+        for bad in [String::new(),download_token(key,"other"),download_token("other-key","op")] {
+            assert!(download_artifact(&store,&sink,key,"op",&bad).await.unwrap().is_none());
+        }
+        for phase in ["armed","polling"] {
+            sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase=$1").bind(phase).execute(store.pool()).await.unwrap();
+            assert_eq!(download_artifact(&store,&sink,key,"op",&token).await.unwrap().unwrap(),data);
+        }
+        for phase in ["releasing","draining","registering","delivery_ready","passed","failed","superseded"] {
+            sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase=$1").bind(phase).execute(store.pool()).await.unwrap();
+            assert!(download_artifact(&store,&sink,key,"op",&token).await.unwrap().is_none(),"{phase}");
+        }
+        sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='polling',deadline=now()-interval '1 second'").execute(store.pool()).await.unwrap();
+        assert!(download_artifact(&store,&sink,key,"op",&token).await.unwrap().is_none());
+        sqlx::query("UPDATE ci_host_heyvm_bootstrap SET deadline=now()+interval '1 hour'").execute(store.pool()).await.unwrap();
+        for table in ["ci_run","ci_job"] {
+            sqlx::query(&format!("UPDATE {table} SET status='cancelled'")).execute(store.pool()).await.unwrap();
+            assert!(download_artifact(&store,&sink,key,"op",&token).await.unwrap().is_none());
+            sqlx::query(&format!("UPDATE {table} SET status='running'")).execute(store.pool()).await.unwrap();
+        }
+        let mut corrupt=req.clone();corrupt["artifact"]["artifact_sha256"]=json!("0".repeat(64));
+        sqlx::query("UPDATE ci_host_heyvm_bootstrap SET request=$1").bind(corrupt).execute(store.pool()).await.unwrap();
+        assert!(download_artifact(&store,&sink,key,"op",&token).await.is_err());
+        assert_eq!(reqwest::get(format!("{origin}/blobs/{}",sha(data))).await.unwrap().status(),StatusCode::UNAUTHORIZED);
+        server.abort();store.pool().close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+        admin.close().await;
+    }
 
     #[tokio::test]
     async fn polling_uses_scoped_route_and_exact_job_identity() {
