@@ -93,7 +93,7 @@ fn inspect_component(bytes:&[u8],component:&str)->Result<(String,String,String)>
     for entry in outer.entries()? { let e=entry?; let p=e.path()?.into_owned();
         ensure!(p.components().all(|c|matches!(c,std::path::Component::Normal(_)|std::path::Component::CurDir)),"unsafe artifact path");
         let name=p.file_name().and_then(|v|v.to_str()).unwrap_or("");
-        if name.starts_with("heyvm-") && name.ends_with("-unknown-linux-gnu-x86_64.tar.gz") { ensure!(found.is_none()&&e.header().entry_type().is_file(),"ambiguous inner heyvm archive"); let mut b=Vec::new(); e.take((LIMIT+1) as u64).read_to_end(&mut b)?; ensure!(b.len()<=LIMIT,"inner archive exceeds bound"); found=Some((p.to_string_lossy().into_owned(),b)); }
+        if name == "heyvm-linux-x86_64.tar.gz" || (name.starts_with("heyvm-") && name.ends_with("-unknown-linux-gnu-x86_64.tar.gz")) { ensure!(found.is_none()&&e.header().entry_type().is_file(),"ambiguous inner heyvm archive"); let mut b=Vec::new(); e.take((LIMIT+1) as u64).read_to_end(&mut b)?; ensure!(b.len()<=LIMIT,"inner archive exceeds bound"); found=Some((p.to_string_lossy().into_owned(),b)); }
     }
     let (path,inner)=found.ok_or_else(||anyhow::anyhow!("exactly one inner heyvm tarball is required"))?;
     let elf=crate::host_maintenance::component_executable_digest(&inner,component)?;
@@ -542,6 +542,7 @@ mod tests {
             archive.append_data(&mut header,"heyvmd",&daemon[..]).unwrap();
             archive.into_inner().unwrap().finish().unwrap();
         }
+        for name in ["heyvm-0.48.1-unknown-linux-gnu-x86_64.tar.gz", "heyvm-linux-x86_64.tar.gz"] {
         let mut outer_tar=Vec::new();
         {
             let mut archive=tar::Builder::new(&mut outer_tar);
@@ -549,27 +550,28 @@ mod tests {
             header.set_size(inner.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            archive.append_data(&mut header,"dist/heyvm-0.48.1-unknown-linux-gnu-x86_64.tar.gz",&inner[..]).unwrap();
+            archive.append_data(&mut header,format!("dist/{name}"),&inner[..]).unwrap();
             archive.finish().unwrap();
         }
         let mut encoder=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());
         std::io::Write::write_all(&mut encoder,&outer_tar).unwrap();
         let outer=encoder.finish().unwrap();
         let (path,archive_sha,binary_sha)=inspect_component(&outer,"heyvm").unwrap();
-        assert_eq!(path,"dist/heyvm-0.48.1-unknown-linux-gnu-x86_64.tar.gz");
+        assert_eq!(path,format!("dist/{name}"));
         assert_eq!(archive_sha,sha(&inner));
         assert_eq!(binary_sha,sha(b"\x7fELFbootstrap"));
         assert_eq!(inspect_component(&outer,"heyvmd").unwrap().2,sha(b"\x7fELFnetwork-daemon"));
+        }
 
         let mut ambiguous_tar=Vec::new();
         {
             let mut archive=tar::Builder::new(&mut ambiguous_tar);
-            for version in ["0.48.1","0.48.2"] {
+            for name in ["heyvm-0.48.1-unknown-linux-gnu-x86_64.tar.gz", "heyvm-linux-x86_64.tar.gz"] {
                 let mut header=tar::Header::new_gnu();
                 header.set_size(inner.len() as u64);
                 header.set_mode(0o644);
                 header.set_cksum();
-                archive.append_data(&mut header,format!("dist/heyvm-{version}-unknown-linux-gnu-x86_64.tar.gz"),&inner[..]).unwrap();
+                archive.append_data(&mut header,format!("dist/{name}"),&inner[..]).unwrap();
             }
             archive.finish().unwrap();
         }
