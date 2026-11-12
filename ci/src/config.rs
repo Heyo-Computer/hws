@@ -304,6 +304,8 @@ pub struct Config {
     pub release_policies: Option<String>,
     /// Opt-in build-only release cutoffs and component membership.
     pub release_builds: Option<String>,
+    /// Trusted namespace artifact sources; never grants deployment rights to the source.
+    pub release_imports: Option<String>,
     /// Named environment promotion policies; absent means no automatic promotion.
     pub release_environments: Option<String>,
     /// Enable only after every original executor sharing the queue is retired.
@@ -637,6 +639,10 @@ impl Config {
         crate::release_build::policies(release_builds.as_deref()).map_err(|error| ConfigError::BadValue {
             var: "CI_RELEASE_BUILDS", value: "<operator policy>".into(), reason: error.to_string(),
         })?;
+        let release_imports = opt("CI_RELEASE_IMPORTS");
+        crate::release_import::policies(release_imports.as_deref()).map_err(|error| ConfigError::BadValue {
+            var: "CI_RELEASE_IMPORTS", value: "<operator policy>".into(), reason: error.to_string(),
+        })?;
         let release_environments = opt("CI_RELEASE_ENVIRONMENTS");
         crate::release_environment::policies(release_environments.as_deref()).map_err(|error| ConfigError::BadValue {
             var: "CI_RELEASE_ENVIRONMENTS", value: "<operator policy>".into(), reason: error.to_string(),
@@ -699,6 +705,7 @@ impl Config {
             expected_sha: opt("HEYO_REVISION").or_else(||opt("CI_EXPECTED_SHA")),
             release_policies: opt("CI_RELEASE_POLICIES"),
             release_builds,
+            release_imports,
             release_environments,
             release_service_environments_enabled: flag("CI_RELEASE_SERVICE_ENVIRONMENTS_ENABLED", false)?,
             host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),

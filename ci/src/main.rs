@@ -52,6 +52,7 @@ mod release_catalog;
 mod release_environment;
 mod release_history;
 mod release_git;
+mod release_import;
 mod release_policy;
 mod repos;
 mod runners;
