@@ -100,6 +100,41 @@ class Tests(unittest.TestCase):
             with self.assertRaises(ValueError): b.download(req,Opener(payload,status))
         self.assertIsNone(b.NoRedirect().redirect_request(None,None,None,None,None,None))
 
+    def test_private_download_authenticates_and_never_follows_redirects(self):
+        import http.server
+        import threading
+        data=b"private release bytes"
+        token="7"*64
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_GET(self):
+                if self.path == "/redirect":
+                    self.send_response(302); self.send_header("Location", "/must-not-follow"); self.end_headers(); return
+                if self.path == "/must-not-follow":
+                    self.server.followed=True
+                if self.headers.get("Authorization") != "Bearer "+token:
+                    self.send_response(401); self.end_headers(); return
+                self.send_response(200); self.end_headers(); self.wfile.write(data)
+        server=http.server.HTTPServer(("127.0.0.1",0),Handler); server.followed=False
+        thread=threading.Thread(target=server.serve_forever); thread.start()
+        try:
+            req=self.req(); req.update(artifact_size=len(data),artifact_sha256=b.sha(data),download_token=token)
+            self.assertEqual(b.request(req),req)
+            req["artifact_url"]=f"http://127.0.0.1:{server.server_port}/blob"
+            self.assertEqual(b.download(req),data)
+            for wrong in (None,"8"*64):
+                bad=req.copy()
+                if wrong is None: del bad["download_token"]
+                else: bad["download_token"]=wrong
+                with self.assertRaises(b.urllib.error.HTTPError) as caught: b.download(bad)
+                caught.exception.close()
+            req["artifact_url"]=f"http://127.0.0.1:{server.server_port}/redirect"
+            with self.assertRaises(b.urllib.error.HTTPError) as caught: b.download(req)
+            caught.exception.close()
+            self.assertFalse(server.followed)
+        finally:
+            server.shutdown(); thread.join(); server.server_close()
+
     def test_service_uses_authoritative_systemd_path_not_argv(self):
         with tempfile.TemporaryDirectory() as td:
             target=self.target(pathlib.Path(td)); exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.write_bytes(b"old")
