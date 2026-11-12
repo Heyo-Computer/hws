@@ -177,8 +177,10 @@ fn routes() -> Router<AppState> {
         .route("/ns/{ns}/repos/{repo_id}/enabled", post(set_repo_enabled))
         .route("/ns/{ns}/repos/{repo_id}/delete", post(delete_repo))
         .route("/ns/{ns}/api/runs", get(api_runs))
+        .route("/ns/{ns}/api/release-artifacts", get(api_release_artifacts))
         .route("/ns/{ns}/api/runs/{run_id}", get(api_run))
         .route("/ns/{ns}/api/runs/{run_id}/logs", get(api_logs))
+        .route("/ns/{ns}/api/runs/{run_id}/release-artifact", get(api_release_artifact))
         .route("/ns/{ns}/api/repos", get(api_repos))
         .route("/ns/{ns}/api/stream/{run_id}/{job_key}", get(api_stream))
 }
@@ -864,6 +866,37 @@ async fn api_run(
         views.push(api::job_json(job, &steps));
     }
     Json(serde_json::json!({ "run": run_json(&state, &ctx, &run), "jobs": views })).into_response()
+}
+
+async fn api_release_artifacts(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<NsContext>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (Some(repository), Some(workflow)) = (q.get("repository"), q.get("workflow")) else {
+        return error(StatusCode::BAD_REQUEST, "repository and workflow are required");
+    };
+    match crate::release_import::candidates(&state.store, &ctx.namespace, repository, workflow,
+        q.get("before").map(String::as_str)).await {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "cannot list release artifacts"),
+    }
+}
+
+async fn api_release_artifact(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<NsContext>,
+    Path((_, run_id)): Path<(String, String)>,
+) -> Response {
+    match state.store.get_run_in(&ctx.namespace, &run_id).await {
+        Ok(Some(_)) => (),
+        Ok(None) => return error(StatusCode::NOT_FOUND, "run not found"),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "cannot load run"),
+    }
+    match crate::release_import::receipt(&state.store, &ctx.namespace, &run_id).await {
+        Ok(receipt) => Json(receipt).into_response(),
+        Err(_) => error(StatusCode::CONFLICT, "run has no complete successful release receipt"),
+    }
 }
 
 async fn api_logs(

@@ -507,7 +507,8 @@ pub async fn admit(
     d.assign_network(&mut plan, policy.network.as_deref(), &mut Vec::new())?;
     let source: Vec<u8> = sqlx::query_scalar(
         "SELECT s.descriptor FROM ci_release_build_run m JOIN ci_run_source s ON s.run_id=m.run_id
-        WHERE m.build_id=$1 ORDER BY m.workflow_path LIMIT 1",
+        WHERE m.build_id=$1
+        UNION ALL SELECT descriptor FROM ci_release_import WHERE build_id=$1 LIMIT 1",
     )
     .bind(bundle["manifest"]["build_id"].as_str())
     .fetch_one(d.store.pool())
