@@ -47,5 +47,39 @@ fn upgrade_replaces_current_install_and_preserves_it_on_corrupt_download() {
     let result = invoke();
     assert!(!result.status.success());
     assert_eq!(fs::read(&installed).unwrap(), original);
+
+    // The normal --upgrade path uses heyvm's S3 layout, without a server login
+    // or a legacy manifest. Never fall back to another release on failure.
+    let releases = root.join("releases");
+    fs::create_dir_all(releases.join("v1.2.3")).unwrap();
+    fs::write(releases.join("latest.txt"), "1.2.3\n").unwrap();
+    let os = if cfg!(target_os = "macos") { "apple-darwin" } else { "unknown-linux-gnu" };
+    let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+    let name = format!("heyctl-1.2.3-{os}-{arch}.tar.gz");
+    let archive_path = releases.join("v1.2.3").join(&name);
+    fs::write(&archive_path, &bytes).unwrap();
+    fs::write(releases.join("v1.2.3").join(format!("{name}.sha256")), &digest).unwrap();
+    let upgrade = |args: &[&str]| {
+        Command::new(&installed).args(args)
+            .env_remove("HEYCTL_DIGEST").env_remove("HEYCTL_STORE_URL")
+            .env_remove("HEYCTL_MANIFEST_URL").env_remove("HEYCTL_BASE_URL")
+            .env_remove("HEYCTL_NO_VERIFY").env_remove("HEYCTL_VERSION")
+            .env("HEYCTL_INSTALL_BASE_URL", reqwest::Url::from_directory_path(&releases).unwrap().as_str())
+            .output().unwrap()
+    };
+    let result = upgrade(&["--upgrade", "get", "deployments"]);
+    assert!(!result.status.success());
+    assert_eq!(fs::read(&installed).unwrap(), original);
+    let result = upgrade(&["--config", "/nonexistent/heyctl-config", "--upgrade"]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(fs::read(&installed).unwrap(), replacement);
+
+    fs::copy(env!("CARGO_BIN_EXE_heyctl"), &installed).unwrap();
+    fs::write(&archive_path, b"corrupted S3 archive").unwrap();
+    assert!(!upgrade(&["--upgrade"]).status.success());
+    assert_eq!(fs::read(&installed).unwrap(), original);
+    fs::write(releases.join("latest.txt"), "9.9.9\n").unwrap();
+    assert!(!upgrade(&["--upgrade"]).status.success());
+    assert_eq!(fs::read(&installed).unwrap(), original);
     fs::remove_dir_all(root).unwrap();
 }

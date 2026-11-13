@@ -1,10 +1,13 @@
 #!/bin/sh
-# heyctl installer — fetches a published `heyctl` binary from the Heyo artifact
-# store and installs it into ${HEYCTL_PREFIX}/bin (default ~/.local/bin).
+# heyctl installer — uses the same public S3 bucket/layout as heyvm, under
+# heyctl/. Installs into ${HEYCTL_PREFIX}/bin (default ~/.local/bin).
+# Default: https://heyo-cli-releases.s3.amazonaws.com/heyctl
+# Override with HEYCTL_INSTALL_BASE_URL. latest.txt selects an immutable
+# vVERSION/heyctl-VERSION-OS-ARCH.tar.gz and its .sha256 checksum.
+# Explicit legacy manifest/base/digest overrides retain the artifact-store
+# contract documented below; normal installs do not use that path.
 #
-#   curl -fsSL https://heyo.computer/heyctl/install.sh | sh
-#   curl -fsSL https://heyo.computer/heyctl/install.sh | sh -s -- --prefix /usr/local
-#   curl -fsSL https://heyo.computer/heyctl/install.sh | HEYCTL_VERSION=0.2.0 sh
+#   curl -fsSL https://heyo-cli-releases.s3.amazonaws.com/heyctl/install.sh | sh
 #
 # Note the `-s --` when passing flags through a pipe: without it `sh` reads the
 # script from stdin and treats the flags as its own.
@@ -105,18 +108,19 @@ usage() {
     cat >&2 <<'USAGE'
 heyctl installer
 
-  curl -fsSL https://heyo.computer/heyctl/install.sh | sh
-  curl -fsSL https://heyo.computer/heyctl/install.sh | sh -s -- --prefix /usr/local
+  curl -fsSL https://heyo-cli-releases.s3.amazonaws.com/heyctl/install.sh | sh
+  curl -fsSL https://heyo-cli-releases.s3.amazonaws.com/heyctl/install.sh | sh -s -- --prefix /usr/local
 
 Options
   --prefix PATH     Install into PATH/bin (default ~/.local)
-  --version VER     Install this version (default: the manifest's "latest")
+  --version VER     Install this version (default: latest.txt)
   --digest SHA256   Install this exact blob, ignoring the manifest
-  --list            Show the versions the manifest offers, install nothing
+  --list            Show the current release (all versions for legacy manifests)
   -h, --help        This
 
 Environment
-  HEYCTL_BASE_URL HEYCTL_MANIFEST_URL HEYCTL_STORE_URL
+  HEYCTL_INSTALL_BASE_URL (default: https://heyo-cli-releases.s3.amazonaws.com/heyctl)
+  HEYCTL_BASE_URL HEYCTL_MANIFEST_URL HEYCTL_STORE_URL (legacy overrides)
   HEYCTL_VERSION HEYCTL_DIGEST HEYCTL_PREFIX HEYCTL_NO_VERIFY
 USAGE
 }
@@ -207,7 +211,9 @@ detect_arch() {
     esac
 }
 
-PLATFORM="$(detect_os)-$(detect_arch)"
+OS="$(detect_os)"
+ARCH="$(detect_arch)"
+PLATFORM="$OS-$ARCH"
 
 # ---- manifest ---------------------------------------------------------------
 
@@ -283,7 +289,35 @@ trap 'rm -rf "$TMP"' EXIT INT TERM
 
 BIN=heyctl
 
-if [ -n "$DIGEST" ]; then
+BLOB_URL=""
+if [ -z "$DIGEST$MANIFEST_URL${HEYCTL_BASE_URL:-}$STORE_URL" ]; then
+    RELEASE_BASE="${HEYCTL_INSTALL_BASE_URL:-https://heyo-cli-releases.s3.amazonaws.com/heyctl}"
+    RELEASE_BASE="${RELEASE_BASE%/}"
+    if [ -z "$VERSION" ] || [ "$DO_LIST" = 1 ]; then
+        download "$RELEASE_BASE/latest.txt" "$TMP/latest.txt" || die "could not fetch latest.txt"
+        VERSION="$(tr -d '\r\n' < "$TMP/latest.txt")"
+    fi
+    VERSION="${VERSION#v}"
+    case "$VERSION" in
+        ""|*[!0-9A-Za-z.+-]*) die "invalid release version: $VERSION" ;;
+    esac
+    if [ "$DO_LIST" = 1 ]; then
+        printf '%s\n' "$VERSION"
+        exit 0
+    fi
+    case "$OS" in
+        darwin) RELEASE_OS=apple-darwin ;;
+        linux) RELEASE_OS=unknown-linux-gnu ;;
+        *) die "unsupported release OS: $OS" ;;
+    esac
+    BLOB_URL="$RELEASE_BASE/v$VERSION/heyctl-$VERSION-$RELEASE_OS-$ARCH.tar.gz"
+    download "$BLOB_URL.sha256" "$TMP/checksum" || die "no published checksum for $VERSION ($PLATFORM)"
+    DIGEST="$(awk 'NR == 1 {print $1}' "$TMP/checksum")"
+    case "$DIGEST" in
+        ""|*[!0-9a-f]*) die "invalid release checksum" ;;
+    esac
+    [ "${#DIGEST}" -eq 64 ] || die "invalid release checksum length"
+elif [ -n "$DIGEST" ]; then
     # The manifest is the thing that says which digest is current; naming one
     # explicitly answers that question, so there is nothing left to fetch.
     case "$DIGEST" in
@@ -341,7 +375,7 @@ else
 fi
 
 STORE_URL="${STORE_URL%/}"
-BLOB_URL="$STORE_URL/blobs/$DIGEST"
+[ -n "$BLOB_URL" ] || BLOB_URL="$STORE_URL/blobs/$DIGEST"
 
 info "heyctl $VERSION  ($PLATFORM)"
 step "store:  $BLOB_URL"
