@@ -21,12 +21,13 @@ SECRET = "shared-secret-must-not-leak"
 
 class SubmitHandler(http.server.BaseHTTPRequestHandler):
     requests = []
+    response = b'{"runs":["test-run"],"url":"http://example/"}'
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["content-length"]))
         headers = {name.lower(): value for name, value in self.headers.items()}
         self.requests.append((self.path, headers, body))
-        response = b'{"runs":["test-run"],"url":"http://example/"}'
+        response = self.response
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(response)))
@@ -65,6 +66,7 @@ class GitSubmitTest(unittest.TestCase):
         self.git("push", "-q", "origin", "HEAD:refs/pull/59/head")
         self.git("switch", "-q", "feature")
         SubmitHandler.requests = []
+        SubmitHandler.response = b'{"runs":["test-run"],"url":"http://example/"}'
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SubmitHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -92,6 +94,19 @@ class GitSubmitTest(unittest.TestCase):
         self.assertNotIn(TOKEN, result.stdout + result.stderr)
         self.assertNotIn(SECRET, result.stdout + result.stderr)
         return result
+
+    def test_no_runs_is_not_success_and_does_not_retry_submission(self):
+        self.git("config", "ci.endpoint", self.base)
+        self.git("config", "ci.token", TOKEN)
+        for response in [b'{"runs":[],"warnings":["Auth was excluded"]}',
+                         b'<html>Wrong service</html>']:
+            with self.subTest(response=response):
+                SubmitHandler.requests = []
+                SubmitHandler.response = response
+                result = self.run_client(check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("submitted ", result.stdout)
+                self.assertEqual(len(SubmitHandler.requests), 1)
 
     def test_payload_metadata_base_endpoint_and_repository_token(self):
         self.git("config", "ci.endpoint", self.base)

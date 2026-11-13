@@ -262,14 +262,18 @@ fi
 response="$work/response.json"
 code="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --max-time "${CI_SUBMIT_TIMEOUT:-300}" -X POST "$submit_url" -H 'content-type: application/json' -H "x-heyo-git-ci-version: $GIT_SUBMIT_VERSION" --config "$auth_config" --data-binary "@$payload")" || die "could not reach $submit_url"
 if [ "$code" -ge 400 ]; then cat "$response" >&2; printf '\n' >&2; die "submit rejected (HTTP $code)"; fi
-printf 'submitted %s on %s (%s patch bytes)\n' "${after:0:12}" "$branch" "$size"
 if python3 -m json.tool "$response" >/dev/null 2>&1; then
   python3 - "$response" <<'PY'
 import json,sys
 r=json.load(open(sys.argv[1]))
+if not isinstance(r,dict):
+    sys.exit('git submit: invalid CI response; outcome unknown. Inspect the controller before retrying.')
 for w in r.get('warnings',[]): print('warning: '+w,file=sys.stderr)
+if not r.get('runs') and not r.get('submission'):
+    sys.exit('git submit: no CI run started. Check the environment and repository workflow selection.')
 for run in r.get('runs',[]): print('  run %s  %sruns/%s'%(run,r.get('url',''),run))
 if r.get('submission'):
     print('  submission (validation, merge, deployment): %sruns/%s'%(r.get('url',''),r['submission']))
 PY
-else cat "$response"; fi
+else die "invalid CI response from $submit_url; outcome unknown. Inspect the controller before retrying."; fi
+printf 'submitted %s on %s (%s patch bytes)\n' "${after:0:12}" "$branch" "$size"
