@@ -434,8 +434,71 @@ export interface DeploymentSpec {
   update?: UpdateSpec;
   auth?: AuthGate;
   feed?: FeedSpec;
+  placement?: Placement;
   /** Anything app-lb sent that this build has no name for. */
   [extra: string]: unknown;
+}
+
+export interface Placement {
+  mode: "pinned" | "spread";
+  home?: string;
+  hosts?: string[];
+}
+
+/** Host image catalog and offload status from GET /images. */
+export interface ImageInventory {
+  generated_at: number;
+  complete: boolean;
+  error?: string;
+  delete_supported: boolean | null;
+  offload: boolean;
+  disk_used_pct?: number;
+  pressure_pct: number;
+  cache_bytes: number | null;
+  cache_budget_bytes?: number;
+  cache_hits: number;
+  cache_misses: number;
+  local_bytes: number;
+  images: ImageEntry[];
+}
+
+export interface ImageEntry {
+  name: string;
+  source: string;
+  tier: string;
+  digest?: string;
+  store?: string;
+  ref?: string;
+  grow_gb?: number;
+  bytes: number;
+  first_seen: number;
+  last_used: number;
+  pinned: boolean;
+  offloaded_to?: string;
+  offloaded_at?: number;
+  failures: number;
+  next_attempt_at: number;
+  last_error?: string;
+  auth?: SecretRef;
+  present: boolean;
+  references: ImageReference[];
+  kept_because?: string;
+}
+
+export interface ImageReference {
+  kind: string;
+  id?: string;
+  deployment?: string;
+  operation?: string;
+  job?: string;
+  ref?: string;
+}
+
+export interface ImageSweep {
+  skipped?: string;
+  pressure: boolean;
+  offloaded: string[];
+  failed: [string, string][];
 }
 
 /** Orchestrator-owned endpoint membership for a static deployment. */
