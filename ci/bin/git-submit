@@ -2,7 +2,7 @@
 # git-submit: send a pinned, fetchable revision plus the exact patch to build.
 set -euo pipefail
 
-GIT_SUBMIT_VERSION="0.6.1"
+GIT_SUBMIT_VERSION="0.6.2"
 me="$(basename "$0")"
 cmd="git ${me#git-}"
 die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
