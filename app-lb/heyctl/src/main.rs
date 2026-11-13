@@ -23,6 +23,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use cmd::Ctx;
 
+mod upgrade;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "heyctl",
@@ -47,6 +49,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Upgrade this CLI from the public release channel (no server login required).
+    Upgrade(upgrade::Args),
+
     /// Verify credentials against a server and save them as a context.
     Login(cmd::auth::LoginArgs),
 
@@ -328,6 +333,7 @@ fn main() {
 fn run(cli: &Cli) -> Result<()> {
     let g = &cli.globals;
     match &cli.command {
+        Command::Upgrade(args) => upgrade::run(args),
         // These touch the config file and build at most their own client, so
         // they must keep working against an unreachable server.
         Command::Login(args) => cmd::auth::login(g, args),

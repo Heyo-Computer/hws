@@ -35,6 +35,14 @@ That is [`install.sh`](install.sh), served from the marketing site. It puts
 else, and `--list` shows what is published. Note the `-s --`: without it `sh`
 reads the script from stdin and takes the flags for its own.
 
+Once installed, run `heyctl upgrade` to install the latest published release in
+the same `bin` directory. Use `heyctl upgrade --to VERSION` for a specific release
+or `heyctl upgrade --prefix PATH` to install into `PATH/bin`. The command uses
+the bundled installer and its checksum verification; it needs no server login
+and does not change saved contexts. It supports Linux and macOS and requires
+write permission to the destination (it does not invoke sudo). Installer
+environment variables such as `HEYCTL_MANIFEST_URL` still apply.
+
 Or build it:
 
 ```sh

@@ -10,9 +10,8 @@ documentation = "https://docs.rs/hws"
 readme = "README.md"
 keywords = ["heyo", "microvm", "load-balancer", "sdk", "observability"]
 categories = ["api-bindings", "command-line-utilities", "web-programming::http-client"]
-# The installer and its manifest publisher are release tooling for the binary
-# on heyo.computer, not part of the crate.
-exclude = ["install.sh", "publish-versions.sh"]
+# The installer is embedded by `heyctl upgrade`; only its publisher is excluded.
+exclude = ["publish-versions.sh"]
 
 # Published to crates.io as `hws` (formerly `serverctl`); the binary keeps the
 # `heyctl` name.
