@@ -23,6 +23,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use cmd::Ctx;
 
+mod upgrade;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "heyctl",
@@ -40,13 +42,20 @@ struct Cli {
     #[command(flatten)]
     globals: GlobalOpts,
 
+    /// Upgrade this CLI from the public S3 release channel.
+    #[arg(long)]
+    upgrade: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Upgrade this CLI from the public release channel (no server login required).
+    Upgrade(upgrade::Args),
+
     /// Verify credentials against a server and save them as a context.
     Login(cmd::auth::LoginArgs),
 
@@ -327,7 +336,16 @@ fn main() {
 
 fn run(cli: &Cli) -> Result<()> {
     let g = &cli.globals;
-    match &cli.command {
+    if cli.upgrade {
+        anyhow::ensure!(cli.command.is_none(), "--upgrade cannot be combined with a command");
+        return upgrade::run(&upgrade::Args { to: None, prefix: None });
+    }
+    let Some(command) = &cli.command else {
+        Cli::command().print_help()?;
+        return Ok(());
+    };
+    match command {
+        Command::Upgrade(args) => upgrade::run(args),
         // These touch the config file and build at most their own client, so
         // they must keep working against an unreachable server.
         Command::Login(args) => cmd::auth::login(g, args),
@@ -546,7 +564,7 @@ mod tests {
         .unwrap();
         let Command::Create {
             cmd: CreateCmd::Deployment(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected create deployment");
         };
@@ -571,7 +589,7 @@ mod tests {
         .unwrap();
         let Command::Create {
             cmd: CreateCmd::Deployment(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected create deployment");
         };
@@ -600,7 +618,7 @@ mod tests {
         .unwrap();
         let Command::Create {
             cmd: CreateCmd::Deployment(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected create deployment");
         };
@@ -634,7 +652,7 @@ mod tests {
         .unwrap();
         let Command::Create {
             cmd: CreateCmd::Secret(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected create secret");
         };
@@ -648,7 +666,7 @@ mod tests {
     fn build_takes_a_one_off_ref_and_can_wait() {
         let cli =
             Cli::try_parse_from(["heyctl", "build", "web", "--ref", "v2.1", "--wait"]).unwrap();
-        let Command::Build(args) = &cli.command else {
+        let Command::Build(args) = cli.command.as_ref().unwrap() else {
             panic!("expected build");
         };
         assert_eq!(args.resource, "web");
@@ -679,7 +697,7 @@ mod tests {
         .unwrap();
         let Command::Set {
             cmd: SetCmd::Update(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected set update");
         };
@@ -693,7 +711,7 @@ mod tests {
     #[test]
     fn running_an_update_can_wait_and_stream() {
         let cli = Cli::try_parse_from(["heyctl", "update", "app-obs", "--logs"]).unwrap();
-        let Command::Update(args) = &cli.command else {
+        let Command::Update(args) = cli.command.as_ref().unwrap() else {
             panic!("expected update");
         };
         assert_eq!(args.resource, "app-obs");
@@ -722,7 +740,7 @@ mod tests {
         .unwrap();
         let Command::Set {
             cmd: SetCmd::Auth(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected set auth");
         };
@@ -764,7 +782,7 @@ mod tests {
             "heyctl", "pull", "web", "--ref", "debian-hermes", "--wait",
         ])
         .unwrap();
-        let Command::Pull(args) = &cli.command else {
+        let Command::Pull(args) = cli.command.as_ref().unwrap() else {
             panic!("expected pull");
         };
         assert_eq!(args.resource, "web");
@@ -792,7 +810,7 @@ mod tests {
         .unwrap();
         let Command::Set {
             cmd: SetCmd::Artifact(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected set artifact");
         };
@@ -820,7 +838,7 @@ mod tests {
             "heyctl", "artifact", "push", "/tmp/a.ext4", "--tag", "acme/web:v2", "--lb", "-n", "acme",
         ])
         .unwrap();
-        let Command::Artifact { opts, .. } = &cli.command else {
+        let Command::Artifact { opts, .. } = cli.command.as_ref().unwrap() else {
             panic!("expected artifact");
         };
         assert!(opts.lb);
@@ -831,7 +849,7 @@ mod tests {
             .unwrap();
         let Command::Set {
             cmd: SetCmd::Artifact(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected set artifact");
         };
@@ -847,7 +865,7 @@ mod tests {
         let Command::Artifact {
             cmd: cmd::artifact::ArtifactCmd::Push(args),
             ..
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected artifact push");
         };
@@ -888,7 +906,7 @@ mod tests {
             "team-a",
         ])
         .unwrap();
-        let Command::Login(args) = &cli.command else {
+        let Command::Login(args) = cli.command.as_ref().unwrap() else {
             panic!("expected login");
         };
         assert!(args.token_stdin);
@@ -918,7 +936,7 @@ mod tests {
         let Command::Artifact {
             cmd: cmd::artifact::ArtifactCmd::Login(args),
             ..
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected artifact login");
         };
@@ -981,7 +999,7 @@ mod tests {
         .unwrap();
         let Command::Create {
             cmd: CreateCmd::Deployment(args),
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected create deployment");
         };
@@ -1027,7 +1045,7 @@ mod tests {
         let Command::Artifact {
             cmd: cmd::artifact::ArtifactCmd::PushDockerfile(args),
             ..
-        } = &cli.command
+        } = cli.command.as_ref().unwrap()
         else {
             panic!("expected artifact push-dockerfile");
         };

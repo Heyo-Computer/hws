@@ -27,13 +27,22 @@ deployments, their microVM pools, and the certificates app-lb issues for their h
 ## Install
 
 ```sh
-curl -fsSL https://heyo.computer/heyctl/install.sh | sh
+curl -fsSL https://heyo-cli-releases.s3.amazonaws.com/heyctl/install.sh | sh
 ```
 
-That is [`install.sh`](install.sh), served from the marketing site. It puts
+That is [`install.sh`](install.sh), served from the same S3 bucket as heyvm. It puts
 `heyctl` in `~/.local/bin`; `sh -s -- --prefix /usr/local` puts it somewhere
 else, and `--list` shows what is published. Note the `-s --`: without it `sh`
 reads the script from stdin and takes the flags for its own.
+
+Once installed, run `heyctl --upgrade` (like `heyvm --upgrade`) to install the latest published release in
+the same `bin` directory. Use `heyctl upgrade --to VERSION` for a specific release
+or `heyctl upgrade --prefix PATH` to install into `PATH/bin`. The command uses
+the bundled installer and its checksum verification; it needs no server login
+and does not change saved contexts. It supports Linux and macOS and requires
+write permission to the destination (it does not invoke sudo). Installer
+environment variables still apply. `HEYCTL_INSTALL_BASE_URL` overrides the
+default `https://heyo-cli-releases.s3.amazonaws.com/heyctl` release prefix.
 
 Or build it:
 
@@ -47,7 +56,34 @@ or the ACME stack — it shares nothing with app-lb but the wire format.
 
 ### What the installer needs from a release
 
-The binaries live in the artifact store, but the store's anonymous carve-out is
+Use the existing `heyo-cli-releases` bucket, with a separate `heyctl/` prefix:
+
+```text
+heyctl/install.sh
+heyctl/latest.txt
+heyctl/vVERSION/heyctl-VERSION-apple-darwin-aarch64.tar.gz
+heyctl/vVERSION/heyctl-VERSION-apple-darwin-aarch64.tar.gz.sha256
+heyctl/vVERSION/heyctl-VERSION-unknown-linux-gnu-x86_64.tar.gz
+heyctl/vVERSION/heyctl-VERSION-unknown-linux-gnu-x86_64.tar.gz.sha256
+```
+
+The channel pointer selects an immutable version, just as for heyvm. The
+installer verifies the archive checksum before replacing the executable and
+fails without replacing it if that version/platform is missing or corrupt.
+It does not fall back to a potentially stale channel alias.
+
+Publish both tested platform archives using `publish-s3.sh VERSION DIST_DIR`.
+The publisher refuses to overwrite different bytes at an existing version,
+verifies anonymous downloads, uploads the installer, and updates `latest.txt`
+last. It never changes `heyvm/` or platform runtime deployments.
+
+### Legacy artifact-store releases
+
+Explicit `HEYCTL_MANIFEST_URL`, `HEYCTL_BASE_URL`, `HEYCTL_STORE_URL`, or
+`HEYCTL_DIGEST` overrides retain the older artifact-store installation path.
+They are not needed for normal installation or `heyctl --upgrade`.
+
+The older binaries live in the artifact store, but the store's anonymous carve-out is
 exactly one route — `GET /blobs/{digest}` for a blob marked public — so tags,
 which is how [`.ci/install.sh`](../../.ci/install.sh) finds the newest build,
 are not readable without `ART_API_KEY`. A public installer therefore cannot ask
