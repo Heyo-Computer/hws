@@ -4108,6 +4108,29 @@ it held. Retiring the single VM that is somebody's working directory should not.
 | Memory | gone | gone |
 | Next scale-up | boots a fresh VM | resumes this one |
 
+**Stateful Firecracker alternative: `idle_action: suspend`.** With PR #684's
+runtime and create-time `lifecycle` support, this captures RAM and writable
+disks, including rootfs writes. App-lb sends the policy before the first boot,
+calls `/sandboxes/:id/suspend` after draining, and uses `/start` to restore the
+same guest. The daemon must report Running and the configured guest health
+check must pass before traffic returns. `retain` above remains disk-only.
+
+Create a new deployment with `heyctl create … --idle-action suspend`, then use
+`heyctl stop DEPLOYMENT` and `heyctl start DEPLOYMENT`. Stop holds the pool at
+zero until start; ordinary idle scale-down instead wakes on demand. Both
+commands report `stopping`/`starting` if their wait deadline expires; that is
+not completion. The lifecycle response includes `idle_action` to distinguish
+memory suspension from disk retention.
+
+This mode requires Firecracker, private writable rootfs, and pinned placement
+when using a fleet. It cannot be combined with workspace tree capture or archive
+creation; a normal `disk_size_gb` data disk is supported. Do not flip existing
+VMs into this mode: their boot configuration predates the contract. Failed or
+uncertain captures remain journaled and block replacement; resume failures do
+not trigger stop/delete or cold-create fallback. Explicit deletion/replacement
+still destroys state. Acknowledgment means **local capture**, not completed
+background persistence or survival of host loss. No remote migration is implied.
+
 **Read the rootfs row again.** On Firecracker, `retain` does not preserve the
 root filesystem, and app-lb cannot make it: mvm-ctrl gives each VM a private
 rootfs copy under `/tmp`, removes it on `stop`, and **recopies it from the base

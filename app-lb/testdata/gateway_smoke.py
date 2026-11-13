@@ -113,8 +113,16 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
         register(da,'local',f'127.0.0.1:{backend.server_port}',f'127.0.0.1:{alternate.server_port}')
         register(sa,'forward',f'https://localhost:{dt}')
         h={'Host':'smoke.example','Authorization':'Bearer application-value'}
+        status,body=None,b''
         for _ in range(80):
-            status,body=request(f'http://127.0.0.1:{source}/ready?q=one%20two',headers=h)
+            try:
+                status,body=request(f'http://127.0.0.1:{source}/ready?q=one%20two',headers=h)
+            except urllib.error.URLError as error:
+                # Admin readiness precedes the forwarding worker's listener.
+                # Retry only connection refusal during this bounded startup wait.
+                if not isinstance(error.reason, ConnectionRefusedError):
+                    raise
+                body=str(error).encode()
             if status==200: break
             time.sleep(.25)
         assert status==200,(status,body)

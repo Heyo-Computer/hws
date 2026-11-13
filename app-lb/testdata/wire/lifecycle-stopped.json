@@ -1,4 +1,5 @@
 {
   "state": "stopped",
-  "retained": true
+  "retained": true,
+  "idle_action": "retain"
 }

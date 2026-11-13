@@ -149,6 +149,9 @@ impl Runtime for Live {
     async fn create(&self, spec: &DeploymentSpec, name: &str) -> Result<String, String> { self.scaler.create_candidate(spec, name).await }
     async fn healthy(&self, info: &heyo_sdk::SandboxInfo, spec: &DeploymentSpec) -> Option<std::net::SocketAddr> {
         let addr = crate::vm::routable_addr(info, spec.vm_spec().port).ok()?;
+        if spec.scaling.idle_action == crate::config::IdleAction::Suspend {
+            self.scaler.vms().require_stateful(&info.id).await.ok()?;
+        }
         crate::health::probe(addr, &spec.health).await.then_some(addr)
     }
     async fn retire(&self, id: &str, deployment: &str) -> Result<(), String> {
@@ -206,7 +209,7 @@ impl Rollouts {
         }
         if reserved(d) || d.state().rollout_revision != request.expected_revision { return Err("deployment reserved or revision changed".into()); }
         validate(&d.spec, &request.spec)?;
-        if !d.pending().is_empty() || d.backends().is_empty() || d.backends().iter().any(|b| b.is_draining()) {
+        if !d.pending().is_empty() || !d.state().suspending.is_empty() || d.backends().is_empty() || d.backends().iter().any(|b| b.is_draining()) {
             return Err("source must have a stable serving pool without pending or draining replicas".into());
         }
         let prefix = format!("applb-{}-r{:x}", d.spec.id, Sha256::digest(format!("{}:{}", request.expected_revision, request.operation_id)));

@@ -27,7 +27,12 @@ const KNOWN = {
     DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "pending_vms", "workspace", "site"],
     SiteRootStatus: ["root", "status", "index_present", "hint"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
-    DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed"],
+    DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed", "placement"],
+    Placement: ["mode", "home", "hosts"],
+    ImageInventory: ["generated_at", "complete", "error", "delete_supported", "offload", "disk_used_pct", "pressure_pct", "cache_bytes", "cache_budget_bytes", "cache_hits", "cache_misses", "local_bytes", "images"],
+    ImageEntry: ["name", "source", "tier", "digest", "store", "ref", "grow_gb", "bytes", "first_seen", "last_used", "pinned", "offloaded_to", "offloaded_at", "failures", "next_attempt_at", "last_error", "auth", "present", "references", "kept_because"],
+    ImageReference: ["kind", "id", "deployment", "operation", "job", "ref"],
+    ImageSweep: ["skipped", "pressure", "offloaded", "failed"],
     DiscoverySpec: ["service_id"],
     WorkspaceArchive: ["archive_id", "s3_key", "size_bytes"],
     RouteRule: ["host", "host_suffix", "path_prefix"],
@@ -96,7 +101,7 @@ const KNOWN = {
     OutputPage: ["offset", "bytes", "next_offset", "total_bytes", "encoding", "data"],
     FileRead: ["sandbox_id", "path", "size", "offset", "bytes", "next_offset", "encoding", "content"],
     FileWritten: ["sandbox_id", "path", "wrote", "size"],
-    LifecycleOutcome: ["state", "retained", "sandbox_id", "warning"],
+    LifecycleOutcome: ["state", "retained", "idle_action", "sandbox_id", "warning"],
     Capacity: ["host", "disk_free_bytes", "disk_total_bytes", "deployments", "running_vms", "booting_vms", "stopped_vms"],
     Transfer: ["id", "deployment", "direction", "path", "extract", "strip_components", "state", "created_at", "expires_at", "max_bytes", "size", "sha256", "sandbox_id", "error", "upload_url", "download_url"],
     EvictOutcome: ["sandbox_id", "outcome"],
@@ -130,6 +135,8 @@ const FIXTURES = {
   "deployment-view-site": "DeploymentView",
   "metrics-response": "MetricsResponse",
   "disks": "DiskInventory",
+  "images": "ImageInventory",
+  "images-sweep": "ImageSweep",
   "security-response": "SecurityResponse",
   "job-build": "JobRecord",
   "job-pull": "JobRecord",
@@ -183,6 +190,7 @@ const MAPS = {
 
 /** Which declaration governs a nested object, by the key that holds it. */
 const NESTED = {
+  placement: "Placement",
   spec: "DeploymentSpec", vm: "VmSpec", scaling: "ScalingPolicy", health: "HealthCheck",
   expected_header: "ExpectedHeader",
   discovery: "DiscoverySpec", build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
@@ -209,6 +217,7 @@ const NESTED = {
 
 /** Which declaration governs the *elements* of an array, by its key. */
 const ELEMENTS = {
+  images: "ImageEntry", references: "ImageReference",
   routes: "RouteRule", vms: "VmStatus", deployments: "DeploymentView", alerts: "SecurityAlert",
   pending_vms: "PendingVmView", host_sandboxes: "HostSandboxView", buckets: "Bucket", env_from: "SecretEnv",
   disks: "DiskInfo", archives: "ArchiveView", parts: "DiskPart",

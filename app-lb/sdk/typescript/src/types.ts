@@ -41,8 +41,8 @@ export interface ScalingPolicy {
   scale_to_zero_after_secs?: number;
   cold_start_timeout_secs?: number;
   drain_timeout_secs?: number;
-  /** `destroy` kills an idle VM; `retain` stops it, keeping its data disk. */
-  idle_action?: "destroy" | "retain";
+  /** `destroy` deletes; `retain` keeps disks; `suspend` also saves RAM for same-host resume. */
+  idle_action?: "destroy" | "retain" | "suspend";
   boot_timeout_secs?: number;
 }
 
@@ -434,8 +434,71 @@ export interface DeploymentSpec {
   update?: UpdateSpec;
   auth?: AuthGate;
   feed?: FeedSpec;
+  placement?: Placement;
   /** Anything app-lb sent that this build has no name for. */
   [extra: string]: unknown;
+}
+
+export interface Placement {
+  mode: "pinned" | "spread";
+  home?: string;
+  hosts?: string[];
+}
+
+/** Host image catalog and offload status from GET /images. */
+export interface ImageInventory {
+  generated_at: number;
+  complete: boolean;
+  error?: string;
+  delete_supported: boolean | null;
+  offload: boolean;
+  disk_used_pct?: number;
+  pressure_pct: number;
+  cache_bytes: number | null;
+  cache_budget_bytes?: number;
+  cache_hits: number;
+  cache_misses: number;
+  local_bytes: number;
+  images: ImageEntry[];
+}
+
+export interface ImageEntry {
+  name: string;
+  source: string;
+  tier: string;
+  digest?: string;
+  store?: string;
+  ref?: string;
+  grow_gb?: number;
+  bytes: number;
+  first_seen: number;
+  last_used: number;
+  pinned: boolean;
+  offloaded_to?: string;
+  offloaded_at?: number;
+  failures: number;
+  next_attempt_at: number;
+  last_error?: string;
+  auth?: SecretRef;
+  present: boolean;
+  references: ImageReference[];
+  kept_because?: string;
+}
+
+export interface ImageReference {
+  kind: string;
+  id?: string;
+  deployment?: string;
+  operation?: string;
+  job?: string;
+  ref?: string;
+}
+
+export interface ImageSweep {
+  skipped?: string;
+  pressure: boolean;
+  offloaded: string[];
+  failed: [string, string][];
 }
 
 /** Orchestrator-owned endpoint membership for a static deployment. */
@@ -559,8 +622,10 @@ export interface DeploymentMetrics {
 export interface LifecycleOutcome {
   /** `stopped`/`stopping` or `running`/`starting`; the `-ing` forms came back before the pool settled. */
   state: "stopped" | "stopping" | "running" | "starting";
-  /** Whether a stopped VM keeps its data disk (`idle_action: retain`). */
+  /** Whether a stopped VM keeps its disks (`retain` or `suspend`). */
   retained: boolean;
+  /** Absent on older servers; `suspend` preserves RAM as well as disks. */
+  idle_action?: "destroy" | "retain" | "suspend";
   /** The VM now serving, once one is. */
   sandbox_id?: string;
   warning?: string;
@@ -574,7 +639,7 @@ export interface Capacity {
   deployments: number;
   running_vms: number;
   booting_vms: number;
-  /** Suspended under `idle_action: retain`: holding a disk, not CPU or memory. */
+  /** Stopped or memory-suspended VMs: saved state on disk, no running guest. */
   stopped_vms: number;
 }
 

@@ -5,6 +5,10 @@ use std::net::TcpListener;
 use std::process::Command;
 
 fn invoke(args: &[&str], response: &str) -> (String, String) {
+    invoke_command("recovery", args, response)
+}
+
+fn invoke_command(command: &str, args: &[&str], response: &str) -> (String, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let response = response.to_owned();
@@ -43,7 +47,7 @@ fn invoke(args: &[&str], response: &str) -> (String, String) {
             "test-recovery-token",
             "--config",
             "/dev/null",
-            "recovery",
+            command,
         ])
         .args(args)
         .output()
@@ -109,4 +113,20 @@ fn binary_proxy_requests_and_output_contract() {
     assert!(first.starts_with("POST /proxy/api/vm-recovery/vm/recoveries "));
     let body = |request: String| request.split_once("\r\n\r\n").unwrap().1.to_owned();
     assert_eq!(body(first), body(second));
+}
+
+#[test]
+fn binary_stateful_stop_start_preserves_mode_and_wait_budget() {
+    for (command, state) in [("stop", "stopping"), ("start", "running")] {
+        let response = format!(r#"{{"state":"{state}","retained":true,"idle_action":"suspend"}}"#);
+        let (request, output) = invoke_command(
+            command, &["deployment/agent", "--wait-secs", "0", "-o", "json"], &response,
+        );
+        assert!(request.starts_with(&format!("POST /proxy/deployments/agent/{command}")), "{request}");
+        let body: serde_json::Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["wait_secs"], 0);
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["state"], state);
+        assert_eq!(value["idle_action"], "suspend");
+    }
 }

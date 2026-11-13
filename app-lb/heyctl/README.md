@@ -1082,6 +1082,25 @@ daemon recopies from the base image on every boot. Pair it with
 or it only saves boot time; `heyctl describe` reports which mode a deployment
 is in under "When idle".
 
+For PR #684's memory-preserving Firecracker lifecycle, use `--idle-action suspend`
+when creating a **new** deployment. It keeps RAM, rootfs writes and attached data
+disks on the same host. It requires a compatible heyvm runtime with create-time
+`lifecycle` support, private rootfs and pinned fleet placement; workspace
+capture/archive mode is not compatible. Existing `retain` VMs are not silently
+converted or rebooted.
+
+```sh
+heyctl stop my-agent --wait-secs 60
+heyctl start my-agent --wait-secs 60
+```
+
+Stop drains and holds the pool at zero; start restores its previous scaling
+policy and waits for guest readiness. `stopping` or `starting` means work is
+still in progress. These commands follow the configured idle action: `destroy`
+deletes, `retain` keeps only `/workspace`, and `suspend` preserves memory and
+disks. Suspend acknowledgment is local capture, not a host-loss backup. Failed
+capture/resume does not silently destroy a stateful guest or boot an empty one.
+
 ### Cordoning and draining static upstreams
 
 `cordon` stops assigning new requests to one address in a static (`upstreams`)
