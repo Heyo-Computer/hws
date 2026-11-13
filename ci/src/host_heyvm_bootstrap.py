@@ -87,7 +87,8 @@ def mapping(raw, alias):
 
 
 def request(value):
-    if not isinstance(value, dict) or set(value) not in (REQUEST_FIELDS, DAEMON_REQUEST_FIELDS): raise ValueError("request fields differ from closed schema")
+    if not isinstance(value, dict) or set(value) not in (REQUEST_FIELDS, DAEMON_REQUEST_FIELDS, REQUEST_FIELDS | {"download_token"}, DAEMON_REQUEST_FIELDS | {"download_token"}): raise ValueError("request fields differ from closed schema")
+    if "download_token" in value and not valid_sha(value["download_token"]): raise ValueError("invalid download credential")
     if value.get("component", "heyvm") not in ("heyvm", "heyvmd"): raise ValueError("invalid component")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value["operation_id"]): raise ValueError("invalid operation ID")
     endpoint(value["artifact_url"])
@@ -104,7 +105,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def download(req, opener=None):
     opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    call = urllib.request.Request(req["artifact_url"], headers={"Accept": "application/octet-stream"})
+    headers = {"Accept": "application/octet-stream"}
+    if "download_token" in req:
+        headers["Authorization"] = "Bearer " + req["download_token"]
+    call = urllib.request.Request(req["artifact_url"], headers=headers)
     with opener.open(call, timeout=60) as response:
         if getattr(response, "status", 200) != 200: raise ValueError("artifact download refused")
         data = response.read(req["artifact_size"] + 1)

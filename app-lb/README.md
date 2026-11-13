@@ -663,6 +663,10 @@ Configuration is environment-only:
 | `APP_LB_SIEM_MAX_ALERTS_PER_MIN` | `60` | Hard ceiling on *new* alerts, for a distributed attack that cannot fold |
 | `APP_LB_SIEM_SCAN_QUERY` | `true` | `0` to match signatures against the path only, never the query string |
 | `APP_LB_SIEM_SHIP` | `true` | `0` to keep alerts local instead of sending them to app-obs |
+| `APP_LB_BOTS` | `true` | `0` to stop classifying [automated traffic](#automated-traffic) |
+| `APP_LB_BOTS_RANGES` | `true` | `0` to never fetch operators' published crawler ranges; claims then read `claimed` or `unverifiable` |
+| `APP_LB_BOTS_REFRESH_SECS` | `86400` | How often the range lists are refetched (a failed fetch retries after 15 minutes) |
+| `APP_LB_BOTS_WINDOW_SECS` | `3600` | Window the automated-traffic table counts over |
 | `APP_LB_GUARD_ENFORCE` | `true` | `0` for a dry run: [rules](#response-actions) match and count, nothing is refused |
 | `APP_LB_OBS_QUEUE_CAPACITY` | `8192` | Records buffered before new ones are dropped |
 | `APP_LB_OBS_BATCH` | `500` | Records per POST |
@@ -4701,6 +4705,65 @@ below — the query string.
 The distinctness requirement on `traffic.scanner` is what separates enumeration
 from one broken client retrying a single dead URL.
 
+**Automated clients**, by what the `User-Agent` claims and whether the address
+backs it up — see [Automated traffic](#automated-traffic).
+
+| Rule | Fires when | Severity |
+| --- | --- | --- |
+| `bot.spoofed` | a UA names an operator that publishes its ranges, from an address outside them | medium |
+| `bot.ai-crawler` | an AI lab's training or AI-search crawler requests a deployment | info |
+| `bot.ai-agent` | an assistant fetches a deployment's pages for a user (ChatGPT-User, Claude-User) | info |
+
+### Automated traffic
+
+Every request with a `User-Agent` is matched against a catalog compiled into
+the binary (`src/bots.rs`) and labelled with a **class**, an **operator** and an
+**agent**:
+
+| Class | Examples |
+| --- | --- |
+| `ai-agent` | ChatGPT-User, Claude-User, Perplexity-User, MistralAI-User |
+| `ai-crawler` | GPTBot, ClaudeBot, CCBot, Bytespider, Meta-ExternalAgent, Amazonbot |
+| `ai-search` | OAI-SearchBot, Claude-SearchBot, PerplexityBot |
+| `search-crawler` | Googlebot, bingbot, Applebot, DuckDuckBot |
+| `seo`, `preview`, `monitor` | AhrefsBot; Slackbot, Twitterbot; UptimeRobot, kube-probe |
+| `scripted` | curl, python-requests, Go-http-client, HeadlessChrome |
+| `scanner` | Nuclei, sqlmap, zgrab, Nmap, Censys |
+| `other-bot` | anything versioned `…Bot/1.0` or carrying a `+https://` contact link |
+
+A `User-Agent` is self-asserted, so each claim also gets a **verification**
+against the IP ranges the operator publishes (OpenAI, Google, Bing, Apple and
+Perplexity do; the lists are fetched over HTTPS and refreshed daily):
+
+- `verified` — the address is inside the operator's ranges.
+- `spoofed` — the lists have loaded and the address is outside them. This raises
+  `bot.spoofed` and is never offered an agent block: a spoofer is a set of
+  addresses, and its alert carries the address block.
+- `claimed` — the lists have not loaded yet, or the fetch is failing. Missing data
+  is never evidence of spoofing.
+- `unverifiable` — the operator publishes no machine-readable ranges (Anthropic,
+  Common Crawl and Meta, at the time of writing).
+
+`GET /security` carries the result as `bots`: one row per deployment, agent and
+verification with requests in the last `APP_LB_BOTS_WINDOW_SECS`, a running
+total, an approximate distinct-source count, and — for a deployment — a
+ready-to-post `block-agent` rule. `?class=ai-crawler` narrows both the rows and
+the alerts. The console shows the table under **Automated traffic** with a
+button per row.
+
+A `block-agent` rule is an ordinary [guard rule](#response-actions) —
+`user_agent_contains` the agent's token on one deployment, for 30 days — so it
+refuses the honest crawler and anyone using its name, and nothing else. For a
+crawler that honours robots.txt a `Disallow` is the polite opt-out; the rule is
+the enforced one.
+
+The raw `User-Agent` is read and discarded: alerts and app-obs records carry the
+catalog name (`user_agent.name`) and `heyo.bot.class`, `heyo.bot.operator` and
+`heyo.bot.verification`, never `user_agent.original`. AI sightings draw on their
+own `APP_LB_SIEM_MAX_ALERTS_PER_MIN` budget, so a busy crawl day cannot crowd an
+attack out of the ring. Web Bot Auth (`Signature-Agent` HTTP message signatures)
+is not verified yet.
+
 ### Reading it
 
 The dashboard grows a **Security** card above the deployment table, and an
@@ -4727,7 +4790,7 @@ curl -su admin:s3cret 'localhost:9090/security?severity=high&limit=20'
            "suppressed": 4118, "tracked_clients": 118}}
 ```
 
-Filter with `?severity=`, `?rule=`, `?deployment=` and `?limit=`. A
+Filter with `?severity=`, `?rule=`, `?deployment=`, `?namespace=`, `?class=` and `?limit=`. A
 deployment-scoped [app-token](#app-tokens) gets its own deployments' alerts and
 never the ones attributed to the LB itself — the set of addresses attacking the
 control plane is fleet information.
@@ -4969,7 +5032,8 @@ activity is the one that goes.
 
 ### What it deliberately does not do
 
-**No `X-Forwarded-For` trust.** Detectors key on the socket peer only. Keying on
+**No `X-Forwarded-For` trust.** Detectors key on the socket peer only — or, for
+a verified fleet hop, the client the peer host vouched for. Keying on
 a client-supplied header would be an alert-spoofing and alert-flooding primitive
 on an unauthenticated path. The consequence is that behind another proxy every
 request appears to come from that proxy, and the per-source rules are only as

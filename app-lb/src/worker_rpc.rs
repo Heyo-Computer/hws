@@ -563,9 +563,19 @@ fn finish(head: &RequestHead, state: &mut RequestState, metrics: &Metrics, acces
     if access_log.is_none() && security.is_none() { return; }
     let method = head.method.as_str();
     let host = head.host();
-    let access = Access { deployment: deployment.as_deref(), backend, method, path: head.uri.path(), host: host.as_deref(), status: completion.status, duration, bytes: completion.bytes, client: head.peer.map(|p| p.ip().to_string()), error: completion.error };
-    if let Some(sink) = security { sink.observe_access(&access, head.uri.query()); }
+    let access = Access { deployment: deployment.as_deref(), backend, method, path: head.uri.path(), host: host.as_deref(), status: completion.status, duration, bytes: completion.bytes, client: access_client(head, state).map(|ip| ip.to_string()), error: completion.error };
+    if let Some(sink) = security {
+        let user_agent = head.headers.get(http::header::USER_AGENT).and_then(|v| v.to_str().ok());
+        sink.observe_access(&access, head.uri.query(), user_agent);
+    }
     if let Some(sink) = access_log { sink.send_access(access); }
+}
+
+/// Who the access log and the security monitor name as the client: the one
+/// `decide` judged (a fleet hop's vouched client), else the socket peer for a
+/// request answered before it got that far.
+fn access_client(head: &RequestHead, state: &RequestState) -> Option<std::net::IpAddr> {
+    state.client().or_else(|| head.peer.map(|p| p.ip()))
 }
 
 async fn hold_until_exit(worker_exited: &mut watch::Receiver<bool>, state: RequestState) {
@@ -620,6 +630,17 @@ mod tests {
         assert!(matches!(client.begin(head.clone()).await, Err(BeginError::HeadersTooLarge)));
         head.headers.insert("x-large", http::HeaderValue::from_bytes(&vec![b'x'; 200_000]).unwrap());
         assert!(matches!(client.begin(head).await, Err(BeginError::Unavailable(_))));
+    }
+
+    #[test]
+    fn the_access_client_is_the_one_decide_judged_not_the_peer_host() {
+        let mut head = head();
+        head.peer = Some("10.0.0.5:4000".parse().unwrap());
+        let state = RequestState::default();
+        assert_eq!(access_client(&head, &state), Some("10.0.0.5".parse().unwrap()), "before decide: the socket peer");
+        let mut state = RequestState::default();
+        state.set_client_for_test("203.0.113.9".parse().unwrap());
+        assert_eq!(access_client(&head, &state), Some("203.0.113.9".parse().unwrap()), "after a fleet hop: its client");
     }
 
     fn head() -> RequestHead {

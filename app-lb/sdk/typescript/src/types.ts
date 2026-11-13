@@ -832,7 +832,7 @@ export interface SecurityAlert {
   /** Epoch millis of the first occurrence folded into this alert. */
   ts: number;
   last_ts: number;
-  /** e.g. `auth.brute-force`, `web.sqli`, `traffic.scanner`. */
+  /** e.g. `auth.brute-force`, `web.sqli`, `traffic.scanner`, `bot.spoofed`. */
   rule: string;
   severity: Severity;
   title: string;
@@ -853,6 +853,9 @@ export interface SecurityAlert {
    * free-form map: app-lb may add fields, and `url.query` is never among them.
    */
   ecs?: Record<string, unknown>;
+  /** The automated client a `bot.*` finding is about. Catalog names only —
+   * never the raw User-Agent. */
+  bot?: BotTag;
   /** What to do about it. Derived server-side, so a client renders rather than
    * reasons. */
   response: AlertResponse;
@@ -870,7 +873,8 @@ export interface AlertResponse {
 }
 
 export interface SuggestedAction {
-  /** `block-client`, `block-client-deployment`, `block-path`, `exempt-client`. */
+  /** `block-client`, `block-client-deployment`, `block-path`, `block-agent`,
+   * `exempt-client`. */
   kind: string;
   label: string;
   /** What it stops and what it leaves alone. Show this next to the button. */
@@ -990,6 +994,75 @@ export interface SecurityResponse {
   /** Withheld from a deployment-scoped token, for whom it would describe
    * traffic it cannot see. */
   stats?: SiemStats;
+  /** Automated traffic per deployment. Absent when `APP_LB_BOTS=0`. */
+  bots?: BotTrafficView;
+}
+
+/** What kind of automated client a request claimed to be. */
+export type BotClass =
+  | "ai-agent"
+  | "ai-crawler"
+  | "ai-search"
+  | "search-crawler"
+  | "seo"
+  | "preview"
+  | "monitor"
+  | "scripted"
+  | "scanner"
+  | "other-bot";
+
+/**
+ * Whether the claim checked out against the operator's published ranges.
+ * `claimed`: the ranges have not loaded (or the address is unknown) — never
+ * evidence of spoofing. `unverifiable`: the operator publishes no ranges.
+ */
+export type BotVerification = "verified" | "claimed" | "spoofed" | "unverifiable";
+
+export interface BotTag {
+  /** The catalog name, e.g. `GPTBot`, `ChatGPT-User`, `Googlebot`. */
+  agent: string;
+  operator: string;
+  class: BotClass;
+  verification: BotVerification;
+}
+
+/** Requests from one agent to one deployment, at one verification state. */
+export interface BotTrafficRow extends BotTag {
+  /** Absent for traffic no deployment matched. */
+  deployment?: string;
+  /** Requests inside {@link BotTrafficView.window_secs}. */
+  requests: number;
+  /** Requests since the row appeared. */
+  total: number;
+  /** Approximate distinct sources (a 64-bit sketch, so it saturates). */
+  sources: number;
+  first_ts: number;
+  last_ts: number;
+  /** "Block this agent on this deployment", ready to post. Absent for a
+   * spoofed row and for traffic no deployment matched. */
+  action?: SuggestedAction;
+}
+
+/** One published range list. */
+export interface RangeStatus {
+  url: string;
+  operator: string;
+  agents: string[];
+  loaded: boolean;
+  prefixes: number;
+  fetched_at?: number;
+  /** The last fetch's failure. A previously loaded list stays in force. */
+  error?: string;
+}
+
+export interface BotTrafficView {
+  window_secs: number;
+  /** Busiest first. */
+  rows: BotTrafficRow[];
+  ranges: RangeStatus[];
+  /** `false` under `APP_LB_BOTS_RANGES=0`: nothing is fetched, nothing verified. */
+  verifying: boolean;
+  at_capacity: boolean;
 }
 
 // -- workflows, jobs, secrets, certs --------------------------------------

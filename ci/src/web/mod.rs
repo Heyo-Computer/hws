@@ -138,6 +138,8 @@ pub fn router(
         // `Accept: text/event-stream` and app-lb's gate admits only
         // `text/html`. It carries its own run-scoped token instead.
         .route("/api/stream/{run_id}/{job_key}", get(log_stream))
+        // Operation-scoped bearer, revoked when the host rollout settles.
+        .route("/api/host-artifacts/{id}", get(host_artifact))
         .route("/api/native/register", post(native_register))
         .route("/api/native/poll", post(native_poll))
         .route("/api/native/heartbeat", post(native_heartbeat))
@@ -445,6 +447,15 @@ async fn activate_application_update(State(state): State<AppState>, Path(id): Pa
     match crate::controller_rollout::activate_application_update(&state.dispatcher, &id, &activation.intent_hash).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => error(StatusCode::CONFLICT, "application update cannot be activated"),
+    }
+}
+
+async fn host_artifact(State(s):State<AppState>,headers:HeaderMap,Path(id):Path<String>)->axum::response::Response {
+    let Some(token)=bearer(&headers) else{return error(StatusCode::UNAUTHORIZED,"host artifact credential required")};
+    match crate::host_heyvm_bootstrap_coordinator::download_artifact(&s.store,s.dispatcher.artifacts.as_ref(),&s.config.webhook_secret,&id,token).await {
+        Ok(Some(bytes)) => ([("content-type","application/octet-stream"),("cache-control","no-store")],bytes).into_response(),
+        Ok(None) => error(StatusCode::FORBIDDEN,"host artifact grant unavailable"),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE,"host artifact unavailable"),
     }
 }
 

@@ -2004,6 +2004,51 @@ Stage automatic policy and production manual policy will be operator-owned;
 manual deployment in an automatic environment needs an explicit hold/resume so
 automation cannot immediately overwrite the operator's selected version.
 
+### Importing validated namespace artifacts
+
+`CI_RELEASE_IMPORTS` optionally lets a release controller consume successful
+namespace CI builds without rebuilding them or giving that namespace deployment
+authority. It is an operator-owned YAML map; leave it unset on preview:
+
+```yaml
+preview-runtime:
+  api_url: https://admin.us5.heyo.work/namespaces/heyo-ci/plugins/ci/api
+  token_secret: PREVIEW_CI_READ_TOKEN
+  repository: https://github.com/Heyo-Computer/heyo.git
+  namespace: heyo-ci
+  workflow: .ci/workflows/validate-libvirt-cleanup.yml
+  job: test
+  artifact: heyvm
+  services: [heyvm, heyvmd]
+```
+
+The token value belongs in the destination release-build workflow's existing
+`default` HeyoSecret scope. Use a namespace-scoped read-only app-lb credential,
+not a submit token, administrator token, or personal login. The importer only
+issues HTTPS GETs; redirects are disabled. The source serves paginated
+`GET /release-artifacts?repository=...&workflow=...&before=...` and
+`GET /runs/{id}/release-artifact` through the existing namespace read gate.
+
+Every source job must have succeeded. Git must independently establish that the
+tested revision belongs to the configured release branch and its tree and
+workflow match the executed descriptor. The destination must use the same
+global content-addressed artifact store: retention verifies the digest and size
+and pins the bytes before the catalog transaction commits. Missing blobs,
+unmerged revisions, incomplete validation, and mismatched receipts cannot become
+release candidates. Cross-store copying is not supported.
+
+Each selected service must already exist in `CI_RELEASE_BUILDS.components`.
+Its configured workflow/job/artifact names are the destination selection names;
+the manifest and `ci_release_import` preserve the actual source provenance.
+Import retries are idempotent. Source run admission time orders candidates, so
+late imports cannot supersede newer builds merely by arriving later.
+
+Import does not change any deployment mode or hold. Existing stage automatic
+promotion consumes retained candidates; preview remains manual. Before enabling
+this setting, deploy the exporter and importer, verify read access and shared
+blob availability, and run a successful build containing the complete runtime
+archive. Existing validation-only artifacts are not complete runtime releases.
+
 ### Manual and daily release builds
 
 `CI_RELEASE_BUILDS` is an opt-in, operator-owned YAML map keyed by repository.
@@ -2505,8 +2550,18 @@ managed host heyvm service before normal host maintenance is available. It accep
 only `target`, a direct `${{ secrets.NAME }}` app-lb namespace-admin `token`, and
 the frozen validation `workflow` and `artifact` names. The coordinator must run in
 a CI-owned VM on a runner other than the target. The artifact must have been
-uploaded as a public artifact to CI's configured HTTP artifact sink and contain
+uploaded to CI's configured HTTP artifact sink and contain
 exactly one `*heyvm.tar.gz` with exactly one ELF `heyvm`.
+
+Artifacts remain private. The installer downloads through
+`CI_PUBLIC_URL/api/host-artifacts/{operation}` with an operation-scoped bearer;
+it never receives the artifact-store credential. Add `/api/host-artifacts/` to
+app-lb's `public_paths` so this route can enforce its own bearer authentication.
+CI serves only the persisted operation's size/digest-verified artifact while
+delivery is armed or polling, the deadline is unexpired, and both job and run
+are running. Completion, failure, cancellation, or timeout revokes access.
+Responses are `no-store`, and the installer refuses redirects. Existing saved
+public-download operations remain readable for receipt-only recovery.
 
 Set `CI_HOST_HEYVM_BOOTSTRAP_TARGETS`, or preferably store the same JSON at the
 operator-only HeyoSecret path `ci-controller/host-heyvm-bootstrap-targets` (the
@@ -2542,7 +2597,7 @@ repair a retained fence; reconcile the persisted operation and launcher job.
 single app-lb launcher delivery, receipt reconciliation, and explicit recovery
 contract as `ci/bootstrap-host-heyvm`. Its inputs are the same closed set:
 `target`, direct `${{ secrets.NAME }}` `token`, frozen validation `workflow`, and
-public `artifact`. Unlike the bootstrap action, it selects the exact root
+private `artifact`. Unlike the bootstrap action, it selects the exact root
 `heyvmd` ELF from the validated inner `heyvm-*-unknown-linux-gnu-x86_64.tar.gz`;
 it never installs or renames `heyvm`.
 

@@ -324,8 +324,11 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
     {
       name: "applb_security_events",
       description:
-        "app-lb's SIEM findings: authentication abuse, attack signatures and traffic " +
-        "anomalies, newest first, plus any block rules in force and the guard's counters. " +
+        "app-lb's SIEM findings: authentication abuse, attack signatures, traffic " +
+        "anomalies and automated clients, newest first, plus any block rules in force and " +
+        "the guard's counters. `bots` lists traffic from AI agents, AI-lab crawlers, search " +
+        "engines and scripts per deployment, each claim marked verified/spoofed/claimed/" +
+        "unverifiable against the operator's published IP ranges; `class` narrows it. " +
         "This is the same data the `/siem` console renders, as JSON, behind the same gate " +
         "(`/security` is `view` tier, like `/metrics`).\n\n" +
         "Each alert carries its own `response` — a runbook (`investigate`) and the rules " +
@@ -365,6 +368,21 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
             "only alerts for deployments in this namespace; app-lb narrows a confined " +
               "credential's answer itself",
           ),
+        class: z
+          .enum([
+            "ai-agent",
+            "ai-crawler",
+            "ai-search",
+            "search-crawler",
+            "seo",
+            "preview",
+            "monitor",
+            "scripted",
+            "scanner",
+            "other-bot",
+          ])
+          .optional()
+          .describe("only automated traffic of this class, and the bot.* alerts about it"),
         limit: num().optional().describe("most recent N alerts after filtering"),
       },
       handler: async (a) =>
@@ -376,6 +394,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
               rule: a.rule as string | undefined,
               deployment: a.deployment as string | undefined,
               namespace: a.namespace as string | undefined,
+              class: a.class as string | undefined,
               limit: a.limit as number | undefined,
             },
           }),

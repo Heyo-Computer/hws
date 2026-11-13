@@ -148,6 +148,15 @@ proxy enforces with an anonymous 403 — the refusal deliberately does not say w
 property matched. A built-in analyzer (on unless <code>APP_LB_SIEM=0</code>) watches
 access and auth failures, folds repeats, and raises findings on
 <code>GET /security</code> with suggested rules.</p>
+<p>It also recognises automated clients — AI agents (ChatGPT-User, Claude-User), AI labs'
+crawlers (GPTBot, ClaudeBot, CCBot), search engines, scripts and scanners — from the
+<code>User-Agent</code>, and checks each claim against the IP ranges the operator publishes:
+<code>verified</code>, <code>spoofed</code>, <code>claimed</code> (ranges not loaded) or
+<code>unverifiable</code> (none published). <code>GET /security</code> carries the per-deployment
+table as <code>bots</code>, filterable with <code>?class=</code>, and each row offers a
+ready rule that blocks that agent on that deployment. A spoofed claim raises
+<code>bot.spoofed</code>. A <code>User-Agent</code> is self-asserted; Web Bot Auth
+signatures are not verified yet.</p>
 
 <footer><a href="deployments.html">← Deployments</a> · next:
 <a href="namespaces.html">Namespaces</a></footer>

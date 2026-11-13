@@ -167,6 +167,36 @@ pub struct Autoscaler {
     /// Consecutive failed resumes per retained sandbox. See
     /// [`MAX_RESUME_ATTEMPTS`].
     resume_failures: std::sync::Mutex<HashMap<String, u32>>,
+    /// Creates awaiting the runtime, per deployment. Unresolved attempts are
+    /// settled only while this is zero: attempts are updated by index, and
+    /// settling one under a create in flight would shift its slot.
+    creating: std::sync::Mutex<HashMap<String, usize>>,
+    /// When each unresolved create attempt (by name) was first seen missing
+    /// from a complete daemon listing. See [`Autoscaler::settle_unresolved_creates`].
+    unresolved_since: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+/// How long an id-less create attempt must stay absent from complete daemon
+/// listings before it is dropped. Long enough for a create the daemon accepted
+/// just as the connection broke to show up in its list.
+const UNRESOLVED_CREATE_GRACE_SECS: u64 = 120;
+
+/// Decrements [`Autoscaler::creating`] when a create returns, however it returns.
+struct CreatingGuard<'a> {
+    creating: &'a std::sync::Mutex<HashMap<String, usize>>,
+    deployment: String,
+}
+
+impl Drop for CreatingGuard<'_> {
+    fn drop(&mut self) {
+        let mut creating = self.creating.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = creating.get_mut(&self.deployment) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                creating.remove(&self.deployment);
+            }
+        }
+    }
 }
 
 impl Autoscaler {
@@ -196,6 +226,8 @@ impl Autoscaler {
             secrets,
             images: std::sync::OnceLock::new(),
             resume_failures: std::sync::Mutex::new(HashMap::new()),
+            creating: std::sync::Mutex::new(HashMap::new()),
+            unresolved_since: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -577,6 +609,8 @@ impl Autoscaler {
         if listing.total_outage() {
             return;
         }
+        // Absence from the fleet proves nothing unless every runtime answered.
+        let listing_complete = listing.heyvm.is_ok() && !matches!(listing.lxc, Some(Err(_)));
         let listing = vm::Listing::from_infos(listing.sandboxes);
 
         // Fetch host + per-VM resource usage alongside the fleet list. It is a
@@ -616,6 +650,9 @@ impl Autoscaler {
                 continue;
             }
             self.recover_allocations(d, &fleet).await;
+            if listing_complete {
+                self.settle_unresolved_creates(d, &fleet);
+            }
             if crate::rollout::reserved(d) {
                 // Keep source health recovery, but do not prune, adopt, scale
                 // or persist over the rollout's durable generation record.
@@ -1435,6 +1472,7 @@ impl Autoscaler {
             let request = self.vms().prepare_create(d.spec.vm_spec(), name.clone(), seed, owner, secret_env.clone(), stateful).await?;
             Some(self.vms().prepare_allocation(&request, &format!("{}:{}:{}", d.spec.namespace, d.spec.id, d.state().rollout_revision))?)
         } else { None };
+        let _creating = self.track_create(&d.spec.id);
         let attempt = d.state().create_attempts.len();
         let history_was_complete = d.state().allocation_history_complete;
         d.mutate_state(|s| {
@@ -1476,6 +1514,99 @@ impl Autoscaler {
                 }
                 Err(error)
             }
+        }
+    }
+
+    fn track_create(&self, deployment: &str) -> CreatingGuard<'_> {
+        *self
+            .creating
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(deployment.to_string())
+            .or_default() += 1;
+        CreatingGuard { creating: &self.creating, deployment: deployment.to_string() }
+    }
+
+    /// Resolve create attempts that never learned their sandbox id.
+    ///
+    /// A create without a correlated allocation records its attempt before
+    /// calling the runtime and fills in the id when the call returns. If the
+    /// call fails in a way that might have created a VM anyway — the daemon
+    /// went away mid-request — the attempt keeps no id, and `scale_up` refuses
+    /// to create while any such attempt exists, so a duplicate replica is
+    /// never booted beside one that might exist. Nothing else ever settled
+    /// it, so one daemon restart during a create stopped the deployment from
+    /// scaling until an operator edited its state by hand.
+    ///
+    /// The VM is named after the attempt, so a complete daemon listing
+    /// answers the question. If the name is listed, the attempt takes that
+    /// sandbox's id (and `adopt_untracked` takes the VM). If it stays absent
+    /// for [`UNRESOLVED_CREATE_GRACE_SECS`], no create happened and the
+    /// attempt is dropped. Only runs while no create is in flight for the
+    /// deployment, and the caller passes only complete listings.
+    fn settle_unresolved_creates(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
+        let unresolved: Vec<String> = d
+            .state()
+            .create_attempts
+            .iter()
+            .filter(|a| a.sandbox_id.is_none() && a.allocation.is_none())
+            .map(|a| a.name.clone())
+            .collect();
+        if unresolved.is_empty() {
+            return;
+        }
+        if self
+            .creating
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&d.spec.id)
+            .is_some_and(|n| *n > 0)
+        {
+            return;
+        }
+        let now = now_secs();
+        let mut found: Vec<(String, String)> = Vec::new();
+        let mut expired: Vec<String> = Vec::new();
+        {
+            let mut since = self.unresolved_since.lock().unwrap_or_else(|e| e.into_inner());
+            for name in &unresolved {
+                if let Some((id, _)) = fleet.iter().find(|(_, info)| &info.name == name) {
+                    since.remove(name);
+                    found.push((name.clone(), id.clone()));
+                    continue;
+                }
+                let first = *since.entry(name.clone()).or_insert(now);
+                if now.saturating_sub(first) >= UNRESOLVED_CREATE_GRACE_SECS {
+                    since.remove(name);
+                    expired.push(name.clone());
+                }
+            }
+        }
+        if found.is_empty() && expired.is_empty() {
+            return;
+        }
+        let before = d.state().create_attempts.clone();
+        d.mutate_state(|s| {
+            for (name, id) in &found {
+                if let Some(a) = s.create_attempts.iter_mut().find(|a| &a.name == name && a.sandbox_id.is_none()) {
+                    a.sandbox_id = Some(id.clone());
+                }
+            }
+            s.create_attempts
+                .retain(|a| !(a.sandbox_id.is_none() && a.allocation.is_none() && expired.contains(&a.name)));
+        });
+        if let Err(e) = self.registry.persist_one(&d.spec.id) {
+            d.mutate_state(|s| s.create_attempts = before);
+            tracing::warn!(deployment = %d.spec.id, error = %e, "could not persist settled create attempts; will retry");
+            return;
+        }
+        for (name, id) in &found {
+            tracing::warn!(deployment = %d.spec.id, attempt = %name, sandbox = %id,
+                "an interrupted create did start a VM; tracking it");
+        }
+        for name in &expired {
+            tracing::warn!(deployment = %d.spec.id, attempt = %name, grace_secs = UNRESOLVED_CREATE_GRACE_SECS,
+                "an interrupted create never reached the daemon; dropping it so the pool can scale again");
         }
     }
 
@@ -3741,6 +3872,51 @@ mod tests {
         reg.remove("demo");
         // Stale, but there is nothing to check — and no registry lookup to make.
         assert!(a.unclaimed(&d, &[]).is_empty());
+    }
+
+    fn unresolved_attempt(name: &str) -> crate::retirement::CreateAttempt {
+        crate::retirement::CreateAttempt { name: name.into(), sandbox_id: None, ..Default::default() }
+    }
+
+    /// An interrupted create whose VM never appeared is dropped after the
+    /// grace period, so the pool can scale again — but not while a create is
+    /// in flight, and not before the grace period.
+    #[test]
+    fn an_interrupted_create_that_made_no_vm_is_dropped_after_the_grace_period() {
+        let (scaler, registry) = autoscaler();
+        let d = registry.get("demo").unwrap();
+        d.mutate_state(|s| s.create_attempts.push(unresolved_attempt("applb-demo-lost")));
+        let fleet = HashMap::new();
+
+        scaler.settle_unresolved_creates(&d, &fleet);
+        assert_eq!(d.state().create_attempts.len(), 1, "inside the grace period");
+
+        let backdated = now_secs() - UNRESOLVED_CREATE_GRACE_SECS - 1;
+        scaler.unresolved_since.lock().unwrap().insert("applb-demo-lost".into(), backdated);
+        {
+            let _inflight = scaler.track_create("demo");
+            scaler.settle_unresolved_creates(&d, &fleet);
+            assert_eq!(d.state().create_attempts.len(), 1, "a create in flight holds settlement");
+        }
+        assert!(scaler.creating.lock().unwrap().get("demo").is_none(), "the guard releases");
+
+        scaler.settle_unresolved_creates(&d, &fleet);
+        assert!(d.state().create_attempts.is_empty());
+        assert!(scaler.unresolved_since.lock().unwrap().is_empty());
+    }
+
+    /// An interrupted create that did start a VM takes that VM's id instead.
+    #[test]
+    fn an_interrupted_create_that_made_a_vm_takes_its_id() {
+        let (scaler, registry) = autoscaler();
+        let d = registry.get("demo").unwrap();
+        let listed = info(heyo_sdk::SandboxStatus::Running, None);
+        d.mutate_state(|s| s.create_attempts.push(unresolved_attempt(&listed.name)));
+        let fleet = HashMap::from([(listed.id.clone(), listed)]);
+
+        scaler.settle_unresolved_creates(&d, &fleet);
+        assert_eq!(d.state().create_attempts.len(), 1);
+        assert_eq!(d.state().create_attempts[0].sandbox_id.as_deref(), Some("sb-1"));
     }
 
     fn info(status: heyo_sdk::SandboxStatus, guest_ip: Option<&str>) -> SandboxInfo {

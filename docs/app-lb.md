@@ -233,6 +233,10 @@ HTTP-01 validation needs the proxy on port 80. To bind 80/443 as a non-root user
 | `APP_LB_SIEM_MAX_ALERTS_PER_MIN` | `60` | Maximum number of new alerts per minute. |
 | `APP_LB_SIEM_SCAN_QUERY` | `true` | Also scan the query string (it is never stored). |
 | `APP_LB_SIEM_SHIP` | `true` | Ship alerts to app-obs. |
+| `APP_LB_BOTS` | `true` | Classify automated traffic (AI agents, AI-lab crawlers, bots) by User-Agent. |
+| `APP_LB_BOTS_RANGES` | `true` | Fetch operators' published crawler ranges to verify claims; `0` makes no outbound requests. |
+| `APP_LB_BOTS_REFRESH_SECS` | `86400` | How often the range lists are refetched. |
+| `APP_LB_BOTS_WINDOW_SECS` | `3600` | Window the automated-traffic table counts over. |
 | `APP_LB_GUARD_ENFORCE` | `true` | Set `0` for a dry run: rules match and count hits but refuse nothing. |
 
 ### LXC driver (Incus)

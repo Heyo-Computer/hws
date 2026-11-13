@@ -573,10 +573,10 @@ table.nsdir td.rowactions a.btn { display: inline-block; text-decoration: none; 
        does not run them, so they are not the pool table. No actions on the
        rows — drain and kill are pool operations, and a sandbox somebody made
        by hand is not app-lb's to reap. -->
-  <div class="section-title">
+  <div class="section-title" data-host-sandboxes>
     Host sandboxes <span class="count" id="hostsb-count"></span>
   </div>
-  <div class="card" id="host-sandboxes"></div>
+  <div class="card" id="host-sandboxes" data-host-sandboxes></div>
 
   <div class="section-title" data-fleet-only>
     Certificates <span class="count" id="certs-count"></span>
@@ -668,6 +668,14 @@ document.getElementById("ns-home").hidden = !nsHomeActive;
 // An admin inside one namespace on a control plane: where it runs across the
 // servers is the workloads rollup narrowed to it, above this server's detail.
 const nsAcrossServers = canLeaveNamespace && MULTI_SERVER && !CALLER_CONFINED;
+// An admin inside one namespace. Host sandboxes belong to no namespace, and
+// the server narrows them by the caller's account, not by `?namespace=` — so
+// for an unconfined admin the list is the whole host's, every customer's,
+// and under one namespace's name it would read as that namespace's. They stay
+// on the directory page. A customer keeps the section: theirs is narrowed to
+// the sandboxes their own account owns.
+const adminInNamespace = !!pinnedNamespace && !CALLER_CONFINED;
+if (adminInNamespace) document.querySelectorAll("[data-host-sandboxes]").forEach(el => el.hidden = true);
 const localView = pageParams.get("view") === "local" || namespaceView || !MULTI_SERVER;
 // The tokens table's "servers" column only means something across a fleet.
 const SHOW_SERVERS = MULTI_SERVER && !namespaceView;
@@ -1057,7 +1065,7 @@ function render(data) {
   // --- per-deployment ---
   renderDeploymentPager(data.matched);
   renderDeployments(data.deployments);
-  renderHostSandboxes(data.host_sandboxes);
+  if (!adminInNamespace) renderHostSandboxes(data.host_sandboxes);
 
   // --- freshness ---
   $("uptime").textContent = "up " + fmtDur(data.uptime_secs);

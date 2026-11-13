@@ -1722,6 +1722,11 @@ struct SecurityResponse {
     guard: crate::guard::GuardStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<crate::siem::SiemSnapshot>,
+    /// Automated traffic — AI agents, AI labs' crawlers, search engines,
+    /// scripts — per deployment, with whether each claim checked out against
+    /// the operator's published ranges. Absent when `APP_LB_BOTS=0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bots: Option<crate::siem::BotTrafficView>,
 }
 
 /// Query parameters for `GET /security`.
@@ -1741,6 +1746,9 @@ struct SecurityQuery {
     /// moment a deployment moves. This is a filter, never a widening: it can
     /// only narrow what the caller's own scope already admits.
     namespace: Option<String>,
+    /// Only automated traffic of this class (`ai-crawler`, `ai-agent`, …):
+    /// narrows the bot rows, and the alerts to the `bot.*` findings about it.
+    class: Option<String>,
     limit: Option<usize>,
 }
 
@@ -2147,8 +2155,10 @@ async fn security_snapshot(
             rules: visible_rules(&state, scope, now),
             guard: state.guard.stats(now),
             stats: None,
+            bots: None,
         });
     };
+    let class = q.class.as_deref().and_then(crate::bots::BotClass::parse);
 
     let min = q.severity.as_deref().and_then(crate::siem::Severity::parse);
     let limit = q.limit.unwrap_or(200).min(1000);
@@ -2190,6 +2200,7 @@ async fn security_snapshot(
                 .is_some_and(|d| ids.iter().any(|id| id == d)),
         })
         .filter(|a| min.is_none_or(|m| a.severity >= m))
+        .filter(|a| class.is_none_or(|c| a.bot.is_some_and(|b| b.class == c)))
         .filter(|a| q.rule.as_deref().is_none_or(|r| a.rule == r))
         .filter(|a| {
             q.deployment
@@ -2199,6 +2210,28 @@ async fn security_snapshot(
         .take(limit)
         .map(crate::siem::AlertView::from)
         .collect();
+
+    // The bot rows go through the same scope, namespace and deployment filters
+    // as the alerts: a row is traffic to a deployment, and naming who crawls a
+    // deployment is as much that deployment's business as its alerts are.
+    let in_ids = |d: Option<&str>, ids: Option<&[String]>| match ids {
+        None => true,
+        Some(ids) => d.is_some_and(|d| ids.iter().any(|id| id == d)),
+    };
+    let bots = ring.bot_traffic(crate::obs::now_millis()).map(|mut view| {
+        view.rows.retain(|r| {
+            in_ids(r.deployment.as_deref(), scope)
+                && in_ids(r.deployment.as_deref(), ns_ids.as_deref())
+                && q.deployment.as_deref().is_none_or(|d| r.deployment.as_deref() == Some(d))
+                && class.is_none_or(|c| r.bot.class == c)
+        });
+        view.rows.truncate(limit);
+        if scope.is_some() {
+            // Fleet-wide, like `stats`.
+            view.at_capacity = false;
+        }
+        view
+    });
 
     Json(SecurityResponse {
         generated_at: now,
@@ -2214,6 +2247,7 @@ async fn security_snapshot(
             .is_none()
             .then(|| state.siem.as_ref().map(|s| s.snapshot()))
             .flatten(),
+        bots,
     })
 }
 

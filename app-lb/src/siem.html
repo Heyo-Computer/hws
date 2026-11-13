@@ -105,6 +105,12 @@
   .tag.block    { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
   .tag.allow    { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
   .tag.dry      { background: color-mix(in srgb, var(--warning) 26%, transparent); color: var(--serious); }
+  /* Verification badges on the automated-traffic table. */
+  .tag.verified     { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.spoofed      { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
+  .tag.claimed,
+  .tag.unverifiable { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
+  .bots-wrap { overflow-x: auto; }
 
   .alert { border-bottom: 1px solid var(--grid); padding: 13px 0; }
   .alert:last-child { border-bottom: 0; padding-bottom: 0; }
@@ -245,6 +251,21 @@
          the reader cannot open. -->
     <select id="f-namespace"><option value="">Any namespace</option></select>
     <input type="text" id="f-deployment" placeholder="deployment" size="14">
+    <!-- Narrows the automated-traffic table and the findings to the bot.*
+         alerts about this class. -->
+    <select id="f-class">
+      <option value="">Any traffic</option>
+      <option value="ai-agent">AI agents</option>
+      <option value="ai-crawler">AI crawlers</option>
+      <option value="ai-search">AI search</option>
+      <option value="search-crawler">Search engines</option>
+      <option value="seo">SEO crawlers</option>
+      <option value="preview">Link previews</option>
+      <option value="monitor">Monitors</option>
+      <option value="scripted">Scripts</option>
+      <option value="scanner">Scanners</option>
+      <option value="other-bot">Other bots</option>
+    </select>
     <span class="spacer"></span>
     <button class="act" id="refresh" type="button">Refresh</button>
     <label style="font-size:12.5px;color:var(--text-2)">
@@ -252,6 +273,11 @@
     </label>
   </div>
   <div class="card" id="alerts"><div class="empty">Loading…</div></div>
+
+  <div id="bots-section" hidden>
+    <div class="section-title">Automated traffic</div>
+    <div class="card" id="bots"></div>
+  </div>
 
   <div class="section-title">Rules in force</div>
   <div class="card" id="enforcement"></div>
@@ -593,6 +619,55 @@ function renderRules(d) {
     locking you out of the page that removes it.</div>`;
 }
 
+const CLASS_LABEL = {
+  "ai-agent": "AI agent", "ai-crawler": "AI crawler", "ai-search": "AI search",
+  "search-crawler": "search engine", "seo": "SEO", "preview": "link preview",
+  "monitor": "monitor", "scripted": "script", "scanner": "scanner", "other-bot": "bot",
+};
+
+// Who is crawling what. A User-Agent is self-asserted, so the badge — whether
+// the address is inside the operator's published ranges — is the part to read.
+function renderBots(d) {
+  const b = d.bots;
+  $("bots-section").hidden = !b;
+  if (!b) return;
+  const el = $("bots");
+  const rows = b.rows || [];
+  const mins = Math.round((b.window_secs || 3600) / 60);
+  const loaded = (b.ranges || []).filter(r => r.loaded).length;
+  const failing = (b.ranges || []).filter(r => r.error);
+  const ranges = !b.verifying
+    ? "Range verification is off (<code>APP_LB_BOTS_RANGES=0</code>): every claim reads as claimed or unverifiable."
+    : `${fmt(loaded)} of ${fmt((b.ranges || []).length)} published range lists loaded${
+        failing.length ? ` — ${failing.map(r => esc(r.operator) + ": " + esc(r.error)).join("; ")}` : ""}.`;
+  if (!rows.length) {
+    el.innerHTML = `<div class="empty">No automated traffic recognised in the last ${esc(mins)} minutes.</div>
+      <div class="note">${ranges}</div>`;
+    return;
+  }
+  const body = rows.map((r, i) => `<tr>
+    <td>${esc(r.agent)}<div class="note" style="margin:2px 0 0">${esc(r.operator)}</div></td>
+    <td><span class="fact">${esc(CLASS_LABEL[r.class] || r.class)}</span></td>
+    <td><span class="tag ${esc(r.verification)}">${esc(r.verification)}</span></td>
+    <td class="mono">${esc(r.deployment || "unrouted")}</td>
+    <td class="num">${fmt(r.requests)}</td>
+    <td class="num">${fmt(r.total)}</td>
+    <td class="num">${r.sources >= 64 ? "64+" : fmt(r.sources)}</td>
+    <td class="num">${esc(ago(Math.floor(r.last_ts / 1000)))}</td>
+    <td style="white-space:nowrap">${r.action
+      ? `<button class="act danger" type="button" data-bot="${i}" title="${esc(r.action.effect)}">${esc(r.action.label)}</button>`
+      : ""}</td>
+  </tr>`).join("");
+  el.innerHTML = `<div class="bots-wrap"><table class="rules">
+    <thead><tr><th>Agent</th><th>Class</th><th>Claim</th><th>Deployment</th>
+      <th>Last ${esc(mins)}m</th><th>Total</th><th>Sources</th><th>Last</th><th></th></tr></thead>
+    <tbody>${body}</tbody></table></div>
+    <div class="note">${ranges} <b>verified</b> means the address is inside the operator's
+    published ranges; <b>spoofed</b> means it is outside a list that loaded; <b>claimed</b> means
+    the list has not loaded; <b>unverifiable</b> means the operator publishes none. Blocking an
+    agent matches its User-Agent token on that deployment only.</div>`;
+}
+
 function ruleOptions(alerts) {
   const sel = $("f-rule");
   const seen = [...new Set(alerts.map(a => a.rule))].sort();
@@ -613,6 +688,7 @@ function query() {
   if ($("f-rule").value) p.set("rule", $("f-rule").value);
   if ($("f-namespace").value) p.set("namespace", $("f-namespace").value);
   if ($("f-deployment").value.trim()) p.set("deployment", $("f-deployment").value.trim());
+  if ($("f-class").value) p.set("class", $("f-class").value);
   const s = p.toString();
   return "/security" + (s ? "?" + s : "");
 }
@@ -651,13 +727,14 @@ async function load() {
   tiles(d);
   ruleOptions(d.alerts || []);
   renderAlerts(d);
+  renderBots(d);
   renderEnforcement(d);
   renderRules(d);
 
   const g = d.guard || {};
   const bits = [];
   bits.push(d.enabled
-    ? `Watching authentication, attack signatures and traffic anomalies over a ${d.window_secs}s window.`
+    ? `Watching authentication, attack signatures, traffic anomalies and automated clients over a ${d.window_secs}s window.`
     : `Detection is off; enforcement is not.`);
   bits.push(`${fmt(g.rules)} rule${g.rules === 1 ? "" : "s"} in force.`);
   if (g.enforcing === false) bits.push("Enforcement is disabled — rules match but nothing is refused.");
@@ -729,6 +806,17 @@ document.addEventListener("click", async ev => {
     return;
   }
 
+  const botBtn = ev.target.closest("button[data-bot]");
+  if (botBtn) {
+    const row = ((latest && latest.bots && latest.bots.rows) || [])[Number(botBtn.getAttribute("data-bot"))];
+    if (!row || !row.action) return;
+    if (!confirm(row.action.effect + "\n\nApply this rule?")) return;
+    botBtn.disabled = true;
+    await applyRule(row.action.rule, row.action.label);
+    botBtn.disabled = false;
+    return;
+  }
+
   const btn = ev.target.closest("button[data-action]");
   if (!btn) return;
   const alertId = btn.getAttribute("data-alert");
@@ -771,7 +859,7 @@ function schedule() {
   if ($("auto").checked) timer = setInterval(load, 10000);
 }
 
-["f-severity", "f-rule", "f-namespace", "f-deployment"].forEach(id =>
+["f-severity", "f-rule", "f-namespace", "f-deployment", "f-class"].forEach(id =>
   $(id).addEventListener("change", load));
 $("f-deployment").addEventListener("input", () => {
   clearTimeout($("f-deployment").debounce);
