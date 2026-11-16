@@ -631,6 +631,34 @@ export interface LifecycleOutcome {
   warning?: string;
 }
 
+/**
+ * `GET /usage`: cumulative billable traffic per (deployment, namespace,
+ * account) series. app-lb counts; whoever bills prices it.
+ */
+export interface UsageReport {
+  /** This app-lb process's run; every series id begins with it. */
+  boot_id: string;
+  /** Unix seconds. */
+  generated_at: number;
+  /** How long an idle series is kept before it is dropped. */
+  retention_secs: number;
+  series: UsageSeries[];
+}
+
+/** One series of {@link UsageReport}. Totals only grow; a restart starts a new series. */
+export interface UsageSeries {
+  series_id: string;
+  deployment_id: string;
+  namespace: string;
+  /** `null`: counted, but metered to nobody. */
+  account_id: string | null;
+  requests: number;
+  /** Response body bytes sent to clients. */
+  egress_bytes: number;
+  first_recorded_at: number;
+  last_recorded_at: number;
+}
+
 /** `GET /capacity`: the host, and the caller's own pools. */
 export interface Capacity {
   host: HostUsage;

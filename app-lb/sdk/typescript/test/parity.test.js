@@ -36,6 +36,10 @@ test("Hws is the client under the package's name, and Heyctl still works", () =>
   assert.equal(Hws, Heyctl);
 });
 
+test("usage", async () => {
+  assert.deepEqual(await one((c) => c.usage()), { url: "/usage", method: "GET", body: undefined });
+});
+
 test("whoami", async () => {
   assert.deepEqual(await one((c) => c.whoami()), { url: "/whoami", method: "GET", body: undefined });
 });

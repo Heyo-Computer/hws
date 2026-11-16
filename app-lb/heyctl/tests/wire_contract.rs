@@ -16,7 +16,7 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use hws::types::{
-    ArtifactStoreInfo, AuthProviderView, Capacity, CreatedPostgresDatabase, DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, FileRead, FileWritten, JobRecord, LifecycleOutcome, MetricsResponse, NamespacePlugin, Operation, PluginInstalls, PluginView, PostgresDatabases, Transfer, UpstreamTrafficStatus, WorkflowList, WorkflowView,
+    ArtifactStoreInfo, AuthProviderView, Capacity, CreatedPostgresDatabase, DeletedPostgresDatabase, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, FileRead, FileWritten, JobRecord, LifecycleOutcome, MetricsResponse, NamespacePlugin, Operation, PluginInstalls, PluginView, PostgresDatabases, Transfer, UpstreamTrafficStatus, UsageReport, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
 
@@ -250,6 +250,18 @@ fn an_unknown_disk_state_degrades_to_unknown() {
 /// Asserting `extra` is empty at every level is what keeps that from recurring:
 /// a lenient deserializer cannot tell an absent field from an unknown one, so
 /// without this a field app-lb adds is simply never shown.
+#[test]
+fn usage_report_understands_every_field() {
+    let u: UsageReport = serde_json::from_str(&fixture("usage-report")).expect("fixture parses");
+    assert!(u.extra.is_empty(), "unknown usage fields: {:?}", u.extra.keys().collect::<Vec<_>>());
+    assert!(!u.series.is_empty(), "the fixture has series");
+    for s in &u.series {
+        assert!(s.extra.is_empty(), "unknown series fields: {:?}", s.extra.keys().collect::<Vec<_>>());
+    }
+    assert!(u.series.iter().any(|s| s.account_id.is_none()), "an unmetered series round-trips");
+    assert!(u.series.iter().all(|s| s.series_id.starts_with(&u.boot_id)));
+}
+
 #[test]
 fn metrics_response_understands_every_field() {
     let m: MetricsResponse =

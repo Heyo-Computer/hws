@@ -634,6 +634,11 @@ fn auth_provider_objects_are_stable() {
 }
 
 #[test]
+fn usage_report_is_stable() {
+    golden("usage-report", &crate::usage::sample_report());
+}
+
+#[test]
 fn metrics_response_is_stable() {
     let m = populated_metrics();
     let spec = vm_spec();

@@ -261,6 +261,10 @@ impl RequestState {
         self.client
     }
     #[cfg(test)]
+    pub(crate) fn set_hop_in_for_test(&mut self) {
+        self.hop_in = true;
+    }
+    #[cfg(test)]
     pub(crate) fn set_client_for_test(&mut self, ip: std::net::IpAddr) {
         self.client = Some(ip);
     }
@@ -269,6 +273,11 @@ impl RequestState {
     }
     pub fn backend(&self) -> Option<&Arc<VmBackend>> {
         self.backend.as_ref()
+    }
+    /// This request was forwarded here by another fleet host, which has
+    /// already counted it for billing (see [`crate::usage`]).
+    pub fn arrived_as_hop(&self) -> bool {
+        self.hop_in
     }
     /// The home host this request is being forwarded to, if it is a hop.
     pub fn hop_target(&self) -> Option<&str> {

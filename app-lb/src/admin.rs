@@ -8524,6 +8524,17 @@ async fn fleet_network(State(state): State<AdminState>, axum::Extension(caller):
     ([(header::CACHE_CONTROL, "no-store")], Json(fleet.network(credential.as_deref()).await)).into_response()
 }
 
+/// `GET /usage` — cumulative billable traffic per (deployment, namespace,
+/// account) series. app-lb counts; the caller prices. Fleet-wide callers only,
+/// and never an ungated app-lb: the report names every metered account.
+async fn usage_report(State(state): State<AdminState>, caller: Option<axum::Extension<Caller>>) -> Response {
+    let fleet_wide = caller.is_some_and(|axum::Extension(c)| !matches!(c, Caller::Ungated) && c.covers_fleet());
+    if !fleet_wide {
+        return forbidden("authenticated fleet view required");
+    }
+    ([(header::CACHE_CONTROL, "no-store")], Json(state.metrics.usage().report())).into_response()
+}
+
 async fn require_fleet_view(State(state): State<AdminState>, req: Request, next: Next) -> Response {
     authorize(state, req, next, crate::tokens::AdminScope::View).await
 }
@@ -8652,6 +8663,10 @@ fn router(state: AdminState) -> Router {
         // enumerates attacker addresses and the probes that reached the fleet —
         // and this group is the one that is gated whenever a password is set.
         .route("/security", get(security_snapshot))
+        // Billable traffic per deployment and owner. View tier so the platform's
+        // view-scoped fleet credential can read it, but fleet-wide callers only:
+        // it names every account this app-lb meters.
+        .route("/usage", get(usage_report))
         // The console that reads it. View tier for the same reason the dashboard
         // is: it renders `/security`, so it must work with whatever credentials
         // the browser already has. The buttons on it post to the CRUD tier and
@@ -13992,6 +14007,8 @@ mod tests {
             // history is fleet state.
             assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
             assert!(matches!(at("/services", "/services"), Verdict::Forbidden(_)));
+            // Billable usage names every metered account on the host.
+            assert!(matches!(at("/usage", "/usage"), Verdict::Forbidden(_)));
             assert!(matches!(at("/fleet", "/fleet"), Verdict::Forbidden(_)));
             assert!(matches!(at("/fleet/network", "/fleet/network"), Verdict::Forbidden(_)));
             // The rollup and drill-down narrow to a namespace in the handler,
@@ -15004,6 +15021,7 @@ mod tests {
                 "/fleet/gateways/:id/metrics",
                 "/fleet/network",
                 "/services",
+                "/usage",
                 "/control-plane/config",
                 "/deployments",
                 "/secrets",

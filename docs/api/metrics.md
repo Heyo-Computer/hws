@@ -83,6 +83,43 @@ Each `deployments[]` entry (`DeploymentView`):
 
 Field meanings are covered further under [Metrics](../app-lb.md#metrics).
 
+## Usage
+
+`GET /usage`
+
+**Tier:** View, fleet-wide callers only. A namespace- or deployment-scoped token is refused, and so is an ungated app-lb: the report names every account this app-lb meters. **Crate:** `Client::usage() -> UsageReport`
+
+Billable traffic, as running totals. app-lb only counts here and never prices anything. A billing system reads these totals and charges for them.
+
+Each **series** is one (deployment, namespace, account) combination. Its `requests` and `egress_bytes` (response body bytes sent to clients) only grow. `account_id` comes from the deployment's owner (`DeploymentSpec::account_id`); `null` means the traffic is counted but billed to nobody.
+
+```json
+{
+  "boot_id": "18a2f0c4d5e6f700-1f40",
+  "generated_at": 1790000300,
+  "retention_secs": 86400,
+  "series": [
+    {
+      "series_id": "18a2f0c4d5e6f700-1f40-1",
+      "deployment_id": "shop",
+      "namespace": "acme",
+      "account_id": "4b7c0e9e-2f0a-4d1c-9a53-0d6b2f1e8c11",
+      "requests": 1204,
+      "egress_bytes": 48211903,
+      "first_recorded_at": 1790000000,
+      "last_recorded_at": 1790000290
+    }
+  ]
+}
+```
+
+How to collect it:
+
+- **Store a watermark per `series_id` and bill `total − watermark`.** A series ID is unique across restarts. A restart, or a series dropped while idle and later revived, starts a new series from zero instead of resetting an old one. A series you have never seen is billed from zero.
+- **Read more often than `retention_secs`.** A series with no traffic for that long is dropped (`APP_LB_USAGE_RETENTION_SECS`, default one day), and any total you had not yet read goes with it.
+- **Each request is counted once.** The host the client connected to counts it. A [fleet hop](../app-lb.md) is counted by the ingress host that forwarded it, not by the home host that served it.
+- **Totals are in memory.** Traffic since your last read is lost if app-lb crashes. That under-bills; it never over-bills.
+
 ## Certificates
 
 `GET /certs`

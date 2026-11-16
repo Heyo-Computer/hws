@@ -13,7 +13,7 @@ These pages document every app-lb admin endpoint that the [`hws`](../../app-lb/h
 | [Exec and shell](exec-shell.md) | `/deployments/:id/exec`, `/deployments/:id/shell` |
 | [Jobs](jobs.md) | build, pull, mount pull, host update, `/jobs` |
 | [Images](images.md) | `/images` |
-| [Metrics and host](metrics.md) | `/metrics`, `/certs`, `/disks`, `/fleet/deployments` |
+| [Metrics and host](metrics.md) | `/metrics`, `/usage`, `/certs`, `/disks`, `/fleet/deployments` |
 | [Namespaces and plugins](namespaces.md) | `/namespaces`, namespace plugins, `/api/plugins`, `/feeds` |
 | [Observability](obs.md) | `/namespaces/:ns/plugins/obs/api/*` |
 | [Secrets](secrets.md) | `/secrets` |
@@ -151,6 +151,7 @@ Use `.in_deployment` with a namespace token: app-lb releases before confined acc
 | `GET /metrics` | `metrics` | [Metrics](metrics.md#metrics) |
 | `GET /certs` | `certs` | [Metrics](metrics.md#certificates) |
 | `GET /disks` | `disks` | [Metrics](metrics.md#disks) |
+| `GET /usage` | `usage` | [Metrics](metrics.md#usage) |
 | `GET /fleet/deployments` | `raw().fleet_deployments` | [Metrics](metrics.md#fleet-deployments) |
 | `GET /namespaces`, `POST /namespaces`, `DELETE /namespaces/:name` | `namespaces`, `create_namespace`, `delete_namespace` | [Namespaces](namespaces.md#namespaces) |
 | `GET /namespaces/:ns/plugins` | `namespace_plugins` | [Namespaces](namespaces.md#namespace-plugins) |
