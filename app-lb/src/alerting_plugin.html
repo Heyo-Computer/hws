@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alerting · {{NAMESPACE}}</title>
+<!-- Read by the script rather than spliced into it: the server fills this
+     escaped for HTML, which is not the same as escaped for JavaScript. -->
+<meta name="plugin-namespace" content="{{NAMESPACE}}">
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
+<style>
+  /* Framed by the plugin console, which draws the bar; this is only the body. */
+  :root {
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+  }
+  * { box-sizing: border-box; }
+  body { padding: 20px 24px 60px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 17px; margin: 0 0 6px; }
+  .lede, .note { color: var(--text-2); font-size: 13px; margin: 0 0 12px; }
+  .note { color: var(--muted); font-size: 12px; }
+  code { font-size: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--border); padding: 14px 16px; margin-bottom: 12px; }
+  .card h2 { font-size: 14px; margin: 0 0 10px; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; font-size: 12px; }
+  .mono { font-family: var(--font-mono, monospace); word-break: break-all; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  input[type=text], input[type=datetime-local], select { font: inherit; font-size: 13px; padding: 5px 8px;
+    border: 1px solid var(--border); background: var(--bg-dark); color: var(--text); }
+  button.act { font: inherit; font-size: 12.5px; padding: 4px 10px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+  button.act:hover { border-color: var(--accent); }
+  button.act.small { font-size: 11px; padding: 1px 6px; }
+  button.act.danger { color: var(--critical); }
+  button.act:disabled { opacity: .5; cursor: not-allowed; }
+  .empty { color: var(--text-2); padding: 16px 0; text-align: center; }
+  .flash { margin: 0 0 12px; padding: 9px 12px; font-size: 13px; display: none; }
+  .flash.on { display: block; }
+  .flash.ok { background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--good); }
+  .flash.bad { background: color-mix(in srgb, var(--critical) 14%, var(--surface)); color: var(--critical); }
+  .ok { color: var(--good); }
+  .down, .sev-critical { color: var(--critical); }
+  .sev-warning { color: var(--warning, #b7791f); }
+  .sev-info { color: var(--text-2); }
+  .tag { font-size: 11px; padding: 0 5px; border: 1px solid var(--border); margin-left: 4px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Alerting</h1>
+  <p class="lede">Alerts for namespace <strong class="mono" id="ns"></strong>. Rules, receivers and
+    checks are the plugin's install configuration; this page shows what they found, and lets a namespace
+    admin acknowledge, silence and test.</p>
+  <div class="flash" id="flash"></div>
+  <p class="note" id="tier"></p>
+  <p class="note" id="summary"></p>
+
+  <div class="card">
+    <h2>Active alerts</h2>
+    <div class="scroll" id="active"><div class="empty">Loading…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Recently resolved</h2>
+    <div class="scroll" id="resolved"><div class="empty">Loading…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Silences</h2>
+    <div class="scroll" id="silences"><div class="empty">Loading…</div></div>
+    <div id="silence-form" hidden>
+      <div class="row">
+        <input type="text" id="s-rule" placeholder="rule (any)" size="14" autocomplete="off">
+        <input type="text" id="s-deployment" placeholder="deployment (any)" size="16" autocomplete="off">
+        <select id="s-severity"><option value="">any severity</option><option>info</option><option>warning</option><option>critical</option></select>
+        <select id="s-for"><option value="3600">for 1 hour</option><option value="14400">for 4 hours</option>
+          <option value="86400">for 1 day</option><option value="604800">for 7 days</option></select>
+        <input type="text" id="s-comment" placeholder="comment" size="24" autocomplete="off">
+        <button class="act" type="button" id="s-create">Silence</button>
+      </div>
+      <p class="note">A silence holds notifications for matching alerts; the alerts still show here.
+        Leave every matcher empty to silence the whole namespace.</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Checks</h2>
+    <div class="scroll" id="checks"><div class="empty">Loading…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Receivers</h2>
+    <div class="scroll" id="receivers"><div class="empty">Loading…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Deliveries</h2>
+    <div class="scroll" id="deliveries"><div class="empty">Loading…</div></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const NS = document.querySelector('meta[name="plugin-namespace"]').content;
+let admin = false;
+
+document.getElementById("ns").textContent = NS;
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function api(method, path, body) {
+  const opts = { method, headers: { accept: "application/json" } };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const r = await fetch(path, opts);
+    const text = await r.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { message: text }; }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+function failure(r, what) {
+  const d = r.data || {};
+  if (r.status === 401 || r.status === 403)
+    return what + " needs a namespace admin; this session cannot.";
+  return what + " failed: " + (d.error || d.message || "HTTP " + r.status);
+}
+
+function flash(kind, message) {
+  const el = document.getElementById("flash");
+  el.className = "flash on " + kind;
+  el.textContent = message;
+}
+
+// What this session may do in NS, from /whoami. Shown, never trusted: the
+// admin API decides every request on its own.
+function tierOf(w) {
+  if (!w) return "none";
+  if (w.fleet) return w.may && w.may.use_admin_routes ? "admin" : "view";
+  if (w.namespaces) return w.namespaces[NS] || "none";
+  if (w.namespace === NS) return w.admin_scope || "none";
+  return "none";
+}
+
+function when(secs) {
+  return secs ? new Date(secs * 1000).toLocaleString() : "—";
+}
+
+function table(head, rows) {
+  return "<table><thead><tr>" + head.map(h => "<th>" + esc(h) + "</th>").join("") +
+    "</tr></thead><tbody>" + rows.join("") + "</tbody></table>";
+}
+
+function sev(s) {
+  return '<span class="sev-' + esc(s) + '">' + esc(s) + "</span>";
+}
+
+// Every path is relative to this page (…/plugins/alerting/ui).
+async function loadAlerts() {
+  const r = await api("GET", "api/alerts");
+  const active = document.getElementById("active");
+  const resolved = document.getElementById("resolved");
+  if (!r.ok) {
+    active.innerHTML = resolved.innerHTML = '<div class="empty">' + esc(failure(r, "Loading alerts")) + "</div>";
+    return;
+  }
+  const a = r.data.active || [];
+  active.innerHTML = !a.length ? '<div class="empty">Nothing is firing.</div>' :
+    table(["Status", "Severity", "Rule", "Deployment", "Summary", "Since", ""], a.map(x =>
+      "<tr><td>" + (x.status === "firing" ? '<span class="down">firing</span>' : "pending") +
+        (x.silenced ? '<span class="tag">silenced</span>' : "") +
+        (x.acked_by ? '<span class="tag" title="' + esc(x.ack_comment || "") + '">acked by ' + esc(x.acked_by) + "</span>" : "") + "</td>" +
+      "<td>" + sev(x.severity) + "</td><td class='mono'>" + esc(x.rule) + "</td><td class='mono'>" + esc(x.deployment) + "</td>" +
+      "<td>" + esc(x.summary) + "</td><td>" + esc(when(x.started_at || x.pending_since)) + "</td>" +
+      "<td>" + (admin && !x.acked_by ? '<button class="act small" type="button" data-ack="' + esc(x.fingerprint) + '">ack</button>' : "") + "</td></tr>"));
+  active.querySelectorAll("[data-ack]").forEach(b => b.addEventListener("click", async () => {
+    const comment = prompt("Acknowledge — optional comment:", "");
+    if (comment === null) return;
+    const r = await api("POST", "api/alerts/" + encodeURIComponent(b.dataset.ack) + "/ack", comment ? { comment } : {});
+    if (!r.ok) return flash("bad", failure(r, "Acknowledging"));
+    flash("ok", "Acknowledged; no more repeats until it resolves.");
+    loadAlerts();
+  }));
+  const done = r.data.resolved || [];
+  resolved.innerHTML = !done.length ? '<div class="empty">Nothing resolved recently.</div>' :
+    table(["Severity", "Rule", "Deployment", "Summary", "Started", "Resolved"], done.slice(0, 25).map(x =>
+      "<tr><td>" + sev(x.severity) + "</td><td class='mono'>" + esc(x.rule) + "</td><td class='mono'>" + esc(x.deployment) +
+      "</td><td>" + esc(x.summary) + "</td><td>" + esc(when(x.started_at)) + "</td><td>" + esc(when(x.resolved_at)) + "</td></tr>"));
+}
+
+async function loadSilences() {
+  const r = await api("GET", "api/silences");
+  const box = document.getElementById("silences");
+  if (!r.ok) { box.innerHTML = '<div class="empty">' + esc(failure(r, "Loading silences")) + "</div>"; return; }
+  const s = r.data.silences || [];
+  box.innerHTML = !s.length ? '<div class="empty">No silences.</div>' :
+    table(["Matches", "Until", "Comment", "By", ""], s.map(x => {
+      const m = x.matchers || {};
+      const parts = [m.rule && "rule=" + m.rule, m.deployment && "deployment=" + m.deployment,
+        m.severity && "severity=" + m.severity].filter(Boolean);
+      return "<tr><td class='mono'>" + esc(parts.join(" ") || "everything") + "</td><td>" + esc(when(x.until)) +
+        "</td><td>" + esc(x.comment) + "</td><td>" + esc(x.created_by || "—") + "</td><td>" +
+        (admin ? '<button class="act small danger" type="button" data-unsilence="' + esc(x.id) + '">remove</button>' : "") + "</td></tr>";
+    }));
+  box.querySelectorAll("[data-unsilence]").forEach(b => b.addEventListener("click", async () => {
+    const r = await api("DELETE", "api/silences/" + encodeURIComponent(b.dataset.unsilence));
+    if (!r.ok) return flash("bad", failure(r, "Removing the silence"));
+    flash("ok", "Silence removed.");
+    loadSilences(); loadAlerts();
+  }));
+}
+
+async function loadChecks() {
+  const r = await api("GET", "api/checks");
+  const box = document.getElementById("checks");
+  if (!r.ok) { box.innerHTML = '<div class="empty">' + esc(failure(r, "Loading checks")) + "</div>"; return; }
+  const c = r.data.checks || [];
+  box.innerHTML = !c.length ? '<div class="empty">No checks configured.</div>' :
+    table(["Check", "Deployment", "Path", "Result", "Passing", "Checked"], c.map(x => {
+      const res = x.result;
+      return "<tr><td class='mono'>" + esc(x.id) + "</td><td class='mono'>" + esc(x.deployment) + "</td><td class='mono'>" + esc(x.path) +
+        "</td><td>" + (!res ? "not run yet" : res.ok ? '<span class="ok">passing</span>'
+          : '<span class="down">failing</span>' + (res.last_error ? '<div class="note">' + esc(res.last_error) + "</div>" : "")) +
+        "</td><td>" + (res ? esc(res.passing + " / " + res.total) + ' <span class="note">(need ' + esc(x.min_passing) + ")</span>" : "—") +
+        "</td><td>" + esc(when(res && res.checked_at)) + "</td></tr>";
+    }));
+}
+
+async function loadStatus() {
+  const r = await api("GET", "api/status");
+  const box = document.getElementById("receivers");
+  if (!r.ok) { box.innerHTML = '<div class="empty">' + esc(failure(r, "Loading status")) + "</div>"; return; }
+  const d = r.data;
+  document.getElementById("summary").innerHTML = esc(d.firing) + " firing, " + esc(d.pending) + " pending, " +
+    esc((d.rules || []).length) + " rules, " + esc(d.checks) + " checks. Last evaluated " + esc(when(d.last_tick)) + "." +
+    (d.state_error ? ' <span class="down">State unreadable: ' + esc(d.state_error) + "</span>" : "");
+  const rc = d.receivers || [];
+  box.innerHTML = !rc.length ? '<div class="empty">No receivers configured: alerts show here only.</div>' :
+    table(["Receiver", "Format", "Endpoint", "Signed", ""], rc.map(x =>
+      "<tr><td class='mono'>" + esc(x.id) + "</td><td>" + esc(x.format) + "</td><td class='mono'>" + esc(x.endpoint) +
+      "</td><td>" + (x.signed ? "yes" : "no") + "</td><td>" +
+      (admin ? '<button class="act small" type="button" data-test="' + esc(x.id) + '">send test</button>' : "") + "</td></tr>"));
+  box.querySelectorAll("[data-test]").forEach(b => b.addEventListener("click", async () => {
+    const r = await api("POST", "api/receivers/" + encodeURIComponent(b.dataset.test) + "/test");
+    if (!r.ok) return flash("bad", failure(r, "Sending a test"));
+    flash("ok", "Test queued as " + r.data.delivery_id + "; see Deliveries.");
+    setTimeout(loadDeliveries, 1500);
+  }));
+}
+
+async function loadDeliveries() {
+  const r = await api("GET", "api/deliveries");
+  const box = document.getElementById("deliveries");
+  if (!r.ok) { box.innerHTML = '<div class="empty">' + esc(failure(r, "Loading deliveries")) + "</div>"; return; }
+  const d = r.data.deliveries || [];
+  box.innerHTML = !d.length ? '<div class="empty">No webhooks sent yet.</div>' :
+    table(["When", "Event", "Receiver", "Status", "Attempts", "Detail"], d.slice(0, 50).map(x =>
+      "<tr><td>" + esc(when(x.created_at)) + "</td><td class='mono'>" + esc(x.event) + "</td><td class='mono'>" + esc(x.receiver) +
+      "</td><td>" + (x.status === "delivered" ? '<span class="ok">delivered</span>' : x.status === "failed" || x.status === "dropped"
+        ? '<span class="down">' + esc(x.status) + "</span>" : esc(x.status)) +
+      "</td><td>" + esc(x.attempts) + "</td><td>" + esc(x.response_status ? "HTTP " + x.response_status : "") +
+      (x.last_error ? '<div class="note">' + esc(x.last_error) + "</div>" : "") + "</td></tr>"));
+}
+
+document.getElementById("s-create").addEventListener("click", async ev => {
+  const v = id => document.getElementById(id).value.trim();
+  const matchers = {};
+  if (v("s-rule")) matchers.rule = v("s-rule");
+  if (v("s-deployment")) matchers.deployment = v("s-deployment");
+  if (v("s-severity")) matchers.severity = v("s-severity");
+  if (!Object.keys(matchers).length && !confirm("Silence every alert in " + NS + "?")) return;
+  const until = Math.floor(Date.now() / 1000) + Number(v("s-for"));
+  ev.target.disabled = true;
+  const r = await api("POST", "api/silences", { matchers, until, comment: v("s-comment") });
+  ev.target.disabled = false;
+  if (!r.ok) return flash("bad", failure(r, "Creating the silence"));
+  flash("ok", "Silenced until " + when(r.data.until) + ".");
+  loadSilences(); loadAlerts();
+});
+
+function refresh() { loadStatus(); loadAlerts(); loadSilences(); loadChecks(); loadDeliveries(); }
+
+(async () => {
+  const who = await api("GET", "/whoami");
+  admin = tierOf(who.ok ? who.data : null) === "admin";
+  document.getElementById("silence-form").hidden = !admin;
+  document.getElementById("tier").textContent = admin ? ""
+    : "Read-only: a namespace admin acknowledges, silences and sends tests.";
+  refresh();
+  setInterval(refresh, 15000);
+})();
+</script>
+</body>
+</html>

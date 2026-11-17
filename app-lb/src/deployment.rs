@@ -58,6 +58,17 @@ pub struct VmBackend {
     /// cloud routes the deployment's URL to. `None` until bound, and again
     /// once unbound on drain. See [`crate::config::IngressSpec`].
     bind: Mutex<Option<String>>,
+    /// The template revision this VM was booted from (see
+    /// [`Deployment::current_revision`]). `None` means "not recorded": a
+    /// static upstream, or a VM placed by the blue/green engine. Such a VM is
+    /// treated as current until a rolling rollout begins, which stamps it with
+    /// the revision it was serving at that moment.
+    revision: Mutex<Option<String>>,
+    /// When this backend was last marked draining (LB clock), `0` while it is
+    /// not draining. A rollout's drain deadline counts from here: a WebSocket
+    /// opened an hour ago has not been "active" since, and must not be cut
+    /// the moment its replica is drained.
+    draining_since: AtomicU64,
 }
 
 impl VmBackend {
@@ -99,6 +110,31 @@ impl VmBackend {
             mem_bytes: AtomicU64::new(0),
             has_usage: AtomicBool::new(false),
             bind: Mutex::new(None),
+            revision: Mutex::new(None),
+            draining_since: AtomicU64::new(0),
+        }
+    }
+
+    /// Builder form of [`set_revision`](Self::set_revision).
+    pub fn with_revision(self, revision: Option<String>) -> Self {
+        *self.revision.lock().unwrap_or_else(|e| e.into_inner()) = revision;
+        self
+    }
+
+    /// The template revision this VM runs, if recorded.
+    pub fn revision(&self) -> Option<String> {
+        self.revision.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_revision(&self, revision: Option<String>) {
+        *self.revision.lock().unwrap_or_else(|e| e.into_inner()) = revision;
+    }
+
+    /// Seconds since this backend was marked draining; `0` when it is not.
+    pub fn draining_for(&self) -> u64 {
+        match self.draining_since.load(Ordering::Relaxed) {
+            0 => 0,
+            since => now_secs().saturating_sub(since),
         }
     }
 
@@ -164,7 +200,12 @@ impl VmBackend {
 
     pub fn set_draining(&self, draining: bool) {
         let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        self.draining.store(draining, Ordering::Relaxed);
+        let was = self.draining.swap(draining, Ordering::Relaxed);
+        if draining && !was {
+            self.draining_since.store(now_secs().max(1), Ordering::Relaxed);
+        } else if !draining {
+            self.draining_since.store(0, Ordering::Relaxed);
+        }
     }
 
     pub fn set_healthy(&self, healthy: bool) {
@@ -307,6 +348,9 @@ pub struct PendingVm {
     /// freed the replica slot, so the next tick created a duplicate — every 2s,
     /// unboundedly, for as long as the condition lasted.
     pub missing_since: Option<u64>,
+    /// The template revision this VM is booting, when known. See
+    /// [`VmBackend::revision`].
+    pub revision: Option<String>,
 }
 
 impl PendingVm {
@@ -321,6 +365,7 @@ impl PendingVm {
             reported_at_secs: 0,
             origin: BootOrigin::Created,
             missing_since: None,
+            revision: None,
         }
     }
 
@@ -426,11 +471,109 @@ pub struct DeploymentState {
     /// fail closed on the regional spec until fresh discovery is observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_handoff: Option<crate::registry::RouteHandoffRecord>,
+    /// Bumped by `POST /deployments/:id/restart`. Part of the template
+    /// revision, so a bump makes every replica stale and rolls the pool.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub restart_nonce: u64,
+    /// The rolling replacement in progress (or last finished). See
+    /// [`RolloutProgress`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_progress: Option<RolloutProgress>,
+    /// Which template revision each of this deployment's sandboxes was booted
+    /// from, by sandbox id. The daemon has no labels to carry it, so this is
+    /// how a restarted app-lb knows which adopted VMs a rollout already
+    /// replaced. Pruned to the sandboxes the pool still holds.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub revisions: std::collections::BTreeMap<String, String>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Where a rolling replacement stands.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutPhase {
+    /// Replacing stale replicas.
+    Progressing,
+    /// Stopped making progress within `rollout.progress_deadline_secs`.
+    /// Nothing more is created; the remaining stale replicas keep serving
+    /// until a new edit starts a new rollout.
+    Paused { reason: String },
+    /// No stale replica remains.
+    Complete,
+}
+
+impl RolloutPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Progressing => "progressing",
+            Self::Paused { .. } => "paused",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+/// The durable record of one rolling replacement: begun by a template edit,
+/// a build/pull roll-out or a restart; advanced by the autoscaler.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RolloutProgress {
+    /// The revision being rolled to.
+    pub revision: String,
+    pub strategy: crate::config::RolloutStrategy,
+    pub phase: RolloutPhase,
+    pub started_at: u64,
+    /// The last time a stale replica was retired or a fresh one became ready.
+    pub last_progress_at: u64,
+    /// Fresh replicas ready, and stale replicas remaining, at the last
+    /// observation. What "progress" is measured against.
+    #[serde(default)]
+    pub updated: u32,
+    #[serde(default)]
+    pub stale: u32,
+    /// Stale replicas drained but still finishing their in-flight work.
+    #[serde(default)]
+    pub draining: u32,
+}
+
+impl RolloutProgress {
+    pub fn new(revision: String, strategy: crate::config::RolloutStrategy, now: u64) -> Self {
+        Self {
+            revision,
+            strategy,
+            phase: RolloutPhase::Progressing,
+            started_at: now,
+            last_progress_at: now,
+            updated: 0,
+            stale: 0,
+            draining: 0,
+        }
+    }
+
+    /// Still replacing (or paused part-way), as opposed to finished.
+    pub fn is_active(&self) -> bool {
+        !matches!(self.phase, RolloutPhase::Complete)
+    }
+}
+
+/// The revision of a VM template: what a replica's identity is compared
+/// against to decide whether a rollout has replaced it. Only the `vm` block
+/// counts, so editing routes, scaling or the rollout policy itself never
+/// rolls a pool; `restart_nonce` lets a restart roll an unchanged template.
+pub fn template_hash(spec: &DeploymentSpec) -> String {
+    use sha2::{Digest, Sha256};
+    let mut value = serde_json::to_value(&spec.vm).unwrap_or_default();
+    value.sort_all_objects();
+    let digest = Sha256::digest(serde_json::to_vec(&value).unwrap_or_default());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Debug)]
 pub struct Deployment {
     pub spec: DeploymentSpec,
+    /// [`template_hash`] of `spec`, computed once.
+    template: String,
     pub regional: Option<Arc<crate::regional::Router>>,
     /// Runtime state, persisted with the spec. Copy-on-write like the pools.
     state: ArcSwap<DeploymentState>,
@@ -494,6 +637,7 @@ impl Deployment {
             .collect();
         Self {
             regional: spec.discovery.as_ref().and_then(|d| d.regional.as_ref()).map(|_| Arc::new(crate::regional::Router::new())),
+            template: template_hash(&spec),
             spec,
             state: ArcSwap::from_pointee(DeploymentState { allocation_history_complete:true, rollout_revision: crate::rollout::revision(), ..Default::default() }),
             backends: ArcSwap::from_pointee(backends),
@@ -509,6 +653,46 @@ impl Deployment {
 
     pub fn state(&self) -> Arc<DeploymentState> {
         self.state.load_full()
+    }
+
+    /// The template revision new replicas are booted from: the `vm` block's
+    /// hash, plus the restart generation once there has been one.
+    pub fn current_revision(&self) -> String {
+        match self.state().restart_nonce {
+            0 => self.template.clone(),
+            n => format!("{}.{n}", self.template),
+        }
+    }
+
+    /// Whether a replica of `revision` must be replaced. An unrecorded
+    /// revision counts as current (see [`VmBackend::revision`]).
+    pub fn is_stale(&self, revision: Option<&str>) -> bool {
+        revision.is_some_and(|r| r != self.current_revision())
+    }
+
+    /// The revision to give a VM this deployment adopts (after a restart, or
+    /// one it was not tracking): the one recorded when it was created, else —
+    /// for a VM created before revisions were recorded — the current one,
+    /// *unless* a rolling rollout is in flight, in which case its revision is
+    /// unknowable and it is treated as stale. Upgrading app-lb therefore never
+    /// rolls a settled pool, and a restart mid-rollout never keeps an old VM.
+    pub fn adopted_revision(&self, sandbox_id: &str) -> String {
+        let state = self.state();
+        if let Some(revision) = state.revisions.get(sandbox_id) {
+            return revision.clone();
+        }
+        if state.rollout_progress.as_ref().is_some_and(RolloutProgress::is_active) {
+            return UNTAGGED_REVISION.to_string();
+        }
+        self.current_revision()
+    }
+
+    /// Why the rolling rollout is paused, when it is.
+    pub fn rollout_stall_reason(&self) -> Option<String> {
+        match &self.state().rollout_progress.as_ref()?.phase {
+            RolloutPhase::Paused { reason } => Some(reason.clone()),
+            _ => None,
+        }
     }
 
     pub fn set_state(&self, state: DeploymentState) {
@@ -715,6 +899,10 @@ impl Deployment {
     }
 }
 
+/// The revision of an adopted VM whose real one cannot be known. Never equal
+/// to any [`template_hash`], so such a VM is always stale.
+pub const UNTAGGED_REVISION: &str = "untagged";
+
 /// First backoff after a failed boot. Small on purpose: one flaky boot must not
 /// add real latency to a request already waiting on a cold start.
 const BOOT_BACKOFF_BASE_SECS: u64 = 30;
@@ -770,7 +958,7 @@ mod tests {
     }
 
     fn deployment(scaling: ScalingPolicy) -> Deployment {
-        Deployment::new(DeploymentSpec { tunnel: None,
+        Deployment::new(DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,
@@ -824,7 +1012,7 @@ mod tests {
 
     /// A static (proxy_pass) deployment with the given upstreams.
     fn static_deployment(upstreams: &[&str]) -> Deployment {
-        Deployment::new(DeploymentSpec { tunnel: None,
+        Deployment::new(DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,

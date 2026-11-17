@@ -459,6 +459,20 @@ impl Client {
             .await
     }
 
+    /// `POST /deployments/:id/rolling-restart`: replace every replica under the
+    /// deployment's `rollout` policy (new replicas first, old ones drained and
+    /// stopped gracefully). Answers at once with the deployment's status; its
+    /// `rollout` says how far the replacement has got. An app-lb without the
+    /// route answers [`Error::NotFound`](crate::Error::NotFound).
+    pub async fn rolling_restart(&self, id: &str) -> Result<DeploymentStatus> {
+        self.read(
+            Request::new(Method::Post, format!("/deployments/{}/rolling-restart", seg(id))),
+            "deployment",
+            id,
+        )
+        .await
+    }
+
     async fn lifecycle(
         &self,
         id: &str,

@@ -2913,6 +2913,29 @@ pub fn restart(ctx: &Ctx, args: &RestartArgs) -> Result<()> {
         return Ok(());
     }
 
+    // A rolling restart server-side: new replicas first, then the old ones
+    // drained and stopped gracefully, under the deployment's rollout policy.
+    // An app-lb that predates it answers 404, and gets the per-VM recycle.
+    if !args.force {
+        match ctx.client.rolling_restart(&id) {
+            Ok(started) => {
+                let strategy = started.rollout.as_ref().map_or("rolling", |r| r.strategy.as_str());
+                println!(
+                    "Rolling restart of deployment/{id} started ({strategy}; {} VM(s) to replace).",
+                    status.vms.len()
+                );
+                if args.wait {
+                    println!();
+                    return wait_rolled(ctx, &id, Duration::from_secs(args.timeout));
+                }
+                println!("\nWatch it with `heyctl rollout status {id}`.");
+                return Ok(());
+            }
+            Err(crate::Error::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
     // Evicting is per-VM: there is no rollout object server-side. The autoscaler
     // boots replacements on its next tick, so this is a recycle, not a shrink.
     println!(
@@ -2994,7 +3017,40 @@ fn wait_ready(ctx: &Ctx, id: &str, timeout: Duration) -> Result<()> {
     }
 }
 
+/// Wait for a rolling replacement to finish, failing if it pauses.
+fn wait_rolled(ctx: &Ctx, id: &str, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    let mut last = String::new();
+    loop {
+        let status: DeploymentStatus = serde_json::from_value(ctx.client.raw().deployment(id)?)?;
+        let line = describe_progress(&status);
+        if line != last {
+            println!("{line}");
+            last = line;
+        }
+        match status.rollout.as_ref().map(|r| r.phase.as_str()) {
+            Some("complete") | None => return wait_ready(ctx, id, timeout.saturating_sub(started.elapsed())),
+            Some("paused") => bail!(
+                "the rollout of deployment/{id} paused: {}",
+                status.rollout.and_then(|r| r.reason).unwrap_or_default()
+            ),
+            _ => {}
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out after {}s waiting for deployment/{id} to roll — \
+                 `heyctl describe deployment {id}` shows where it is stuck",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
 fn describe_progress(s: &DeploymentStatus) -> String {
+    if let Some(r) = s.rollout.as_ref().filter(|r| r.phase != "complete") {
+        return format!("Rolling deployment/{}: {}", s.spec.id, r.summary());
+    }
     let healthy = s.vms.iter().filter(|v| v.healthy && !v.draining).count();
     let draining = s.vms.iter().filter(|v| v.draining).count();
     format!(

@@ -51,8 +51,49 @@ pub struct DeploymentStatus {
     pub workspace: Option<WorkspaceStatus>,
     /// Present for a site: whether its root on the LB host can serve.
     pub site: Option<SiteRootStatus>,
+    /// The rolling replacement in progress, or the last one. Absent for a
+    /// deployment that has never rolled.
+    pub rollout: Option<RolloutView>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+/// Where a deployment's rolling replacement stands.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct RolloutView {
+    /// The template revision new replicas boot from.
+    pub revision: String,
+    /// `rolling` or `recreate`.
+    pub strategy: String,
+    /// `progressing`, `paused` or `complete`.
+    pub phase: String,
+    /// Why it paused, when it did.
+    pub reason: Option<String>,
+    /// Replicas on the current revision, serving.
+    pub updated: usize,
+    /// Old replicas still taking traffic (or booting).
+    pub stale: usize,
+    /// Old replicas drained, finishing their in-flight work.
+    pub draining: usize,
+    pub started_at: u64,
+    pub last_progress_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl RolloutView {
+    /// `progressing: 2 new, 1 old, 1 draining`, plus why when paused.
+    pub fn summary(&self) -> String {
+        let mut out = format!("{}: {} new, {} old", self.phase, self.updated, self.stale);
+        if self.draining > 0 {
+            out.push_str(&format!(", {} draining", self.draining));
+        }
+        if let Some(reason) = &self.reason {
+            out.push_str(&format!(" ({reason})"));
+        }
+        out
+    }
 }
 
 /// A site's root as the LB host sees it.
@@ -168,6 +209,36 @@ pub struct DeploymentSpec {
     /// Which host of an app-lb fleet runs it. Absent on a single server, and
     /// on a fleet deployment that runs wherever it is loaded.
     pub placement: Option<Placement>,
+    /// How a template change replaces running replicas. Absent when it is
+    /// the default (rolling, one surge replica).
+    pub rollout: Option<RolloutPolicy>,
+}
+
+/// A deployment's `rollout` block. Absent fields are server defaults.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct RolloutPolicy {
+    /// `rolling` or `recreate`.
+    pub strategy: String,
+    pub max_surge: Option<u32>,
+    pub max_unavailable: Option<u32>,
+    pub min_ready_secs: u64,
+    pub progress_deadline_secs: u64,
+    pub drain_timeout_secs: Option<u64>,
+    pub pre_stop: Option<PreStop>,
+    pub stop_grace_secs: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A command run in a replica before it is stopped.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PreStop {
+    pub command: String,
+    pub timeout_secs: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// Where a fleet deployment runs: `pinned` to its `home` host, or (later)
@@ -1292,6 +1363,8 @@ pub struct DeploymentView {
     /// health check for six minutes.
     pub pending_vms: Vec<PendingVmView>,
     pub metrics: DeploymentMetrics,
+    /// See [`DeploymentStatus::rollout`].
+    pub rollout: Option<RolloutView>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -1430,6 +1503,8 @@ pub struct AutoscaleCounts {
     pub create_failures: u64,
     /// What the daemon said the last time it refused.
     pub last_create_error: Option<String>,
+    /// Rolling replacements that passed their progress deadline and paused.
+    pub rollout_stalls: u64,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -2777,6 +2852,232 @@ pub struct DeletedPostgresDatabase {
     /// The secret left behind, if any.
     pub secret_kept: Option<String>,
     pub note: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// -- the alerting plugin ---------------------------------------------------
+
+/// `GET /namespaces/:ns/plugins/alerting/api/status`: what the namespace's
+/// install configures, and how many alerts are live.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingStatus {
+    pub namespace: String,
+    pub receivers: Vec<AlertingReceiver>,
+    pub rules: Vec<AlertingRuleSummary>,
+    /// How many checks are configured.
+    pub checks: usize,
+    pub firing: usize,
+    pub pending: usize,
+    pub silences: usize,
+    /// When rules were last evaluated (unix seconds).
+    pub last_tick: Option<u64>,
+    /// Why the plugin's state file could not be read, when it could not:
+    /// acks and silences are refused until an operator fixes it.
+    pub state_error: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A receiver in [`AlertingStatus`]. Never carries the webhook's path.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingReceiver {
+    pub id: String,
+    /// `generic` or `slack`.
+    pub format: String,
+    /// Scheme, host and port only.
+    pub endpoint: String,
+    /// Whether requests carry `X-Heyo-Signature`.
+    pub signed: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A rule in [`AlertingStatus`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingRuleSummary {
+    pub id: String,
+    /// A deployment id, or `*`.
+    pub deployment: String,
+    /// The condition's `type`, e.g. `no_healthy_replicas`.
+    pub condition: String,
+    pub severity: String,
+    pub receivers: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET …/alerting/api/alerts`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingAlerts {
+    pub namespace: String,
+    /// Pending and firing.
+    pub active: Vec<AlertingAlert>,
+    /// Recently resolved, newest first.
+    pub resolved: Vec<AlertingAlert>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One alert: one rule on one deployment.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingAlert {
+    /// Stable for the `(namespace, rule, deployment)`.
+    pub fingerprint: String,
+    pub rule: String,
+    pub deployment: String,
+    pub severity: String,
+    pub condition: String,
+    /// `pending`, `firing` or `resolved`.
+    pub status: String,
+    pub summary: String,
+    pub pending_since: u64,
+    pub started_at: Option<u64>,
+    pub resolved_at: Option<u64>,
+    /// Whether the firing webhook went out (it is held while silenced).
+    pub notified: bool,
+    pub last_notified_at: Option<u64>,
+    pub acked_by: Option<String>,
+    pub acked_at: Option<u64>,
+    pub ack_comment: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    /// Whether a silence matches it now.
+    pub silenced: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET …/alerting/api/silences`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingSilences {
+    pub namespace: String,
+    pub silences: Vec<AlertingSilence>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A silence: notifications for matching alerts are held until `until`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingSilence {
+    pub id: String,
+    pub matchers: AlertingSilenceMatchers,
+    /// Unix seconds.
+    pub until: u64,
+    pub comment: String,
+    pub created_by: Option<String>,
+    pub created_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// What a silence matches. An unset matcher matches anything.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingSilenceMatchers {
+    pub rule: Option<String>,
+    pub deployment: Option<String>,
+    pub severity: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The reply to removing a silence.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct DeletedAlertingSilence {
+    pub deleted: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET …/alerting/api/checks`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingChecks {
+    pub namespace: String,
+    pub checks: Vec<AlertingCheck>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One configured check and its last result.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingCheck {
+    pub id: String,
+    pub deployment: String,
+    pub path: String,
+    pub interval_secs: u64,
+    pub expect_status: Option<u16>,
+    pub min_passing: u32,
+    /// `None` until the check first runs.
+    pub result: Option<AlertingCheckResult>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The last run of an [`AlertingCheck`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingCheckResult {
+    pub id: String,
+    pub deployment: String,
+    pub path: String,
+    pub ok: bool,
+    pub passing: u32,
+    pub total: u32,
+    pub last_error: Option<String>,
+    pub checked_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET …/alerting/api/deliveries`: the last webhooks, newest first.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingDeliveries {
+    pub namespace: String,
+    pub deliveries: Vec<AlertingDelivery>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One webhook.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingDelivery {
+    /// Also sent as `X-Heyo-Delivery`.
+    pub delivery_id: String,
+    pub receiver: String,
+    /// `alert.firing`, `alert.resolved` or `alert.test`.
+    pub event: String,
+    pub fingerprint: Option<String>,
+    /// `queued`, `retrying`, `delivered`, `failed` or `dropped`.
+    pub status: String,
+    pub attempts: u32,
+    pub response_status: Option<u16>,
+    pub last_error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The reply to `POST …/alerting/api/receivers/:id/test`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingTestDelivery {
+    pub delivery_id: String,
+    pub receiver: String,
+    /// `queued`: follow it in the delivery log.
+    pub status: String,
     #[serde(flatten)]
     pub extra: Extra,
 }

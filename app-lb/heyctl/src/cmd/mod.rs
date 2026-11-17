@@ -1,5 +1,6 @@
 //! Command implementations, and the context they share.
 
+pub mod alerts;
 pub mod artifact;
 pub mod auth;
 pub mod feed;

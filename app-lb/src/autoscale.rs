@@ -174,6 +174,14 @@ pub struct Autoscaler {
     /// When each unresolved create attempt (by name) was first seen missing
     /// from a complete daemon listing. See [`Autoscaler::settle_unresolved_creates`].
     unresolved_since: std::sync::Mutex<HashMap<String, u64>>,
+    /// Sandboxes being stopped gracefully in the background (pre_stop, then
+    /// the daemon's SIGTERM grace). Out of every pool already, but still in
+    /// the daemon's listing until the stop lands, so adoption must not take
+    /// them back.
+    terminating: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Deleted deployments whose replicas are still draining. Hard-killed on
+    /// shutdown so a restart does not find them owned by nobody.
+    retiring: Arc<std::sync::Mutex<Vec<Arc<Deployment>>>>,
 }
 
 /// How long an id-less create attempt must stay absent from complete daemon
@@ -228,7 +236,60 @@ impl Autoscaler {
             resume_failures: std::sync::Mutex::new(HashMap::new()),
             creating: std::sync::Mutex::new(HashMap::new()),
             unresolved_since: std::sync::Mutex::new(HashMap::new()),
+            terminating: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            retiring: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Whether `sandbox_id` is being stopped in the background.
+    fn is_terminating(&self, sandbox_id: &str) -> bool {
+        self.terminating
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(sandbox_id)
+    }
+
+    /// The guards every destroy of a deployment's replica honours; see
+    /// [`kill_vm`](Self::kill_vm). True when the sandbox must be left alone.
+    fn kill_protected(&self, d: &Arc<Deployment>, sandbox_id: &str) -> bool {
+        self.registry.allocation_protects(sandbox_id)
+            || self.registry.retirement_protects(sandbox_id, Some(&d.spec.id))
+            || self.workspaces.retirement_protects(sandbox_id)
+            || self.workspaces.recovery_pinned(sandbox_id)
+    }
+
+    /// Stop one of `d`'s replicas gracefully, in the background: `pre_stop`,
+    /// then the daemon's terminate with `rollout.stop_grace_secs`, then a
+    /// backstop kill (see [`VmManager::terminate`]). Background, because a
+    /// hook plus a grace period is tens of seconds and the reconcile pass
+    /// awaits every deployment before the next tick.
+    ///
+    /// The caller has already removed the VM from routing. Until the stop
+    /// lands it stays in [`terminating`](Self::terminating), so adoption does
+    /// not hand it straight back to the pool.
+    fn spawn_terminate(&self, d: &Arc<Deployment>, sandbox_id: String) {
+        if self.kill_protected(d, &sandbox_id) {
+            return;
+        }
+        {
+            let mut set = self.terminating.lock().unwrap_or_else(|e| e.into_inner());
+            if !set.insert(sandbox_id.clone()) {
+                return; // already on its way out
+            }
+        }
+        let runtime = self.runtime.clone();
+        let terminating = self.terminating.clone();
+        let driver = d.spec.driver().unwrap_or_default();
+        let pre_stop = d.spec.rollout.pre_stop.clone();
+        let grace = d.spec.rollout.stop_grace_secs;
+        let deployment = d.spec.id.clone();
+        tokio::spawn(async move {
+            tracing::info!(deployment = %deployment, sandbox = %sandbox_id, grace_secs = grace, "stopping VM gracefully");
+            if let Err(e) = runtime.terminate(driver, &sandbox_id, pre_stop.as_ref(), grace).await {
+                tracing::warn!(deployment = %deployment, sandbox = %sandbox_id, error = %e, "failed to stop VM");
+            }
+            terminating.lock().unwrap_or_else(|e| e.into_inner()).remove(&sandbox_id);
+        });
     }
 
     /// See [`Autoscaler::images`]. Set once at startup.
@@ -491,6 +552,7 @@ impl Autoscaler {
                 || self.workspaces.recovery_pinned(id)
                 || self.workspaces.recovery_active(&d.spec.id)
                 || tracked.contains(id.as_str())
+                || self.is_terminating(id)
                 || state.suspended.contains(id)
                 || state.suspending.contains(id)
                 || vm::is_terminal(&info.status)
@@ -514,6 +576,7 @@ impl Autoscaler {
                 // disk. A genuinely orphaned one is still reclaimed later by the
                 // disk sweep; the reverse mistake destroys retained state.
                 origin: BootOrigin::Resumed,
+                revision: Some(d.adopted_revision(id)),
                 ..PendingVm::new(id.clone())
             });
         }
@@ -830,12 +893,18 @@ impl Autoscaler {
         self.reprobe_unhealthy_managed(d, fleet).await;
         self.promote_pending(d, fleet).await;
 
+        // A rolling replacement owns this tick's capacity decisions while it
+        // runs: it counts revisions, which plain scaling does not.
+        let rolling = self.step_rollout(d).await;
+
         let desired = d.desired_replicas();
         let ready = d.backends().len();
         let pending = d.pending().len();
         let live = ready + pending;
 
-        if live < desired as usize {
+        if rolling {
+            // Decided above.
+        } else if live < desired as usize {
             // `debug`, not a per-tick warning: the embargo was announced once,
             // loudly, when it was set.
             match d.boot_backoff_remaining(now_secs()) {
@@ -859,8 +928,206 @@ impl Autoscaler {
         self.reconcile_ingress(d).await;
 
         self.reap_drained(d).await;
+        self.prune_revisions(d);
         self.renew_ttls(d, fleet).await;
         self.apply_usage(d, usage);
+    }
+
+    /// Forget the recorded revision of every sandbox this deployment no
+    /// longer holds, so the record cannot grow without bound.
+    fn prune_revisions(&self, d: &Arc<Deployment>) {
+        let state = d.state();
+        if state.revisions.is_empty() {
+            return;
+        }
+        let (backends, pending) = (d.backends(), d.pending());
+        let held: HashSet<&str> = backends
+            .iter()
+            .map(|b| b.sandbox_id.as_str())
+            .chain(pending.iter().map(|p| p.sandbox_id.as_str()))
+            .chain(state.suspended.iter().map(String::as_str))
+            .chain(state.suspending.iter().map(String::as_str))
+            .collect();
+        if state.revisions.keys().all(|id| held.contains(id.as_str())) {
+            return;
+        }
+        if d.mutate_state(|s| s.revisions.retain(|id, _| held.contains(id.as_str())))
+            && let Err(e) = self.registry.persist_one(&d.spec.id)
+        {
+            tracing::error!(deployment = %d.spec.id, error = %e, "failed to persist state");
+        }
+    }
+
+    /// Advance a rolling replacement by one tick. Returns whether it owns
+    /// this tick's capacity decisions (so plain scaling must stand aside).
+    ///
+    /// *Stale* replicas are those whose revision is not the deployment's
+    /// current one. Under `rolling`, fresh replicas are created while the
+    /// non-draining pool is below `target + max_surge`, and stale ones are
+    /// drained — most idle first — only while what stays available is at
+    /// least `target - max_unavailable`, counting a fresh replica only once
+    /// it has been healthy for `min_ready_secs`. Under `recreate`, every stale
+    /// replica is drained first and nothing is created until they are gone.
+    /// Draining is never a kill: `reap_drained` stops a drained replica once
+    /// its in-flight work (requests, WebSockets, shells) ends, or at the
+    /// rollout's drain deadline.
+    ///
+    /// A booting stale replica holds no traffic and is killed outright, and
+    /// so is a retained stale one, which would otherwise be resumed into the
+    /// new pool.
+    pub(crate) async fn step_rollout(&self, d: &Arc<Deployment>) -> bool {
+        let state = d.state();
+        let Some(progress) = state.rollout_progress.clone() else {
+            return false;
+        };
+        if !progress.is_active() {
+            return false;
+        }
+        let policy = d.spec.effective_rollout();
+        let current = d.current_revision();
+        let now = now_secs();
+
+        // Booting stale replicas: nothing to drain, so they simply go.
+        let pending = d.pending();
+        let (stale_pending, fresh_pending): (Vec<PendingVm>, Vec<PendingVm>) = pending
+            .iter()
+            .cloned()
+            .partition(|p| d.is_stale(p.revision.as_deref()));
+        if !stale_pending.is_empty() {
+            d.set_pending(fresh_pending.clone());
+            for p in &stale_pending {
+                tracing::info!(deployment = %d.spec.id, sandbox = %p.sandbox_id, "killing a booting replica of a stale revision");
+                if let Err(e) = self.kill_vm(d, &p.sandbox_id).await {
+                    tracing::warn!(sandbox = %p.sandbox_id, error = %e, "failed to kill stale pending VM");
+                }
+            }
+        }
+        // Retained (stopped) stale replicas would be resumed by the next
+        // scale-up; they belong to the old template.
+        for id in state.suspended.clone() {
+            if d.is_stale(Some(&d.adopted_revision(&id))) {
+                tracing::info!(deployment = %d.spec.id, sandbox = %id, "destroying a retained replica of a stale revision");
+                match self.kill_vm(d, &id).await {
+                    Ok(()) => self.forget_suspended(d, &id),
+                    Err(e) => tracing::warn!(sandbox = %id, error = %e, "failed to kill stale retained VM"),
+                }
+            }
+        }
+
+        let backends = d.backends();
+        let is_stale = |b: &Arc<VmBackend>| d.is_stale(b.revision().as_deref());
+        let mut stale_live: Vec<Arc<VmBackend>> =
+            backends.iter().filter(|b| is_stale(b) && !b.is_draining()).cloned().collect();
+        let stale_draining = backends.iter().filter(|b| is_stale(b) && b.is_draining()).count();
+        let fresh: Vec<&Arc<VmBackend>> =
+            backends.iter().filter(|b| !is_stale(b) && !b.is_draining()).collect();
+        let fresh_ready = fresh
+            .iter()
+            .filter(|b| b.is_healthy() && b.uptime_secs() >= policy.min_ready_secs)
+            .count();
+
+        let mut next = progress.clone();
+        next.revision = current.clone();
+        let progressed = fresh_ready as u32 > progress.updated
+            || (stale_live.len() as u32) < progress.stale
+            || (stale_draining as u32) < progress.draining;
+        next.updated = fresh_ready as u32;
+        next.stale = stale_live.len() as u32;
+        next.draining = stale_draining as u32;
+        if progressed {
+            next.last_progress_at = now;
+        }
+
+        if stale_live.is_empty() && stale_draining == 0 {
+            next.phase = crate::deployment::RolloutPhase::Complete;
+            next.last_progress_at = now;
+            tracing::info!(deployment = %d.spec.id, revision = %current, "rolling replacement complete");
+            self.save_progress(d, next);
+            return false;
+        }
+
+        if matches!(next.phase, crate::deployment::RolloutPhase::Paused { .. }) {
+            self.save_progress(d, next);
+            return true;
+        }
+
+        if now.saturating_sub(next.last_progress_at) >= policy.progress_deadline_secs {
+            let reason = format!(
+                "no progress for {}s: {} replica(s) on revision {current} ready, {} old replica(s) \
+                 still serving; nothing more is created until the deployment is edited again",
+                policy.progress_deadline_secs,
+                fresh_ready,
+                stale_live.len() + stale_draining,
+            );
+            tracing::warn!(deployment = %d.spec.id, %reason, "rolling replacement paused");
+            self.metrics.record_rollout_stall(&d.spec.id);
+            self.feed.issue(
+                &d.spec,
+                format!("{}: rollout paused", d.spec.id),
+                reason.clone(),
+                now,
+            );
+            next.phase = crate::deployment::RolloutPhase::Paused { reason };
+            self.save_progress(d, next);
+            return true;
+        }
+        self.save_progress(d, next);
+
+        let target = d.desired_replicas() as usize;
+        match policy.strategy {
+            crate::config::RolloutStrategy::Recreate => {
+                for b in &stale_live {
+                    tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, in_flight = b.in_flight(), "draining a stale replica (recreate)");
+                    b.set_draining(true);
+                }
+                self.metrics.record_scale_down(&d.spec.id, stale_live.len() as u64);
+            }
+            crate::config::RolloutStrategy::Rolling => {
+                let fresh_live = fresh.len() + fresh_pending.len();
+                let live = fresh_live + stale_live.len();
+                let ceiling = target + policy.max_surge as usize;
+                let create = target
+                    .saturating_sub(fresh_live)
+                    .min(ceiling.saturating_sub(live));
+                if create > 0 && d.boot_backoff_remaining(now).is_none() {
+                    self.scale_up(d, create).await;
+                }
+
+                let floor = target.saturating_sub(policy.max_unavailable as usize);
+                let mut available =
+                    fresh_ready + stale_live.iter().filter(|b| b.is_healthy()).count();
+                // Unhealthy first (draining one costs no availability), then
+                // the most idle, so drains finish quickly.
+                stale_live.sort_by_key(|b| (b.is_healthy(), b.in_flight(), b.last_active()));
+                let mut drained = 0u64;
+                for b in &stale_live {
+                    if b.is_healthy() {
+                        if available <= floor {
+                            break;
+                        }
+                        available -= 1;
+                    }
+                    tracing::info!(
+                        deployment = %d.spec.id,
+                        sandbox = %b.sandbox_id,
+                        in_flight = b.in_flight(),
+                        "draining a stale replica",
+                    );
+                    b.set_draining(true);
+                    drained += 1;
+                }
+                self.metrics.record_scale_down(&d.spec.id, drained);
+            }
+        }
+        true
+    }
+
+    /// Store a rollout's progress, persisting it when it changed.
+    fn save_progress(&self, d: &Arc<Deployment>, next: crate::deployment::RolloutProgress) {
+        if d.mutate_state(|s| s.rollout_progress = Some(next)) && let Err(e) = self.registry.persist_one(&d.spec.id)
+        {
+            tracing::error!(deployment = %d.spec.id, error = %e, "failed to persist rollout progress");
+        }
     }
 
     /// Start a scheduled workspace snapshot, if one is due.
@@ -1229,7 +1496,9 @@ impl Autoscaler {
                 if d.spec.scaling.idle_action == IdleAction::Suspend {
                     self.forget_suspended(d, &p.sandbox_id);
                 }
-                promoted.push(Arc::new(VmBackend::new(p.sandbox_id.clone(), addr)));
+                promoted.push(Arc::new(
+                    VmBackend::new(p.sandbox_id.clone(), addr).with_revision(p.revision.clone()),
+                ));
                 continue;
             }
 
@@ -1656,6 +1925,10 @@ impl Autoscaler {
         let _permit = self.creates.acquire().await;
         let mut pending = (*d.pending()).clone();
         let mut created = Vec::new();
+        // Revisions are recorded for fresh creates only: a resumed replica
+        // keeps whatever was recorded when it was first created.
+        let revision = d.current_revision();
+        let mut fresh = Vec::new();
 
         for _ in 0..count {
             // Each create is a slow await, so re-check between boots: an admin
@@ -1701,7 +1974,10 @@ impl Autoscaler {
                         // `resumed`, not `new`: this sandbox's data disk is the
                         // deployment's retained state, so if the boot never
                         // finishes the give-up path must not reclaim it.
-                        pending.push(PendingVm::resumed(sandbox_id));
+                        pending.push(PendingVm {
+                            revision: Some(d.adopted_revision(&sandbox_id)),
+                            ..PendingVm::resumed(sandbox_id)
+                        });
                         if d.spec.scaling.idle_action == IdleAction::Suspend { break; }
                         continue;
                     }
@@ -1755,7 +2031,11 @@ impl Autoscaler {
                         );
                     }
                     created.push(sandbox_id.clone());
-                    pending.push(PendingVm::new(sandbox_id));
+                    fresh.push(sandbox_id.clone());
+                    pending.push(PendingVm {
+                        revision: Some(revision.clone()),
+                        ..PendingVm::new(sandbox_id)
+                    });
                 }
                 Err(e) => {
                     tracing::error!(deployment = %d.spec.id, error = %e, "failed to create VM");
@@ -1812,6 +2092,16 @@ impl Autoscaler {
         // safely inherited and must not be killed. Whatever the replacement did
         // not take, `kill_unclaimed` reaps.
         d.set_pending(pending);
+        if !fresh.is_empty()
+            && d.mutate_state(|s| {
+                for id in &fresh {
+                    s.revisions.insert(id.clone(), revision.clone());
+                }
+            })
+            && let Err(e) = self.registry.persist_one(&d.spec.id)
+        {
+            tracing::error!(deployment = %d.spec.id, error = %e, "failed to persist replica revisions");
+        }
         self.kill_unclaimed(d, &created).await;
     }
 
@@ -1847,13 +2137,21 @@ impl Autoscaler {
     async fn reap_drained(&self, d: &Arc<Deployment>) {
         let backends = d.backends();
         let deadline = d.spec.scaling.drain_timeout_secs;
+        // A replica a rollout replaced gets the rollout's own deadline, counted
+        // from when it was drained rather than from its last request: a
+        // WebSocket opened an hour ago is in-flight work, not idleness.
+        let rollout_deadline = d.spec.effective_rollout().drain_timeout_secs;
 
         let (done, keep): (Vec<_>, Vec<_>) = backends.iter().cloned().partition(|b| {
             if !b.is_draining() {
                 return false;
             }
             let idle = b.in_flight() == 0;
-            let expired = now_secs().saturating_sub(b.last_active()) >= deadline;
+            let expired = if d.is_stale(b.revision().as_deref()) {
+                b.draining_for() >= rollout_deadline
+            } else {
+                now_secs().saturating_sub(b.last_active()) >= deadline
+            };
             if !idle && expired {
                 tracing::warn!(
                     deployment = %d.spec.id,
@@ -1907,7 +2205,9 @@ impl Autoscaler {
                 }
                 continue;
             }
-            if retain {
+            // A replica of a stale revision is not worth retaining: the next
+            // resume would bring the old template back into the pool.
+            if retain && !d.is_stale(b.revision().as_deref()) {
                 tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "suspending VM");
                 // `retain` promises the data disk back on resume; the stop
                 // kills the guest, so flush it first. Short, since this holds
@@ -1942,10 +2242,8 @@ impl Autoscaler {
                     }
                 }
             } else {
-                tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "killing VM");
-                if let Err(e) = self.kill_vm(d, &b.sandbox_id).await {
-                    tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
-                }
+                // Graceful: pre_stop, SIGTERM grace, then the kill.
+                self.spawn_terminate(d, b.sandbox_id.clone());
             }
         }
         self.remember_suspended(d, suspended);
@@ -2487,7 +2785,10 @@ impl Autoscaler {
                     adopted
                         .entry(owner.to_string())
                         .or_default()
-                        .push(Arc::new(VmBackend::new(info.id.clone(), addr)));
+                        .push(Arc::new(
+                            VmBackend::new(info.id.clone(), addr)
+                                .with_revision(Some(d.adopted_revision(&info.id))),
+                        ));
                 }
                 _ if d.spec.scaling.idle_action == IdleAction::Suspend => {
                     self.remember_suspended(d, vec![info.id.clone()]);
@@ -2531,7 +2832,107 @@ impl Autoscaler {
         }
     }
 
-    /// Drain and kill every VM of a deployment, e.g. on DELETE.
+    /// Retire a deleted deployment's pool **without cutting off in-flight
+    /// work**: every replica stops taking new requests at once, keeps serving
+    /// what it has until that ends or `rollout.drain_timeout_secs` (else
+    /// `scaling.drain_timeout_secs`) passes, and is then stopped gracefully
+    /// (`pre_stop`, the daemon's SIGTERM grace, a backstop kill).
+    ///
+    /// The wait runs in the background, so a DELETE answers at once. Booting
+    /// and retained replicas hold no traffic and go immediately. Workspace and
+    /// `idle_action: suspend` deployments keep [`teardown`](Self::teardown),
+    /// whose capture semantics are what protects their state. A drain still
+    /// running when app-lb shuts down is finished with a hard kill (see
+    /// [`kill_retiring`](Self::kill_retiring)), because after a restart these
+    /// VMs would belong to no deployment and nothing would reap them.
+    pub async fn teardown_draining(&self, d: &Arc<Deployment>) {
+        if !d.spec.is_managed()
+            || Self::has_workspace(d)
+            || d.spec.scaling.idle_action == IdleAction::Suspend
+        {
+            return self.teardown(d).await;
+        }
+        for p in d.pending().iter() {
+            if let Err(e) = self.kill_vm(d, &p.sandbox_id).await {
+                tracing::warn!(sandbox = %p.sandbox_id, error = %e, "failed to kill pending VM");
+            }
+        }
+        for sandbox_id in d.state().suspended.iter() {
+            if let Err(e) = self.kill_vm(d, sandbox_id).await {
+                tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill suspended VM");
+            }
+        }
+        d.set_pending(Vec::new());
+        d.mutate_state(|s| { s.suspended.clear(); s.suspending.clear(); });
+
+        let backends = d.backends();
+        let mut ids = Vec::new();
+        for b in backends.iter() {
+            b.set_draining(true);
+            self.unbind(d, b).await;
+            if !self.kill_protected(d, &b.sandbox_id) {
+                ids.push(b.sandbox_id.clone());
+            }
+        }
+        if ids.is_empty() {
+            d.set_backends(Vec::new());
+            return;
+        }
+        self.terminating
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(ids.iter().cloned());
+        self.retiring.lock().unwrap_or_else(|e| e.into_inner()).push(d.clone());
+
+        let (d, runtime) = (d.clone(), self.runtime.clone());
+        let (terminating, retiring) = (self.terminating.clone(), self.retiring.clone());
+        tokio::spawn(async move {
+            let deadline = Duration::from_secs(d.spec.effective_rollout().drain_timeout_secs);
+            let started = tokio::time::Instant::now();
+            while d.backends().iter().any(|b| b.in_flight() > 0) && started.elapsed() < deadline {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let driver = d.spec.driver().unwrap_or_default();
+            let pre_stop = d.spec.rollout.pre_stop.clone();
+            let grace = d.spec.rollout.stop_grace_secs;
+            futures::stream::iter(ids)
+                .for_each_concurrent(CREATE_CONCURRENCY, |id| {
+                    let (runtime, pre_stop, terminating) = (&runtime, &pre_stop, &terminating);
+                    let deployment = d.spec.id.clone();
+                    async move {
+                        if let Err(e) = runtime.terminate(driver, &id, pre_stop.as_ref(), grace).await {
+                            tracing::warn!(deployment = %deployment, sandbox = %id, error = %e, "failed to stop VM of a deleted deployment");
+                        }
+                        terminating.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    }
+                })
+                .await;
+            d.set_backends(Vec::new());
+            retiring.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| !Arc::ptr_eq(r, &d));
+            tracing::info!(deployment = %d.spec.id, "deleted deployment's replicas drained and stopped");
+        });
+    }
+
+    /// Hard-kill whatever deleted deployments are still draining. Called on
+    /// shutdown: a drain cannot outlive the process that owns it.
+    pub async fn kill_retiring(&self) {
+        let retiring = std::mem::take(&mut *self.retiring.lock().unwrap_or_else(|e| e.into_inner()));
+        for d in retiring {
+            let driver = d.spec.driver().unwrap_or_default();
+            for b in d.backends().iter() {
+                tracing::info!(deployment = %d.spec.id, sandbox = %b.sandbox_id, "shutting down mid-drain; killing VM of a deleted deployment");
+                if let Err(e) = self.runtime.kill(driver, &b.sandbox_id).await {
+                    tracing::warn!(sandbox = %b.sandbox_id, error = %e, "failed to kill VM");
+                }
+            }
+            d.set_backends(Vec::new());
+        }
+    }
+
+    /// Drain and kill every VM of a deployment, at once. The replace path for
+    /// changes a rolling replacement cannot express (see
+    /// [`crate::registry::rolls_in_place`]), and the delete path for workspace
+    /// and stateful-suspend pools.
     pub async fn teardown(&self, d: &Arc<Deployment>) {
         // Only a managed deployment's backends are sandboxes. A static one's are
         // addresses and a site has none at all, so for both there is nothing to
@@ -2755,6 +3156,7 @@ impl BackgroundService for Autoscaler {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("autoscaler shutting down");
+                        self.kill_retiring().await;
                         return;
                     }
                 }
@@ -2873,6 +3275,10 @@ fn at_rest(
 ) -> bool {
     let backends = d.backends();
     if !d.state().suspending.is_empty() { return false; }
+    // A rolling replacement advances only in `reconcile_one`.
+    if d.state().rollout_progress.as_ref().is_some_and(|p| p.is_active()) {
+        return false;
+    }
     if !d.pending().is_empty() || backends.iter().any(|b| b.is_draining() || !b.is_healthy()) {
         return false;
     }
@@ -2964,7 +3370,7 @@ mod tests {
     use crate::config::Driver;
 
     fn spec() -> DeploymentSpec {
-        DeploymentSpec { tunnel: None,
+        DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,
@@ -3018,7 +3424,7 @@ mod tests {
 
     /// A static (proxy_pass) deployment with fixed upstreams.
     fn static_spec() -> DeploymentSpec {
-        DeploymentSpec { tunnel: None,
+        DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,
@@ -4770,5 +5176,323 @@ mod tests {
         mode.store(3, Ordering::SeqCst);
         assert!(scaler.has_owned_resources("demo").await.is_err(), "unavailable inventory is not empty");
         server.abort();
+    }
+
+    /// Rolling replacement against a fake daemon: creates, listing, kills and
+    /// graceful terminates are all recorded.
+    mod rolling {
+        use super::*;
+        use crate::config::RolloutStrategy;
+        use crate::deployment::RolloutPhase;
+        use axum::{
+            Json, Router,
+            extract::{Path, State},
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{delete, get, post},
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Fake {
+            /// (id, name, booted) for every sandbox the daemon is running.
+            vms: Mutex<Vec<(String, String, bool)>>,
+            next: AtomicU64,
+            /// Whether a newly created sandbox ever becomes routable.
+            boots: std::sync::atomic::AtomicBool,
+            /// Status the terminate route answers with (204 when 0).
+            terminate_status: std::sync::atomic::AtomicU16,
+            terminated: Mutex<Vec<String>>,
+            killed: Mutex<Vec<String>>,
+            execs: Mutex<Vec<String>>,
+            health_port: std::sync::atomic::AtomicU16,
+        }
+
+        impl Fake {
+            fn remove(&self, id: &str) -> bool {
+                let mut vms = self.vms.lock().unwrap();
+                let before = vms.len();
+                vms.retain(|(v, _, _)| v != id);
+                vms.len() != before
+            }
+        }
+
+        async fn daemon() -> (String, Arc<Fake>) {
+            let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = health.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                axum::serve(health, Router::new().route("/", get(|| async { "ok" }))).await.unwrap()
+            });
+            let fake = Arc::new(Fake::default());
+            fake.boots.store(true, Ordering::SeqCst);
+            fake.health_port.store(port, Ordering::SeqCst);
+            let app = Router::new()
+                .route("/deployed-sandboxes", get(|State(f): State<Arc<Fake>>| async move {
+                    let rows: Vec<serde_json::Value> = f.vms.lock().unwrap().iter().map(|(id, name, up)| serde_json::json!({
+                        "id": id, "name": name,
+                        "status": if *up { "running" } else { "provisioning" },
+                        "image": "img",
+                        "guest_ip": if *up { Some("127.0.0.1") } else { None },
+                        "uptime_secs": 0, "ttl_seconds": 100000, "is_deployed": true,
+                        "status_changed_at": "", "urls": []
+                    })).collect();
+                    Json(serde_json::Value::Array(rows))
+                }))
+                .route("/sandboxes/inactive", get(|| async {
+                    Json(serde_json::json!({"sandboxes": [], "next_cursor": null}))
+                }))
+                .route("/sandbox-deploy", post(|State(f): State<Arc<Fake>>, Json(body): Json<serde_json::Value>| async move {
+                    let id = format!("new{:04}", f.next.fetch_add(1, Ordering::SeqCst));
+                    let name = body["name"].as_str().unwrap_or_default().to_string();
+                    let up = f.boots.load(Ordering::SeqCst);
+                    f.vms.lock().unwrap().push((id.clone(), name.clone(), up));
+                    Json(serde_json::json!({"id": id, "name": name, "status": "provisioning"}))
+                }))
+                .route("/deployed-sandboxes/:id", delete(|State(f): State<Arc<Fake>>, Path(id): Path<String>| async move {
+                    f.killed.lock().unwrap().push(id.clone());
+                    if f.remove(&id) { StatusCode::OK.into_response() } else { StatusCode::NOT_FOUND.into_response() }
+                }))
+                .route("/sandboxes/:id/terminate", post(|State(f): State<Arc<Fake>>, Path(id): Path<String>, Json(body): Json<serde_json::Value>| async move {
+                    assert!(body["grace_secs"].is_u64(), "terminate carries grace_secs");
+                    match f.terminate_status.load(Ordering::SeqCst) {
+                        0 => {
+                            f.terminated.lock().unwrap().push(id.clone());
+                            f.remove(&id);
+                            StatusCode::NO_CONTENT.into_response()
+                        }
+                        code => StatusCode::from_u16(code).unwrap().into_response(),
+                    }
+                }))
+                .route("/sandbox/:id/exec", post(|State(f): State<Arc<Fake>>, Path(id): Path<String>, Json(body): Json<serde_json::Value>| async move {
+                    f.execs.lock().unwrap().push(format!("{id} {}", body["command"].as_str().unwrap_or("")));
+                    Json(serde_json::json!({"stdout": "", "stderr": "", "exit_code": 0, "output": ""}))
+                }))
+                .fallback(|| async { Json(serde_json::json!({})) })
+                .with_state(fake.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (url, fake)
+        }
+
+        fn pool(fake: &Fake, replicas: u32) -> DeploymentSpec {
+            let mut s = spec();
+            s.vm.as_mut().unwrap().port = fake.health_port.load(Ordering::SeqCst);
+            s.scaling.min_replicas = replicas;
+            s.scaling.max_replicas = replicas + 2;
+            s.scaling.target_concurrency = 1000;
+            s
+        }
+
+        /// A new template: anything in `vm` changes the revision.
+        fn edited(s: &DeploymentSpec, tag: &str) -> DeploymentSpec {
+            let mut next = s.clone();
+            next.vm.as_mut().unwrap().env_vars =
+                Some([("RELEASE".to_string(), tag.to_string())].into_iter().collect());
+            next
+        }
+
+        /// Existing replicas the daemon is running for `demo`, adopted.
+        async fn seeded(replicas: u32) -> (Autoscaler, Arc<Registry>, Arc<Fake>, Vec<String>) {
+            let (url, fake) = daemon().await;
+            let ids: Vec<String> = (0..replicas).map(|i| format!("old{i}")).collect();
+            for (i, id) in ids.iter().enumerate() {
+                fake.vms.lock().unwrap().push((id.clone(), vm::replica_name("demo", i as u64 + 1), true));
+            }
+            let (scaler, registry) = autoscaler_against(&url, pool(&fake, replicas));
+            scaler.adopt_existing().await;
+            assert_eq!(registry.get("demo").unwrap().backends().len(), replicas as usize);
+            (scaler, registry, fake, ids)
+        }
+
+        /// Let background terminates land.
+        async fn settle() {
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        fn progress(registry: &Registry) -> crate::deployment::RolloutProgress {
+            registry.get("demo").unwrap().state().rollout_progress.clone().expect("a rollout")
+        }
+
+        #[tokio::test]
+        async fn a_rolling_replacement_keeps_capacity_and_terminates_the_old_pool_gracefully() {
+            let (scaler, registry, fake, old) = seeded(3).await;
+            let next = edited(&registry.get("demo").unwrap().spec, "v2");
+            registry.roll(next, false).unwrap();
+
+            for _ in 0..40 {
+                scaler.reconcile().await;
+                settle().await;
+                let d = registry.get("demo").unwrap();
+                let available = d.backends().iter().filter(|b| b.is_available()).count();
+                let total = d.backends().iter().filter(|b| !b.is_draining()).count() + d.pending().len();
+                assert!(available >= 3, "available {available} fell below target - max_unavailable");
+                assert!(total <= 4, "{total} replicas exceeds target + max_surge");
+                if !progress(&registry).is_active() {
+                    break;
+                }
+            }
+            let d = registry.get("demo").unwrap();
+            assert_eq!(progress(&registry).phase, RolloutPhase::Complete);
+            assert_eq!(d.backends().len(), 3);
+            assert!(d.backends().iter().all(|b| b.revision().as_deref() == Some(d.current_revision().as_str())));
+            settle().await;
+            let mut terminated = fake.terminated.lock().unwrap().clone();
+            terminated.sort();
+            assert_eq!(terminated, old, "every old replica went through the graceful terminate");
+        }
+
+        #[tokio::test]
+        async fn an_old_replica_holding_work_is_not_stopped_until_it_is_released_or_its_deadline() {
+            let (scaler, registry, fake, old) = seeded(1).await;
+            let slot = registry.get("demo").unwrap().backends()[0].try_hold().unwrap();
+            let next = edited(&registry.get("demo").unwrap().spec, "v2");
+            registry.roll(next.clone(), false).unwrap();
+
+            for _ in 0..6 {
+                scaler.reconcile().await;
+                settle().await;
+            }
+            let d = registry.get("demo").unwrap();
+            let old_backend = d.backends().iter().find(|b| b.sandbox_id == old[0]).cloned().expect("still in the pool");
+            assert!(old_backend.is_draining(), "replaced, so drained");
+            assert!(fake.terminated.lock().unwrap().is_empty(), "a held slot keeps the replica up");
+            assert!(d.backends().iter().any(|b| b.sandbox_id != old[0] && b.is_available()));
+
+            // The deadline: a rollout-only edit is not a rebuild, so the pool
+            // (and the drained replica) carry over.
+            let mut short = next;
+            short.rollout.drain_timeout_secs = Some(0);
+            registry.update(short).unwrap();
+            scaler.reconcile().await;
+            settle().await;
+            assert_eq!(fake.terminated.lock().unwrap().clone(), old, "stopped at the drain deadline");
+            drop(slot);
+        }
+
+        #[tokio::test]
+        async fn recreate_drains_every_old_replica_before_creating() {
+            let (scaler, registry, fake, mut old) = seeded(2).await;
+            let mut next = edited(&registry.get("demo").unwrap().spec, "v2");
+            next.rollout.strategy = RolloutStrategy::Recreate;
+            registry.roll(next, false).unwrap();
+
+            scaler.reconcile().await;
+            settle().await;
+            let d = registry.get("demo").unwrap();
+            assert!(d.pending().is_empty(), "nothing is created while old replicas remain");
+            let mut terminated = fake.terminated.lock().unwrap().clone();
+            terminated.sort();
+            old.sort();
+            assert_eq!(terminated, old);
+
+            for _ in 0..6 {
+                scaler.reconcile().await;
+                settle().await;
+            }
+            let d = registry.get("demo").unwrap();
+            assert_eq!(progress(&registry).phase, RolloutPhase::Complete);
+            assert_eq!(d.backends().len(), 2);
+            assert!(d.backends().iter().all(|b| !old.contains(&b.sandbox_id)));
+        }
+
+        #[tokio::test]
+        async fn a_stalled_rollout_pauses_with_the_old_pool_serving_and_a_revert_completes_it() {
+            let (scaler, registry, fake, old) = seeded(1).await;
+            let original = registry.get("demo").unwrap().spec.clone();
+            fake.boots.store(false, Ordering::SeqCst); // the new template never comes up
+            registry.roll(edited(&original, "broken"), false).unwrap();
+            scaler.reconcile().await;
+            assert_eq!(registry.get("demo").unwrap().pending().len(), 1, "one surge replica booting");
+
+            registry.get("demo").unwrap().mutate_state(|s| {
+                s.rollout_progress.as_mut().unwrap().last_progress_at = now_secs() - 10_000;
+            });
+            scaler.reconcile().await;
+            let p = progress(&registry);
+            assert!(matches!(p.phase, RolloutPhase::Paused { .. }), "{p:?}");
+            assert!(registry.rollout_stall_reason("demo").is_some());
+            let d = registry.get("demo").unwrap();
+            assert!(d.backends().iter().any(|b| b.sandbox_id == old[0] && b.is_available()), "old replica keeps serving");
+            scaler.reconcile().await;
+            assert_eq!(registry.get("demo").unwrap().pending().len(), 1, "a paused rollout creates nothing more");
+
+            // Reverting: the old replica is current again, the broken one stale.
+            registry.roll(original, false).unwrap();
+            scaler.reconcile().await;
+            settle().await;
+            let d = registry.get("demo").unwrap();
+            assert_eq!(progress(&registry).phase, RolloutPhase::Complete);
+            assert!(registry.rollout_stall_reason("demo").is_none());
+            assert!(d.pending().is_empty(), "the stale booting replica is killed");
+            assert!(d.backends().iter().any(|b| b.sandbox_id == old[0] && b.is_available()));
+            assert!(fake.killed.lock().unwrap().iter().any(|id| id.starts_with("new")));
+        }
+
+        #[tokio::test]
+        async fn adoption_keeps_recorded_revisions_and_distrusts_untagged_vms_mid_rollout() {
+            let (url, fake) = daemon().await;
+            for (i, id) in ["a", "b", "c"].iter().enumerate() {
+                fake.vms.lock().unwrap().push((id.to_string(), vm::replica_name("demo", i as u64 + 1), true));
+            }
+            let (scaler, registry) = autoscaler_against(&url, pool(&fake, 3));
+            let d = registry.get("demo").unwrap();
+            let current = d.current_revision();
+            d.mutate_state(|s| {
+                s.revisions.insert("a".into(), "older".into());
+                s.revisions.insert("b".into(), current.clone());
+                s.rollout_progress = Some(crate::deployment::RolloutProgress::new(current.clone(), RolloutStrategy::Rolling, now_secs()));
+            });
+            scaler.adopt_existing().await;
+            let d = registry.get("demo").unwrap();
+            let rev = |id: &str| d.backends().iter().find(|b| b.sandbox_id == id).unwrap().revision();
+            assert_eq!(rev("a").as_deref(), Some("older"));
+            assert_eq!(rev("b"), Some(current.clone()));
+            assert_eq!(rev("c").as_deref(), Some(crate::deployment::UNTAGGED_REVISION), "unknowable mid-rollout");
+
+            // With no rollout in flight an untagged VM is the current revision,
+            // so upgrading app-lb never rolls a settled pool.
+            d.mutate_state(|s| s.rollout_progress = None);
+            assert_eq!(d.adopted_revision("c"), current);
+        }
+
+        #[tokio::test]
+        async fn terminate_runs_pre_stop_and_falls_back_to_kill_on_an_old_daemon() {
+            let (url, fake) = daemon().await;
+            fake.vms.lock().unwrap().push(("sb-1".into(), "x".into(), true));
+            fake.terminate_status.store(404, Ordering::SeqCst);
+            let vms = VmManager::new(Some(url), None, crate::mounts::MountStore::new(std::env::temp_dir(), 0)).unwrap();
+            let hook = crate::config::PreStop { command: "drain-connections".into(), timeout_secs: 5 };
+            vms.terminate("sb-1", Some(&hook), 3).await.unwrap();
+            assert_eq!(fake.execs.lock().unwrap().clone(), vec!["sb-1 drain-connections".to_string()]);
+            assert!(fake.terminated.lock().unwrap().is_empty());
+            assert_eq!(fake.killed.lock().unwrap().clone(), vec!["sb-1".to_string()], "fell back to kill");
+
+            // A daemon with the route stops it; the backstop kill finds nothing.
+            fake.vms.lock().unwrap().push(("sb-2".into(), "y".into(), true));
+            fake.terminate_status.store(0, Ordering::SeqCst);
+            vms.terminate("sb-2", None, 3).await.unwrap();
+            assert_eq!(fake.terminated.lock().unwrap().clone(), vec!["sb-2".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn deleting_drains_before_stopping() {
+            let (scaler, registry, fake, old) = seeded(1).await;
+            let d = registry.get("demo").unwrap();
+            let slot = d.backends()[0].try_hold().unwrap();
+            let d = registry.remove("demo").unwrap();
+            scaler.teardown_draining(&d).await;
+            settle().await;
+            assert!(d.backends()[0].is_draining());
+            assert!(fake.terminated.lock().unwrap().is_empty(), "in-flight work finishes first");
+            drop(slot);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            settle().await;
+            assert_eq!(fake.terminated.lock().unwrap().clone(), old);
+            assert!(d.backends().is_empty());
+        }
     }
 }

@@ -1,0 +1,16 @@
+{
+  "deliveries": [
+    {
+      "attempts": 1,
+      "created_at": 1760000015,
+      "delivery_id": "dlv_0123456789abcdef01234567",
+      "event": "alert.resolved",
+      "fingerprint": "8749e89d9cac8e9377e28df359772aca",
+      "receiver": "ops",
+      "response_status": 200,
+      "status": "delivered",
+      "updated_at": 1760000015
+    }
+  ],
+  "namespace": "team-a"
+}

@@ -668,7 +668,7 @@ mod tests {
     }
 
     fn deployment(scaling: ScalingPolicy) -> Arc<Deployment> {
-        Arc::new(Deployment::new(DeploymentSpec { tunnel: None,
+        Arc::new(Deployment::new(DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,

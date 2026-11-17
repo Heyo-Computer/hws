@@ -1,0 +1,157 @@
+{
+  "rollout_revision": "persisted-opaque-revision",
+  "spec": {
+    "id": "sandbox-rolling",
+    "routes": [
+      {
+        "host": "sandbox.example.com"
+      },
+      {
+        "host_suffix": "sb.example.com",
+        "path_prefix": "/api"
+      }
+    ],
+    "vm": {
+      "driver": "firecracker",
+      "image": "agent-base",
+      "port": 8080,
+      "start_command": "/usr/local/bin/agent serve",
+      "size_class": "medium",
+      "disk_size_gb": 20,
+      "working_directory": "/workspace",
+      "env_vars": {
+        "RUST_LOG": "info"
+      },
+      "setup_hooks": [
+        "apt-get update"
+      ],
+      "open_ports": [
+        9229
+      ],
+      "mounts": [
+        {
+          "path": "/data/corpus",
+          "store": "http://127.0.0.1:8080",
+          "ref": "corpus-2026-08",
+          "auth": {
+            "secret": "art-key",
+            "key": "token"
+          },
+          "strip_components": 1,
+          "read_only": true,
+          "digest": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        }
+      ],
+      "ttl_seconds": 86400
+    },
+    "scaling": {
+      "min_replicas": 0,
+      "max_replicas": 1,
+      "warm_pool": 0,
+      "target_concurrency": 1,
+      "scale_to_zero_after_secs": 900,
+      "cold_start_timeout_secs": 120,
+      "drain_timeout_secs": 30,
+      "boot_timeout_secs": 300,
+      "idle_action": "destroy"
+    },
+    "health": {
+      "expected_header": {
+        "name": "x-heyo-revision",
+        "value": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "path": "/healthz",
+      "port": 8080,
+      "timeout_secs": 2
+    },
+    "build": {
+      "repo": "https://github.com/example/agent",
+      "ref": "main",
+      "dockerfile": "Dockerfile",
+      "context": ".",
+      "image_name": "agent-base",
+      "image_size_mb": 4096,
+      "auth": {
+        "secret": "github",
+        "key": "token",
+        "username": "git"
+      }
+    },
+    "auth": {
+      "provider": "google",
+      "client_id": "1234.apps.googleusercontent.com",
+      "client_secret": {
+        "secret": "google-oauth",
+        "key": "client_secret"
+      },
+      "allowed_domains": [
+        "example.com"
+      ],
+      "allowed_emails": [
+        "someone@other.example"
+      ],
+      "public_paths": [
+        {
+          "path": "/healthz",
+          "scope": "public"
+        },
+        {
+          "path": "/api/",
+          "scope": "view"
+        }
+      ],
+      "session_scope": "admin",
+      "base_path": "/__applb/auth",
+      "session_ttl_secs": 43200,
+      "cookie_name": "applb_session",
+      "cookie_domain": ".example.com",
+      "redirect_url": "https://sandbox.example.com/__applb/auth/callback",
+      "forward_identity": true
+    },
+    "rollout": {
+      "strategy": "rolling",
+      "max_surge": 2,
+      "max_unavailable": 1,
+      "min_ready_secs": 10,
+      "progress_deadline_secs": 900,
+      "drain_timeout_secs": 120,
+      "pre_stop": {
+        "command": "kill -TERM 1 && sleep 5",
+        "timeout_secs": 20
+      },
+      "stop_grace_secs": 30
+    }
+  },
+  "kind": "vm",
+  "desired_replicas": 1,
+  "ready": 1,
+  "pending": 1,
+  "total_in_flight": 3,
+  "vms": [
+    {
+      "sandbox_id": "applb-sandbox-a1b2c3",
+      "addr": "172.16.0.4:8080",
+      "in_flight": 3,
+      "healthy": true,
+      "draining": false
+    }
+  ],
+  "pending_vms": [
+    {
+      "sandbox_id": "applb-sandbox-d4e5f6",
+      "age_secs": 12,
+      "status": "running"
+    }
+  ],
+  "rollout": {
+    "revision": "3f9a0c1d2e4b5a6c.1",
+    "strategy": "rolling",
+    "phase": "paused",
+    "reason": "no progress for 900s: 1 replica(s) on revision 3f9a0c1d2e4b5a6c.1 ready, 2 old replica(s) still serving; nothing more is created until the deployment is edited again",
+    "updated": 1,
+    "stale": 2,
+    "draining": 0,
+    "started_at": 1722400000,
+    "last_progress_at": 1722400100
+  }
+}

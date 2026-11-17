@@ -1,0 +1,35 @@
+{
+  "checks": 1,
+  "firing": 1,
+  "last_tick": 1760000015,
+  "namespace": "team-a",
+  "pending": 1,
+  "receivers": [
+    {
+      "endpoint": "https://hooks.example.com",
+      "format": "generic",
+      "id": "ops",
+      "signed": true
+    }
+  ],
+  "rules": [
+    {
+      "condition": "no_healthy_replicas",
+      "deployment": "*",
+      "id": "down",
+      "receivers": [
+        "ops"
+      ],
+      "severity": "critical"
+    },
+    {
+      "condition": "check_failing",
+      "deployment": "web",
+      "id": "home",
+      "receivers": [],
+      "severity": "warning"
+    }
+  ],
+  "silences": 1,
+  "state_error": null
+}

@@ -1737,13 +1737,25 @@ impl Jobs {
         let previous = vm.image.clone();
         vm.image = Some(image.to_string());
 
-        let deployment = self.registry.upsert(spec);
+        // An ordinary pool rolls in place. Under a new restart generation
+        // always: the same image name may hold new bytes (see above), so an
+        // unchanged spec must still replace every replica.
+        let in_place = crate::registry::rolls_in_place(&old.spec, &spec);
+        let deployment = if in_place {
+            self.registry
+                .roll(spec, true)
+                .ok_or_else(|| format!("deployment {deployment_id:?} could not be rolled"))?
+        } else {
+            self.registry.upsert(spec)
+        };
         let persistence_error = self.registry.persist_one(&deployment.spec.id).err();
         if let Some(e) = &persistence_error {
             tracing::error!(error = %e, "failed to persist state after a build");
         }
         drop(change);
-        self.autoscaler.teardown(&old).await;
+        if !in_place {
+            self.autoscaler.teardown(&old).await;
+        }
         deployment.scale_signal.notify_one();
 
         self.update_record(job_id, |r| {
@@ -2129,12 +2141,21 @@ impl Jobs {
             return Ok(false);
         }
 
-        let deployment = self.registry.upsert(spec);
+        let in_place = crate::registry::rolls_in_place(&old.spec, &spec);
+        let deployment = if in_place {
+            self.registry
+                .roll(spec, false)
+                .ok_or_else(|| format!("deployment {deployment_id:?} could not be rolled"))?
+        } else {
+            self.registry.upsert(spec)
+        };
         if let Err(e) = self.registry.persist_one(&deployment.spec.id) {
             tracing::error!(error = %e, "failed to persist state after a mount pull");
         }
         drop(change);
-        self.autoscaler.teardown(&old).await;
+        if !in_place {
+            self.autoscaler.teardown(&old).await;
+        }
         deployment.scale_signal.notify_one();
 
         let rolled = changed.clone();

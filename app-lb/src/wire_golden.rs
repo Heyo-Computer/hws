@@ -71,7 +71,7 @@ pub(crate) fn golden(name: &str, value: &impl Serialize) {
 /// `upstreams` and `site` together would serialize fine and describe a
 /// deployment that cannot exist.
 fn vm_spec() -> DeploymentSpec {
-    DeploymentSpec { tunnel: None,
+    DeploymentSpec { tunnel: None, rollout: Default::default(),
         placement: None,
         ingress: None,
         account_id: None,
@@ -234,8 +234,30 @@ fn owned_vm_spec() -> DeploymentSpec {
     s
 }
 
+/// A pool with a non-default rollout policy, mid-replacement.
+fn rolling_vm_spec() -> DeploymentSpec {
+    let mut s = vm_spec();
+    s.id = "sandbox-rolling".into();
+    // A pool of interchangeable replicas: single-writer state cannot surge.
+    s.scaling.idle_action = crate::config::IdleAction::Destroy;
+    s.rollout = crate::config::RolloutPolicy {
+        strategy: crate::config::RolloutStrategy::Rolling,
+        max_surge: Some(2),
+        max_unavailable: Some(1),
+        min_ready_secs: 10,
+        progress_deadline_secs: 900,
+        drain_timeout_secs: Some(120),
+        pre_stop: Some(crate::config::PreStop {
+            command: "kill -TERM 1 && sleep 5".into(),
+            timeout_secs: 20,
+        }),
+        stop_grace_secs: 30,
+    };
+    s
+}
+
 fn site_spec() -> DeploymentSpec {
-    DeploymentSpec { tunnel: None,
+    DeploymentSpec { tunnel: None, rollout: Default::default(),
         placement: None,
         ingress: None,
         account_id: None,
@@ -296,7 +318,7 @@ fn site_spec() -> DeploymentSpec {
 }
 
 fn static_spec() -> DeploymentSpec {
-    DeploymentSpec { tunnel: None,
+    DeploymentSpec { tunnel: None, rollout: Default::default(),
         placement: None,
         ingress: None,
         account_id: None,
@@ -473,6 +495,7 @@ fn populated_metrics() -> crate::metrics::Metrics {
     m.record_cold_start_hit("sandbox");
     m.record_cold_start_timeout("sandbox");
     m.record_boot_timeout("sandbox");
+    m.record_rollout_stall("sandbox");
     // A refused create, with the daemon's own words. Recorded in the fixture
     // rather than left at zero so `last_create_error` appears in the wire shape
     // at all — it is `skip_serializing_if = "Option::is_none"`, so a fixture
@@ -493,6 +516,7 @@ fn deployment_status_is_stable() {
         ("deployment-status-artifact", artifact_spec()),
         ("deployment-status-site-artifact", site_artifact_spec()),
         ("deployment-status-jwt", jwt_spec()),
+        ("deployment-status-vm-rolling", rolling_vm_spec()),
     ] {
         spec.validate().unwrap_or_else(|e| {
             panic!("fixture {name} describes a deployment the server would reject: {e}")
@@ -511,6 +535,17 @@ fn deployment_status_is_stable() {
         golden(
             name,
             &DeploymentStatus {
+                rollout: (name == "deployment-status-vm-rolling").then(|| RolloutView {
+                    revision: "3f9a0c1d2e4b5a6c.1".into(),
+                    strategy: "rolling",
+                    phase: "paused",
+                    reason: Some("no progress for 900s: 1 replica(s) on revision 3f9a0c1d2e4b5a6c.1 ready, 2 old replica(s) still serving; nothing more is created until the deployment is edited again".into()),
+                    updated: 1,
+                    stale: 2,
+                    draining: 0,
+                    started_at: 1_722_400_000,
+                    last_progress_at: 1_722_400_100,
+                }),
                 rollout_revision: "persisted-opaque-revision".into(),
                 spec,
                 kind,
@@ -730,6 +765,17 @@ fn metrics_response_is_stable() {
                     status: Some(heyo_sdk::SandboxStatus::Provisioning),
                 }],
                 metrics: m.deployment_snapshot(&spec.id),
+                rollout: Some(RolloutView {
+                    revision: "3f9a0c1d2e4b5a6c".into(),
+                    strategy: "rolling",
+                    phase: "progressing",
+                    reason: None,
+                    updated: 1,
+                    stale: 1,
+                    draining: 1,
+                    started_at: 1_722_400_000,
+                    last_progress_at: 1_722_400_030,
+                }),
             }],
             matched: 3,
             tracked_deployments: 3,
@@ -793,6 +839,7 @@ fn a_site_view_carries_its_root_and_spa_flag() {
             vms: vec![],
             pending_vms: vec![],
             metrics: m.deployment_snapshot("docs"),
+            rollout: None,
         },
     );
 }

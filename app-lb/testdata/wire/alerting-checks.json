@@ -1,0 +1,23 @@
+{
+  "checks": [
+    {
+      "deployment": "web",
+      "expect_status": 200,
+      "id": "home",
+      "interval_secs": 30,
+      "min_passing": 1,
+      "path": "/healthz",
+      "result": {
+        "checked_at": 1760000000,
+        "deployment": "web",
+        "id": "home",
+        "last_error": "no available replicas to probe",
+        "ok": false,
+        "passing": 0,
+        "path": "/healthz",
+        "total": 0
+      }
+    }
+  ],
+  "namespace": "team-a"
+}

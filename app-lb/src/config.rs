@@ -803,6 +803,203 @@ impl Default for ScalingPolicy {
     }
 }
 
+/// How a VM-template change replaces a running pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RolloutStrategy {
+    /// Replace replicas a few at a time, keeping capacity up: new replicas
+    /// boot and pass their health check before old ones are drained.
+    #[default]
+    Rolling,
+    /// Drain every old replica first, then boot the new ones. For workloads
+    /// that cannot run two versions side by side; costs a gap in capacity.
+    Recreate,
+}
+
+impl RolloutStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rolling => "rolling",
+            Self::Recreate => "recreate",
+        }
+    }
+}
+
+/// A command run inside a replica before it is stopped. See
+/// [`RolloutPolicy::pre_stop`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PreStop {
+    /// Run through `sh -c` in the guest. Its exit status is logged and never
+    /// blocks the stop.
+    pub command: String,
+    /// How long the command may run before the stop proceeds without it.
+    #[serde(default = "default_pre_stop_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_pre_stop_timeout_secs() -> u64 {
+    30
+}
+fn default_progress_deadline_secs() -> u64 {
+    600
+}
+fn default_stop_grace_secs() -> u64 {
+    10
+}
+
+/// Longest `pre_stop.command` accepted. A hook is a command line, not a
+/// script; anything longer belongs in the image.
+pub const MAX_PRE_STOP_COMMAND: usize = 4096;
+/// The daemon's own ceiling on `POST /sandboxes/:id/terminate` grace.
+pub const MAX_STOP_GRACE_SECS: u64 = 300;
+
+/// How a change to the VM template (or `POST /deployments/:id/restart`)
+/// replaces running replicas.
+///
+/// Every replica carries the *revision* of the template it was booted from.
+/// After an edit, replicas of an older revision are "stale"; the autoscaler
+/// replaces them under this policy without ever emptying the pool:
+///
+/// * `rolling` keeps at most `target + max_surge` replicas taking traffic and
+///   at least `target - max_unavailable` available. A stale replica is drained
+///   (no new requests; in-flight ones and open WebSockets finish) only once
+///   enough fresh replicas have been healthy for `min_ready_secs`.
+/// * `recreate` drains every stale replica, waits for them to stop, then boots.
+///
+/// A drained replica is stopped gracefully once idle or after
+/// `drain_timeout_secs`: `pre_stop` runs first, then the daemon is asked to
+/// stop the guest with `stop_grace_secs` of SIGTERM grace before it is killed.
+///
+/// `max_surge` and `max_unavailable` default per deployment: `1`/`0` for an
+/// ordinary pool, and `0`/`1` for single-writer state (`vm.workspace`, or
+/// `scaling.idle_action` `retain`/`suspend`), where two replicas side by side
+/// would each own a divergent copy. An explicit `max_surge` above 0 on such a
+/// deployment is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RolloutPolicy {
+    #[serde(default)]
+    pub strategy: RolloutStrategy,
+    /// Extra replicas allowed above the target while rolling. Absent means 1
+    /// (0 for single-writer state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_surge: Option<u32>,
+    /// Replicas allowed below the target while rolling. Absent means 0 (1 for
+    /// single-writer state). `max_surge` and `max_unavailable` cannot both be 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<u32>,
+    /// How long a new replica must stay healthy before it counts as available
+    /// and an old one may be drained against it.
+    #[serde(default)]
+    pub min_ready_secs: u64,
+    /// With no replica replaced and none becoming ready for this long, the
+    /// rollout pauses: nothing more is created and the remaining old replicas
+    /// keep serving. A new edit (including reverting) starts a new rollout.
+    #[serde(default = "default_progress_deadline_secs")]
+    pub progress_deadline_secs: u64,
+    /// How long a drained old replica may keep serving in-flight work before
+    /// it is stopped anyway. Absent means `scaling.drain_timeout_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_timeout_secs: Option<u64>,
+    /// Run before every graceful stop: rollout drains, scale-down and delete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_stop: Option<PreStop>,
+    /// SIGTERM grace the daemon gives the guest before killing it. A daemon
+    /// without the graceful terminate route kills immediately.
+    #[serde(default = "default_stop_grace_secs")]
+    pub stop_grace_secs: u64,
+}
+
+impl Default for RolloutPolicy {
+    fn default() -> Self {
+        Self {
+            strategy: RolloutStrategy::default(),
+            max_surge: None,
+            max_unavailable: None,
+            min_ready_secs: 0,
+            progress_deadline_secs: default_progress_deadline_secs(),
+            drain_timeout_secs: None,
+            pre_stop: None,
+            stop_grace_secs: default_stop_grace_secs(),
+        }
+    }
+}
+
+/// [`RolloutPolicy`] with every per-deployment default resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveRollout {
+    pub strategy: RolloutStrategy,
+    pub max_surge: u32,
+    pub max_unavailable: u32,
+    pub min_ready_secs: u64,
+    pub progress_deadline_secs: u64,
+    pub drain_timeout_secs: u64,
+}
+
+impl RolloutPolicy {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Resolve the defaults that depend on the deployment. `single_writer`
+    /// is [`DeploymentSpec::single_writer`].
+    pub fn effective(&self, single_writer: bool, scaling: &ScalingPolicy) -> EffectiveRollout {
+        let (surge, unavailable) = if single_writer { (0, 1) } else { (1, 0) };
+        EffectiveRollout {
+            strategy: self.strategy,
+            max_surge: self.max_surge.unwrap_or(surge),
+            max_unavailable: self.max_unavailable.unwrap_or(unavailable),
+            min_ready_secs: self.min_ready_secs,
+            progress_deadline_secs: self.progress_deadline_secs,
+            drain_timeout_secs: self.drain_timeout_secs.unwrap_or(scaling.drain_timeout_secs),
+        }
+    }
+
+    fn validate(&self, single_writer: Option<&str>, scaling: &ScalingPolicy) -> Result<(), SpecError> {
+        let bad = |why: String| Err(SpecError::InvalidRollout(why));
+        if let (Some(why), Some(surge)) = (single_writer, self.max_surge)
+            && surge > 0
+        {
+            return bad(format!(
+                "max_surge must be 0 because {why}: two replicas side by side would each own a \
+                 divergent copy of that state (omit it, or use max_unavailable)"
+            ));
+        }
+        let effective = self.effective(single_writer.is_some(), scaling);
+        if effective.max_surge == 0 && effective.max_unavailable == 0 {
+            return bad("max_surge and max_unavailable cannot both be 0; nothing could be replaced".into());
+        }
+        if effective.max_surge > 100 || effective.max_unavailable > 100 {
+            return bad("max_surge and max_unavailable must be at most 100".into());
+        }
+        if self.min_ready_secs > 3600 {
+            return bad("min_ready_secs must be at most 3600".into());
+        }
+        if !(10..=86_400).contains(&self.progress_deadline_secs) {
+            return bad("progress_deadline_secs must be between 10 and 86400".into());
+        }
+        if self.drain_timeout_secs.is_some_and(|t| t > 86_400) {
+            return bad("drain_timeout_secs must be at most 86400".into());
+        }
+        if self.stop_grace_secs > MAX_STOP_GRACE_SECS {
+            return bad(format!("stop_grace_secs must be at most {MAX_STOP_GRACE_SECS}"));
+        }
+        if let Some(hook) = &self.pre_stop {
+            if hook.command.trim().is_empty() {
+                return bad("pre_stop.command must not be empty".into());
+            }
+            if hook.command.len() > MAX_PRE_STOP_COMMAND || hook.command.contains('\0') {
+                return bad(format!(
+                    "pre_stop.command must be at most {MAX_PRE_STOP_COMMAND} bytes with no NUL"
+                ));
+            }
+            if !(1..=600).contains(&hook.timeout_secs) {
+                return bad("pre_stop.timeout_secs must be between 1 and 600".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_health_path() -> Option<String> {
     Some("/".into())
 }
@@ -3688,6 +3885,12 @@ pub struct DeploymentSpec {
     /// deployment, exclusive with `vm`, `upstreams` and `site`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<TunnelSpec>,
+    /// How a change to the VM template replaces the running replicas. See
+    /// [`RolloutPolicy`]: rolling by default, so an edit never empties the
+    /// pool or cuts off in-flight requests. Omitted from the wire when it is
+    /// the default, so existing specs (and their ETags) are unchanged.
+    #[serde(default, skip_serializing_if = "RolloutPolicy::is_default")]
+    pub rollout: RolloutPolicy,
 }
 
 /// Where a tunnel deployment's backend is: an app-lb behind NAT that
@@ -4211,6 +4414,8 @@ pub enum SpecError {
     /// A `placement` that names no usable host, or a mode not yet available.
     InvalidPlacement(String),
     InvalidSuspend(String),
+    /// A `rollout` block that cannot be honoured, with why.
+    InvalidRollout(String),
     /// Workflow ids are interpolated into NATS subjects and VM names unescaped.
     BadWorkflowId(String),
     EmptyWorkflowRepo,
@@ -4512,6 +4717,7 @@ impl std::fmt::Display for SpecError {
             ),
             Self::InvalidPlacement(why) => write!(f, "{why}"),
             Self::InvalidSuspend(why) => write!(f, "idle_action suspend: {why}"),
+            Self::InvalidRollout(why) => write!(f, "rollout: {why}"),
             Self::IngressWithoutVm => write!(
                 f,
                 "ingress.cloud binds a VM's port on the daemon, and this deployment \
@@ -5152,6 +5358,25 @@ impl DeploymentSpec {
             .expect("vm_spec() on a static deployment; guard on is_static() first")
     }
 
+    /// Why this deployment's replicas hold single-writer state, if they do:
+    /// state two replicas side by side would each own a divergent copy of.
+    /// Such a deployment rolls with `max_surge: 0` (see [`RolloutPolicy`]).
+    pub fn single_writer(&self) -> Option<&'static str> {
+        if self.vm.as_ref().is_some_and(|vm| vm.workspace.is_some()) {
+            return Some("vm.workspace is single-writer state");
+        }
+        match self.scaling.idle_action {
+            IdleAction::Retain => Some("scaling.idle_action `retain` keeps per-replica state"),
+            IdleAction::Suspend => Some("scaling.idle_action `suspend` keeps per-replica state"),
+            IdleAction::Destroy => None,
+        }
+    }
+
+    /// The rollout policy with its per-deployment defaults resolved.
+    pub fn effective_rollout(&self) -> EffectiveRollout {
+        self.rollout.effective(self.single_writer().is_some(), &self.scaling)
+    }
+
     /// Rejects specs the data plane could not serve.
     ///
     /// A deployment is either *managed* (a `vm` template, autoscaled) or *static*
@@ -5445,6 +5670,7 @@ impl DeploymentSpec {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
         }
+        self.rollout.validate(self.single_writer(), &self.scaling)?;
         if self.scaling.idle_action == IdleAction::Suspend {
             let Some(vm) = &self.vm else {
                 return Err(SpecError::InvalidSuspend("requires a Firecracker VM pool".into()));
@@ -6557,7 +6783,7 @@ mod tests {
     }
 
     fn spec() -> DeploymentSpec {
-        DeploymentSpec { tunnel: None,
+        DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,
@@ -6638,7 +6864,7 @@ mod tests {
 
     /// A static (proxy_pass) deployment: `upstreams` set, no `vm`.
     fn static_spec(upstreams: &[&str]) -> DeploymentSpec {
-        DeploymentSpec { tunnel: None,
+        DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,
@@ -9830,9 +10056,10 @@ mod tests {
                     .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_dir() {
+                    // `examples/plugins/` holds plugin configurations, not specs.
+                    if path.is_dir() && !path.ends_with("examples/plugins") {
                         walk(&path, out);
-                    } else if path.extension().is_some_and(|e| e == "json") {
+                    } else if path.is_file() && path.extension().is_some_and(|e| e == "json") {
                         out.push(path);
                     }
                 }
@@ -9925,5 +10152,62 @@ mod tests {
             layout.postgres_ownership_path(),
             crate::plugins::plugin_dir(state).join("state").join("postgres.json")
         );
+        assert_eq!(
+            layout.alerting_state_path(),
+            crate::plugins::plugin_dir(state).join("state").join("alerting.json")
+        );
+    }
+
+    /// Single-writer state rolls one replica down, never one up: the default
+    /// resolves to surge 0 / unavailable 1, and an explicit surge is refused.
+    #[test]
+    fn rollout_defaults_coerce_for_single_writer_state_and_refuse_a_surge() {
+        let plain = spec();
+        let e = plain.effective_rollout();
+        assert_eq!((e.max_surge, e.max_unavailable), (1, 0));
+        assert_eq!(e.strategy, RolloutStrategy::Rolling);
+        assert_eq!(e.drain_timeout_secs, plain.scaling.drain_timeout_secs, "falls back to scaling");
+        assert!(plain.rollout.is_default());
+        assert!(serde_json::to_value(&plain).unwrap().get("rollout").is_none(), "the default is not on the wire");
+
+        let mut retained = spec();
+        retained.scaling.idle_action = IdleAction::Retain;
+        let e = retained.effective_rollout();
+        assert_eq!((e.max_surge, e.max_unavailable), (0, 1));
+        assert!(retained.validate().is_ok());
+        retained.rollout.max_surge = Some(1);
+        let err = retained.validate().unwrap_err();
+        assert!(matches!(err, SpecError::InvalidRollout(_)), "{err}");
+        assert!(err.to_string().contains("max_surge must be 0"), "{err}");
+        retained.rollout.max_surge = Some(0);
+        assert!(retained.validate().is_ok(), "an explicit 0 is what the default is");
+    }
+
+    #[test]
+    fn rollout_policy_bounds_are_enforced() {
+        let with = |f: &dyn Fn(&mut RolloutPolicy)| {
+            let mut s = spec();
+            f(&mut s.rollout);
+            s.validate()
+        };
+        assert!(with(&|r| { r.max_surge = Some(0); r.max_unavailable = Some(0); }).is_err());
+        assert!(with(&|r| r.max_surge = Some(101)).is_err());
+        assert!(with(&|r| r.progress_deadline_secs = 1).is_err());
+        assert!(with(&|r| r.stop_grace_secs = MAX_STOP_GRACE_SECS + 1).is_err());
+        assert!(with(&|r| r.pre_stop = Some(PreStop { command: "  ".into(), timeout_secs: 5 })).is_err());
+        assert!(with(&|r| r.pre_stop = Some(PreStop { command: "x".repeat(MAX_PRE_STOP_COMMAND + 1), timeout_secs: 5 })).is_err());
+        assert!(with(&|r| r.pre_stop = Some(PreStop { command: "drain".into(), timeout_secs: 0 })).is_err());
+        assert!(with(&|r| {
+            r.strategy = RolloutStrategy::Recreate;
+            r.pre_stop = Some(PreStop { command: "nginx -s quit".into(), timeout_secs: 30 });
+            r.stop_grace_secs = 60;
+        }).is_ok());
+
+        // Every field is optional on the wire.
+        let parsed: RolloutPolicy = serde_json::from_value(serde_json::json!({"strategy": "recreate"})).unwrap();
+        assert_eq!(parsed.progress_deadline_secs, 600);
+        assert_eq!(parsed.stop_grace_secs, 10);
+        let hook: PreStop = serde_json::from_value(serde_json::json!({"command": "x"})).unwrap();
+        assert_eq!(hook.timeout_secs, 30);
     }
 }

@@ -4,6 +4,16 @@ All notable changes to the `hws` crate (the Heyo Web Services SDK and the
 `heyctl` CLI). The crate follows [semantic versioning](https://semver.org/);
 while it is `0.x`, a minor bump may break the API.
 
+## Unreleased
+
+### Added
+
+- **Alerts, through the `alerting` plugin.** `Client::alerting(ns)` returns
+  an `AlertingClient` — `status`, `alerts`, `ack`, `silences`, `silence`
+  (`NewSilence`), `unsilence`, `checks`, `deliveries`, `test_receiver` — with
+  blocking twins, and `heyctl alerts {list,ack,silence,unsilence,silences,
+  checks,deliveries,test-receiver} -n <ns>` on the CLI.
+
 ## 0.4.0 — 2026-10-12
 
 ### Added

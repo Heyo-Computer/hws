@@ -46,6 +46,54 @@ export interface ScalingPolicy {
   boot_timeout_secs?: number;
 }
 
+/** A command run inside a replica before it is stopped. */
+export interface PreStop {
+  /** Run through `sh -c` in the guest; its exit status never blocks the stop. */
+  command: string;
+  /** Defaults to 30. */
+  timeout_secs?: number;
+}
+
+/**
+ * How a VM-template change (or a rolling restart) replaces running replicas.
+ * Every field defaults; absent on the wire when it is the default.
+ */
+export interface RolloutPolicy {
+  /** `rolling` (default): new replicas first; `recreate`: drain all, then boot. */
+  strategy?: "rolling" | "recreate";
+  /** Extra replicas above target while rolling. Default 1 (0 for single-writer state). */
+  max_surge?: number;
+  /** Replicas allowed below target while rolling. Default 0 (1 for single-writer state). */
+  max_unavailable?: number;
+  /** How long a new replica must be healthy before it counts as available. */
+  min_ready_secs?: number;
+  /** No progress for this long pauses the rollout. Default 600. */
+  progress_deadline_secs?: number;
+  /** How long a drained old replica may finish its work. Default `scaling.drain_timeout_secs`. */
+  drain_timeout_secs?: number;
+  pre_stop?: PreStop;
+  /** SIGTERM grace the daemon gives the guest before killing it. Default 10, max 300. */
+  stop_grace_secs?: number;
+}
+
+/** Where a deployment's rolling replacement stands. */
+export interface RolloutView {
+  /** The template revision new replicas boot from. */
+  revision: string;
+  strategy: "rolling" | "recreate";
+  phase: "progressing" | "paused" | "complete";
+  /** Why it paused, when it did. */
+  reason?: string;
+  /** Replicas on the current revision, serving. */
+  updated: number;
+  /** Old replicas still taking traffic, or booting. */
+  stale: number;
+  /** Old replicas drained, finishing their in-flight work. */
+  draining: number;
+  started_at: number;
+  last_progress_at: number;
+}
+
 export interface ExpectedHeader {
   name: string;
   value: string;
@@ -435,6 +483,8 @@ export interface DeploymentSpec {
   auth?: AuthGate;
   feed?: FeedSpec;
   placement?: Placement;
+  /** How a template change replaces running replicas; rolling by default. */
+  rollout?: RolloutPolicy;
   /** Anything app-lb sent that this build has no name for. */
   [extra: string]: unknown;
 }
@@ -547,6 +597,8 @@ export interface DeploymentStatus {
   workspace?: WorkspaceStatus;
   /** Present for a site: whether its root on the LB host can serve. */
   site?: SiteRootStatus;
+  /** The rolling replacement in progress, or the last one; absent if it never rolled. */
+  rollout?: RolloutView;
 }
 
 /** A site's root as the LB host sees it. */
@@ -609,6 +661,8 @@ export interface AutoscaleCounts {
   create_failures: number;
   /** What the most recent failed create said; absent until one has failed. */
   last_create_error?: string;
+  /** Rolling replacements that paused at their progress deadline; absent while zero. */
+  rollout_stalls?: number;
 }
 
 export interface DeploymentMetrics {
@@ -750,6 +804,8 @@ export interface DeploymentView {
   vms: VmView[];
   pending_vms: PendingVmView[];
   metrics: DeploymentMetrics;
+  /** See `DeploymentStatus.rollout`. */
+  rollout?: RolloutView;
 }
 
 export interface ObsStats {
@@ -1776,6 +1832,185 @@ export interface DeletedPostgresDatabase {
   /** The `pg-<name>` secret left behind, if any. */
   secret_kept: string | null;
   note: string;
+  [extra: string]: unknown;
+}
+
+// -- alerts (the alerting plugin) -------------------------------------------
+
+/** A receiver in {@link AlertingStatus}. Never carries the webhook's path. */
+export interface AlertingReceiver {
+  id: string;
+  /** `generic` or `slack`. */
+  format: string;
+  /** Scheme, host and port only. */
+  endpoint: string;
+  /** Whether requests carry `X-Heyo-Signature`. */
+  signed: boolean;
+  [extra: string]: unknown;
+}
+
+/** A rule in {@link AlertingStatus}. */
+export interface AlertingRuleSummary {
+  id: string;
+  /** A deployment id, or `*`. */
+  deployment: string;
+  /** The condition's `type`, e.g. `no_healthy_replicas`. */
+  condition: string;
+  severity: string;
+  receivers: string[];
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/status`. */
+export interface AlertingStatus {
+  namespace: string;
+  receivers: AlertingReceiver[];
+  rules: AlertingRuleSummary[];
+  /** How many checks are configured. */
+  checks: number;
+  firing: number;
+  pending: number;
+  silences: number;
+  /** When rules were last evaluated (unix seconds). */
+  last_tick: number | null;
+  /** Why the plugin's state could not be read; acks and silences are refused meanwhile. */
+  state_error: string | null;
+  [extra: string]: unknown;
+}
+
+/** One alert: one rule on one deployment. */
+export interface AlertingAlert {
+  /** Stable for the `(namespace, rule, deployment)`. */
+  fingerprint: string;
+  rule: string;
+  deployment: string;
+  severity: string;
+  condition: string;
+  /** `pending`, `firing` or `resolved`. */
+  status: string;
+  summary: string;
+  pending_since: number;
+  started_at?: number;
+  resolved_at?: number;
+  /** Whether the firing webhook went out (it is held while silenced). */
+  notified: boolean;
+  last_notified_at?: number;
+  acked_by?: string;
+  acked_at?: number;
+  ack_comment?: string;
+  labels: Record<string, string>;
+  /** Whether a silence matches it now. */
+  silenced: boolean;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/alerts`. */
+export interface AlertingAlerts {
+  namespace: string;
+  /** Pending and firing. */
+  active: AlertingAlert[];
+  /** Recently resolved, newest first. */
+  resolved: AlertingAlert[];
+  [extra: string]: unknown;
+}
+
+/** What a silence matches. An unset matcher matches anything. */
+export interface AlertingSilenceMatchers {
+  rule?: string;
+  deployment?: string;
+  severity?: string;
+  [extra: string]: unknown;
+}
+
+/** A silence: notifications for matching alerts are held until `until`. */
+export interface AlertingSilence {
+  id: string;
+  matchers: AlertingSilenceMatchers;
+  /** Unix seconds. */
+  until: number;
+  comment: string;
+  created_by?: string;
+  created_at: number;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/silences`. */
+export interface AlertingSilences {
+  namespace: string;
+  silences: AlertingSilence[];
+  [extra: string]: unknown;
+}
+
+/** The reply to removing a silence. */
+export interface DeletedAlertingSilence {
+  deleted: string;
+  [extra: string]: unknown;
+}
+
+/** The last run of an {@link AlertingCheck}. */
+export interface AlertingCheckResult {
+  id: string;
+  deployment: string;
+  path: string;
+  ok: boolean;
+  passing: number;
+  total: number;
+  last_error?: string;
+  checked_at: number;
+  [extra: string]: unknown;
+}
+
+/** One configured check and its last result. */
+export interface AlertingCheck {
+  id: string;
+  deployment: string;
+  path: string;
+  interval_secs: number;
+  expect_status?: number;
+  min_passing: number;
+  /** `null` until the check first runs. */
+  result: AlertingCheckResult | null;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/checks`. */
+export interface AlertingChecks {
+  namespace: string;
+  checks: AlertingCheck[];
+  [extra: string]: unknown;
+}
+
+/** One webhook. */
+export interface AlertingDelivery {
+  /** Also sent as `X-Heyo-Delivery`. */
+  delivery_id: string;
+  receiver: string;
+  /** `alert.firing`, `alert.resolved` or `alert.test`. */
+  event: string;
+  fingerprint?: string;
+  /** `queued`, `retrying`, `delivered`, `failed` or `dropped`. */
+  status: string;
+  attempts: number;
+  response_status?: number;
+  last_error?: string;
+  created_at: number;
+  updated_at: number;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/deliveries`: the last webhooks, newest first. */
+export interface AlertingDeliveries {
+  namespace: string;
+  deliveries: AlertingDelivery[];
+  [extra: string]: unknown;
+}
+
+/** The reply to `POST …/alerting/api/receivers/:id/test`. */
+export interface AlertingTestDelivery {
+  delivery_id: string;
+  receiver: string;
+  /** `queued`: follow it in the delivery log. */
+  status: string;
   [extra: string]: unknown;
 }
 

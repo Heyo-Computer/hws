@@ -24,10 +24,13 @@ const WIRE = join(here, "..", "..", "..", "testdata", "wire");
  */
 const KNOWN = {
   common: {
-    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "pending_vms", "workspace", "site"],
+    DeploymentStatus: ["rollout_revision", "spec", "kind", "desired_replicas", "ready", "pending", "total_in_flight", "vms", "pending_vms", "workspace", "site", "rollout"],
+    RolloutView: ["revision", "strategy", "phase", "reason", "updated", "stale", "draining", "started_at", "last_progress_at"],
+    RolloutPolicy: ["strategy", "max_surge", "max_unavailable", "min_ready_secs", "progress_deadline_secs", "drain_timeout_secs", "pre_stop", "stop_grace_secs"],
+    PreStop: ["command", "timeout_secs"],
     SiteRootStatus: ["root", "status", "index_present", "hint"],
     VmStatus: ["sandbox_id", "addr", "in_flight", "healthy", "draining"],
-    DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed", "placement"],
+    DeploymentSpec: ["id", "namespace", "account_id", "user_id", "routes", "vm", "scaling", "health", "upstreams", "discovery", "build", "artifact", "site", "update", "auth", "feed", "placement", "rollout"],
     Placement: ["mode", "home", "hosts"],
     ImageInventory: ["generated_at", "complete", "error", "delete_supported", "offload", "disk_used_pct", "pressure_pct", "cache_bytes", "cache_budget_bytes", "cache_hits", "cache_misses", "local_bytes", "images"],
     ImageEntry: ["name", "source", "tier", "digest", "store", "ref", "grow_gb", "bytes", "first_seen", "last_used", "pinned", "offloaded_to", "offloaded_at", "failures", "next_attempt_at", "last_error", "auth", "present", "references", "kept_because"],
@@ -51,7 +54,7 @@ const KNOWN = {
     AuthProviderView: ["name", "namespace", "description", "created_at", "provider", "client_id", "client_secret", "allowed_domains", "allowed_emails", "jwt", "cookie_domain"],
     PublicPath: ["path", "scope"],
     JwtSpec: ["secret", "public_key", "jwks_url", "algorithms", "issuer", "audience", "require", "subject_claim", "email_claim", "name_claim", "leeway_secs", "cookie", "login_endpoint", "login_url", "login_redirect_param", "authorize_url", "token_url"],
-    DeploymentView: ["id", "namespace", "account_id", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics"],
+    DeploymentView: ["id", "namespace", "account_id", "kind", "upstreams", "routed", "hosts", "urls", "site_root", "site_spa", "job_kind", "pool", "vms", "pending_vms", "metrics", "rollout"],
     UpstreamTrafficStatus: ["deployment_id", "upstream", "state", "healthy", "in_flight", "reason", "started_at"],
     PoolStatus: ["desired_replicas", "ready", "draining", "pending", "total_in_flight", "target_concurrency", "min_replicas", "max_replicas", "warm_pool", "utilization", "cpu_percent", "memory_bytes", "boot_timeout_secs", "cold_start_timeout_secs", "boot_failures", "boot_backoff_secs"],
     VmView: ["sandbox_id", "addr", "in_flight", "healthy", "draining", "uptime_secs", "cpu_percent", "memory_bytes"],
@@ -60,7 +63,7 @@ const KNOWN = {
     StatusCounts: ["total", "c2xx", "c3xx", "c4xx", "c5xx", "errors"],
     Histogram: ["count", "sum", "mean", "p50", "p90", "p99", "buckets"],
     Bucket: ["le", "count"],
-    AutoscaleCounts: ["vms_created", "vms_drained", "vms_reaped", "scale_up_events", "scale_down_events", "cold_start_waits", "cold_start_hits", "cold_start_timeouts", "boot_timeouts", "create_failures", "last_create_error"],
+    AutoscaleCounts: ["vms_created", "vms_drained", "vms_reaped", "scale_up_events", "scale_down_events", "cold_start_waits", "cold_start_hits", "cold_start_timeouts", "boot_timeouts", "create_failures", "last_create_error", "rollout_stalls"],
     HostUsage: ["available", "cpu_count", "cpu_percent", "memory_total_bytes", "memory_used_bytes", "sampled_at_ms"],
     FleetPool: ["deployments", "ready", "draining", "pending", "total_in_flight"],
     ObsStats: ["queued", "dropped", "shipped", "failed", "healthy"],
@@ -122,6 +125,20 @@ const KNOWN = {
     CreatedPostgresDatabase: ["name", "database", "user", "password", "host", "port", "sslmode", "url", "secret", "secret_error", "status", "note"],
     DeletedPostgresDatabase: ["deleted", "database", "secret_kept", "note"],
     ArtifactStoreInfo: ["namespace", "available", "writable", "prefix"],
+    AlertingStatus: ["namespace", "receivers", "rules", "checks", "firing", "pending", "silences", "last_tick", "state_error"],
+    AlertingReceiver: ["id", "format", "endpoint", "signed"],
+    AlertingRuleSummary: ["id", "deployment", "condition", "severity", "receivers"],
+    AlertingAlerts: ["namespace", "active", "resolved"],
+    // `labels` is a string map; its keys are data.
+    AlertingAlert: ["fingerprint", "rule", "deployment", "severity", "condition", "status", "summary", "pending_since", "started_at", "resolved_at", "notified", "last_notified_at", "acked_by", "acked_at", "ack_comment", "labels", "silenced"],
+    AlertingSilence: ["id", "matchers", "until", "comment", "created_by", "created_at"],
+    AlertingSilenceMatchers: ["rule", "deployment", "severity"],
+    AlertingChecks: ["namespace", "checks"],
+    AlertingCheck: ["id", "deployment", "path", "interval_secs", "expect_status", "min_passing", "result"],
+    AlertingCheckResult: ["id", "deployment", "path", "ok", "passing", "total", "last_error", "checked_at"],
+    AlertingDeliveries: ["namespace", "deliveries"],
+    AlertingDelivery: ["delivery_id", "receiver", "event", "fingerprint", "status", "attempts", "response_status", "last_error", "created_at", "updated_at"],
+    AlertingTestDelivery: ["delivery_id", "receiver", "status"],
   },
 };
 
@@ -134,6 +151,7 @@ const FIXTURES = {
   "deployment-status-artifact": "DeploymentStatus",
   "deployment-status-site-artifact": "DeploymentStatus",
   "deployment-status-jwt": "DeploymentStatus",
+  "deployment-status-vm-rolling": "DeploymentStatus",
   "deployment-view-site": "DeploymentView",
   "metrics-response": "MetricsResponse",
   "disks": "DiskInventory",
@@ -178,6 +196,12 @@ const FIXTURES = {
   "postgres-database-created": "CreatedPostgresDatabase",
   "postgres-database-deleted": "DeletedPostgresDatabase",
   "artifact-store-info": "ArtifactStoreInfo",
+  "alerting-status": "AlertingStatus",
+  "alerting-alerts": "AlertingAlerts",
+  "alerting-silence": "AlertingSilence",
+  "alerting-checks": "AlertingChecks",
+  "alerting-deliveries": "AlertingDeliveries",
+  "alerting-test-delivery": "AlertingTestDelivery",
   "auth-provider-google": "AuthProviderView",
   "auth-provider-heyo": "AuthProviderView",
   "deployment-inherited-gate": "DeploymentSpec",
@@ -194,6 +218,8 @@ const MAPS = {
 /** Which declaration governs a nested object, by the key that holds it. */
 const NESTED = {
   placement: "Placement",
+  // A spec's `rollout` is its policy; a status's is where a rollout stands.
+  rollout: "RolloutPolicy", pre_stop: "PreStop",
   spec: "DeploymentSpec", vm: "VmSpec", scaling: "ScalingPolicy", health: "HealthCheck",
   expected_header: "ExpectedHeader",
   discovery: "DiscoverySpec", build: "BuildSpec", artifact: "ArtifactSpec", site: "SiteSpec", update: "UpdateSpec",
@@ -216,6 +242,7 @@ const NESTED = {
   rule: "RuleSpec", match: "RuleMatch",
   global: "DeploymentMetrics", requests: "StatusCounts", latency_ms: "Histogram",
   cold_start_s: "Histogram", autoscale: "AutoscaleCounts",
+  matchers: "AlertingSilenceMatchers", result: "AlertingCheckResult",
 };
 
 /** Which declaration governs the *elements* of an array, by its key. */
@@ -229,6 +256,8 @@ const ELEMENTS = {
   workflows: "WorkflowSpec",
   databases: "PostgresDatabase",
   series: "UsageSeries",
+  active: "AlertingAlert", resolved: "AlertingAlert", checks: "AlertingCheck",
+  deliveries: "AlertingDelivery", receivers: "AlertingReceiver",
   // `mounts` is a MountSpec on a VmSpec and a MountOutcome on a JobRecord — the
   // spec's declaration of a mount, and what one pull of it did. Disambiguated
   // below by the declaration we are inside, the same way `vms` and `auth` are.
@@ -264,6 +293,7 @@ function check(value, declName, path, unknown) {
       if (key === "totals" && declName === "DiskInventory") nested = "DiskTotals";
       // A spec's `site` is how to serve it; a status's is whether it can.
       if (key === "site") nested = declName === "DeploymentStatus" ? "SiteRootStatus" : "SiteSpec";
+      if (key === "rollout") nested = declName === "DeploymentSpec" ? "RolloutPolicy" : "RolloutView";
       // A plugin's `config` and `status` are its own business.
       if ((key === "config" || key === "status") && /Plugin|Install/.test(declName)) nested = undefined;
       // A free-form claim map: the keys are whatever the issuer sends.
@@ -273,6 +303,9 @@ function check(value, declName, path, unknown) {
       let elem = ELEMENTS[key];
       if (key === "vms") elem = declName === "DeploymentView" ? "VmView" : "VmStatus";
       if (key === "mounts") elem = declName === "JobRecord" ? "MountOutcome" : "MountSpec";
+      // `rules` is a guard rule in a security response and a summary on the
+      // alerting plugin's status.
+      if (key === "rules" && declName === "AlertingStatus") elem = "AlertingRuleSummary";
       if (elem) {
         child.forEach((item, i) => {
           if (item && typeof item === "object") check(item, elem, `${path}.${key}[${i}]`, unknown);

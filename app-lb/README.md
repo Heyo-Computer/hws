@@ -208,6 +208,41 @@ itself (`APP_LB_LXC_*`), not through heyvm.
   otherwise uses `http://127.0.0.1:34099`
 - `cmake` — a hard build dependency of `pingora-core`, via `flate2`'s `zlib-ng` backend
 
+## Rolling updates (the default)
+
+Changing a VM pool's template — `PUT /deployments/:id` with a new `vm` block,
+a finished build or pull, a mount moving digest, or re-registering the same id —
+replaces the pool **in place and without interrupting it**. Every VM carries the
+revision of the template it booted from; the autoscaler boots new-revision VMs
+and drains old ones under the spec's `rollout` policy (default
+`strategy: rolling`, `max_surge: 1`, `max_unavailable: 0`), so capacity never
+drops below the target and in-flight requests, WebSockets and shells are never
+cut. A drained VM takes no new requests; once its work ends (or after
+`rollout.drain_timeout_secs`, else `scaling.drain_timeout_secs`, counted from the
+drain) app-lb runs the optional `rollout.pre_stop` command in the guest, then asks
+the daemon to stop it gracefully with `POST /sandboxes/:id/terminate
+{"grace_secs": rollout.stop_grace_secs}`. A daemon without that route answers
+404/405 and app-lb falls back to the plain kill; a kill always follows as a
+backstop. Scale-down and `DELETE /deployments/:id` use the same graceful stop
+(delete drains in the background and hard-kills on app-lb shutdown).
+
+`strategy: recreate` drains every old VM before booting new ones. If no old VM
+is retired and no new one becomes ready for `progress_deadline_secs` (600), the
+rollout pauses — the old VMs keep serving, nothing more is created, and the
+feed and `GET /deployments/:id` (`rollout.phase: paused`, `rollout.reason`) say
+why; any new edit, including reverting, starts a fresh rollout.
+`POST /deployments/:id/rolling-restart` rolls every VM with no spec change
+(`heyctl restart` uses it). Editing only `rollout`, routes, scaling or health
+starts nothing.
+
+Single-writer state (`vm.workspace`, `scaling.idle_action: retain|suspend`)
+defaults to `max_surge: 0, max_unavailable: 1`; an explicit surge is refused.
+Workspace and `suspend` pools, driver changes and switches between backend kinds
+keep the capture-first replace-and-teardown path. A VM adopted after an app-lb
+restart keeps the revision recorded when it was created; one with no record (it
+predates this feature) counts as current unless a rollout is in progress, so
+upgrading app-lb never rolls a settled pool.
+
 ## Conditional candidate-first service rollout
 
 For existing **stateless Firecracker services**, use `POST /deployments/:id/rollouts`
@@ -596,6 +631,8 @@ Configuration is environment-only:
 | `APP_LB_AUTH_KEY` | `app-lb-auth-key` | Signing key for sign-in sessions; generated `0600` on first use |
 | `APP_LB_GUARD_PATH` | `app-lb-guard.json` | Where [block rules](#response-actions) persist, so a restart does not unblock an attacker |
 | `APP_LB_NAME` | `app-lb` | Display name in the dashboard header and page title |
+| `APP_LB_ALERTING_ALLOW_INSECURE` | `false` | Let the [alerting plugin](#alerting-alerting)'s webhook receivers use plain `http://`. The plugin's own `allow_insecure` setting outranks it |
+| `APP_LB_ALERTING_ALLOW_PRIVATE` | `false` | Let alerting receivers resolve to loopback, RFC 1918, link-local, CGNAT or ULA addresses. Cloud metadata, multicast and unspecified addresses stay refused. The plugin's `allow_private` setting outranks it |
 | `APP_LB_USAGE_RETENTION_SECS` | `86400` | How long a billable-traffic series with no new traffic is kept for `GET /usage` before it is dropped. Collectors must read more often than this |
 | `APP_LB_DAEMON_URL` | *(auto: unix socket, else `http://127.0.0.1:34099`)* | heyvm daemon. Left unset, app-lb takes a unix socket when one is discoverable and alive — `HEYVM_SOCKET`, then `socket_path` in `~/.heyo/daemon.json` — and falls back to loopback TCP. Set this to name a non-default or remote daemon: an explicit address is always honoured as given, never traded for a local socket. The transport actually chosen is logged at startup |
 | `APP_LB_DAEMON_API_KEY` | `HEYO_API_KEY` | Bearer credential for an authenticated heyvm daemon; use the HeyoSecret-backed host internal API key in deployments |
@@ -3444,6 +3481,153 @@ JSON
   used for health probes.
 - A namespace holds at most `APP_LB_TUNNELS_PER_NAMESPACE` tunnels
   (default 10).
+
+### Alerting (`alerting`)
+
+Alert rules over a namespace's own deployments, HTTP checks against their
+replicas, and signed webhooks when an alert fires and when it resolves. The
+operator enables it — `{}` is a complete configuration — and each namespace
+installs it with its receivers, rules and checks as the install
+configuration:
+
+```sh
+heyctl plugins enable alerting
+heyctl plugins install alerting -n team-a -f examples/plugins/alerting.json
+heyctl alerts list -n team-a
+```
+
+The operator's configuration takes `allow_insecure` and `allow_private`
+(see `APP_LB_ALERTING_ALLOW_INSECURE` / `APP_LB_ALERTING_ALLOW_PRIVATE`, which
+they outrank) and `tick_secs`, how often rules are evaluated (default 15).
+
+A namespace's configuration ([`examples/plugins/alerting.json`](examples/plugins/alerting.json)):
+
+```json
+{
+  "receivers": [
+    {"id": "ops", "url": "https://hooks.example.com/alerts",
+     "secret": {"secret": "alert-hook", "key": "signing_key"}},
+    {"id": "slack", "url": "https://hooks.slack.com/services/…", "format": "slack"}
+  ],
+  "rules": [
+    {"id": "down", "deployment": "*", "condition": {"type": "no_healthy_replicas"},
+     "for_secs": 60, "severity": "critical", "receivers": ["ops", "slack"]},
+    {"id": "home-page", "deployment": "web",
+     "condition": {"type": "check_failing", "check": "home"}, "receivers": ["ops"]}
+  ],
+  "checks": [
+    {"id": "home", "deployment": "web", "path": "/healthz", "expect_status": 200}
+  ]
+}
+```
+
+- **Receivers** (at most 20): an `https` URL, an optional signing `secret` —
+  a reference into the *namespace's own* secret store, resolved at every send
+  — `format` `generic` (default) or `slack`, and optional extra `headers`
+  (not `Authorization`, `Cookie` or `X-Heyo-*`: credentials belong in the
+  signing secret).
+- **Rules** (at most 100): a `deployment` id or `"*"` for every deployment in
+  the namespace, a `condition`, `for_secs` the condition must hold before the
+  alert fires (default 0), `severity` (`info`, `warning` — the default — or
+  `critical`), the `receivers` to notify, and `repeat_secs` (default 3600; 0
+  never repeats).
+- **Checks** (at most 50): every `interval_secs` (≥ 10, default 30; checks
+  run on the evaluation tick), a `GET path` against each *available* replica
+  of `deployment`, with a `timeout_secs` (default 5). A replica passes on
+  `expect_status`, or any 2xx/3xx when that is unset; redirects are not
+  followed. The check passes when at least `min_passing` (default 1) do.
+
+Conditions, by `type`:
+
+| `type` | Holds when |
+| --- | --- |
+| `no_healthy_replicas` | The deployment has replicas (ready, booting, or a `min_replicas` floor) and none is available. A pool scaled to zero is not an outage |
+| `healthy_replicas_below` `{n}` | Fewer than `n` replicas are available |
+| `create_failures` `{n, window_secs}` | At least `n` VM creates were refused in the window (60–86400s) |
+| `boot_timeouts` `{n, window_secs}` | At least `n` VMs never passed their health check in the window |
+| `cold_start_timeouts` `{n, window_secs}` | At least `n` requests gave up waiting for a cold start in the window |
+| `upstream_unhealthy` | A static deployment has an upstream failing its health check |
+| `rollout_stalled` | A rolling rollout of the deployment stopped making progress |
+| `check_failing` `{check}` | The named check is failing (it probes its own deployment) |
+
+Only deployments whose spec is in the installing namespace are evaluated or
+probed. A named deployment that does not exist yet is simply not evaluated
+until it does. In a fleet the plugin runs on its record's `home` host, which
+evaluates the deployments registered there.
+
+Each `(namespace, rule, deployment)` is one alert with a stable
+`fingerprint`. It is *pending* while the condition holds for less than
+`for_secs`, then *firing*, then *resolved*. A webhook goes out when it fires,
+when it resolves, and every `repeat_secs` while it fires — unless it has been
+acknowledged (`heyctl alerts ack <fingerprint>`; an ack clears on resolve) or
+silenced (`heyctl alerts silence --deployment web --for 2h`). A firing alert
+held by a silence is announced when the silence lapses; a resolve is sent for
+every alert whose firing was.
+
+The webhook (`format: generic`):
+
+```json
+{
+  "version": 1,
+  "namespace": "team-a",
+  "status": "firing",
+  "alert": {
+    "fingerprint": "e3db30bc6149edb819bf012e75b9e110",
+    "rule": "down", "deployment": "web", "severity": "critical",
+    "summary": "web: no healthy replicas (0 of 2 available)",
+    "started_at": 1760000000, "resolved_at": null,
+    "labels": {"namespace": "team-a", "deployment": "web", "rule": "down",
+               "severity": "critical", "condition": "no_healthy_replicas"}
+  },
+  "delivery_id": "dlv_…"
+}
+```
+
+with `Content-Type: application/json`, `X-Heyo-Event: alert.firing`,
+`alert.resolved` or `alert.test`, `X-Heyo-Delivery: <delivery_id>`, and — when
+the receiver has a secret — `X-Heyo-Signature: t=<unix>,v1=<hex>`, where `v1`
+is HMAC-SHA256 with the secret over `"<t>.<raw body>"`. Verify it before
+trusting the body, and reject an old `t` to stop replays:
+
+```python
+import hmac, hashlib, time
+
+def verify(secret: bytes, header: str, body: bytes, tolerance=300) -> bool:
+    parts = dict(p.split("=", 1) for p in header.split(","))
+    t, sig = parts["t"], parts["v1"]
+    if abs(time.time() - int(t)) > tolerance:
+        return False
+    mac = hmac.new(secret, f"{t}.".encode() + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, sig)
+```
+
+Delivery is from a bounded queue (1000; the oldest is dropped when it is
+full, and counted): up to 5 attempts with exponential backoff (1s, 2s, 4s,
+8s, capped at 60s), a 10s timeout, no redirects, and any 2xx is success. Every
+send re-checks the URL: the host is resolved, every address must be public —
+not loopback, RFC 1918, link-local (the metadata service among them), CGNAT,
+ULA, multicast, or an IPv4-mapped spelling of one — and the connection is
+pinned to the address that was checked, with no proxy. The last 200 deliveries
+per namespace are kept in memory.
+
+The namespace surface, under `/namespaces/<ns>/plugins/alerting/`, with the
+page at `ui` (in the plugin console):
+
+| Route | Tier | |
+| --- | --- | --- |
+| `GET api/status` | view | Receivers (origin only), rules, counts |
+| `GET api/alerts` | view | `{active, resolved}` |
+| `POST api/alerts/:fingerprint/ack` | admin | `{comment?}` |
+| `GET api/silences` · `POST api/silences` | view · admin | `{matchers: {rule?, deployment?, severity?}, until, comment?}` — `until` unix seconds or RFC 3339, at most 90 days out |
+| `DELETE api/silences/:id` | admin | |
+| `GET api/checks` | view | Each check and its last result |
+| `GET api/deliveries` | view | The delivery log, newest first |
+| `POST api/receivers/:id/test` | admin | Queue an `alert.test` webhook |
+
+Alerts, acknowledgements and silences persist in
+`app-lb-plugins.d/state/alerting.json` (the `alerting-state` document in a
+fleet). If it cannot be read, alerts still fire but acks and silences are
+refused, and the file is left for an operator to fix.
 
 ### Namespace hosts
 

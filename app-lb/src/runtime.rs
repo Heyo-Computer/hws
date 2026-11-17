@@ -147,6 +147,22 @@ impl Runtime {
     }
 
     /// Destroy a replica. One the runtime has already forgotten counts as gone.
+    /// Stop one of a deployment's replicas gracefully (see
+    /// [`VmManager::terminate`]). A container has no graceful path here and
+    /// is killed as before.
+    pub async fn terminate(
+        &self,
+        driver: Driver,
+        sandbox_id: &str,
+        pre_stop: Option<&crate::config::PreStop>,
+        grace_secs: u64,
+    ) -> Result<(), VmError> {
+        match driver {
+            Driver::Lxc => self.kill(driver, sandbox_id).await,
+            _ => self.heyvm.terminate(sandbox_id, pre_stop, grace_secs).await,
+        }
+    }
+
     pub async fn kill(&self, driver: Driver, sandbox_id: &str) -> Result<(), VmError> {
         match driver {
             Driver::Lxc => self

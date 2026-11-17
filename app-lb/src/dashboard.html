@@ -1288,7 +1288,15 @@ function updateCard(el, d, fresh) {
     `<a class="dep-link" href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u.replace(/^https?:\/\//, ""))}</a>`
   ).join("");
 
+  // A rolling replacement in flight (or paused) gets one tile: how far it
+  // has got, and — when paused — why, in the tooltip.
+  const ro = d.rollout;
+  const rolloutTile = (!ro || ro.phase === "complete") ? "" :
+      `<div title="${esc(ro.reason || `revision ${ro.revision} (${ro.strategy})`)}"><div class="label">Rollout ${esc(ro.phase)}</div>
+       <div class="value ${ro.phase === "paused" ? "err" : ""}">${fmt(ro.updated)} new · ${fmt(ro.stale)} old${ro.draining ? ` · ${fmt(ro.draining)} draining` : ""}</div></div>`;
+
   const kv = `<div><div class="label">In-flight</div><div class="value">${fmt(p.total_in_flight)}</div></div>
+    ${rolloutTile}
     ${poolTiles}
     <div><div class="label">Requests</div><div class="value">${fmt(m.requests.total)}</div></div>
     <div><div class="label">Lat p50</div><div class="value">${m.latency_ms.count ? fmtMs(m.latency_ms.p50) : "—"}</div></div>
