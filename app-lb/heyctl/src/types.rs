@@ -2038,6 +2038,41 @@ pub struct FileWritten {
     pub extra: Extra,
 }
 
+/// `GET /usage`: cumulative billable traffic per (deployment, namespace,
+/// account) series. app-lb counts; whoever bills prices it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UsageReport {
+    /// This app-lb process's run; every series id begins with it.
+    pub boot_id: String,
+    /// Unix seconds.
+    pub generated_at: u64,
+    /// How long an idle series is kept before it is dropped.
+    pub retention_secs: u64,
+    pub series: Vec<UsageSeries>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One series of [`UsageReport`]. Totals only grow; a restart starts a new
+/// series rather than resetting this one.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UsageSeries {
+    pub series_id: String,
+    pub deployment_id: String,
+    pub namespace: String,
+    /// `None`: counted, but metered to nobody.
+    pub account_id: Option<String>,
+    pub requests: u64,
+    /// Response body bytes sent to clients.
+    pub egress_bytes: u64,
+    pub first_recorded_at: u64,
+    pub last_recorded_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// `GET /capacity`: the host, and the caller's own pools.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]

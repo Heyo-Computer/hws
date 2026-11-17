@@ -1,0 +1,27 @@
+{
+  "boot_id": "18a2f0c4d5e6f700-1f40",
+  "generated_at": 1790000300,
+  "retention_secs": 86400,
+  "series": [
+    {
+      "series_id": "18a2f0c4d5e6f700-1f40-1",
+      "deployment_id": "shop",
+      "namespace": "acme",
+      "account_id": "4b7c0e9e-2f0a-4d1c-9a53-0d6b2f1e8c11",
+      "requests": 1204,
+      "egress_bytes": 48211903,
+      "first_recorded_at": 1790000000,
+      "last_recorded_at": 1790000290
+    },
+    {
+      "series_id": "18a2f0c4d5e6f700-1f40-2",
+      "deployment_id": "internal-tools",
+      "namespace": "default",
+      "account_id": null,
+      "requests": 17,
+      "egress_bytes": 9330,
+      "first_recorded_at": 1790000100,
+      "last_recorded_at": 1790000200
+    }
+  ]
+}

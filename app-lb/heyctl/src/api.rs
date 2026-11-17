@@ -482,6 +482,13 @@ impl Client {
             .await
     }
 
+    /// `GET /usage`: cumulative billable traffic per deployment and owner.
+    /// Fleet-wide credentials only.
+    pub async fn usage(&self) -> Result<UsageReport> {
+        self.read(Request::new(Method::Get, "/usage"), "server", "")
+            .await
+    }
+
     // -- running things inside a VM ----------------------------------------
 
     /// Run a command in the deployment's VM and wait for it to finish.

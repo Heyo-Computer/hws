@@ -42,6 +42,7 @@ import type {
   FileWritten,
   LifecycleOutcome,
   Capacity,
+  UsageReport,
 } from "./types.js";
 import type { Shell, ShellOptions } from "./shell.js";
 import type { WaitForJobOptions, WaitForReadyOptions } from "./wait.js";
@@ -653,6 +654,11 @@ export class Heyctl {
   /** What the host has left, and the caller's own pools. */
   capacity(signal?: AbortSignal): Promise<Capacity> {
     return this.request("GET", "/capacity", { kind: "server", name: "", signal });
+  }
+
+  /** Cumulative billable traffic per deployment and owner. Fleet-wide credentials only. */
+  usage(signal?: AbortSignal): Promise<UsageReport> {
+    return this.request("GET", "/usage", { kind: "server", name: "", signal });
   }
 
   // -- transfers ----------------------------------------------------------

@@ -103,6 +103,8 @@ const KNOWN = {
     FileWritten: ["sandbox_id", "path", "wrote", "size"],
     LifecycleOutcome: ["state", "retained", "idle_action", "sandbox_id", "warning"],
     Capacity: ["host", "disk_free_bytes", "disk_total_bytes", "deployments", "running_vms", "booting_vms", "stopped_vms"],
+    UsageReport: ["boot_id", "generated_at", "retention_secs", "series"],
+    UsageSeries: ["series_id", "deployment_id", "namespace", "account_id", "requests", "egress_bytes", "first_recorded_at", "last_recorded_at"],
     Transfer: ["id", "deployment", "direction", "path", "extract", "strip_components", "state", "created_at", "expires_at", "max_bytes", "size", "sha256", "sandbox_id", "error", "upload_url", "download_url"],
     EvictOutcome: ["sandbox_id", "outcome"],
     TokenSummary: ["id", "name", "admin", "namespace", "deployments", "created_at", "expires_at", "last_used_at", "fleet", "mirrored_from"],
@@ -156,6 +158,7 @@ const FIXTURES = {
   "lifecycle-stopped": "LifecycleOutcome",
   "lifecycle-started": "LifecycleOutcome",
   capacity: "Capacity",
+  "usage-report": "UsageReport",
   "transfer-created": "Transfer",
   "transfer-ready": "Transfer",
   "evict-response": "EvictOutcome",
@@ -225,6 +228,7 @@ const ELEMENTS = {
   rows: "BotTrafficRow", ranges: "RangeStatus",
   workflows: "WorkflowSpec",
   databases: "PostgresDatabase",
+  series: "UsageSeries",
   // `mounts` is a MountSpec on a VmSpec and a MountOutcome on a JobRecord — the
   // spec's declaration of a mount, and what one pull of it did. Disambiguated
   // below by the declaration we are inside, the same way `vms` and `auth` are.

@@ -446,6 +446,10 @@ pub struct Metrics {
     /// The unowned sandboxes on the host as of the last successful listing,
     /// whole-vector swapped so a reader never sees a half-written tick.
     host_sandboxes: ArcSwap<Vec<HostSandboxView>>,
+    /// Billable traffic per deployment and owner, for `GET /usage`. Separate
+    /// from the counters above: those are a monitoring view that retires with
+    /// the deployment, these are series a billing collector reads by id.
+    usage: crate::usage::UsageMeter,
 }
 
 #[derive(Debug, Default)]
@@ -511,7 +515,13 @@ impl Metrics {
             host: HostGauge::default(),
             daemon: DaemonGauge::default(),
             host_sandboxes: ArcSwap::from_pointee(Vec::new()),
+            usage: crate::usage::UsageMeter::default(),
         }
+    }
+
+    /// Billable traffic counters (see [`crate::usage`]).
+    pub fn usage(&self) -> &crate::usage::UsageMeter {
+        &self.usage
     }
 
     /// Overwrite the host usage gauge with the daemon's latest sample.

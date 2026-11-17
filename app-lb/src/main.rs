@@ -72,6 +72,7 @@ mod tls;
 mod tokens;
 mod transfers;
 mod unpack;
+mod usage;
 mod tunnel_dialer;
 mod vm;
 mod worker;

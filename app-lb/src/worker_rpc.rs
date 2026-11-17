@@ -555,6 +555,13 @@ async fn send_decision(stream: &mut UnixStream, decision: RequestDecision, state
 }
 
 fn finish(head: &RequestHead, state: &mut RequestState, metrics: &Metrics, access_log: Option<&LogSink>, security: Option<&SecuritySink>, completion: Completion) {
+    // Billable traffic is counted by the host the client reached; a fleet hop
+    // was already counted by the host that forwarded it.
+    if !state.arrived_as_hop()
+        && let Some(d) = state.deployment()
+    {
+        metrics.usage().record(&d.spec.id, &d.spec.namespace, d.spec.account_id.as_deref(), completion.bytes as u64);
+    }
     let deployment = state.deployment().map(|d| d.spec.id.clone());
     let backend = state.backend().map(|b| b.sandbox_id.clone());
     state.complete(); // Admission is released before any telemetry is emitted.
@@ -846,6 +853,36 @@ mod tests {
         exited.send(true).unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap().is_err());
         assert_eq!(backend.in_flight(), 0);
+    }
+
+    #[test]
+    fn finished_requests_are_metered_once_by_the_ingress_host() {
+        let spec: crate::config::DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "shop", "namespace": "acme", "account_id": "acct-1",
+            "routes": [{"host": "app.example"}], "upstreams": ["127.0.0.1:8000"]
+        }))
+        .unwrap();
+        let deployment = Arc::new(crate::deployment::Deployment::new(spec));
+        let metrics = Metrics::new();
+        let completion = |bytes| Completion { status: Some(200), duration_micros: 1_000, bytes, error: None };
+
+        let mut state = RequestState::default();
+        state.set_deployment(deployment.clone());
+        finish(&head(), &mut state, &metrics, None, None, completion(1_500));
+        // The home host of a fleet hop serves it but does not count it again.
+        let mut hop = RequestState::default();
+        hop.set_deployment(deployment.clone());
+        hop.set_hop_in_for_test();
+        finish(&head(), &mut hop, &metrics, None, None, completion(9_999));
+        // An unrouted request is billable to nobody.
+        finish(&head(), &mut RequestState::default(), &metrics, None, None, completion(42));
+
+        let report = metrics.usage().report();
+        assert_eq!(report.series.len(), 1);
+        let series = &report.series[0];
+        assert_eq!((series.deployment_id.as_str(), series.namespace.as_str()), ("shop", "acme"));
+        assert_eq!(series.account_id.as_deref(), Some("acct-1"));
+        assert_eq!((series.requests, series.egress_bytes), (1, 1_500));
     }
 
     #[tokio::test]
