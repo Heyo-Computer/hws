@@ -33,5 +33,14 @@
   "health": {
     "path": "/health",
     "timeout_secs": 2
+  },
+  "rollout": {
+    "strategy": "rolling",
+    "max_surge": 1,
+    "max_unavailable": 0,
+    "min_ready_secs": 10,
+    "drain_timeout_secs": 120,
+    "pre_stop": { "command": "kill -TERM $(cat /run/web.pid) && sleep 5", "timeout_secs": 20 },
+    "stop_grace_secs": 15
   }
 }

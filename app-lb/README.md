@@ -208,6 +208,41 @@ itself (`APP_LB_LXC_*`), not through heyvm.
   otherwise uses `http://127.0.0.1:34099`
 - `cmake` — a hard build dependency of `pingora-core`, via `flate2`'s `zlib-ng` backend
 
+## Rolling updates (the default)
+
+Changing a VM pool's template — `PUT /deployments/:id` with a new `vm` block,
+a finished build or pull, a mount moving digest, or re-registering the same id —
+replaces the pool **in place and without interrupting it**. Every VM carries the
+revision of the template it booted from; the autoscaler boots new-revision VMs
+and drains old ones under the spec's `rollout` policy (default
+`strategy: rolling`, `max_surge: 1`, `max_unavailable: 0`), so capacity never
+drops below the target and in-flight requests, WebSockets and shells are never
+cut. A drained VM takes no new requests; once its work ends (or after
+`rollout.drain_timeout_secs`, else `scaling.drain_timeout_secs`, counted from the
+drain) app-lb runs the optional `rollout.pre_stop` command in the guest, then asks
+the daemon to stop it gracefully with `POST /sandboxes/:id/terminate
+{"grace_secs": rollout.stop_grace_secs}`. A daemon without that route answers
+404/405 and app-lb falls back to the plain kill; a kill always follows as a
+backstop. Scale-down and `DELETE /deployments/:id` use the same graceful stop
+(delete drains in the background and hard-kills on app-lb shutdown).
+
+`strategy: recreate` drains every old VM before booting new ones. If no old VM
+is retired and no new one becomes ready for `progress_deadline_secs` (600), the
+rollout pauses — the old VMs keep serving, nothing more is created, and the
+feed and `GET /deployments/:id` (`rollout.phase: paused`, `rollout.reason`) say
+why; any new edit, including reverting, starts a fresh rollout.
+`POST /deployments/:id/rolling-restart` rolls every VM with no spec change
+(`heyctl restart` uses it). Editing only `rollout`, routes, scaling or health
+starts nothing.
+
+Single-writer state (`vm.workspace`, `scaling.idle_action: retain|suspend`)
+defaults to `max_surge: 0, max_unavailable: 1`; an explicit surge is refused.
+Workspace and `suspend` pools, driver changes and switches between backend kinds
+keep the capture-first replace-and-teardown path. A VM adopted after an app-lb
+restart keeps the revision recorded when it was created; one with no record (it
+predates this feature) counts as current unless a rollout is in progress, so
+upgrading app-lb never rolls a settled pool.
+
 ## Conditional candidate-first service rollout
 
 For existing **stateless Firecracker services**, use `POST /deployments/:id/rollouts`

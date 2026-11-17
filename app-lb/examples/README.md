@@ -389,6 +389,13 @@ heyctl build web --wait --logs
 
 ### Notes on the spec
 
+- **A finished build rolls the pool; it never empties it.** `rollout` says how:
+  one extra replica boots on the new image (`max_surge: 1`), and only once it has
+  been healthy for `min_ready_secs` is an old one drained — it takes no new
+  requests, finishes what it has (up to `drain_timeout_secs`), runs `pre_stop`,
+  and gets `stop_grace_secs` of SIGTERM before it is killed. Omit the block and
+  you get the same rolling behaviour with a one-replica surge and no hook.
+
 - **`vm.image` is the image running *now*; `build` says where the next one comes
   from.** They are separate fields on purpose. Editing `build` is not a template
   change, so it never disturbs the pool — only a finished build does, when it

@@ -1133,7 +1133,7 @@ mod tests {
 
     fn registry_with(routes: Vec<RouteRule>) -> Arc<Registry> {
         let registry = Arc::new(Registry::new("/dev/null"));
-        registry.upsert(DeploymentSpec { tunnel: None,
+        registry.upsert(DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,

@@ -460,6 +460,10 @@ impl Registry {
             // The admin API's rule: a new VM template rebuilds the pool, and
             // anything else keeps it.
             match self.get(&spec.id) {
+                Some(old) if rebuilds(&old.spec, &spec) && rolls_in_place(&old.spec, &spec) => {
+                    tracing::info!(deployment = %spec.id, "applying another fleet host's change to a spread deployment (template changed; rolling)");
+                    self.roll(spec, false);
+                }
                 Some(old) if rebuilds(&old.spec, &spec) => {
                     tracing::info!(deployment = %spec.id, "applying another fleet host's change to a spread deployment (backends changed; rebuilding)");
                     self.upsert(spec);
@@ -886,6 +890,86 @@ impl Registry {
         Some(new)
     }
 
+    /// Swap in a spec whose VM template changed **without emptying the pool**,
+    /// and start a rolling replacement of the replicas it now makes stale.
+    ///
+    /// The live backends and pending VMs are carried as by [`update`]; every one
+    /// of them without a recorded revision is first stamped with the revision
+    /// it was serving (the old deployment's), so the autoscaler can tell old
+    /// from new. `restart` bumps the restart generation, which changes the
+    /// revision even when the template did not — how a restart, or a rebuild
+    /// that reuses an image name, rolls an unchanged spec.
+    ///
+    /// Only valid where [`rolls_in_place`] holds; the caller decides.
+    ///
+    /// [`update`]: Self::update
+    pub fn roll(&self, spec: DeploymentSpec, restart: bool) -> Option<Arc<Deployment>> {
+        let old = self.get(&spec.id)?;
+        if old.state().retirement.is_some() {
+            return None;
+        }
+        let old_revision = old.current_revision();
+        let mut stamped = Vec::new();
+        for b in old.backends().iter() {
+            match b.revision() {
+                Some(r) => stamped.push((b.sandbox_id.clone(), r)),
+                None => {
+                    b.set_revision(Some(old_revision.clone()));
+                    stamped.push((b.sandbox_id.clone(), old_revision.clone()));
+                }
+            }
+        }
+        let pending: Vec<_> = old
+            .pending()
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                let r = p.revision.get_or_insert_with(|| old_revision.clone()).clone();
+                stamped.push((p.sandbox_id.clone(), r));
+                p
+            })
+            .collect();
+        old.set_pending(pending);
+        let new = self.update(spec)?;
+        let now = crate::deployment::now_secs();
+        new.mutate_state(|s| {
+            if restart {
+                s.restart_nonce = s.restart_nonce.saturating_add(1);
+            }
+            for (id, revision) in &stamped {
+                s.revisions.insert(id.clone(), revision.clone());
+            }
+            // A retained (stopped) replica was booted from the old template
+            // unless its revision says otherwise.
+            for id in s.suspended.clone() {
+                s.revisions.entry(id).or_insert_with(|| old_revision.clone());
+            }
+        });
+        let revision = new.current_revision();
+        let strategy = new.spec.effective_rollout().strategy;
+        new.mutate_state(|s| {
+            s.rollout_progress = Some(crate::deployment::RolloutProgress::new(revision, strategy, now));
+        });
+        tracing::info!(
+            deployment = %new.spec.id,
+            from = %old_revision,
+            to = %new.current_revision(),
+            strategy = strategy.as_str(),
+            "rolling replacement started",
+        );
+        new.scale_signal.notify_one();
+        Some(new)
+    }
+
+    /// Why `deployment_id`'s rolling rollout is paused, when it is: the
+    /// progress deadline passed with neither an old replica retired nor a new
+    /// one ready. `None` while it progresses, once it completes, and for an
+    /// unknown id. For alerting.
+    #[allow(dead_code)] // read by the alerting plugin
+    pub fn rollout_stall_reason(&self, deployment_id: &str) -> Option<String> {
+        self.get(deployment_id)?.rollout_stall_reason()
+    }
+
     pub fn remove(&self, id: &str) -> Option<Arc<Deployment>> {
         let removed = self.get(id)?;
         if removed.state().retirement.is_some() {return None;}
@@ -1298,6 +1382,27 @@ fn state_key(id: &str) -> String {
     out
 }
 
+/// Whether a VM-template change from `old` to `new` can be rolled in place
+/// ([`Registry::roll`]) instead of rebuilding the pool from scratch.
+///
+/// Both must be ordinary VM pools on the same runtime. Everything else keeps
+/// the historical replace-and-tear-down path:
+/// * a change of backend kind (VM ⇄ static upstreams, site or tunnel) — the
+///   old backends are not replicas of anything the new spec describes;
+/// * a driver change — old replicas live on a different runtime;
+/// * `vm.workspace` and `idle_action: suspend` — their teardown captures
+///   single-writer state before the next replica may boot, which that path
+///   already sequences (a workspace fence, a stateful capture).
+pub fn rolls_in_place(old: &DeploymentSpec, new: &DeploymentSpec) -> bool {
+    use crate::config::IdleAction;
+    let plain = |s: &DeploymentSpec| {
+        s.is_managed()
+            && s.vm.as_ref().is_some_and(|vm| vm.workspace.is_none())
+            && s.scaling.idle_action != IdleAction::Suspend
+    };
+    plain(old) && plain(new) && old.driver() == new.driver()
+}
+
 /// Whether moving from `old` to `new` needs a new pool: the admin API's
 /// rule (a different VM template or upstream list), except that a pull
 /// filling in `vm.image` for an unchanged artifact is the same template. Each
@@ -1330,7 +1435,7 @@ mod tests {
     use std::path::Path;
 
     fn spec(id: &str, routes: Vec<RouteRule>) -> DeploymentSpec {
-        DeploymentSpec { tunnel: None,
+        DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,
@@ -1376,7 +1481,7 @@ mod tests {
     }
 
     fn static_spec(id: &str, routes: Vec<RouteRule>, upstreams: &[&str]) -> DeploymentSpec {
-        DeploymentSpec { tunnel: None,
+        DeploymentSpec { tunnel: None, rollout: Default::default(),
             placement: None,
             ingress: None,
             account_id: None,
@@ -2165,11 +2270,14 @@ mod tests {
         assert!(r.get("web").is_some() && r.route(Some("web.example"), "/").is_some());
         assert!(r.get("pin").is_none(), "a pinned change waits for this host's next start");
 
-        // Changed there: changed here, and a new template rebuilds the pool.
+        // Changed there: changed here, and a new template rolls the pool in
+        // place rather than handing it to teardown.
         write("web", spread.clone(), 9090);
         r.apply_fleet_changes();
-        assert_eq!(r.get("web").unwrap().spec.vm.as_ref().unwrap().port, 9090);
-        assert_eq!(r.take_fleet_removed().len(), 1, "the old pool goes to teardown");
+        let web = r.get("web").unwrap();
+        assert_eq!(web.spec.vm.as_ref().unwrap().port, 9090);
+        assert!(web.state().rollout_progress.as_ref().is_some_and(|p| p.is_active()), "a rolling replacement starts");
+        assert!(r.take_fleet_removed().is_empty(), "the pool is kept, not torn down");
 
         // Moved off this host, then gone: out of routing, handed to teardown.
         write("web", serde_json::json!({"mode": "spread", "hosts": ["us5"]}), 9090);

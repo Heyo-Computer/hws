@@ -69,6 +69,49 @@ sandbox reached only through <code>exec</code>/<code>shell</code>.</p>
   <tr><td><code>idle_action</code></td><td><code>destroy</code></td><td><code>retain</code> stops idle VMs instead of destroying them; the next scale-up <em>resumes</em> the stopped VM, keeping its <code>/workspace</code> disk.</td></tr>
 </table>
 
+<h2>Rolling updates</h2>
+<p>A change to the <code>vm</code> block — an edit, a finished <code>build</code> or
+<code>pull</code>, a mount moving to a new digest — never empties the pool. Every VM
+carries the <em>revision</em> of the template it booted from; after the change the old
+ones are <em>stale</em>, and the autoscaler replaces them under the
+<code>rollout</code> policy while the pool keeps serving. Editing anything else
+(routes, scaling, health, <code>rollout</code> itself) starts no rollout.</p>
+<pre><code>"rollout": {
+  "strategy": "rolling",
+  "max_surge": 1,
+  "max_unavailable": 0,
+  "min_ready_secs": 10,
+  "progress_deadline_secs": 600,
+  "drain_timeout_secs": 120,
+  "pre_stop": { "command": "nginx -s quit", "timeout_secs": 30 },
+  "stop_grace_secs": 10
+}</code></pre>
+<table>
+  <tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+  <tr><td><code>strategy</code></td><td><code>rolling</code></td><td><code>rolling</code> boots new VMs before draining old ones; <code>recreate</code> drains every old VM, waits for them to stop, then boots.</td></tr>
+  <tr><td><code>max_surge</code></td><td>1 (0 for single-writer state)</td><td>VMs allowed above the target while rolling.</td></tr>
+  <tr><td><code>max_unavailable</code></td><td>0 (1 for single-writer state)</td><td>VMs allowed below the target. Cannot be 0 together with <code>max_surge</code>.</td></tr>
+  <tr><td><code>min_ready_secs</code></td><td>0</td><td>How long a new VM must be healthy before an old one may be drained against it.</td></tr>
+  <tr><td><code>progress_deadline_secs</code></td><td>600</td><td>With no old VM retired and no new one ready for this long, the rollout <em>pauses</em>: nothing more is created, the old VMs keep serving, and the event feed says why. Any new edit — reverting included — starts a new rollout.</td></tr>
+  <tr><td><code>drain_timeout_secs</code></td><td><code>scaling.drain_timeout_secs</code></td><td>How long a drained old VM may finish in-flight requests, WebSockets and shells, counted from the drain.</td></tr>
+  <tr><td><code>pre_stop</code></td><td>none</td><td>A command run in the guest (<code>sh -c</code>) before every graceful stop — rollout, scale-down and delete. Bounded by its <code>timeout_secs</code> (default 30); a failure is logged and the stop continues.</td></tr>
+  <tr><td><code>stop_grace_secs</code></td><td>10</td><td>SIGTERM grace the daemon gives the guest (<code>POST /sandboxes/:id/terminate</code>) before killing it. A daemon without that route is sent a plain kill.</td></tr>
+</table>
+<p><em>Single-writer state</em> is <code>vm.workspace</code> or
+<code>scaling.idle_action</code> <code>retain</code>/<code>suspend</code>: two replicas side
+by side would each own a divergent copy, so such a deployment defaults to
+<code>max_surge: 0, max_unavailable: 1</code> and an explicit surge is refused.
+Workspace and <code>suspend</code> deployments still replace their pool through the
+capture-first teardown path rather than in place; so does any change between backend
+kinds or drivers.</p>
+<p><code>GET /deployments/:id</code> reports progress as
+<code>rollout: {revision, strategy, phase, reason, updated, stale, draining, started_at,
+last_progress_at}</code>; <code>heyctl describe</code> and the dashboard show it too.
+<code>POST /deployments/:id/rolling-restart</code> (or <code>heyctl restart</code>) rolls
+every VM without a spec change. Deleting a deployment also drains first: VMs stop
+taking requests at once and are stopped gracefully once idle or at the drain
+deadline.</p>
+
 <h3>What a cold start looks like</h3>
 <ol>
   <li>A request routes to a deployment whose pool has no available backend.</li>

@@ -922,6 +922,82 @@ impl VmManager {
         }
     }
 
+    /// Stop a VM gracefully, then make sure it is gone.
+    ///
+    /// Three steps, each best-effort except the last:
+    /// 1. `pre_stop`, when given, runs in the guest through the ordinary exec
+    ///    route, bounded by its own timeout. A failure is logged and the stop
+    ///    goes on: a hook must never be able to keep a VM alive.
+    /// 2. `POST /sandboxes/:id/terminate` with `{"grace_secs": N}` asks the
+    ///    daemon to SIGTERM the workload and wait up to `N` seconds before
+    ///    destroying the sandbox. A daemon without the route answers 404 or
+    ///    405; a 404 cannot be told apart from "no such sandbox", and both
+    ///    end the same way — at step 3.
+    /// 3. A plain [`kill`](Self::kill), always, as the backstop: a sandbox the
+    ///    terminate already removed is NotFound, which `kill` treats as done.
+    pub async fn terminate(
+        &self,
+        sandbox_id: &str,
+        pre_stop: Option<&crate::config::PreStop>,
+        grace_secs: u64,
+    ) -> Result<(), VmError> {
+        if let Some(hook) = pre_stop {
+            let within = Duration::from_secs(hook.timeout_secs);
+            let run = self.exec(
+                sandbox_id,
+                &hook.command,
+                CommandRunOptions { cwd: None, env: None, timeout: Some(within) },
+            );
+            match tokio::time::timeout(within + Duration::from_secs(5), run).await {
+                Ok(Ok(result)) if result.exit_code == 0 => {
+                    tracing::info!(sandbox = %sandbox_id, "pre_stop hook finished");
+                }
+                Ok(Ok(result)) => tracing::warn!(
+                    sandbox = %sandbox_id,
+                    exit_code = result.exit_code,
+                    "pre_stop hook failed; stopping the VM anyway",
+                ),
+                Ok(Err(e)) => tracing::warn!(
+                    sandbox = %sandbox_id, error = %e,
+                    "pre_stop hook could not run; stopping the VM anyway",
+                ),
+                Err(_) => tracing::warn!(
+                    sandbox = %sandbox_id,
+                    timeout_secs = hook.timeout_secs,
+                    "pre_stop hook timed out; stopping the VM anyway",
+                ),
+            }
+        }
+        let grace = grace_secs.min(crate::config::MAX_STOP_GRACE_SECS);
+        let path = format!(
+            "/sandboxes/{}/terminate",
+            form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()
+        );
+        let body = serde_json::json!({ "grace_secs": grace });
+        let opts = heyo_sdk::RequestOptions {
+            timeout: Some(Duration::from_secs(grace + 15)),
+            ..heyo_sdk::RequestOptions::default()
+        };
+        match self.client.raw_request(reqwest::Method::POST, &path, Some(&body), opts).await {
+            Ok(response) if response.status().is_success() => {
+                tracing::debug!(sandbox = %sandbox_id, grace_secs = grace, "daemon terminated VM");
+            }
+            Ok(response) => {
+                let status = response.status();
+                if matches!(status.as_u16(), 404 | 405 | 501) {
+                    tracing::debug!(
+                        sandbox = %sandbox_id, %status,
+                        "daemon has no graceful terminate for this VM (or no such VM); killing",
+                    );
+                } else {
+                    tracing::warn!(sandbox = %sandbox_id, %status, "graceful terminate refused; killing");
+                }
+            }
+            Err(e) => tracing::warn!(sandbox = %sandbox_id, error = %e, "graceful terminate failed; killing"),
+        }
+        self.kill(sandbox_id).await
+    }
+
     /// Keep a VM's TTL backstop from expiring under a long-lived deployment.
     pub async fn renew_ttl(&self, sandbox_id: &str, ttl_seconds: u64) -> Result<(), VmError> {
         let sandbox = self.connect(sandbox_id.to_string())?;

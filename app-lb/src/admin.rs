@@ -1368,6 +1368,53 @@ struct DeploymentStatus {
     /// path that only exists on the caller's machine is noticed at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     site: Option<crate::site::RootStatus>,
+    /// The rolling replacement in progress, or the last one. Absent for a
+    /// deployment that has never rolled, so older payloads are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollout: Option<RolloutView>,
+}
+
+/// Where a deployment's rolling replacement stands, counted from the live
+/// pool. See [`crate::deployment::RolloutProgress`].
+#[derive(Serialize)]
+struct RolloutView {
+    /// The template revision being rolled to (and that new replicas boot).
+    revision: String,
+    strategy: &'static str,
+    /// `progressing`, `paused` or `complete`.
+    phase: &'static str,
+    /// Why it paused, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// Replicas on the current revision, serving.
+    updated: usize,
+    /// Replicas of an older revision still taking traffic, or booting.
+    stale: usize,
+    /// Old replicas drained, finishing their in-flight work.
+    draining: usize,
+    started_at: u64,
+    last_progress_at: u64,
+}
+
+fn rollout_view(d: &crate::deployment::Deployment) -> Option<RolloutView> {
+    let progress = d.state().rollout_progress.clone()?;
+    let backends = d.backends();
+    let stale = |r: Option<String>| d.is_stale(r.as_deref());
+    Some(RolloutView {
+        revision: d.current_revision(),
+        strategy: progress.strategy.as_str(),
+        phase: progress.phase.as_str(),
+        reason: match &progress.phase {
+            crate::deployment::RolloutPhase::Paused { reason } => Some(reason.clone()),
+            _ => None,
+        },
+        updated: backends.iter().filter(|b| !b.is_draining() && !stale(b.revision())).count(),
+        stale: backends.iter().filter(|b| !b.is_draining() && stale(b.revision())).count()
+            + d.pending().iter().filter(|p| stale(p.revision.clone())).count(),
+        draining: backends.iter().filter(|b| b.is_draining() && stale(b.revision())).count(),
+        started_at: progress.started_at,
+        last_progress_at: progress.last_progress_at,
+    })
 }
 
 fn is_default_namespace_str(ns: &String) -> bool {
@@ -1479,6 +1526,7 @@ fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> Depl
             })
             .collect(),
         pending_vms: pending_vms_of(d),
+        rollout: rollout_view(d),
     }
 }
 
@@ -1612,6 +1660,9 @@ struct DeploymentView {
     /// Booting VMs, oldest first — the ones holding a cold start open.
     pending_vms: Vec<PendingVmView>,
     metrics: DeploymentMetricsSnapshot,
+    /// See [`DeploymentStatus::rollout`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollout: Option<RolloutView>,
 }
 
 /// A rollup of pool gauges across every deployment, for the top-of-dashboard
@@ -1952,6 +2003,7 @@ async fn metrics_snapshot(
                 },
                 pending_vms: if q.summary { Vec::new() } else { pending_vms_of(d) },
                 metrics: state.metrics.deployment_snapshot(&d.spec.id),
+                rollout: rollout_view(d),
             }
         })
         .collect();
@@ -4976,7 +5028,21 @@ async fn register(
         },
         None => None,
     };
-    let deployment = state.registry.upsert(spec);
+    // Replacing an ordinary VM pool rolls it in place rather than abandoning
+    // it: same template or not, a replace means fresh replicas, so an
+    // identical template rolls under a new restart generation.
+    let in_place = old.as_ref().is_some_and(|old| {
+        crate::registry::rolls_in_place(&old.spec, &spec) && workspace_replacement.is_none()
+    });
+    let deployment = if in_place {
+        let restart = old.as_ref().is_some_and(|old| old.spec.vm == spec.vm);
+        match state.registry.roll(spec, restart) {
+            Some(d) => d,
+            None => return err(StatusCode::CONFLICT, "deployment could not be replaced").into_response(),
+        }
+    } else {
+        state.registry.upsert(spec)
+    };
     if let Err(e) = state.registry.persist_one(&id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
         if create_only {
@@ -4985,7 +5051,7 @@ async fn register(
         }
     }
     drop(change);
-    if let Some(old) = old {
+    if let Some(old) = old.filter(|_| !in_place) {
         state.autoscaler.teardown(&old).await;
     }
     if let Some(fence) = workspace_replacement {
@@ -5111,10 +5177,16 @@ async fn update(
     }
 
     // The owner is not part of the template, so a stamp never recycles a pool.
+    // Neither is the `rollout` policy: changing how a rollout runs starts none.
     let rebuild = old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams;
     if !rebuild && stateful_policy_change_holds(&old, spec.scaling.idle_action) {
         return err(StatusCode::CONFLICT, "stateful lifecycle is a boot-time contract; create a new deployment instead of changing it on an existing VM pool").into_response();
     }
+    // A new template on an ordinary VM pool rolls in place: the pool is kept
+    // and replaced a few replicas at a time under `spec.rollout`. Everything
+    // else a rebuild can be keeps the replace-and-tear-down path.
+    let in_place = rebuild && crate::registry::rolls_in_place(&old.spec, &spec);
+    let rebuild = rebuild && !in_place;
     let workspace_replacement = if rebuild {
         match state.autoscaler.fence_workspace_replacement(&old).await {
             Ok(fence) => fence,
@@ -5123,7 +5195,13 @@ async fn update(
     } else {
         None
     };
-    let deployment = if rebuild {
+    let deployment = if in_place {
+        tracing::info!(deployment = %id, "updating deployment (template changed; rolling)");
+        match state.registry.roll(spec, false) {
+            Some(d) => d,
+            None => return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response(),
+        }
+    } else if rebuild {
         // The backend set changed — a managed VM *template*, or a static
         // deployment's upstream list (or a switch between the two kinds). The
         // running backends no longer match the spec, so rebuild from scratch
@@ -5592,6 +5670,47 @@ async fn restart_deployment(
     match start_pool(&state, &id, wait).await {
         Ok(r) | Err(r) => r,
     }
+}
+
+/// `POST /deployments/:id/rolling-restart` — replace every replica under the
+/// deployment's `rollout` policy, without emptying the pool or cutting off
+/// in-flight work. Bumps the restart generation, which is part of every
+/// replica's revision, so all of them become stale and roll.
+///
+/// Distinct from `POST …/restart`, which stops and resumes the same sandbox
+/// (the agent-sandbox lifecycle): a client probing for this route gets a 404
+/// from an older app-lb rather than a stop it did not ask for.
+async fn rolling_restart(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    let change = state.registry.change_guard().await;
+    let Some(old) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+    };
+    if crate::rollout::reserved(&old) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
+    if !old.spec.is_managed() {
+        return err(StatusCode::BAD_REQUEST, format!("deployment {id:?} has no VMs to restart")).into_response();
+    }
+    if !crate::registry::rolls_in_place(&old.spec, &old.spec) {
+        return err(
+            StatusCode::CONFLICT,
+            "this deployment's replicas hold single-writer state (vm.workspace or idle_action \
+             suspend) and cannot roll; use POST /deployments/:id/restart with {\"fresh\": true}",
+        )
+        .into_response();
+    }
+    let Some(deployment) = state.registry.roll(old.spec.clone(), true) else {
+        return err(StatusCode::CONFLICT, "deployment permanently frozen for retirement").into_response();
+    };
+    if let Err(e) = state.registry.persist_one(&id) {
+        tracing::error!(deployment = %id, error = %e, "failed to persist state");
+    }
+    drop(change);
+    tracing::info!(deployment = %id, "rolling restart requested");
+    (StatusCode::ACCEPTED, Json(status_of(&state, &deployment))).into_response()
 }
 
 /// `GET /capacity`: what the host has left, and what the caller's
@@ -6459,7 +6578,8 @@ async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> 
     }
     drop(change);
     // Removed from routing first, so the teardown can't race new requests in.
-    state.autoscaler.teardown(&d).await;
+    // Drain-aware: in-flight requests finish before their VM is stopped.
+    state.autoscaler.teardown_draining(&d).await;
     // Its counters fold into the global rollup and its entry goes; a fleet whose
     // ids churn would otherwise accumulate one per sandbox that ever existed.
     state.metrics.retire(&id);
@@ -8365,6 +8485,11 @@ async fn start_rollout(State(state): State<AdminState>, Path(id): Path<String>, 
     let _lifecycle = state.autoscaler.rollout_guard().await;
     let _change = state.registry.change_guard().await;
     let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    // Two engines must not replace one pool at once: the candidate engine
+    // would retire replicas the rolling replacement is counting.
+    if d.state().rollout_progress.as_ref().is_some_and(|p| p.phase == crate::deployment::RolloutPhase::Progressing) {
+        return err(StatusCode::CONFLICT, "a rolling replacement of this deployment is in progress; wait for it to complete (GET /deployments/:id shows `rollout`) before starting a candidate rollout").into_response();
+    }
     match state.jobs.with_rollout_slot(&id, || state.rollouts.admit(&d, request)) {
         Ok(o) => (StatusCode::ACCEPTED, Json(o.view())).into_response(),
         Err(e) => err(StatusCode::CONFLICT, e).into_response(),
@@ -8746,6 +8871,7 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/stop", post(stop_deployment))
         .route("/deployments/:id/start", post(start_deployment))
         .route("/deployments/:id/restart", post(restart_deployment))
+        .route("/deployments/:id/rolling-restart", post(rolling_restart))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
         .route(
             "/deployments/:id/upstreams/:upstream/drain",
@@ -10501,6 +10627,66 @@ mod tests {
                     }))
                     .unwrap(),
                 );
+            }
+
+            /// A new template keeps the pool and rolls it; a rollout-policy
+            /// edit is not a template change at all. While it rolls, the
+            /// candidate engine stays out, and a rolling restart starts a new
+            /// generation.
+            #[tokio::test]
+            async fn a_template_edit_rolls_in_place_and_a_rollout_only_edit_is_not_a_rebuild() {
+                let f = fixture(true).await;
+                f.registry.upsert(
+                    serde_json::from_value(json!({
+                        "id": "web", "routes": [],
+                        "vm": {"driver": "firecracker", "port": 8080},
+                        "scaling": {"min_replicas": 1}
+                    }))
+                    .unwrap(),
+                );
+                let d = f.registry.get("web").unwrap();
+                let old = Arc::new(crate::deployment::VmBackend::new(
+                    "sb-old".into(),
+                    "127.0.0.1:9".parse().unwrap(),
+                ));
+                d.set_backends(vec![old.clone()]);
+                let mut spec = serde_json::to_value(&d.spec).unwrap();
+
+                spec["rollout"] = json!({"max_surge": 2, "stop_grace_secs": 30});
+                let (status, body) = call(&f, "PUT", "/deployments/web", spec.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let d = f.registry.get("web").unwrap();
+                assert!(Arc::ptr_eq(&d.backends()[0], &old), "pool preserved");
+                assert!(d.state().rollout_progress.is_none(), "a policy edit starts no rollout");
+                assert_eq!(d.spec.rollout.max_surge, Some(2));
+                assert!(body.get("rollout").is_none());
+
+                spec["vm"]["env_vars"] = json!({"RELEASE": "2"});
+                let (status, body) = call(&f, "PUT", "/deployments/web", spec.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["rollout"]["phase"], "progressing", "{body}");
+                assert_eq!(body["rollout"]["stale"], 1);
+                let d = f.registry.get("web").unwrap();
+                assert!(Arc::ptr_eq(&d.backends()[0], &old), "the old replica keeps serving");
+                assert!(!old.is_draining());
+                assert!(d.is_stale(old.revision().as_deref()));
+
+                let (status, body) = call(&f, "POST", "/deployments/web/rollouts", json!({
+                    "operation_id": "op-1",
+                    "expected_revision": d.state().rollout_revision,
+                    "spec": spec,
+                }))
+                .await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert!(body["error"].as_str().unwrap().contains("rolling replacement"), "{body}");
+
+                let before = d.current_revision();
+                let (status, body) = call(&f, "POST", "/deployments/web/rolling-restart", json!({})).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+                let d = f.registry.get("web").unwrap();
+                assert_eq!(d.state().restart_nonce, 1);
+                assert_ne!(d.current_revision(), before);
+                assert_eq!(body["rollout"]["revision"], d.current_revision());
             }
 
             #[tokio::test]

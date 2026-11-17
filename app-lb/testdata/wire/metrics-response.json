@@ -160,6 +160,7 @@
       "cold_start_timeouts": 1,
       "boot_timeouts": 1,
       "create_failures": 1,
+      "rollout_stalls": 1,
       "last_create_error": "api error (500): No space left on device"
     }
   },
@@ -376,8 +377,19 @@
           "cold_start_timeouts": 1,
           "boot_timeouts": 1,
           "create_failures": 1,
+          "rollout_stalls": 1,
           "last_create_error": "api error (500): No space left on device"
         }
+      },
+      "rollout": {
+        "revision": "3f9a0c1d2e4b5a6c",
+        "strategy": "rolling",
+        "phase": "progressing",
+        "updated": 1,
+        "stale": 1,
+        "draining": 1,
+        "started_at": 1722400000,
+        "last_progress_at": 1722400030
       }
     }
   ],

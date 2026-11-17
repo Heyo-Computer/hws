@@ -270,6 +270,8 @@ struct AutoscaleCounts {
     /// system produces, and it is exactly the state a host with no room for a
     /// `disk_size_gb` allocation lands in.
     create_failures: AtomicU64,
+    /// Rolling replacements that hit their progress deadline and paused.
+    rollout_stalls: AtomicU64,
     /// What the daemon said the last time it refused. The counter says a pool is
     /// stuck; this says why, which is the half that ends the investigation —
     /// "No space left on device" and "image not found" produce identical
@@ -291,6 +293,7 @@ impl AutoscaleCounts {
             cold_start_timeouts: self.cold_start_timeouts.load(Ordering::Relaxed),
             boot_timeouts: self.boot_timeouts.load(Ordering::Relaxed),
             create_failures: self.create_failures.load(Ordering::Relaxed),
+            rollout_stalls: self.rollout_stalls.load(Ordering::Relaxed),
             last_create_error: self
                 .last_create_error
                 .lock()
@@ -312,8 +315,16 @@ pub struct AutoscaleSnapshot {
     pub cold_start_timeouts: u64,
     pub boot_timeouts: u64,
     pub create_failures: u64,
+    /// Omitted while zero, so the payload is unchanged for a fleet that has
+    /// never had a rollout stall.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rollout_stalls: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_create_error: Option<String>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl AutoscaleSnapshot {
@@ -328,6 +339,7 @@ impl AutoscaleSnapshot {
         self.cold_start_timeouts += o.cold_start_timeouts;
         self.boot_timeouts += o.boot_timeouts;
         self.create_failures += o.create_failures;
+        self.rollout_stalls += o.rollout_stalls;
         if self.last_create_error.is_none() {
             self.last_create_error = o.last_create_error.clone();
         }
@@ -681,6 +693,11 @@ impl Metrics {
         let m = self.deployment(deployment);
         m.autoscale.vms_drained.fetch_add(n, Ordering::Relaxed);
         m.autoscale.scale_down_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A rolling replacement passed its progress deadline and paused.
+    pub fn record_rollout_stall(&self, deployment: &str) {
+        self.deployment(deployment).autoscale.rollout_stalls.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_reaped(&self, deployment: &str, n: u64) {
