@@ -3,7 +3,7 @@
 // drift on the wire.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ArtifactsClient, ConflictError, Hws, Heyctl, ObsClient, PostgresClient, logQueryString } from "../dist/index.js";
+import { AlertingClient, ArtifactsClient, ConflictError, Hws, Heyctl, ObsClient, PostgresClient, logQueryString } from "../dist/index.js";
 
 function stub(...replies) {
   const seen = [];
@@ -161,6 +161,35 @@ test("postgres databases go through the namespace's plugin route", async () => {
   );
   assert.deepEqual(s.seen[0].body, { name: "app", secret: true });
   assert.deepEqual(s.seen[1].body, { name: "scratch", secret: false });
+});
+
+test("alerts go through the namespace's plugin route", async () => {
+  const s = stub(
+    { body: { namespace: "team a", active: [{ fingerprint: "f1", status: "firing" }], resolved: [] } },
+    { body: { fingerprint: "f1", acked_by: "user:1" } },
+    { status: 201, body: { id: "sil_1", matchers: { deployment: "web" }, until: 99 } },
+    { body: { deleted: "sil_1" } },
+    { status: 202, body: { delivery_id: "dlv_1", receiver: "ops", status: "queued" } },
+    { body: { namespace: "team a", checks: [] } },
+    { body: { namespace: "team a", deliveries: [] } },
+  );
+  const a = lb(s).alerting("team a");
+  assert.ok(a instanceof AlertingClient);
+  assert.equal((await a.alerts()).active[0].fingerprint, "f1");
+  assert.equal((await a.ack("f1", "on it")).acked_by, "user:1");
+  assert.equal((await a.silence({ deployment: "web", until: 99 })).id, "sil_1");
+  assert.equal((await a.unsilence("sil_1")).deleted, "sil_1");
+  assert.equal((await a.testReceiver("ops")).delivery_id, "dlv_1");
+  await a.checks();
+  await a.deliveries();
+  const base = "/namespaces/team%20a/plugins/alerting/api";
+  assert.deepEqual(
+    s.seen.map((r) => `${r.method} ${r.url}`),
+    [`GET ${base}/alerts`, `POST ${base}/alerts/f1/ack`, `POST ${base}/silences`, `DELETE ${base}/silences/sil_1`,
+      `POST ${base}/receivers/ops/test`, `GET ${base}/checks`, `GET ${base}/deliveries`],
+  );
+  assert.deepEqual(s.seen[1].body, { comment: "on it" });
+  assert.deepEqual(s.seen[2].body, { matchers: { deployment: "web" }, until: 99, comment: "" });
 });
 
 test("artifacts go through the namespace's plugin route, a tag's digest as text", async () => {

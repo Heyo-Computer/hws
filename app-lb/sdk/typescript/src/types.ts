@@ -1779,6 +1779,185 @@ export interface DeletedPostgresDatabase {
   [extra: string]: unknown;
 }
 
+// -- alerts (the alerting plugin) -------------------------------------------
+
+/** A receiver in {@link AlertingStatus}. Never carries the webhook's path. */
+export interface AlertingReceiver {
+  id: string;
+  /** `generic` or `slack`. */
+  format: string;
+  /** Scheme, host and port only. */
+  endpoint: string;
+  /** Whether requests carry `X-Heyo-Signature`. */
+  signed: boolean;
+  [extra: string]: unknown;
+}
+
+/** A rule in {@link AlertingStatus}. */
+export interface AlertingRuleSummary {
+  id: string;
+  /** A deployment id, or `*`. */
+  deployment: string;
+  /** The condition's `type`, e.g. `no_healthy_replicas`. */
+  condition: string;
+  severity: string;
+  receivers: string[];
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/status`. */
+export interface AlertingStatus {
+  namespace: string;
+  receivers: AlertingReceiver[];
+  rules: AlertingRuleSummary[];
+  /** How many checks are configured. */
+  checks: number;
+  firing: number;
+  pending: number;
+  silences: number;
+  /** When rules were last evaluated (unix seconds). */
+  last_tick: number | null;
+  /** Why the plugin's state could not be read; acks and silences are refused meanwhile. */
+  state_error: string | null;
+  [extra: string]: unknown;
+}
+
+/** One alert: one rule on one deployment. */
+export interface AlertingAlert {
+  /** Stable for the `(namespace, rule, deployment)`. */
+  fingerprint: string;
+  rule: string;
+  deployment: string;
+  severity: string;
+  condition: string;
+  /** `pending`, `firing` or `resolved`. */
+  status: string;
+  summary: string;
+  pending_since: number;
+  started_at?: number;
+  resolved_at?: number;
+  /** Whether the firing webhook went out (it is held while silenced). */
+  notified: boolean;
+  last_notified_at?: number;
+  acked_by?: string;
+  acked_at?: number;
+  ack_comment?: string;
+  labels: Record<string, string>;
+  /** Whether a silence matches it now. */
+  silenced: boolean;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/alerts`. */
+export interface AlertingAlerts {
+  namespace: string;
+  /** Pending and firing. */
+  active: AlertingAlert[];
+  /** Recently resolved, newest first. */
+  resolved: AlertingAlert[];
+  [extra: string]: unknown;
+}
+
+/** What a silence matches. An unset matcher matches anything. */
+export interface AlertingSilenceMatchers {
+  rule?: string;
+  deployment?: string;
+  severity?: string;
+  [extra: string]: unknown;
+}
+
+/** A silence: notifications for matching alerts are held until `until`. */
+export interface AlertingSilence {
+  id: string;
+  matchers: AlertingSilenceMatchers;
+  /** Unix seconds. */
+  until: number;
+  comment: string;
+  created_by?: string;
+  created_at: number;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/silences`. */
+export interface AlertingSilences {
+  namespace: string;
+  silences: AlertingSilence[];
+  [extra: string]: unknown;
+}
+
+/** The reply to removing a silence. */
+export interface DeletedAlertingSilence {
+  deleted: string;
+  [extra: string]: unknown;
+}
+
+/** The last run of an {@link AlertingCheck}. */
+export interface AlertingCheckResult {
+  id: string;
+  deployment: string;
+  path: string;
+  ok: boolean;
+  passing: number;
+  total: number;
+  last_error?: string;
+  checked_at: number;
+  [extra: string]: unknown;
+}
+
+/** One configured check and its last result. */
+export interface AlertingCheck {
+  id: string;
+  deployment: string;
+  path: string;
+  interval_secs: number;
+  expect_status?: number;
+  min_passing: number;
+  /** `null` until the check first runs. */
+  result: AlertingCheckResult | null;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/checks`. */
+export interface AlertingChecks {
+  namespace: string;
+  checks: AlertingCheck[];
+  [extra: string]: unknown;
+}
+
+/** One webhook. */
+export interface AlertingDelivery {
+  /** Also sent as `X-Heyo-Delivery`. */
+  delivery_id: string;
+  receiver: string;
+  /** `alert.firing`, `alert.resolved` or `alert.test`. */
+  event: string;
+  fingerprint?: string;
+  /** `queued`, `retrying`, `delivered`, `failed` or `dropped`. */
+  status: string;
+  attempts: number;
+  response_status?: number;
+  last_error?: string;
+  created_at: number;
+  updated_at: number;
+  [extra: string]: unknown;
+}
+
+/** `…/plugins/alerting/api/deliveries`: the last webhooks, newest first. */
+export interface AlertingDeliveries {
+  namespace: string;
+  deliveries: AlertingDelivery[];
+  [extra: string]: unknown;
+}
+
+/** The reply to `POST …/alerting/api/receivers/:id/test`. */
+export interface AlertingTestDelivery {
+  delivery_id: string;
+  receiver: string;
+  /** `queued`: follow it in the delivery log. */
+  status: string;
+  [extra: string]: unknown;
+}
+
 // -- artifacts (the artifacts plugin) ----------------------------------------
 
 /** `…/plugins/artifacts/api` — the namespace's view of the store. Never names it. */

@@ -966,3 +966,67 @@ fn transfers_parse_with_nothing_left_over() {
     let t: Transfer = serde_json::from_str(&fixture("transfer-ready")).unwrap();
     assert_eq!((t.direction.as_str(), t.state.as_str()), ("out", "ready"));
 }
+
+/// The alerting plugin's answers, recorded from the plugin itself
+/// (`src/plugins/alerting/tests.rs`) rather than from a response type.
+#[test]
+fn alerting_plugin_answers_are_understood() {
+    use hws::types::{
+        AlertingAlerts, AlertingChecks, AlertingDeliveries, AlertingSilence, AlertingStatus,
+        AlertingTestDelivery,
+    };
+    fn none_extra(what: &str, extra: &hws::types::Extra) {
+        assert!(extra.is_empty(), "unknown {what} fields: {:?}", extra.keys().collect::<Vec<_>>());
+    }
+
+    let alerts: AlertingAlerts =
+        serde_json::from_str(&fixture("alerting-alerts")).expect("fixture parses");
+    none_extra("alerts", &alerts.extra);
+    for a in alerts.active.iter().chain(&alerts.resolved) {
+        none_extra("alert", &a.extra);
+    }
+    let firing = alerts.active.iter().find(|a| a.status == "firing").expect("a firing alert");
+    assert_eq!(firing.acked_by.as_deref(), Some("user:alice"));
+    assert!(firing.silenced && firing.notified);
+    assert_eq!(firing.labels.get("severity").map(String::as_str), Some("critical"));
+    assert_eq!(alerts.resolved[0].status, "resolved");
+    assert!(alerts.resolved[0].resolved_at.is_some());
+
+    let s: AlertingSilence =
+        serde_json::from_str(&fixture("alerting-silence")).expect("fixture parses");
+    none_extra("silence", &s.extra);
+    none_extra("matchers", &s.matchers.extra);
+    assert_eq!(s.matchers.deployment.as_deref(), Some("web"));
+    assert_eq!(s.created_by.as_deref(), Some("user:alice"));
+
+    let checks: AlertingChecks =
+        serde_json::from_str(&fixture("alerting-checks")).expect("fixture parses");
+    none_extra("checks", &checks.extra);
+    let c = &checks.checks[0];
+    none_extra("check", &c.extra);
+    let r = c.result.as_ref().expect("a result");
+    none_extra("check result", &r.extra);
+    assert_eq!((c.expect_status, r.ok), (Some(200), false));
+
+    let status: AlertingStatus =
+        serde_json::from_str(&fixture("alerting-status")).expect("fixture parses");
+    none_extra("status", &status.extra);
+    none_extra("receiver", &status.receivers[0].extra);
+    for r in &status.rules {
+        none_extra("rule", &r.extra);
+    }
+    assert!(status.receivers[0].signed);
+    assert_eq!((status.firing, status.pending, status.silences), (1, 1, 1));
+
+    let d: AlertingDeliveries =
+        serde_json::from_str(&fixture("alerting-deliveries")).expect("fixture parses");
+    none_extra("deliveries", &d.extra);
+    none_extra("delivery", &d.deliveries[0].extra);
+    assert_eq!(d.deliveries[0].event, "alert.resolved");
+    assert_eq!(d.deliveries[0].status, "delivered");
+
+    let t: AlertingTestDelivery =
+        serde_json::from_str(&fixture("alerting-test-delivery")).expect("fixture parses");
+    none_extra("test delivery", &t.extra);
+    assert_eq!(t.status, "queued");
+}

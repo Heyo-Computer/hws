@@ -78,6 +78,11 @@ enum Command {
     #[command(subcommand, visible_alias = "plugin")]
     Plugins(cmd::plugins::PluginsCmd),
 
+    /// A namespace's alerts from the alerting plugin: list and acknowledge
+    /// them, silence, read checks and webhook deliveries, test a receiver.
+    #[command(visible_alias = "alert")]
+    Alerts(cmd::alerts::AlertsArgs),
+
     /// heyvm's image catalog: what is on the host, what holds each image, and
     /// offloading what nothing uses. Fleet scope.
     #[command(subcommand, visible_alias = "image")]
@@ -355,6 +360,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Token(cmd) => cmd::token::run(&Ctx::new(g)?, cmd),
         Command::Feed(args) => cmd::feed::run(&Ctx::new(g)?, args),
         Command::Plugins(cmd) => cmd::plugins::run(&Ctx::new(g)?, cmd),
+        Command::Alerts(args) => cmd::alerts::run(&Ctx::new(g)?, args),
         Command::Images(cmd) => cmd::images::run(&Ctx::new(g)?, cmd),
         Command::Recovery(cmd) => cmd::recovery::run(&Ctx::new(g)?, cmd),
         Command::Completion { shell } => {

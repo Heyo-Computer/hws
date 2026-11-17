@@ -23,6 +23,7 @@
 use crate::api::{ExecRequest, Gates, MetricsQuery, NewToken};
 use crate::error::{Error, Result};
 use crate::obs::{LogQuery, NewAlert};
+use crate::alerting::{AlertingRead, NewSilence};
 use crate::postgres::NewDatabase;
 use crate::gate::Gate;
 use crate::shell::{ShellEvent, ShellExit, ShellOptions};
@@ -604,6 +605,14 @@ impl Client {
         }
     }
 
+    /// One namespace's alerts. See [`crate::Client::alerting`].
+    pub fn alerting(&self, namespace: impl Into<String>) -> AlertingClient<'_> {
+        AlertingClient {
+            client: self,
+            inner: self.inner.alerting(namespace),
+        }
+    }
+
     // -- identity, rollouts, discovery ---------------------------------------
 
     pub fn whoami(&self) -> Result<WhoAmI> {
@@ -731,6 +740,54 @@ impl PostgresClient<'_> {
 
     pub fn delete_database(&self, name: &str) -> Result<DeletedPostgresDatabase> {
         block_on(&self.client.rt, self.inner.delete_database(name))?
+    }
+}
+
+/// One namespace's alerts, blocking. See [`crate::AlertingClient`].
+pub struct AlertingClient<'a> {
+    client: &'a Client,
+    inner: crate::AlertingClient,
+}
+
+impl AlertingClient<'_> {
+    pub fn namespace(&self) -> &str {
+        self.inner.namespace()
+    }
+
+    pub fn status(&self) -> Result<AlertingStatus> {
+        block_on(&self.client.rt, self.inner.status())?
+    }
+
+    pub fn alerts(&self) -> Result<AlertingAlerts> {
+        block_on(&self.client.rt, self.inner.alerts())?
+    }
+
+    pub fn ack(&self, fingerprint: &str, comment: Option<&str>) -> Result<AlertingAlert> {
+        block_on(&self.client.rt, self.inner.ack(fingerprint, comment))?
+    }
+
+    pub fn silences(&self) -> Result<AlertingSilences> {
+        block_on(&self.client.rt, self.inner.silences())?
+    }
+
+    pub fn silence(&self, new: &NewSilence) -> Result<AlertingSilence> {
+        block_on(&self.client.rt, self.inner.silence(new))?
+    }
+
+    pub fn unsilence(&self, id: &str) -> Result<DeletedAlertingSilence> {
+        block_on(&self.client.rt, self.inner.unsilence(id))?
+    }
+
+    pub fn checks(&self) -> Result<AlertingChecks> {
+        block_on(&self.client.rt, self.inner.checks())?
+    }
+
+    pub fn deliveries(&self) -> Result<AlertingDeliveries> {
+        block_on(&self.client.rt, self.inner.deliveries())?
+    }
+
+    pub fn test_receiver(&self, receiver: &str) -> Result<AlertingTestDelivery> {
+        block_on(&self.client.rt, self.inner.test_receiver(receiver))?
     }
 }
 
@@ -949,6 +1006,10 @@ impl Raw<'_> {
 
     pub fn obs_alerts(&self, namespace: &str) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().obs_alerts(namespace))?
+    }
+
+    pub fn alerting(&self, namespace: &str, what: AlertingRead) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().alerting(namespace, what))?
     }
 
     pub fn postgres_databases(&self, namespace: &str) -> Result<Value> {

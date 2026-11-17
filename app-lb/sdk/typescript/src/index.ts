@@ -60,6 +60,8 @@ export { applyGate } from "./gate.js";
 export type { Gate, GatePath } from "./gate.js";
 export { PostgresClient, POSTGRES_PLUGIN } from "./postgres.js";
 export type { NewDatabase } from "./postgres.js";
+export { AlertingClient, ALERTING_PLUGIN } from "./alerting.js";
+export type { NewSilence } from "./alerting.js";
 
 export { Shell, PING_INTERVAL_MS } from "./shell.js";
 export type { ShellExit, ShellOptions } from "./shell.js";

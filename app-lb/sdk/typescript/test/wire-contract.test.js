@@ -122,6 +122,20 @@ const KNOWN = {
     CreatedPostgresDatabase: ["name", "database", "user", "password", "host", "port", "sslmode", "url", "secret", "secret_error", "status", "note"],
     DeletedPostgresDatabase: ["deleted", "database", "secret_kept", "note"],
     ArtifactStoreInfo: ["namespace", "available", "writable", "prefix"],
+    AlertingStatus: ["namespace", "receivers", "rules", "checks", "firing", "pending", "silences", "last_tick", "state_error"],
+    AlertingReceiver: ["id", "format", "endpoint", "signed"],
+    AlertingRuleSummary: ["id", "deployment", "condition", "severity", "receivers"],
+    AlertingAlerts: ["namespace", "active", "resolved"],
+    // `labels` is a string map; its keys are data.
+    AlertingAlert: ["fingerprint", "rule", "deployment", "severity", "condition", "status", "summary", "pending_since", "started_at", "resolved_at", "notified", "last_notified_at", "acked_by", "acked_at", "ack_comment", "labels", "silenced"],
+    AlertingSilence: ["id", "matchers", "until", "comment", "created_by", "created_at"],
+    AlertingSilenceMatchers: ["rule", "deployment", "severity"],
+    AlertingChecks: ["namespace", "checks"],
+    AlertingCheck: ["id", "deployment", "path", "interval_secs", "expect_status", "min_passing", "result"],
+    AlertingCheckResult: ["id", "deployment", "path", "ok", "passing", "total", "last_error", "checked_at"],
+    AlertingDeliveries: ["namespace", "deliveries"],
+    AlertingDelivery: ["delivery_id", "receiver", "event", "fingerprint", "status", "attempts", "response_status", "last_error", "created_at", "updated_at"],
+    AlertingTestDelivery: ["delivery_id", "receiver", "status"],
   },
 };
 
@@ -178,6 +192,12 @@ const FIXTURES = {
   "postgres-database-created": "CreatedPostgresDatabase",
   "postgres-database-deleted": "DeletedPostgresDatabase",
   "artifact-store-info": "ArtifactStoreInfo",
+  "alerting-status": "AlertingStatus",
+  "alerting-alerts": "AlertingAlerts",
+  "alerting-silence": "AlertingSilence",
+  "alerting-checks": "AlertingChecks",
+  "alerting-deliveries": "AlertingDeliveries",
+  "alerting-test-delivery": "AlertingTestDelivery",
   "auth-provider-google": "AuthProviderView",
   "auth-provider-heyo": "AuthProviderView",
   "deployment-inherited-gate": "DeploymentSpec",
@@ -216,6 +236,7 @@ const NESTED = {
   rule: "RuleSpec", match: "RuleMatch",
   global: "DeploymentMetrics", requests: "StatusCounts", latency_ms: "Histogram",
   cold_start_s: "Histogram", autoscale: "AutoscaleCounts",
+  matchers: "AlertingSilenceMatchers", result: "AlertingCheckResult",
 };
 
 /** Which declaration governs the *elements* of an array, by its key. */
@@ -229,6 +250,8 @@ const ELEMENTS = {
   workflows: "WorkflowSpec",
   databases: "PostgresDatabase",
   series: "UsageSeries",
+  active: "AlertingAlert", resolved: "AlertingAlert", checks: "AlertingCheck",
+  deliveries: "AlertingDelivery", receivers: "AlertingReceiver",
   // `mounts` is a MountSpec on a VmSpec and a MountOutcome on a JobRecord — the
   // spec's declaration of a mount, and what one pull of it did. Disambiguated
   // below by the declaration we are inside, the same way `vms` and `auth` are.
@@ -273,6 +296,9 @@ function check(value, declName, path, unknown) {
       let elem = ELEMENTS[key];
       if (key === "vms") elem = declName === "DeploymentView" ? "VmView" : "VmStatus";
       if (key === "mounts") elem = declName === "JobRecord" ? "MountOutcome" : "MountSpec";
+      // `rules` is a guard rule in a security response and a summary on the
+      // alerting plugin's status.
+      if (key === "rules" && declName === "AlertingStatus") elem = "AlertingRuleSummary";
       if (elem) {
         child.forEach((item, i) => {
           if (item && typeof item === "object") check(item, elem, `${path}.${key}[${i}]`, unknown);
