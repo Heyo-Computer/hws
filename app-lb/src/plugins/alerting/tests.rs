@@ -560,3 +560,51 @@ async fn wire_fixtures_are_recorded() {
     test["delivery_id"] = json!("dlv_0123456789abcdef01234567");
     crate::admin::wire_golden::golden("alerting-test-delivery", &test);
 }
+
+#[tokio::test]
+async fn a_paused_rollout_fires_rollout_stalled_and_resolves_when_it_moves_on() {
+    use crate::deployment::{DeploymentState, RolloutPhase, RolloutProgress};
+    let f = fixture().await;
+    let (rx, url) = receiver(vec![]).await;
+    let d = f.registry.upsert(static_deployment("web", "team-a", "127.0.0.1:9"));
+    f.host
+        .install(
+            PLUGIN_ID,
+            "team-a",
+            json!({
+                "receivers": [{"id": "ops", "url": url}],
+                "rules": [{"id": "stuck", "deployment": "web", "condition": {"type": "rollout_stalled"},
+                           "severity": "warning", "receivers": ["ops"]}],
+            }),
+            Some("user:alice".into()),
+        )
+        .await
+        .unwrap();
+    let set_phase = |phase: RolloutPhase| {
+        let mut progress =
+            RolloutProgress::new("rev-2".into(), crate::config::RolloutStrategy::Rolling, 0);
+        progress.phase = phase;
+        let mut state: DeploymentState = (*d.state()).clone();
+        state.rollout_progress = Some(progress);
+        d.set_state(state);
+    };
+
+    let now = now_secs();
+    set_phase(RolloutPhase::Progressing);
+    f.plugin.tick_at(now).await;
+    let (_, v) = call(&f, "team-a", "GET", "/api/alerts", Value::Null).await;
+    assert_eq!(v["active"], json!([]), "a progressing rollout is not stalled: {v}");
+
+    set_phase(RolloutPhase::Paused { reason: "new replicas never became healthy".into() });
+    f.plugin.tick_at(now + 15).await;
+    wait_for(|| rx.seen.lock().unwrap().len() == 1).await;
+    let (headers, body) = rx.seen.lock().unwrap()[0].clone();
+    assert_eq!(headers["x-heyo-event"], "alert.firing");
+    assert_eq!(body["alert"]["rule"], "stuck");
+    assert_eq!(body["alert"]["deployment"], "web");
+
+    set_phase(RolloutPhase::Complete);
+    f.plugin.tick_at(now + 30).await;
+    wait_for(|| rx.seen.lock().unwrap().len() == 2).await;
+    assert_eq!(rx.seen.lock().unwrap()[1].0["x-heyo-event"], "alert.resolved");
+}

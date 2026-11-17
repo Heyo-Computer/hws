@@ -207,11 +207,11 @@ impl AlertingPlugin {
 
     // ---- observing ------------------------------------------------------------
 
-    /// Why `deployment`'s rollout is stalled, if it is.
-    // TODO(rollout): wire to DeploymentState.rollout once merged — report the
-    // paused/stalled phase and its reason from the deployment's rollout state.
-    fn rollout_stall_reason(&self, _deployment: &Deployment) -> Option<String> {
-        None
+    /// Why `deployment`'s rolling replacement is paused, if it is: the
+    /// autoscaler pauses a rollout that made no progress within the policy's
+    /// `progress_deadline_secs`.
+    fn rollout_stall_reason(&self, deployment: &Deployment) -> Option<String> {
+        deployment.rollout_stall_reason()
     }
 
     /// Every deployment of `ns` this host knows, as the conditions see it.
