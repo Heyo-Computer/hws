@@ -10182,6 +10182,7 @@ mod tests {
                         crate::plugins::obs::ObsPlugin::new(plugin_secrets.clone()),
                         crate::plugins::ci::CiPlugin::new(plugin_secrets.clone()),
                         crate::plugins::secrets::SecretsPlugin::new(plugin_secrets.clone()),
+                        crate::plugins::alerting::AlertingPlugin::new(registry.clone(), plugin_secrets.clone(), root.join("plugins").join("state")),
                         crate::plugins::postgres::PostgresPlugin::new(plugin_secrets, root.join("plugins").join("state")),
                     ],
                     crate::plugins::PluginStore::new(root.join("plugins")),
@@ -12810,6 +12811,35 @@ mod tests {
             f.state.plugins.set("secrets", false, None).await.unwrap();
             f.state.plugins.set("ci", false, None).await.unwrap();
             f.state.plugins.set("postgres", false, None).await.unwrap();
+
+            // The alerting plugin's reads are view tier; acking, silencing and
+            // sending a test are CRUD tier, and another namespace's token
+            // reaches none of it.
+            f.state.plugins.set("alerting", true, Some(serde_json::json!({}))).await.unwrap();
+            f.state.plugins.install("alerting", "team-a", serde_json::json!({
+                "receivers": [{"id": "ops", "url": "https://hooks.example.com/x"}]
+            }), None).await.unwrap();
+            let base = "/namespaces/team-a/plugins/alerting/api";
+            let (status, v) = call("GET", &format!("{base}/alerts"), &viewer, "").await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let silence = format!(r#"{{"matchers": {{"rule": "down"}}, "until": {}}}"#, now_secs() + 3600);
+            let silence = silence.as_str();
+            for (path, body) in [("silences", silence), ("receivers/ops/test", ""), ("alerts/abc/ack", "")] {
+                let (status, v) = call("POST", &format!("{base}/{path}"), &viewer, body).await;
+                assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED), "{path}: {status} {v}");
+            }
+            let (status, v) = call("POST", &format!("{base}/silences"), &admin, silence).await;
+            assert_eq!(status, StatusCode::CREATED, "{v}");
+            assert!(v["created_by"].as_str().is_some_and(|s| s.starts_with("token:")), "{v}");
+            let (status, v) = call("POST", &format!("{base}/alerts/abc/ack"), &admin, "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+            let other = f.state.tokens.mint(NewToken { tunnel: false,
+                fleet: false, name: "other".into(), admin: AdminScope::Admin,
+                namespace: Some("team-b".into()), deployments: vec![], expires_in_secs: None,
+            }, now_secs()).unwrap().1;
+            let (status, _) = call("GET", &format!("{base}/silences"), &other, "").await;
+            assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED), "{status}");
+            f.state.plugins.set("alerting", false, None).await.unwrap();
         }
 
         async fn remove(f: &Fixture, etag: Option<&str>) -> StatusCode {

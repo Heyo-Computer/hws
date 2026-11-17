@@ -74,6 +74,49 @@ pub async fn probe_https(address: &str, host: &str, check: &HealthCheck) -> bool
     }
 }
 
+/// One plain-HTTP `GET path` against `target`, returning the status code (or
+/// why there was none) rather than a verdict. For callers that judge the
+/// status themselves — the alerting plugin's checks, which may expect a
+/// particular code. No redirects are followed: the request is one exchange.
+pub async fn probe_status(target: SocketAddr, path: &str, timeout: Duration) -> Result<u16, String> {
+    let exchange = async {
+        let mut stream = TcpStream::connect(target).await?;
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {target}\r\nUser-Agent: app-lb/health\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await?;
+        stream.flush().await?;
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).await?;
+        parse_status(&buf[..n]).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed or empty HTTP response")
+        })
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(Ok(code)) => Ok(code),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
+    }
+}
+
+/// [`probe_status`] for an HTTPS static upstream, verified as [`probe_https`]
+/// verifies one.
+pub async fn probe_https_status(address: &str, host: &str, path: &str, timeout: Duration) -> Result<u16, String> {
+    let port = address.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(443);
+    let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    client
+        .get(format!("https://{host}:{port}{path}"))
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .map_err(|e| e.without_url().to_string())
+}
+
 async fn probe_inner(target: SocketAddr, path: Option<&str>, expected: Option<&crate::config::ExpectedHeader>) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(target).await?;
     let Some(path) = path else {

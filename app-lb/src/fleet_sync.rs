@@ -1118,6 +1118,8 @@ pub struct FleetStores {
     pub tokens: Arc<FleetDocument>,
     pub guard: Arc<FleetDocument>,
     pub pg_ownership: Arc<FleetDocument>,
+    /// The alerting plugin's alerts, acknowledgements and silences.
+    pub alerting_state: Arc<FleetDocument>,
     pub acme_account: Arc<FleetDocument>,
     pub acme_backoff: Arc<FleetDocument>,
     pub cert_chains: Arc<FleetCollection>,
@@ -1200,6 +1202,11 @@ impl FleetStores {
             pg_ownership: fleet.document(
                 "pg-ownership",
                 FileDocument::new(layout.postgres_ownership_path(), FileOptions::PLAIN),
+                plain,
+            ),
+            alerting_state: fleet.document(
+                "alerting-state",
+                FileDocument::new(layout.alerting_state_path(), FileOptions::PLAIN),
                 plain,
             ),
             acme_account: fleet.document(

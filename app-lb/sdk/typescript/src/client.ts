@@ -7,6 +7,7 @@ import {
 } from "./errors.js";
 import { ObsClient } from "./obs.js";
 import { PostgresClient } from "./postgres.js";
+import { AlertingClient } from "./alerting.js";
 import { ArtifactsClient } from "./artifacts.js";
 import { applyGate, pluginFor, type Gate } from "./gate.js";
 import type {
@@ -904,6 +905,11 @@ export class Heyctl {
   /** One namespace's Postgres databases through the `postgres` plugin. Makes no request. */
   postgres(namespace: string): PostgresClient {
     return new PostgresClient(this, namespace);
+  }
+
+  /** One namespace's alerts through the `alerting` plugin. Makes no request. */
+  alerting(namespace: string): AlertingClient {
+    return new AlertingClient(this, namespace);
   }
 
   // -- secrets --------------------------------------------------------------

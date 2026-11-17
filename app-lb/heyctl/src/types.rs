@@ -2856,6 +2856,232 @@ pub struct DeletedPostgresDatabase {
     pub extra: Extra,
 }
 
+// -- the alerting plugin ---------------------------------------------------
+
+/// `GET /namespaces/:ns/plugins/alerting/api/status`: what the namespace's
+/// install configures, and how many alerts are live.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingStatus {
+    pub namespace: String,
+    pub receivers: Vec<AlertingReceiver>,
+    pub rules: Vec<AlertingRuleSummary>,
+    /// How many checks are configured.
+    pub checks: usize,
+    pub firing: usize,
+    pub pending: usize,
+    pub silences: usize,
+    /// When rules were last evaluated (unix seconds).
+    pub last_tick: Option<u64>,
+    /// Why the plugin's state file could not be read, when it could not:
+    /// acks and silences are refused until an operator fixes it.
+    pub state_error: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A receiver in [`AlertingStatus`]. Never carries the webhook's path.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingReceiver {
+    pub id: String,
+    /// `generic` or `slack`.
+    pub format: String,
+    /// Scheme, host and port only.
+    pub endpoint: String,
+    /// Whether requests carry `X-Heyo-Signature`.
+    pub signed: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A rule in [`AlertingStatus`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingRuleSummary {
+    pub id: String,
+    /// A deployment id, or `*`.
+    pub deployment: String,
+    /// The condition's `type`, e.g. `no_healthy_replicas`.
+    pub condition: String,
+    pub severity: String,
+    pub receivers: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET …/alerting/api/alerts`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingAlerts {
+    pub namespace: String,
+    /// Pending and firing.
+    pub active: Vec<AlertingAlert>,
+    /// Recently resolved, newest first.
+    pub resolved: Vec<AlertingAlert>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One alert: one rule on one deployment.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingAlert {
+    /// Stable for the `(namespace, rule, deployment)`.
+    pub fingerprint: String,
+    pub rule: String,
+    pub deployment: String,
+    pub severity: String,
+    pub condition: String,
+    /// `pending`, `firing` or `resolved`.
+    pub status: String,
+    pub summary: String,
+    pub pending_since: u64,
+    pub started_at: Option<u64>,
+    pub resolved_at: Option<u64>,
+    /// Whether the firing webhook went out (it is held while silenced).
+    pub notified: bool,
+    pub last_notified_at: Option<u64>,
+    pub acked_by: Option<String>,
+    pub acked_at: Option<u64>,
+    pub ack_comment: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    /// Whether a silence matches it now.
+    pub silenced: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET …/alerting/api/silences`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingSilences {
+    pub namespace: String,
+    pub silences: Vec<AlertingSilence>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A silence: notifications for matching alerts are held until `until`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingSilence {
+    pub id: String,
+    pub matchers: AlertingSilenceMatchers,
+    /// Unix seconds.
+    pub until: u64,
+    pub comment: String,
+    pub created_by: Option<String>,
+    pub created_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// What a silence matches. An unset matcher matches anything.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingSilenceMatchers {
+    pub rule: Option<String>,
+    pub deployment: Option<String>,
+    pub severity: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The reply to removing a silence.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct DeletedAlertingSilence {
+    pub deleted: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET …/alerting/api/checks`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingChecks {
+    pub namespace: String,
+    pub checks: Vec<AlertingCheck>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One configured check and its last result.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingCheck {
+    pub id: String,
+    pub deployment: String,
+    pub path: String,
+    pub interval_secs: u64,
+    pub expect_status: Option<u16>,
+    pub min_passing: u32,
+    /// `None` until the check first runs.
+    pub result: Option<AlertingCheckResult>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The last run of an [`AlertingCheck`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingCheckResult {
+    pub id: String,
+    pub deployment: String,
+    pub path: String,
+    pub ok: bool,
+    pub passing: u32,
+    pub total: u32,
+    pub last_error: Option<String>,
+    pub checked_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET …/alerting/api/deliveries`: the last webhooks, newest first.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingDeliveries {
+    pub namespace: String,
+    pub deliveries: Vec<AlertingDelivery>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One webhook.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingDelivery {
+    /// Also sent as `X-Heyo-Delivery`.
+    pub delivery_id: String,
+    pub receiver: String,
+    /// `alert.firing`, `alert.resolved` or `alert.test`.
+    pub event: String,
+    pub fingerprint: Option<String>,
+    /// `queued`, `retrying`, `delivered`, `failed` or `dropped`.
+    pub status: String,
+    pub attempts: u32,
+    pub response_status: Option<u16>,
+    pub last_error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The reply to `POST …/alerting/api/receivers/:id/test`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertingTestDelivery {
+    pub delivery_id: String,
+    pub receiver: String,
+    /// `queued`: follow it in the delivery log.
+    pub status: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 // -- the artifacts plugin --------------------------------------------------
 
 /// The namespace's view of the global artifact store, from

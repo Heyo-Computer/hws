@@ -53,6 +53,7 @@ mod jwt;
 mod metrics;
 mod mounts;
 mod namespaces;
+mod net_guard;
 mod obs;
 mod operations;
 mod onboarding;
@@ -776,6 +777,19 @@ fn main() {
         external_tls.clone(),
         secrets.clone(),
     );
+    // Handed the metrics registry below, once it exists.
+    let alerting_plugin = match &fleet_stores {
+        Some(fs) => plugins::alerting::AlertingPlugin::with_state_document(
+            registry.clone(),
+            secrets.clone(),
+            fs.alerting_state.clone(),
+        ),
+        None => plugins::alerting::AlertingPlugin::new(
+            registry.clone(),
+            secrets.clone(),
+            plugin_store.dir().join("state"),
+        ),
+    };
     let plugin_host = Arc::new(plugins::PluginHost::new(
         vec![
             plugins::pgfc::PgFcPlugin::new(secrets.clone()),
@@ -810,6 +824,7 @@ fn main() {
                     plugin_store.dir().join("state"),
                 ),
             },
+            alerting_plugin.clone(),
         ],
         plugin_store,
     ).with_host(fleet_stores.as_ref().map(|fs| fs.host.clone())));
@@ -1144,6 +1159,7 @@ fn main() {
     // autoscaler (cold-start timing, scaling activity), and the admin API
     // (which serves the dashboard from it).
     let metrics = Arc::new(Metrics::new());
+    alerting_plugin.attach(metrics.clone());
 
     // Note: nothing above may spawn threads or build a runtime — `run_forever`
     // may fork for daemonization and anything created before it would be lost.

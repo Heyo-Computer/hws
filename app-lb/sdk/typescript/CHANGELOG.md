@@ -3,6 +3,14 @@
 Versioned with the [`hws`](https://crates.io/crates/hws) crate; the two
 releases share a wire contract and are checked against the same app-lb fixtures.
 
+## Unreleased
+
+### Added
+
+- `alerting(namespace)`: an `AlertingClient` for the `alerting` plugin —
+  `status`, `alerts`, `ack`, `silences`, `silence`, `unsilence`, `checks`,
+  `deliveries`, `testReceiver` — and its response types.
+
 ## 0.4.0 — 2026-10-12
 
 ### Added

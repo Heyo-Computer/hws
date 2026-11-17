@@ -710,6 +710,10 @@ impl Layout {
     pub fn postgres_ownership_path(&self) -> PathBuf {
         self.plugin_dir().join("state").join("postgres.json")
     }
+    /// The alerting plugin's alerts, acknowledgements and silences.
+    pub fn alerting_state_path(&self) -> PathBuf {
+        self.plugin_dir().join("state").join("alerting.json")
+    }
     pub fn acme_certs_dir(&self) -> PathBuf {
         self.acme_dir.join("certs")
     }
