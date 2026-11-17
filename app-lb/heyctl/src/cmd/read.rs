@@ -1141,6 +1141,9 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
     if let Some(placement) = &d.spec.placement {
         output::top_field("Placement", placement.summary());
     }
+    if let Some(rollout) = &d.rollout {
+        output::top_field("Rollout", rollout.summary());
+    }
 
     output::section("Routes");
     if d.spec.routes.is_empty() {

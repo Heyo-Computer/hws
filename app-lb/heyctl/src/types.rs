@@ -51,8 +51,49 @@ pub struct DeploymentStatus {
     pub workspace: Option<WorkspaceStatus>,
     /// Present for a site: whether its root on the LB host can serve.
     pub site: Option<SiteRootStatus>,
+    /// The rolling replacement in progress, or the last one. Absent for a
+    /// deployment that has never rolled.
+    pub rollout: Option<RolloutView>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+/// Where a deployment's rolling replacement stands.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct RolloutView {
+    /// The template revision new replicas boot from.
+    pub revision: String,
+    /// `rolling` or `recreate`.
+    pub strategy: String,
+    /// `progressing`, `paused` or `complete`.
+    pub phase: String,
+    /// Why it paused, when it did.
+    pub reason: Option<String>,
+    /// Replicas on the current revision, serving.
+    pub updated: usize,
+    /// Old replicas still taking traffic (or booting).
+    pub stale: usize,
+    /// Old replicas drained, finishing their in-flight work.
+    pub draining: usize,
+    pub started_at: u64,
+    pub last_progress_at: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl RolloutView {
+    /// `progressing: 2 new, 1 old, 1 draining`, plus why when paused.
+    pub fn summary(&self) -> String {
+        let mut out = format!("{}: {} new, {} old", self.phase, self.updated, self.stale);
+        if self.draining > 0 {
+            out.push_str(&format!(", {} draining", self.draining));
+        }
+        if let Some(reason) = &self.reason {
+            out.push_str(&format!(" ({reason})"));
+        }
+        out
+    }
 }
 
 /// A site's root as the LB host sees it.
@@ -168,6 +209,36 @@ pub struct DeploymentSpec {
     /// Which host of an app-lb fleet runs it. Absent on a single server, and
     /// on a fleet deployment that runs wherever it is loaded.
     pub placement: Option<Placement>,
+    /// How a template change replaces running replicas. Absent when it is
+    /// the default (rolling, one surge replica).
+    pub rollout: Option<RolloutPolicy>,
+}
+
+/// A deployment's `rollout` block. Absent fields are server defaults.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct RolloutPolicy {
+    /// `rolling` or `recreate`.
+    pub strategy: String,
+    pub max_surge: Option<u32>,
+    pub max_unavailable: Option<u32>,
+    pub min_ready_secs: u64,
+    pub progress_deadline_secs: u64,
+    pub drain_timeout_secs: Option<u64>,
+    pub pre_stop: Option<PreStop>,
+    pub stop_grace_secs: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A command run in a replica before it is stopped.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PreStop {
+    pub command: String,
+    pub timeout_secs: u64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// Where a fleet deployment runs: `pinned` to its `home` host, or (later)
@@ -1292,6 +1363,8 @@ pub struct DeploymentView {
     /// health check for six minutes.
     pub pending_vms: Vec<PendingVmView>,
     pub metrics: DeploymentMetrics,
+    /// See [`DeploymentStatus::rollout`].
+    pub rollout: Option<RolloutView>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -1430,6 +1503,8 @@ pub struct AutoscaleCounts {
     pub create_failures: u64,
     /// What the daemon said the last time it refused.
     pub last_create_error: Option<String>,
+    /// Rolling replacements that passed their progress deadline and paused.
+    pub rollout_stalls: u64,
     #[serde(flatten)]
     pub extra: Extra,
 }

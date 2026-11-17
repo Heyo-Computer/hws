@@ -46,6 +46,54 @@ export interface ScalingPolicy {
   boot_timeout_secs?: number;
 }
 
+/** A command run inside a replica before it is stopped. */
+export interface PreStop {
+  /** Run through `sh -c` in the guest; its exit status never blocks the stop. */
+  command: string;
+  /** Defaults to 30. */
+  timeout_secs?: number;
+}
+
+/**
+ * How a VM-template change (or a rolling restart) replaces running replicas.
+ * Every field defaults; absent on the wire when it is the default.
+ */
+export interface RolloutPolicy {
+  /** `rolling` (default): new replicas first; `recreate`: drain all, then boot. */
+  strategy?: "rolling" | "recreate";
+  /** Extra replicas above target while rolling. Default 1 (0 for single-writer state). */
+  max_surge?: number;
+  /** Replicas allowed below target while rolling. Default 0 (1 for single-writer state). */
+  max_unavailable?: number;
+  /** How long a new replica must be healthy before it counts as available. */
+  min_ready_secs?: number;
+  /** No progress for this long pauses the rollout. Default 600. */
+  progress_deadline_secs?: number;
+  /** How long a drained old replica may finish its work. Default `scaling.drain_timeout_secs`. */
+  drain_timeout_secs?: number;
+  pre_stop?: PreStop;
+  /** SIGTERM grace the daemon gives the guest before killing it. Default 10, max 300. */
+  stop_grace_secs?: number;
+}
+
+/** Where a deployment's rolling replacement stands. */
+export interface RolloutView {
+  /** The template revision new replicas boot from. */
+  revision: string;
+  strategy: "rolling" | "recreate";
+  phase: "progressing" | "paused" | "complete";
+  /** Why it paused, when it did. */
+  reason?: string;
+  /** Replicas on the current revision, serving. */
+  updated: number;
+  /** Old replicas still taking traffic, or booting. */
+  stale: number;
+  /** Old replicas drained, finishing their in-flight work. */
+  draining: number;
+  started_at: number;
+  last_progress_at: number;
+}
+
 export interface ExpectedHeader {
   name: string;
   value: string;
@@ -435,6 +483,8 @@ export interface DeploymentSpec {
   auth?: AuthGate;
   feed?: FeedSpec;
   placement?: Placement;
+  /** How a template change replaces running replicas; rolling by default. */
+  rollout?: RolloutPolicy;
   /** Anything app-lb sent that this build has no name for. */
   [extra: string]: unknown;
 }
@@ -547,6 +597,8 @@ export interface DeploymentStatus {
   workspace?: WorkspaceStatus;
   /** Present for a site: whether its root on the LB host can serve. */
   site?: SiteRootStatus;
+  /** The rolling replacement in progress, or the last one; absent if it never rolled. */
+  rollout?: RolloutView;
 }
 
 /** A site's root as the LB host sees it. */
@@ -609,6 +661,8 @@ export interface AutoscaleCounts {
   create_failures: number;
   /** What the most recent failed create said; absent until one has failed. */
   last_create_error?: string;
+  /** Rolling replacements that paused at their progress deadline; absent while zero. */
+  rollout_stalls?: number;
 }
 
 export interface DeploymentMetrics {
@@ -750,6 +804,8 @@ export interface DeploymentView {
   vms: VmView[];
   pending_vms: PendingVmView[];
   metrics: DeploymentMetrics;
+  /** See `DeploymentStatus.rollout`. */
+  rollout?: RolloutView;
 }
 
 export interface ObsStats {

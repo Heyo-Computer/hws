@@ -374,6 +374,34 @@ fn placement_survives_the_wire() {
     assert!(single.spec.placement.is_none(), "absent on a single server");
 }
 
+/// A rollout policy and a rollout in flight, which `describe` and `restart
+/// --wait` read: dropped, a paused rollout would look like a settled pool.
+#[test]
+fn a_rolling_replacement_survives_the_wire() {
+    let d: DeploymentStatus =
+        serde_json::from_str(&fixture("deployment-status-vm-rolling")).expect("fixture parses");
+    assert!(d.extra.is_empty(), "unknown status fields: {:?}", d.extra.keys().collect::<Vec<_>>());
+    let policy = d.spec.rollout.expect("the fixture sets a policy");
+    assert!(policy.extra.is_empty(), "unknown policy fields: {:?}", policy.extra);
+    assert_eq!(policy.strategy, "rolling");
+    assert_eq!((policy.max_surge, policy.max_unavailable), (Some(2), Some(1)));
+    assert_eq!(policy.drain_timeout_secs, Some(120));
+    assert_eq!(policy.stop_grace_secs, 30);
+    let hook = policy.pre_stop.expect("pre_stop");
+    assert!(hook.extra.is_empty());
+    assert_eq!(hook.timeout_secs, 20);
+
+    let rollout = d.rollout.expect("the fixture is mid-rollout");
+    assert!(rollout.extra.is_empty(), "unknown rollout fields: {:?}", rollout.extra);
+    assert_eq!(rollout.phase, "paused");
+    assert_eq!((rollout.updated, rollout.stale, rollout.draining), (1, 2, 0));
+    assert!(rollout.summary().starts_with("paused: 1 new, 2 old ("));
+
+    let settled: DeploymentStatus =
+        serde_json::from_str(&fixture("deployment-status-vm")).expect("fixture parses");
+    assert!(settled.rollout.is_none() && settled.spec.rollout.is_none(), "absent when it never rolled");
+}
+
 /// The third kind of pull, whose result lives in `mounts` rather than in
 /// `image` — so a client that only understood the other two would render a mount
 /// pull as a job that did nothing.

@@ -195,6 +195,10 @@ impl Client {
         run!(self, self.inner.start(id, wait_secs))
     }
 
+    pub fn rolling_restart(&self, id: &str) -> Result<DeploymentStatus> {
+        run!(self, self.inner.rolling_restart(id))
+    }
+
     /// Which tiers a server is gating, probed anonymously.
     pub fn gates(server: &str, insecure: bool, timeout: Duration) -> Result<Gates> {
         let probe = Self::builder(server).insecure(insecure).timeout(timeout).build()?;
