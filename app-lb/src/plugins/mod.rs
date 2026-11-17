@@ -57,6 +57,7 @@
 //! at `/api/plugins/<id>/machine/…` outside the admin gate, answer 404 while
 //! the plugin is disabled, and authenticate every request themselves.
 
+pub mod alerting;
 pub mod artifacts;
 pub mod auth;
 pub mod ci;

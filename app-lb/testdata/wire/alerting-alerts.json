@@ -1,0 +1,72 @@
+{
+  "active": [
+    {
+      "condition": "check_failing",
+      "deployment": "web",
+      "fingerprint": "531beb369907c48962dfecbd7a77cb9b",
+      "labels": {
+        "condition": "check_failing",
+        "deployment": "web",
+        "namespace": "team-a",
+        "rule": "home",
+        "severity": "warning"
+      },
+      "notified": false,
+      "pending_since": 1760000000,
+      "rule": "home",
+      "severity": "warning",
+      "silenced": false,
+      "status": "pending",
+      "summary": "web: check home (/healthz) failing: 0 of 0 replicas passing (no available replicas to probe)"
+    },
+    {
+      "ack_comment": "on it",
+      "acked_at": 1760000018,
+      "acked_by": "user:alice",
+      "condition": "no_healthy_replicas",
+      "deployment": "web",
+      "fingerprint": "e3db30bc6149edb819bf012e75b9e110",
+      "labels": {
+        "condition": "no_healthy_replicas",
+        "deployment": "web",
+        "namespace": "team-a",
+        "rule": "down",
+        "severity": "critical"
+      },
+      "last_notified_at": 1760000000,
+      "notified": true,
+      "pending_since": 1760000000,
+      "rule": "down",
+      "severity": "critical",
+      "silenced": true,
+      "started_at": 1760000000,
+      "status": "firing",
+      "summary": "web: no healthy replicas (0 of 1 available)"
+    }
+  ],
+  "namespace": "team-a",
+  "resolved": [
+    {
+      "condition": "no_healthy_replicas",
+      "deployment": "api",
+      "fingerprint": "8749e89d9cac8e9377e28df359772aca",
+      "labels": {
+        "condition": "no_healthy_replicas",
+        "deployment": "api",
+        "namespace": "team-a",
+        "rule": "down",
+        "severity": "critical"
+      },
+      "last_notified_at": 1760000015,
+      "notified": true,
+      "pending_since": 1760000000,
+      "resolved_at": 1760000015,
+      "rule": "down",
+      "severity": "critical",
+      "silenced": false,
+      "started_at": 1760000000,
+      "status": "resolved",
+      "summary": "api: no healthy replicas (0 of 1 available)"
+    }
+  ]
+}

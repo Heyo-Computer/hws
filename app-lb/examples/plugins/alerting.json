@@ -1,0 +1,88 @@
+{
+  "receivers": [
+    {
+      "id": "ops",
+      "url": "https://hooks.example.com/heyo/alerts",
+      "secret": { "secret": "alert-hook", "key": "signing_key" }
+    },
+    {
+      "id": "slack",
+      "url": "https://hooks.slack.com/services/T000/B000/XXXX",
+      "format": "slack"
+    }
+  ],
+  "rules": [
+    {
+      "id": "down",
+      "deployment": "*",
+      "condition": { "type": "no_healthy_replicas" },
+      "for_secs": 60,
+      "severity": "critical",
+      "receivers": ["ops", "slack"]
+    },
+    {
+      "id": "thin",
+      "deployment": "web",
+      "condition": { "type": "healthy_replicas_below", "n": 2 },
+      "for_secs": 300,
+      "severity": "warning",
+      "receivers": ["slack"],
+      "repeat_secs": 7200
+    },
+    {
+      "id": "creates",
+      "deployment": "*",
+      "condition": { "type": "create_failures", "n": 3, "window_secs": 600 },
+      "severity": "critical",
+      "receivers": ["ops"]
+    },
+    {
+      "id": "boots",
+      "deployment": "*",
+      "condition": { "type": "boot_timeouts", "n": 2, "window_secs": 900 },
+      "severity": "warning",
+      "receivers": ["ops"]
+    },
+    {
+      "id": "cold",
+      "deployment": "web",
+      "condition": { "type": "cold_start_timeouts", "n": 5, "window_secs": 300 },
+      "severity": "warning",
+      "receivers": ["slack"]
+    },
+    {
+      "id": "upstream",
+      "deployment": "*",
+      "condition": { "type": "upstream_unhealthy" },
+      "for_secs": 120,
+      "severity": "warning",
+      "receivers": ["slack"]
+    },
+    {
+      "id": "rollout",
+      "deployment": "*",
+      "condition": { "type": "rollout_stalled" },
+      "severity": "warning",
+      "receivers": ["ops"]
+    },
+    {
+      "id": "home-page",
+      "deployment": "web",
+      "condition": { "type": "check_failing", "check": "home" },
+      "for_secs": 60,
+      "severity": "critical",
+      "receivers": ["ops", "slack"]
+    }
+  ],
+  "checks": [
+    {
+      "id": "home",
+      "deployment": "web",
+      "path": "/healthz",
+      "interval_secs": 30,
+      "timeout_secs": 5,
+      "expect_status": 200,
+      "min_passing": 1
+    }
+  ]
+}

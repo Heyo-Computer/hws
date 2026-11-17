@@ -1,0 +1,11 @@
+{
+  "comment": "deploy",
+  "created_at": 1760000020,
+  "created_by": "user:alice",
+  "id": "sil_0123456789abcdef",
+  "matchers": {
+    "deployment": "web",
+    "severity": "critical"
+  },
+  "until": 1760086400
+}

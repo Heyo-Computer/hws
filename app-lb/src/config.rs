@@ -9830,9 +9830,10 @@ mod tests {
                     .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_dir() {
+                    // `examples/plugins/` holds plugin configurations, not specs.
+                    if path.is_dir() && !path.ends_with("examples/plugins") {
                         walk(&path, out);
-                    } else if path.extension().is_some_and(|e| e == "json") {
+                    } else if path.is_file() && path.extension().is_some_and(|e| e == "json") {
                         out.push(path);
                     }
                 }
@@ -9924,6 +9925,10 @@ mod tests {
         assert_eq!(
             layout.postgres_ownership_path(),
             crate::plugins::plugin_dir(state).join("state").join("postgres.json")
+        );
+        assert_eq!(
+            layout.alerting_state_path(),
+            crate::plugins::plugin_dir(state).join("state").join("alerting.json")
         );
     }
 }

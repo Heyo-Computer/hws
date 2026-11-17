@@ -256,6 +256,7 @@ const KINDS: &[&str] = &[
 const JOIN_KINDS: &[&str] = &[
     "plugins",
     "pg-ownership",
+    "alerting-state",
     "acme-account",
     "cert-chains",
     "cert-keys",
@@ -364,6 +365,7 @@ fn read_records(
         collection("cert-chains", layout.acme_certs_dir(), ".crt.pem", &raw)?;
         collection("cert-keys", layout.acme_certs_dir(), ".key.pem", &raw)?;
         documents.push(("pg-ownership", layout.postgres_ownership_path()));
+        documents.push(("alerting-state", layout.alerting_state_path()));
         documents.push(("acme-account", layout.acme_dir.join("account.json")));
     }
     for (kind, path) in documents {
