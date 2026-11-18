@@ -314,6 +314,26 @@ pub struct Workspaces {
     http: reqwest::Client,
 }
 
+/// What a [`Workspaces::store_send`] request carries.
+#[derive(Clone, Copy)]
+enum StoreBody<'a> {
+    Empty,
+    Text(&'a str),
+    File(&'a Path),
+}
+
+/// One way to reach a remote store: a replica directly, or the public URL.
+struct StoreTarget {
+    /// Base URL requests are made against, without a trailing slash.
+    base: String,
+    /// The `Host` to send when `base` addresses a replica rather than the store.
+    host: Option<String>,
+    /// The replica, for messages.
+    via: Option<String>,
+    /// An in-flight slot on that replica, released when the request is done.
+    _slot: Option<crate::deployment::BackendSlot>,
+}
+
 impl Workspaces {
     pub fn new(
         cfg: WorkspaceConfig,
@@ -1373,35 +1393,30 @@ impl Workspaces {
             }
             WorkspaceStore::Remote(base) => {
                 let key = self.api_key(ws)?;
-                let url = format!("{base}/blobs/{digest}");
-                let file = tokio::fs::File::open(bundle)
-                    .await
-                    .map_err(|e| format!("{}: {e}", bundle.display()))?;
-                let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-                let body = reqwest::Body::wrap_stream(file_stream(file));
-                let resp = self
-                    .authed(
-                        self.http
-                            .put(&url)
-                            .header(reqwest::header::CONTENT_LENGTH, len)
-                            .body(body),
+                let (resp, url) = self
+                    .store_send(
+                        base,
+                        reqwest::Method::PUT,
+                        &format!("/blobs/{digest}"),
                         key.as_deref(),
+                        StoreBody::File(bundle),
                     )
-                    .send()
-                    .await
-                    .map_err(|e| format!("PUT {url} failed: {e}"))?;
+                    .await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
                     return Err(format!("PUT {url} answered {status}: {}", text.trim()));
                 }
                 let tag = ws.tag(deployment_id);
-                let url = format!("{base}/tags/{tag}");
-                let resp = self
-                    .authed(self.http.put(&url).body(digest.to_string()), key.as_deref())
-                    .send()
-                    .await
-                    .map_err(|e| format!("PUT {url} failed: {e}"))?;
+                let (resp, url) = self
+                    .store_send(
+                        base,
+                        reqwest::Method::PUT,
+                        &format!("/tags/{tag}"),
+                        key.as_deref(),
+                        StoreBody::Text(digest),
+                    )
+                    .await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
@@ -1464,12 +1479,15 @@ impl Workspaces {
             WorkspaceStore::Remote(base) => {
                 let key = self.api_key(ws)?;
                 let tag = ws.tag(deployment_id);
-                let url = format!("{base}/tags/{tag}");
-                let resp = self
-                    .authed(self.http.get(&url), key.as_deref())
-                    .send()
-                    .await
-                    .map_err(|e| format!("GET {url} failed: {e}"))?;
+                let (resp, url) = self
+                    .store_send(
+                        base,
+                        reqwest::Method::GET,
+                        &format!("/tags/{tag}"),
+                        key.as_deref(),
+                        StoreBody::Empty,
+                    )
+                    .await?;
                 match resp.status() {
                     s if s.is_success() => {
                         let text = resp.text().await.map_err(|e| format!("GET {url}: {e}"))?;
@@ -1602,12 +1620,15 @@ impl Workspaces {
                 }
                 WorkspaceStore::Remote(base) => {
                     let key = self.api_key(ws)?;
-                    let url = format!("{base}/blobs/{digest}");
-                    let resp = self
-                        .authed(self.http.get(&url), key.as_deref())
-                        .send()
-                        .await
-                        .map_err(|e| format!("GET {url} failed: {e}"))?;
+                    let (resp, url) = self
+                        .store_send(
+                            base,
+                            reqwest::Method::GET,
+                            &format!("/blobs/{digest}"),
+                            key.as_deref(),
+                            StoreBody::Empty,
+                        )
+                        .await?;
                     if !resp.status().is_success() {
                         let status = resp.status();
                         return Err(format!("GET {url} answered {status}"));
@@ -1676,6 +1697,111 @@ impl Workspaces {
             Some(k) => req.bearer_auth(k),
             None => req,
         }
+    }
+
+    /// Where to send a request for `path` on the remote store at `base`.
+    ///
+    /// A store whose hostname this LB itself routes to a managed deployment —
+    /// `art.<region>` served by an `art` deployment on the same host — is
+    /// reached at a ready replica directly, over the private network, ahead of
+    /// its public URL. Going through our own front door would put a
+    /// multi-gigabyte bundle through TLS and the proxy, whose upstream timeouts
+    /// are tuned for request/response traffic: a replica that stalls on disk for
+    /// a minute while it ingests the upload trips them and the push starts over,
+    /// forever, on a busy host. The public URL stays as the fallback for when
+    /// the replica cannot be connected to.
+    fn store_targets(&self, base: &str, path: &str) -> Vec<StoreTarget> {
+        let mut targets = Vec::with_capacity(2);
+        if let Some(direct) = self.direct_store_target(base, path) {
+            targets.push(direct);
+        }
+        targets.push(StoreTarget {
+            base: base.to_string(),
+            host: None,
+            via: None,
+            _slot: None,
+        });
+        targets
+    }
+
+    fn direct_store_target(&self, base: &str, path: &str) -> Option<StoreTarget> {
+        let url = reqwest::Url::parse(base).ok()?;
+        let host = url.host_str()?.to_ascii_lowercase();
+        let base_path = url.path().trim_end_matches('/');
+        let (rule, deployment) =
+            self.registry.route_rule(Some(&host), &format!("{base_path}{path}"))?;
+        // A rule that rewrites the request is the proxy's to apply; reproducing
+        // it here would be a second implementation to keep in step.
+        if rule.redirect.is_some() || rule.strip_prefix || !deployment.spec.is_managed() {
+            return None;
+        }
+        let backend = deployment.select(&[])?;
+        if backend.tls {
+            return None;
+        }
+        // Counted as in flight, so a drain or scale-down waits for the transfer.
+        let slot = backend.try_hold()?;
+        let host_header = rule.upstream_host.clone().unwrap_or_else(|| match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.clone(),
+        });
+        Some(StoreTarget {
+            base: format!("http://{}{base_path}", backend.address),
+            host: Some(host_header),
+            via: Some(format!("{} ({})", backend.sandbox_id, backend.address)),
+            _slot: Some(slot),
+        })
+    }
+
+    /// Send one store request, trying each of [`store_targets`](Self::store_targets)
+    /// in turn. Only a failure to *connect* moves on to the next target: once a
+    /// request is under way its failure is the caller's to retry, because a
+    /// half-sent upload repeated against a second path is just the same upload
+    /// twice. Returns the response and the URL it was asked of, for messages.
+    async fn store_send(
+        &self,
+        base: &str,
+        method: reqwest::Method,
+        path: &str,
+        api_key: Option<&str>,
+        body: StoreBody<'_>,
+    ) -> Result<(reqwest::Response, String), String> {
+        let targets = self.store_targets(base, path);
+        let last = targets.len() - 1;
+        for (i, target) in targets.iter().enumerate() {
+            let url = format!("{}{path}", target.base);
+            let shown = match &target.via {
+                Some(via) => format!("{base}{path} via {via}"),
+                None => url.clone(),
+            };
+            let mut req = self.http.request(method.clone(), &url);
+            if let Some(host) = &target.host {
+                req = req.header(reqwest::header::HOST, host);
+            }
+            let req = match body {
+                StoreBody::Empty => req,
+                StoreBody::Text(text) => req.body(text.to_string()),
+                StoreBody::File(path) => {
+                    // Opened per attempt: a stream cannot be replayed.
+                    let file = tokio::fs::File::open(path)
+                        .await
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                    req.header(reqwest::header::CONTENT_LENGTH, len)
+                        .body(reqwest::Body::wrap_stream(file_stream(file)))
+                }
+            };
+            let req = self.authed(req, api_key);
+            match req.send().await {
+                Ok(resp) => return Ok((resp, shown)),
+                Err(e) if e.is_connect() && i < last => {
+                    tracing::warn!(store = %base, target = %shown, error = %e,
+                        "store replica unreachable; using the public URL");
+                }
+                Err(e) => return Err(format!("{method} {shown} failed: {e}")),
+            }
+        }
+        unreachable!("store_targets always ends with the public URL")
     }
 
     async fn aws(&self, args: &[&str], stdin: Option<String>) -> Result<String, String> {
@@ -2055,6 +2181,116 @@ mod tests {
         .unwrap();
         s.validate().unwrap();
         s
+    }
+
+    /// A fake `art serve`: answers every request with the `Host` it saw and
+    /// the request path, so a test can tell which way a request came in.
+    async fn fake_art() -> std::net::SocketAddr {
+        let app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
+            let host = req
+                .headers()
+                .get(http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            format!("{host} {}", req.uri().path())
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    fn art_deployment(registry: &Registry, route: serde_json::Value) -> Arc<Deployment> {
+        let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "artifacts",
+            "routes": [route],
+            "vm": {"driver": "firecracker", "port": 8080},
+            "scaling": {"min_replicas": 1, "max_replicas": 1}
+        }))
+        .unwrap();
+        spec.validate().unwrap();
+        registry.upsert(spec)
+    }
+
+    fn closed_port() -> std::net::SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    }
+
+    async fn answer(ws: &Workspaces, base: &str) -> (String, String) {
+        let (resp, shown) = ws
+            .store_send(base, reqwest::Method::GET, "/tags/x", None, StoreBody::Empty)
+            .await
+            .unwrap();
+        (resp.text().await.unwrap(), shown)
+    }
+
+    /// A store this LB routes to one of its own managed deployments is sent to
+    /// the replica, not back through the proxy — with the store's hostname, so
+    /// the replica cannot tell the difference — and holds an in-flight slot.
+    #[tokio::test]
+    async fn a_store_this_lb_serves_is_reached_at_its_replica() {
+        let (ws, registry, _) = store("direct-store");
+        let art = fake_art().await;
+        let d = art_deployment(&registry, serde_json::json!({"host": "art.test"}));
+        let backend = Arc::new(crate::deployment::VmBackend::new("sb-art".into(), art));
+        d.set_backends(vec![backend.clone()]);
+
+        // The public URL is unconnectable, so success proves the direct path.
+        let public = format!("http://art.test:{}", closed_port().port());
+        let targets = ws.store_targets(&public, "/tags/x");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(backend.in_flight(), 1, "the direct target holds a slot");
+        drop(targets);
+        assert_eq!(backend.in_flight(), 0);
+
+        let (body, shown) = answer(&ws, &public).await;
+        assert_eq!(body, format!("art.test:{} /tags/x", closed_port_of(&public)));
+        assert!(shown.contains("via sb-art"), "{shown}");
+        assert_eq!(backend.in_flight(), 0);
+    }
+
+    fn closed_port_of(url: &str) -> u16 {
+        reqwest::Url::parse(url).unwrap().port().unwrap()
+    }
+
+    /// A replica that refuses connections falls back to the public URL, and so
+    /// does a store no deployment here serves.
+    #[tokio::test]
+    async fn an_unreachable_or_foreign_store_uses_the_public_url() {
+        let (ws, registry, _) = store("direct-fallback");
+        let art = fake_art().await;
+        let public = format!("http://127.0.0.1:{}", art.port());
+
+        let (body, shown) = answer(&ws, &public).await;
+        assert_eq!(body, format!("127.0.0.1:{} /tags/x", art.port()));
+        assert_eq!(shown, format!("{public}/tags/x"));
+
+        let d = art_deployment(&registry, serde_json::json!({"host": "127.0.0.1"}));
+        d.set_backends(vec![Arc::new(crate::deployment::VmBackend::new(
+            "sb-gone".into(),
+            closed_port(),
+        ))]);
+        assert_eq!(ws.store_targets(&public, "/tags/x").len(), 2);
+        let (body, shown) = answer(&ws, &public).await;
+        assert_eq!(body, format!("127.0.0.1:{} /tags/x", art.port()));
+        assert_eq!(shown, format!("{public}/tags/x"));
+    }
+
+    /// A rule that rewrites requests stays with the proxy.
+    #[test]
+    fn a_rewriting_route_is_not_bypassed() {
+        let (ws, registry, _) = store("direct-rewrite");
+        let d = art_deployment(
+            &registry,
+            serde_json::json!({"host": "art.test", "path_prefix": "/art", "strip_prefix": true}),
+        );
+        d.set_backends(vec![Arc::new(crate::deployment::VmBackend::new(
+            "sb-art".into(),
+            "127.0.0.1:9".parse().unwrap(),
+        ))]);
+        assert_eq!(ws.store_targets("https://art.test/art", "/tags/x").len(), 1);
     }
 
     #[test]
