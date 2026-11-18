@@ -4754,6 +4754,170 @@ running* VMs is a host-RAM question and does not. `idle_action: retain` with
 `scale_to_zero_after_secs` is what reconciles the two — a fleet of thousands with
 tens awake, each waking in a resume rather than a cold boot.
 
+## Several hosts, one fleet
+
+Several app-lbs can share one fleet store — a Postgres database
+(`APP_LB_FLEET_DATABASE_URL`) holding deployments, namespaces, secrets, tokens,
+plugins, certificates and the rest of the tenant state — while each keeps
+driving only its own heyvm daemon. The design, its phases and the live
+evidence are in
+[docs/design/fleet-shared-state.md](../docs/design/fleet-shared-state.md).
+What follows is how to run one.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `APP_LB_FLEET_DATABASE_URL` | *(unset)* | **Setting it enables fleet mode.** The writer of the fleet store. Needs `APP_LB_SECRET_KEY`, the same on every host: sealed records are sealed with it |
+| `APP_LB_FLEET_HOST` | the hostname | This host's fleet name: what `placement.home` names and `fleet.hosts` lists. Letters, digits, `-`, `_`, `.` |
+| `APP_LB_FLEET_ADDRESS` | *(unset)* | Where peers reach this host's public ingress (an IP or name; port 443). Without it the host takes no fleet hops, tenant or admin |
+| `APP_LB_FLEET_FORWARD` | `0` | `1` to forward: tenant requests for another host's deployments, and [admin calls](#one-admin-api-across-the-fleet) that belong to another host. Accepting hops needs only fleet mode |
+| `APP_LB_FLEET_ADMIN_HOST` | *(unset)* | The name every host routes to its own admin deployment (e.g. `us.heyo.work`), used for an admin hop when the fleet's registry shows no admin route for the peer |
+| `APP_LB_FLEET_DRIVERS` | *(daemon's `/capabilities`)* | Comma-separated VM drivers this host boots (`firecracker`, `kvm`, `libvirt`, `lxc`), published for placement. heyvmd lists every driver it was built with, whether or not the host has KVM or libvirt — set this on a host that cannot boot one of them |
+| `APP_LB_FLEET_FANOUT_TIMEOUT_MS` | `3000` | How long a merged admin read waits for each other member |
+| `APP_LB_FLEET_DRAIN_QUIET_SECS` | DNS TTL + margin | How long a draining host must see no direct `spread` traffic before it enters maintenance |
+| `APP_LB_FLEET_TIMEOUT_MS` | `5000` | Ceiling on one fleet-store call |
+| `APP_LB_FLEET_CA_FILE` | system bundle | CA bundle for TLS to the fleet database |
+
+### One admin API across the fleet
+
+Any member's admin API answers any admin call, so the fleet can have one admin
+name — `us.heyo.work`, spread across the hosts by weighted DNS — rather than one
+per host. With `APP_LB_FLEET_FORWARD=1`:
+
+- **Fleet state is written where the call lands.** Namespaces, secrets, tokens,
+  auth providers, workflows, guard rules, `/fleet-hosts` and every
+  deployment's spec are fleet records already.
+- **A call that acts where something runs is forwarded once to that host.**
+  Anything under `/deployments/:id` for a deployment another host runs
+  (reads, `PUT`, `DELETE`, scaling, stop/start/restart, rollouts, exec, shell,
+  files, operations, transfers, jobs, adoptions, VM eviction); a call naming a
+  VM (`vms/:id`, `?sandbox_id=`, or `sandbox_id` in an exec/operation/transfer
+  body) of a `spread` deployment, to the host holding that VM; an operation,
+  transfer or job id another host minted; and a plugin's surfaces
+  (`/api/plugins/:id/…`, machine routes included, and a namespace's
+  `/namespaces/:ns/plugins/:id` install, uninstall and surface) to the
+  plugin's home. The answer streams back, WebSocket upgrades (the shell)
+  included, with `x-heyo-fleet-served-by: <host>`.
+- **Listings merge every live member.** `GET /deployments`, `GET /metrics`
+  (`summary=true` too: every member answers its summary) and `GET
+  /deployments/:id` for a `spread` deployment ask each other member in
+  parallel, with `APP_LB_FLEET_FANOUT_TIMEOUT_MS` each. Items carry `host`; a
+  spread deployment is listed once, with `hosts` and every host's VMs (each
+  tagged `host`). A member that does not answer is never dropped silently:
+  the answer carries `x-heyo-fleet-partial: 1` and
+  `x-heyo-fleet-unreachable: <hosts>`, and `/metrics` also `partial` and
+  `hosts_unreachable`, plus each member's host and daemon readings under
+  `members`. `limit`/`offset` on `/metrics` page each member's list. A single
+  server's answers are unchanged.
+- **A deployment unknown anywhere is a 404, as before.** A home host that is
+  not live answers 503 `fleet_home_unreachable` ("home host us5 unreachable:
+  …"). A forwarded call is never forwarded again: one that would need a second
+  hop answers 503 `fleet_hop_loop`.
+
+**How the hop travels.** Exactly like a tenant hop: HTTPS to the peer's
+`APP_LB_FLEET_ADDRESS` on 443, with `x-heyo-fleet-hop` and the fleet's sealed
+peer token. Its `Host` and SNI are a name the peer routes to *its own* admin
+deployment — the shared name the client used, when the peer's admin deployment
+routes it, else that deployment's first route, else `APP_LB_FLEET_ADMIN_HOST`.
+The peer's ingress admits the hop by its token, runs its edge checks (guard,
+the admin deployment's gate), and passes the hop headers to its admin listener
+only; the admin listener checks the token again, in constant time. The admin
+port is never exposed. The client address travels only as the origin
+ingress judged it (`x-heyo-fleet-client`, which that ingress sets and strips
+from clients); a client's own `X-Forwarded-For` is never forwarded.
+
+**Who is allowed.** The peer token says only "a fleet member sent this". The
+home host re-authorizes the caller's own credential — `Authorization`,
+cookies and `If-Match` are forwarded untouched, and tokens are fleet state — so
+a token without reach is refused there exactly as it would be locally.
+Cookie sign-in needs the shared name on both ends (`Origin` is checked against
+`Host`); a bearer works through any name.
+
+**Where a VM is.** Each host publishes, with its heartbeat (`fleet.hosts.facts`,
+every 5 s), the sandbox ids of its `spread` deployments' VMs; a host reads the
+table back every 5 s. A VM booted in the last ~10 s may not be known yet: a call
+naming it is answered locally ("no such VM") and succeeds on retry. A pinned
+deployment's VMs are all at its home, so no map is needed for them.
+
+**Host-scoped ids.** In fleet mode, operation ids, transfer ids and tokens, and
+job ids are minted as `<host>~<id>` (`us5~op_…`, `us5~job-…`), so a call naming
+one goes to the host that minted it. An id without `~`, minted before, is the
+receiving host's. `APP_LB_TRANSFER_URL` stays per host. Rollout operation ids
+are chosen by the caller and follow their deployment.
+
+### Placement by capability and capacity
+
+Each host also publishes which VM drivers it boots (`APP_LB_FLEET_DRIVERS`, else
+the daemon's `/capabilities`), its free memory and its idle vCPUs (from the
+daemon's host usage). A `POST /deployments` (or a creating `PUT`) of a **VM
+pool with no `placement`** is pinned to the live, `active` member that says it
+boots the spec's `vm.driver` (`firecracker` when unset) and has the most free
+memory, then the most idle vCPUs, then the first name; the call is forwarded
+there and registered by that host. A member that publishes no facts (an older
+binary, a daemon that will not say) is never chosen automatically; when no
+member is known capable the receiving host keeps it, as before, unless it
+knows it cannot boot that driver (409 `no_capable_host`).
+
+An explicit `placement` wins but is checked: a pinned `home` that says it
+cannot boot the driver is refused with 409 `driver_unsupported`, and so is a
+`spread` whose listed hosts (all live members, when it lists none) include one
+that says it cannot — the placer splits a spread across every listed host, so
+list only capable ones in `placement.hosts`. A registration with an explicit
+home on another host is forwarded there rather than refused. Static, site and
+tunnel deployments keep the receiving host: their upstreams and files are
+that host's. A replace of an existing deployment goes to the host that runs it.
+
+### One admin name on every host
+
+1. Each host keeps its own host-scoped static admin deployment
+   (`app-lb-admin-usN`, upstream `127.0.0.1:9090`). Give each one the shared
+   route as well — `us.heyo.work` — alongside its per-host name. A host's own
+   route always wins over a foreign one, so the shared name reaches the local
+   admin listener with no hop.
+2. Point `us.heyo.work` at every active host with weighted records, health
+   checked on `/fleet/v1/healthz` (503 while the host drains).
+3. Set `APP_LB_FLEET_FORWARD=1` and `APP_LB_FLEET_ADDRESS` on every host
+   (optionally `APP_LB_FLEET_ADMIN_HOST=us.heyo.work`).
+4. The shared name's certificate is ordered by **one** host — the first live,
+   active host by name among those whose deployments route it — over HTTP-01,
+   after it has checked that every live member answers the challenge (any host
+   answers any host's challenge from the fleet store). Every host loads the
+   certificate from the fleet store. The bare `us.heyo.work` is not covered by
+   `*.us.heyo.work`, so it gets a certificate of its own — unless
+   `APP_LB_ACME_WILDCARD` names it, in which case the wildcard order names the
+   bare domain too, and is stored under it, so no separate order is made.
+
+### Joining a host
+
+1. **Credentials.** Deliver the fleet database's password and the fleet's
+   `APP_LB_SECRET_KEY` to the new host as ciphertext only (encrypted to that
+   host's key, from HeyoSecret). Never paste them.
+2. **Build.** Install the same app-lb build the fleet runs; migrations are
+   additive, and a newer binary migrates the store for everyone (older members
+   ignore columns they do not know).
+3. **Export what the host already has**, if it already serves anything:
+   `app-lb-fleet-import --export --join --from-host usN --to-key FLEET.pub.pem
+   --out usN.bundle --host-scoped app-lb-admin` carries its tenant state, its
+   plugins (homed on it), the postgres ownership map, its ACME account and
+   certificates, and its admin deployment as `app-lb-admin-usN`.
+   `--dry-run` first reports the counts.
+4. **Apply it into the fleet store:** `app-lb-fleet-import --apply usN.bundle
+   --key FLEET.pem --dry-run`, then without `--dry-run`. (`--seed` only for the
+   first host of an empty store.)
+5. **Configure** `/etc/app-lb/fleet.env`: `APP_LB_FLEET_DATABASE_URL`,
+   `APP_LB_FLEET_HOST=usN`, `APP_LB_FLEET_ADDRESS=<public IP>`,
+   `APP_LB_FLEET_FORWARD=1`, and `APP_LB_FLEET_DRIVERS` when the host cannot
+   boot every driver its daemon lists.
+6. **Start (or hand off).** The host takes the fleet's records, runs only what
+   is placed on it, keeps the rest as foreign, and starts only plugins homed
+   on it. Check `GET /fleet-hosts` on any member: the new host is `live`, with
+   its facts.
+7. **Give its admin deployment the shared admin route**, then add the host to
+   the weighted DNS records, health check first.
+
+Rollback is the reverse: remove it from DNS, drain it
+(`PUT /fleet-hosts/usN {"state": "draining"}`), then stop it or move
+`fleet.env` aside and restart in file mode.
+
 ## Shipping logs to app-obs
 
 [app-obs](../app-obs) polls `/metrics` for numbers, but the *logs* it stores have
