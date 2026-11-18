@@ -655,6 +655,7 @@ mod tests {
             state: "active".into(),
             boot_id: "b".into(),
             age_secs: 0.0,
+            facts: None,
         }
     }
 

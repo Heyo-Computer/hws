@@ -162,7 +162,18 @@ CREATE TABLE {s}.placement_targets (
 );
 "#,
     ),
+    (
+        4,
+        r#"
+ALTER TABLE {s}.hosts ADD COLUMN facts text;
+ALTER TABLE {s}.hosts ADD COLUMN facts_at timestamptz;
+"#,
+    ),
 ];
+
+/// A host's facts older than this are not believed: its binary may predate
+/// them, or it stopped publishing them.
+pub const FACTS_STALE_SECS: f64 = 30.0;
 
 const UPSERT_ANY: &str = "INSERT INTO {s}.records (kind, key, body, revision, updated_by)
      VALUES ($1, $2, $3, nextval('{s}.revision'), $4)
@@ -255,6 +266,49 @@ pub struct HostRow {
     pub boot_id: String,
     /// Seconds since its last heartbeat.
     pub age_secs: f64,
+    /// What it last said it can run and has room for, while that is fresh
+    /// ([`FACTS_STALE_SECS`]). `None` for a host whose binary publishes
+    /// none, which placement treats as unknown rather than incapable.
+    pub facts: Option<HostFacts>,
+}
+
+/// What a host publishes with its heartbeat (`hosts.facts`, migration 4):
+/// the VM drivers it can boot, how much room it has, and which VMs of its
+/// `spread` deployments it holds. Additive JSON: a field a newer binary adds
+/// is ignored here, and one this binary expects and finds missing is empty.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HostFacts {
+    /// Driver names (`firecracker`, `kvm`, `libvirt`, `lxc`). `None` when
+    /// the host could not tell, which is not the same as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drivers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpus: Option<u64>,
+    /// Idle vCPUs, estimated from the host's CPU use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpus_free: Option<f64>,
+    /// `sandbox id -> deployment id` for the VMs this host runs for its
+    /// `spread` deployments: where an admin call naming one of them goes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub vms: std::collections::BTreeMap<String, String>,
+}
+
+impl HostFacts {
+    fn parse(body: Option<String>, age: Option<f64>) -> Option<Self> {
+        if age.is_none_or(|a| a > FACTS_STALE_SECS) {
+            return None;
+        }
+        serde_json::from_str(&body?).ok()
+    }
+
+    /// Whether this host says it can boot `driver`; `None` when it never said.
+    pub fn supports(&self, driver: &str) -> Option<bool> {
+        self.drivers.as_ref().map(|d| d.iter().any(|x| x == driver))
+    }
 }
 
 /// A live record with its last writer: `(key, body, revision, updated_by)`.
@@ -930,26 +984,32 @@ impl PgStore {
     }
 
     /// Say this host is alive, and where its peers reach it. Its own row, so
-    /// a heartbeat never touches the change feed.
+    /// a heartbeat never touches the change feed. `facts` (a [`HostFacts`]
+    /// as JSON) replaces what the row published before; `None` leaves it.
     pub async fn heartbeat(
         &self,
         host: &str,
         address: Option<&str>,
         boot_id: &str,
+        facts: Option<&str>,
     ) -> Result<(), PgFailure> {
         let sql = self.sql(
-            "INSERT INTO {s}.hosts (host, address, boot_id, heartbeat_at) VALUES ($1, $2, $3, now())
+            "INSERT INTO {s}.hosts (host, address, boot_id, heartbeat_at, facts, facts_at)
+             VALUES ($1, $2, $3, now(), $4, CASE WHEN $4::text IS NULL THEN NULL ELSE now() END)
              ON CONFLICT (host) DO UPDATE
-             SET address = EXCLUDED.address, boot_id = EXCLUDED.boot_id, heartbeat_at = now()",
+             SET address = EXCLUDED.address, boot_id = EXCLUDED.boot_id, heartbeat_at = now(),
+                 facts = COALESCE(EXCLUDED.facts, {s}.hosts.facts),
+                 facts_at = COALESCE(EXCLUDED.facts_at, {s}.hosts.facts_at)",
         );
-        let (host, address, boot_id) = (
+        let (host, address, boot_id, facts) = (
             host.to_string(),
             address.map(str::to_string),
             boot_id.to_string(),
+            facts.map(str::to_string),
         );
         self.call(move |pool| async move {
             let c = pool.get().await.map_err(pool_failure)?;
-            c.execute(&sql, &[&host, &address, &boot_id])
+            c.execute(&sql, &[&host, &address, &boot_id, &facts])
                 .await
                 .map_err(classify)?;
             Ok(())
@@ -976,7 +1036,8 @@ impl PgStore {
     pub async fn hosts(&self) -> Result<Vec<HostRow>, PgFailure> {
         let sql = self.sql(
             "SELECT host, address, state, boot_id,
-                    extract(epoch FROM now() - heartbeat_at)::float8
+                    extract(epoch FROM now() - heartbeat_at)::float8,
+                    facts, extract(epoch FROM now() - facts_at)::float8
              FROM {s}.hosts ORDER BY host",
         );
         self.call(move |pool| async move {
@@ -990,6 +1051,7 @@ impl PgStore {
                     state: r.get(2),
                     boot_id: r.get(3),
                     age_secs: r.get::<_, f64>(4).max(0.0),
+                    facts: HostFacts::parse(r.get(5), r.get(6)),
                 })
                 .collect())
         })
@@ -1603,11 +1665,11 @@ pub(crate) mod tests {
             return;
         };
         let cursor = a.snapshot().unwrap().cursor;
-        a.heartbeat("us5", Some("203.0.113.5"), "boot-1")
+        a.heartbeat("us5", Some("203.0.113.5"), "boot-1", None)
             .await
             .unwrap();
-        a.heartbeat("us4", None, "boot-2").await.unwrap();
-        a.heartbeat("us5", Some("203.0.113.6"), "boot-3")
+        a.heartbeat("us4", None, "boot-2", Some(r#"{"drivers":["libvirt"],"memory_free_bytes":7,"vms":{"sb-1":"web"}}"#)).await.unwrap();
+        a.heartbeat("us5", Some("203.0.113.6"), "boot-3", None)
             .await
             .unwrap();
         let hosts = a.hosts().await.unwrap();
@@ -1618,6 +1680,15 @@ pub(crate) mod tests {
         assert_eq!(hosts[1].address.as_deref(), Some("203.0.113.6"));
         assert_eq!(hosts[1].boot_id, "boot-3");
         assert!(hosts[1].age_secs < 5.0);
+        assert_eq!(hosts[1].facts, None, "us5 never published facts");
+        let us4 = hosts[0].facts.clone().expect("us4's facts");
+        assert_eq!(us4.supports("libvirt"), Some(true));
+        assert_eq!(us4.supports("firecracker"), Some(false));
+        assert_eq!(us4.memory_free_bytes, Some(7));
+        assert_eq!(us4.vms.get("sb-1").map(String::as_str), Some("web"));
+        // A heartbeat without facts keeps the last ones.
+        a.heartbeat("us4", None, "boot-2", None).await.unwrap();
+        assert_eq!(a.hosts().await.unwrap()[0].facts.as_ref(), Some(&us4));
         assert_eq!(
             a.snapshot().unwrap().cursor,
             cursor,

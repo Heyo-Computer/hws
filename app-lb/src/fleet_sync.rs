@@ -294,6 +294,9 @@ pub struct Fleet {
     identity: Mutex<Option<Identity>>,
     /// The members as last read, and when.
     members: Mutex<(Option<Instant>, Vec<crate::fleet_pg::HostRow>)>,
+    /// What this host publishes with its heartbeat (`fleet_admin::facts`),
+    /// as JSON; `None` until something has.
+    facts: Mutex<Option<String>>,
     synced_at: AtomicU64,
 }
 
@@ -322,6 +325,7 @@ impl Fleet {
             duties: Mutex::new(Vec::new()),
             identity: Mutex::new(None),
             members: Mutex::new((None, Vec::new())),
+            facts: Mutex::new(None),
             synced_at: AtomicU64::new(0),
         })
     }
@@ -335,6 +339,12 @@ impl Fleet {
             address,
             boot_id: id.iter().map(|b| format!("{b:02x}")).collect(),
         });
+    }
+
+    /// Publish `facts` (a [`crate::fleet_pg::HostFacts`]) with the next
+    /// heartbeats.
+    pub fn set_facts(&self, facts: &crate::fleet_pg::HostFacts) {
+        *lock(&self.facts) = serde_json::to_string(facts).ok();
     }
 
     /// `host`, while its heartbeat is live.
@@ -399,10 +409,11 @@ impl Fleet {
     /// Heartbeat this host and re-read the members.
     async fn membership(&self) {
         let identity = lock(&self.identity).clone();
+        let facts = lock(&self.facts).clone();
         if let Some(id) = identity
             && let Err(e) = self
                 .pg
-                .heartbeat(&id.host, id.address.as_deref(), &id.boot_id)
+                .heartbeat(&id.host, id.address.as_deref(), &id.boot_id, facts.as_deref())
                 .await
         {
             tracing::debug!(error = %e, "fleet heartbeat failed");
