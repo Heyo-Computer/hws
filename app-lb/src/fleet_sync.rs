@@ -1622,6 +1622,34 @@ mod tests {
         );
     }
 
+    /// Facts a host publishes with its heartbeat reach every member, and
+    /// placement reads them there: against Postgres, two hosts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_facts_reach_every_member_and_steer_placement() {
+        let pg_a = pg_or_skip!("facts", "us4/1");
+        let (a_dir, b_dir) = (Dir::new("fa"), Dir::new("fb"));
+        let a = Fleet::new(pg_a.clone(), snapshot_meta_path(&a_dir.state()), KEY.to_vec());
+        let b = Fleet::new(peer(&pg_a, "us5/1"), snapshot_meta_path(&b_dir.state()), KEY.to_vec());
+        a.set_identity("us4", Some("198.51.100.4".into()));
+        b.set_identity("us5", Some("198.51.100.5".into()));
+        let mut fa = crate::fleet_pg::HostFacts { drivers: Some(vec!["firecracker".into()]), memory_free_bytes: Some(10), ..Default::default() };
+        fa.vms.insert("sb-a".into(), "web".into());
+        a.set_facts(&fa);
+        b.set_facts(&crate::fleet_pg::HostFacts { drivers: Some(vec!["libvirt".into()]), memory_free_bytes: Some(99), ..Default::default() });
+        a.membership().await;
+        b.membership().await;
+        a.membership().await;
+        let seen_by_b = b.live_members();
+        assert_eq!(seen_by_b.len(), 2);
+        b.membership().await;
+        let members = b.live_members();
+        let us4 = members.iter().find(|m| m.host == "us4").unwrap();
+        assert_eq!(us4.facts.as_ref(), Some(&fa));
+        assert_eq!(crate::fleet_admin::choose_home("us5", &members, "firecracker").unwrap(), "us4");
+        assert_eq!(crate::fleet_admin::choose_home("us5", &members, "libvirt").unwrap(), "us5");
+        assert!(crate::fleet_admin::choose_home("us5", &members, "kvm").is_err());
+    }
+
     #[test]
     fn the_first_host_seeds_and_the_second_takes_the_fleets_records() {
         let pg_a = pg_or_skip!("seed2", "host-a");

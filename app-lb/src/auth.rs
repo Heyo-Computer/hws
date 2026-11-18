@@ -1759,7 +1759,7 @@ fn validate_claims(claims: &IdClaims, client_id: &str) -> Result<Identity, Strin
 /// No DNS. This runs on the request path, and a name lookup there would trade a
 /// comparison for a network round trip; a hostname that needs one falls through
 /// to `false`, which refuses rather than admits.
-fn same_listener(admin: &str, upstream: &str) -> bool {
+pub(crate) fn same_listener(admin: &str, upstream: &str) -> bool {
     fn split(s: &str) -> Option<(String, String)> {
         let (host, port) = s.trim().rsplit_once(':')?;
         let host = host.trim().trim_start_matches('[').trim_end_matches(']');

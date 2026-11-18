@@ -379,6 +379,12 @@ impl Registry {
         table.1.get(id).cloned()
     }
 
+    /// Stand in for the fleet feed: these deployments run on other hosts.
+    #[cfg(test)]
+    pub fn set_foreign_for_test(&self, specs: Vec<DeploymentSpec>) {
+        self.set_foreign(specs.into_iter().map(|s| (s.id.clone(), Arc::new(s))).collect());
+    }
+
     /// Fleet deployments this host keeps but does not run.
     pub fn foreign(&self) -> Arc<HashMap<String, Arc<DeploymentSpec>>> {
         self.foreign.load_full()
