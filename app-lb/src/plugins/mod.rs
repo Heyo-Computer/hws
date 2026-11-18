@@ -462,6 +462,9 @@ struct Slot {
     /// Held across `apply`, so two edits to one plugin cannot interleave.
     lock: tokio::sync::Mutex<()>,
     last_error: std::sync::Mutex<Option<String>>,
+    /// The configuration last applied on this host (`None`: stopped), so a
+    /// fleet reload applies only what changed.
+    applied: std::sync::Mutex<Option<Value>>,
 }
 
 /// The built-in plugins and their records.
@@ -493,6 +496,7 @@ impl PluginHost {
                     namespace_router,
                     lock: tokio::sync::Mutex::new(()),
                     last_error: std::sync::Mutex::new(None),
+                    applied: std::sync::Mutex::new(None),
                 })
             })
             .collect();
@@ -529,6 +533,61 @@ impl PluginHost {
     /// Enabled, and run by this host.
     pub fn is_enabled(&self, id: &str) -> bool {
         self.store.get(id).is_some_and(|r| r.enabled && self.runs_here(&r))
+    }
+
+    /// In fleet mode, the host that runs plugin `id`, if its record names one.
+    /// `None` on a single server, and for a plugin homed nowhere yet.
+    pub fn home_of(&self, id: &str) -> Option<String> {
+        self.host.as_ref()?;
+        self.store.get(id)?.home
+    }
+
+    /// Why plugin `id` does not answer here: switched off, or run by another
+    /// fleet host. The second is not something `heyctl plugins enable` fixes.
+    fn not_here(&self, id: &str) -> Response {
+        match self.store.get(id) {
+            Some(r) if r.enabled && !self.runs_here(&r) => plugin_error(
+                StatusCode::CONFLICT,
+                Some("plugin_elsewhere"),
+                format!(
+                    "the {id} plugin runs on fleet host {}, not this one; this host forwards to it \
+                     when fleet hops are on",
+                    r.home.unwrap_or_default()
+                ),
+            ),
+            _ => disabled(id),
+        }
+    }
+
+    /// Bring this host's running plugins in line with their records, after
+    /// another fleet host changed them: start what is now enabled and homed
+    /// here, stop what is not, and re-apply a changed configuration.
+    pub async fn reconcile(&self) {
+        self.store.load();
+        for slot in &self.slots {
+            let id = slot.plugin.meta().id;
+            let record = self.store.get(id);
+            let desired = record
+                .as_ref()
+                .filter(|r| r.enabled && self.runs_here(r))
+                .map(|r| r.config.clone());
+            let _held = slot.lock.lock().await;
+            if *slot.applied.lock().unwrap() == desired {
+                continue;
+            }
+            if let Some(config) = &desired
+                && let Err(e) = slot.plugin.validate(config)
+            {
+                tracing::warn!(plugin = id, error = %e, "the fleet's plugin configuration is invalid; not applying it");
+                *slot.last_error.lock().unwrap() = Some(format!("invalid configuration: {e}"));
+                continue;
+            }
+            tracing::info!(plugin = id, enabled = desired.is_some(), "applying a plugin change made on another fleet host");
+            self.apply_slot(slot, desired.clone()).await;
+            if let Some(config) = &desired {
+                self.refresh_installs(slot, config).await;
+            }
+        }
     }
 
     pub async fn list(&self) -> Vec<PluginView> {
@@ -767,6 +826,11 @@ impl PluginHost {
             unreachable!("installable() only returns per-namespace plugins");
         };
         if !self.is_enabled(id) {
+            if self.home_of(id).is_some_and(|h| Some(h.as_str()) != self.host.as_deref())
+                && self.store.get(id).is_some_and(|r| r.enabled)
+            {
+                return self.not_here(id);
+            }
             return plugin_error(
                 StatusCode::CONFLICT,
                 Some("plugin_disabled"),
@@ -811,7 +875,8 @@ impl PluginHost {
     async fn apply_slot(&self, slot: &Slot, config: Option<Value>) {
         let id = slot.plugin.meta().id;
         let on = config.is_some();
-        let result = slot.plugin.apply(config).await;
+        let result = slot.plugin.apply(config.clone()).await;
+        *slot.applied.lock().unwrap() = if result.is_ok() { config } else { None };
         if let Err(e) = &result {
             tracing::warn!(plugin = id, enabled = on, error = %e, "plugin apply failed");
         } else {
@@ -893,7 +958,7 @@ impl PluginHost {
                         if host.is_enabled(id) {
                             next.run(req).await
                         } else {
-                            disabled(id)
+                            host.not_here(id)
                         }
                     }
                 }
@@ -940,6 +1005,11 @@ impl PluginHost {
                                 format!("no {id} machine route here"),
                             );
                         };
+                        // Only the host that runs the plugin holds what its
+                        // machine routes act on.
+                        if !host.runs_here(&record) {
+                            return host.not_here(id);
+                        }
                         req.extensions_mut()
                             .insert(Installs(record.installs.keys().cloned().collect()));
                         next.run(req).await
@@ -1159,6 +1229,42 @@ mod tests {
         single.store.load();
         assert!(single.is_enabled("probe"));
         assert!(PluginRecord { enabled: true, ..Default::default() }.runs_on(Some("us4")));
+    }
+
+    /// A change made on another fleet host is applied by the home host when
+    /// the feed reloads it; a host that is not home says where it runs
+    /// rather than that it is disabled.
+    #[tokio::test]
+    async fn the_home_host_applies_a_change_made_elsewhere_and_others_name_it() {
+        let dir = TempDir::new();
+        let probe = Arc::new(Probe::default());
+        let us5 = PluginHost::new(vec![probe.clone()], PluginStore::new(&dir.0)).with_host(Some("us5".into()));
+        us5.set("probe", true, Some(serde_json::json!({"x": 1}))).await.unwrap();
+        assert_eq!(probe.applied.lock().unwrap().len(), 1);
+        us5.reconcile().await;
+        assert_eq!(probe.applied.lock().unwrap().len(), 1, "nothing changed: nothing applied");
+
+        let us4 = Arc::new(PluginHost::new(vec![Arc::new(Probe::default())], PluginStore::new(&dir.0)).with_host(Some("us4".into())));
+        us4.store.load();
+        us4.set("probe", true, Some(serde_json::json!({"x": 2}))).await.unwrap();
+        assert_eq!(us4.home_of("probe").as_deref(), Some("us5"));
+        us5.reconcile().await;
+        assert_eq!(probe.applied.lock().unwrap().last().unwrap(), &Some(serde_json::json!({"x": 2})));
+        us4.set("probe", false, None).await.unwrap();
+        us5.reconcile().await;
+        assert_eq!(probe.applied.lock().unwrap().last().unwrap(), &None, "disabled elsewhere, stopped at home");
+
+        us4.set("probe", true, None).await.unwrap();
+        let (view, _) = us4.routers();
+        let resp = tower_service::Service::call(&mut view.clone(), axum::http::Request::get("/api/plugins/probe/ping").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "plugin_elsewhere");
+        assert!(body["error"].as_str().unwrap().contains("us5"), "{body}");
+        assert!(!body["error"].as_str().unwrap().contains("heyctl plugins enable"));
+        // A single server has no home to name.
+        assert_eq!(PluginHost::new(vec![Arc::new(Probe::default())], PluginStore::new(&dir.0)).home_of("probe"), None);
     }
 
     #[tokio::test]
