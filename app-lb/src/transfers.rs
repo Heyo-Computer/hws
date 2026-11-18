@@ -319,7 +319,9 @@ impl TransferConfig {
 fn mint() -> (String, String) {
     let mut bytes = [0u8; 32];
     openssl::rand::rand_bytes(&mut bytes).expect("entropy for a transfer token");
-    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    // In a fleet, `<host>~` first: the host holding the file, for a member
+    // that receives the URL on a shared name.
+    let token = crate::fleet_admin::scoped(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes));
     let hash = hash(&token);
     (token, hash)
 }
@@ -338,10 +340,10 @@ fn matches(stored: Option<&String>, presented: &str) -> bool {
 fn new_id() -> String {
     let mut bytes = [0u8; 8];
     openssl::rand::rand_bytes(&mut bytes).expect("entropy for a transfer id");
-    format!(
+    crate::fleet_admin::scoped(format!(
         "tr_{}",
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-    )
+    ))
 }
 
 // -- guest scripts -----------------------------------------------------------

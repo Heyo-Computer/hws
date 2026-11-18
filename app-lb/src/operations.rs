@@ -426,14 +426,15 @@ pub fn judge(op: &Operation, boot_now: Option<&str>, probe: Option<&Probe>, now:
     }
 }
 
-/// A new operation id: `op_` and 16 hex characters.
+/// A new operation id: `op_` and 16 hex characters, after `<host>~` in a
+/// fleet so any member can send a call naming it to the host that runs it.
 pub fn new_id() -> String {
     let mut bytes = [0u8; 8];
     openssl::rand::rand_bytes(&mut bytes).expect("entropy for an operation id");
-    format!(
+    crate::fleet_admin::scoped(format!(
         "op_{}",
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-    )
+    ))
 }
 
 /// The record a new operation starts with.

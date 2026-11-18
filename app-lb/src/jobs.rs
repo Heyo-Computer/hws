@@ -2802,7 +2802,8 @@ fn new_job_id() -> String {
         bytes.copy_from_slice(&n.to_le_bytes()[..6]);
     }
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("job-{hex}")
+    // `<host>~` first in a fleet, so `/jobs/:id` on any member finds it.
+    crate::fleet_admin::scoped(format!("job-{hex}"))
 }
 
 #[cfg(test)]
