@@ -56,7 +56,11 @@ pingora-http = "0.9.0"
 http = "1"
 bytes = "1"
 
-heyo-sdk = "0.1.11"
+# 0.1.12+ for `SandboxInfo::port_mappings`, the host ports a libvirt guest is
+# reached through. Default features off: the default `workloads` feature pulls
+# in `hws`, which turns on serde_json's `preserve_order` for this whole crate
+# and so changes the key order of every `serde_json::Value` app-lb serializes.
+heyo-sdk = { version = "0.1.15", default-features = false }
 
 # ACME (Let's Encrypt) client for per-deployment certificates. In-process rather
 # than shelling out to certbot: no external binary, and no root — the account key
