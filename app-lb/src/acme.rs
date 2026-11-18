@@ -701,7 +701,12 @@ impl AcmeManager {
                         .external_tls
                         .read()
                         .is_ok_and(|set| set.contains(&host));
-                    if self.covering_wildcard(&host).is_none() && !external {
+                    // A name other hosts' deployments route as well is
+                    // issued by one of them, and loaded by all.
+                    if !self.issues_shared(&host) {
+                        continue;
+                    }
+                    if self.covering_wildcard(&host).is_none() && !external && !self.apex_of_wildcard(&host) {
                         hosts.insert(host);
                     }
                 }
@@ -745,6 +750,44 @@ impl AcmeManager {
                         .is_some_and(|h| h.trim().eq_ignore_ascii_case(host))
                 })
         })
+    }
+
+    /// The other fleet hosts whose deployments route exactly `host` too:
+    /// pinned deployments homed elsewhere, as the fleet's registry has them.
+    fn sharing_hosts(&self, host: &str) -> Vec<String> {
+        let me = self.registry.fleet_host();
+        let mut out: Vec<String> = self
+            .registry
+            .foreign()
+            .values()
+            .filter(|s| s.routes.iter().any(|r| r.host.as_deref().is_some_and(|h| h.trim().eq_ignore_ascii_case(host))))
+            .filter_map(|s| s.placement.as_ref().and_then(|p| p.home.clone()))
+            .filter(|h| Some(h.as_str()) != me)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Whether this host orders `host`'s certificate, when other hosts'
+    /// deployments route it too.
+    fn issues_shared(&self, host: &str) -> bool {
+        let others = self.sharing_hosts(host);
+        others.is_empty()
+            || crate::fleet_placement::placer().is_none_or(|p| p.issues_shared_name(&others))
+    }
+
+    /// Whether `host` is the bare domain of a wildcard: its wildcard order
+    /// names it as well (`issue_wildcard`) and is stored under it, so an
+    /// HTTP-01 certificate of its own would overwrite the wildcard and every
+    /// name beneath would lose it. Configured here, or already installed —
+    /// by another fleet host, say — as a certificate that wildcards `host`.
+    fn apex_of_wildcard(&self, host: &str) -> bool {
+        self.certifies(host)
+            || self
+                .certs
+                .lookup(host)
+                .is_some_and(|c| c.wildcard_of().as_deref() == Some(host))
     }
 
     /// Whether `domain` is one of the domains we issue a wildcard for.
@@ -1024,7 +1067,7 @@ impl AcmeManager {
                 if let Some(shared) = &self.shared {
                     shared.publish(&token, &key_authorization)?;
                     shared
-                        .answerable(host, &token, &key_authorization, self.spreads(host))
+                        .answerable(host, &token, &key_authorization, self.spreads(host) || !self.sharing_hosts(host).is_empty())
                         .await?;
                 }
                 challenge.set_ready().await?;
@@ -1196,6 +1239,38 @@ mod tests {
 
     fn manager(tag: &str, registry: Arc<Registry>) -> AcmeManager {
         manager_in(&tmpdir(tag), registry)
+    }
+
+    /// A name other hosts' pinned deployments route too — each host's admin
+    /// deployment on the shared admin name — is checked at every member, and
+    /// a configured wildcard's bare domain is never ordered on its own: the
+    /// wildcard order names it and is stored under it.
+    #[test]
+    fn a_shared_name_asks_every_member_and_an_apex_is_left_to_its_wildcard() {
+        let route = |host: &str| RouteRule {
+            host: Some(host.into()),
+            host_suffix: None,
+            path_prefix: None,
+            strip_prefix: false,
+            upstream_host: None,
+            redirect: None,
+        };
+        let registry = registry_with(vec![route("us.example.com"), route("admin.us4.example.com"), route("sb.example.com")]);
+        let mut theirs = registry.deployments().values().next().unwrap().spec.clone();
+        theirs.id = "admin-us5".into();
+        theirs.routes = vec![route("US.example.com"), route("admin.us5.example.com")];
+        theirs.placement = Some(crate::config::Placement::pinned("us5"));
+        registry.set_foreign_for_test(vec![theirs]);
+        let manager = manager_with_wildcards(&tmpdir("shared-name"), registry, vec!["sb.example.com".into()]);
+        assert_eq!(manager.sharing_hosts("us.example.com"), ["us5"]);
+        assert!(manager.sharing_hosts("admin.us4.example.com").is_empty());
+        // Without a placer (a single server) this host issues it.
+        assert!(manager.issues_shared("us.example.com"));
+        assert_eq!(
+            manager.desired_hosts(),
+            vec!["admin.us4.example.com".to_string(), "us.example.com".to_string()],
+            "sb.example.com is the wildcard's own"
+        );
     }
 
     /// A `spread` deployment's name is checked at every fleet member before
