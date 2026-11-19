@@ -1152,12 +1152,10 @@ async fn authorize(
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string());
-    let browser_auth = if state.gate_admin && state.federated.is_some() && state.auth.is_some() {
-        match browser_login::session(req.headers(), req.method()) {
-            Ok(value) => value,
-            Err(()) => return forbidden("invalid session or cross-origin session request"),
-        }
-    } else { None };
+    let browser_auth = match browser_session(&state, req.headers(), req.method()) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let browser_navigation = req.method() == axum::http::Method::GET
         && !req.headers().contains_key(header::AUTHORIZATION)
         && req.headers().get(header::ACCEPT).and_then(|h| h.to_str().ok()).is_some_and(|h| h.contains("text/html"));
@@ -1205,15 +1203,7 @@ async fn authorize(
     // token never costs a round trip and a local token is always preferred.
     // Header only: the `?app_token=` query is for app-lb's own tokens.
     let now = now_secs();
-    let federated = match (state.federated.as_ref(), state.auth.as_ref(), bearer(header.as_deref())) {
-        (Some(f), Some(_), Some(raw))
-            if !raw.starts_with(crate::federated::LOCAL_TOKEN_PREFIX)
-                && state.tokens.verify(raw, now).is_none() =>
-        {
-            f.resolve(raw).await.map(|g| bind_grant(&state.namespaces, g))
-        }
-        _ => None,
-    };
+    let federated = federated_grant(&state, header.as_deref(), now).await;
 
     let verdict = decide_access(
         state.auth.as_deref(),
@@ -1309,6 +1299,100 @@ fn observe_auth_failure(
             subject: None,
         });
     }
+}
+
+/// The browser session standing in for an `Authorization` header, when
+/// browser sign-in is on. `Err` is a session that is invalid or cross-origin.
+#[allow(clippy::result_large_err)]
+fn browser_session(state: &AdminState, headers: &axum::http::HeaderMap, method: &axum::http::Method) -> Result<Option<String>, Response> {
+    if state.gate_admin && state.federated.is_some() && state.auth.is_some() {
+        browser_login::session(headers, method)
+            .map_err(|()| forbidden("invalid session or cross-origin session request"))
+    } else {
+        Ok(None)
+    }
+}
+
+/// What federation says a bearer this server does not know is. Asked only
+/// when federation and the gate are both on, and never for a local token.
+async fn federated_grant(state: &AdminState, header: Option<&str>, now: u64) -> Option<Arc<crate::federated::Grant>> {
+    match (state.federated.as_ref(), state.auth.as_ref(), bearer(header)) {
+        (Some(f), Some(_), Some(raw))
+            if !raw.starts_with(crate::federated::LOCAL_TOKEN_PREFIX)
+                && state.tokens.verify(raw, now).is_none() =>
+        {
+            f.resolve(raw).await.map(|g| bind_grant(&state.namespaces, g))
+        }
+        _ => None,
+    }
+}
+
+/// Fleet mode: before a call leaves this host (forwarded, or fanned out to
+/// every member), it must carry a credential this host recognizes — tokens,
+/// sessions and federation are fleet state, so this host can tell. Only "no
+/// usable credential" is refused here; tier and scope are the home host's to
+/// judge, and it does. Ungated tiers stay open, as they are locally: reads
+/// follow `gate_view`, everything else `gate_admin`.
+fn fleet_credential_check(state: &AdminState, req: &Request) -> impl std::future::Future<Output = Result<(), Response>> + Send + 'static {
+    let state = state.clone();
+    let prepared = fleet_credential_inputs(&state, req);
+    async move {
+        match prepared {
+            Ok(None) => Ok(()),
+            Ok(Some((header, path, query, peer))) => credential_verdict(&state, header, path, query, peer).await,
+            Err(refused) => Err(refused),
+        }
+    }
+}
+
+type CredentialInputs = (Option<String>, String, Option<String>, Option<std::net::IpAddr>);
+
+/// What [`fleet_credential_check`] decides on; `None` when the tier is ungated.
+#[allow(clippy::result_large_err)]
+fn fleet_credential_inputs(state: &AdminState, req: &Request) -> Result<Option<CredentialInputs>, Response> {
+    let read = matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    if !(if read { state.gate_view } else { state.gate_admin }) {
+        return Ok(None);
+    }
+    // Everything the decision needs, taken before the first await: a
+    // `&Request` held across one would make this middleware's future !Send.
+    let header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or(browser_session(state, req.headers(), req.method())?);
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_owned);
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ConnectInfo(a)| a.ip());
+    Ok(Some((header, path, query, peer)))
+}
+
+async fn credential_verdict(
+    state: &AdminState,
+    header: Option<String>,
+    path: String,
+    query: Option<String>,
+    peer: Option<std::net::IpAddr>,
+) -> Result<(), Response> {
+    let path = path.as_str();
+    let now = now_secs();
+    let federated = federated_grant(state, header.as_deref(), now).await;
+    let verdict = decide_access(
+        state.auth.as_deref(),
+        &state.tokens,
+        &Presented { header: header.as_deref(), matched: None, path, query: query.as_deref(), target_namespace: None, federated },
+        crate::tokens::AdminScope::None,
+        now,
+    );
+    if matches!(verdict, Verdict::Unauthorized) {
+        let scheme = crate::siem::AuthScheme::of(header.as_deref());
+        tracing::warn!(path = %path, scheme = scheme.as_str(), client = ?peer,
+            "admin API request rejected before it left this host: no usable credential");
+        observe_auth_failure(state, peer, path, AuthAction::AdminRejected, scheme);
+        return Err(unauthorized());
+    }
+    Ok(())
 }
 
 async fn require_view_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
@@ -9632,7 +9716,14 @@ async fn fleet_forward(
     next: middleware::Next,
 ) -> Response {
     match state.fleet_admin.clone() {
-        Some(admin) => admin.handle(req, next).await,
+        Some(admin) => {
+            if admin.may_leave(&req)
+                && let Err(refused) = fleet_credential_check(&state, &req).await
+            {
+                return refused;
+            }
+            admin.handle(req, next).await
+        }
         None => next.run(req).await,
     }
 }
@@ -13734,8 +13825,13 @@ mod tests {
 
             /// us4 (`a`) and us5 (`b`); us6 is a live member nobody can reach.
             async fn pair(us5_live: bool, configure_b: impl FnOnce(&mut Fixture)) -> Pair {
+                pair_with(us5_live, |_| {}, configure_b).await
+            }
+
+            async fn pair_with(us5_live: bool, configure_a: impl FnOnce(&mut Fixture), configure_b: impl FnOnce(&mut Fixture)) -> Pair {
                 let mut a = fixture(true).await;
                 let mut b = fixture(true).await;
+                configure_a(&mut a);
                 configure_b(&mut b);
                 let (la, lb) = (tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
                     tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
@@ -13978,7 +14074,72 @@ mod tests {
                 let (status, h, body) = send(&p.a_url, "GET", "/deployments/s", &[], None).await;
                 assert_eq!(status, StatusCode::OK, "{body}");
                 assert_eq!(body["hosts"], json!(["us4", "us5"]));
-                assert!(h.get(header::ETAG.as_str()).is_some(), "this host's ETag is kept");
+                let etag = h.get(header::ETAG.as_str()).and_then(|v| v.to_str().ok()).unwrap_or_default();
+                assert!(etag.starts_with("\"fleet-"), "the merged body's own validator, not this host's: {etag}");
+            }
+
+            /// With a gate on, nothing leaves a host for a caller with no
+            /// credential: no fan-out, no forward, no body sent on. A caller
+            /// with one is forwarded as before, and a transfer URL — whose path
+            /// is its credential — still goes to the host that minted it.
+            #[tokio::test]
+            async fn an_anonymous_call_never_leaves_a_gated_host() {
+                let gate = |f: &mut Fixture| {
+                    f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
+                    f.state.gate_admin = true;
+                    f.state.gate_view = true;
+                };
+                let p = pair_with(true, gate, gate).await;
+                for (method, path) in [("GET", "/deployments"), ("GET", "/metrics"), ("GET", "/deployments/web"), ("DELETE", "/deployments/web")] {
+                    let (status, h, _) = send(&p.a_url, method, path, &[], None).await;
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+                    assert_eq!(served_by(&h), None, "{method} {path} reached a peer");
+                    assert!(h.get(PARTIAL).is_none(), "{method} {path} fanned out");
+                }
+                let new = json!({"id": "sneaky", "routes": [], "vm": {"driver": "firecracker", "port": 8080}});
+                let (status, _, _) = send(&p.a_url, "POST", "/deployments", &[], Some(new)).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert!(p.b.registry.get("sneaky").is_none() && p.a.registry.get("sneaky").is_none());
+                assert!(p.b.registry.get("web").is_some(), "the anonymous DELETE never arrived");
+
+                let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("operator:password"));
+                let (status, h, body) = send(&p.a_url, "GET", "/deployments/web", &[("authorization", &basic)], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(served_by(&h), Some("us5"));
+
+                let (_, h, _) = send(&p.a_url, "GET", "/transfers/us5~token", &[], None).await;
+                assert_eq!(served_by(&h), Some("us5"), "a transfer URL carries its own credential");
+            }
+
+            /// A spread deployment on named hosts is asked of those hosts only
+            /// (us6 holds it as foreign and is never asked), so a complete
+            /// answer is not marked partial — and only a complete answer can be
+            /// "not modified", by its own merged ETag.
+            #[tokio::test]
+            async fn a_spread_on_named_hosts_merges_completely_and_answers_not_modified() {
+                let p = pair(true, |_| {}).await;
+                for f in [&p.a, &p.b] {
+                    let mut t = serde_json::to_value(spec("t", "x")).unwrap();
+                    t["placement"] = json!({"mode": "spread", "hosts": ["us4", "us5"]});
+                    f.registry.upsert(serde_json::from_value(t).unwrap());
+                }
+                let (status, h, body) = send(&p.a_url, "GET", "/deployments/t", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert!(h.get(PARTIAL).is_none(), "{:?}", h.get(UNREACHABLE));
+                assert_eq!(body["hosts"], json!(["us4", "us5"]));
+                let etag = h.get(header::ETAG.as_str()).unwrap().to_str().unwrap().to_string();
+
+                let (status, _, _) = send(&p.a_url, "GET", "/deployments/t", &[("if-none-match", &etag)], None).await;
+                assert_eq!(status, StatusCode::NOT_MODIFIED);
+                let (status, _, body) = send(&p.a_url, "GET", "/deployments/t", &[("if-none-match", "\"stale\"")], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+
+                // With us6 in the spread and unreachable, never "not modified".
+                let (_, h, _) = send(&p.a_url, "GET", "/deployments/s", &[], None).await;
+                let partial_etag = h.get(header::ETAG.as_str()).unwrap().to_str().unwrap().to_string();
+                assert_eq!(h.get(PARTIAL).unwrap(), "1");
+                let (status, _, _) = send(&p.a_url, "GET", "/deployments/s", &[("if-none-match", &partial_etag)], None).await;
+                assert_eq!(status, StatusCode::OK);
             }
 
             /// A WebSocket (the shell) is forwarded as an upgrade, byte for byte.

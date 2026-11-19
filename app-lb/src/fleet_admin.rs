@@ -27,7 +27,7 @@
 //! forwarded call is never forwarded again: a hop that would need another
 //! answers 503.
 
-use crate::fleet_hop::{FleetHop, HOP, Inbound, TOKEN};
+use crate::fleet_hop::{CLIENT_SEAL, FleetHop, HOP, Inbound, TOKEN};
 use crate::fleet_pg::{HostFacts, HostRow};
 use crate::fleet_sync::Fleet;
 use crate::registry::Registry;
@@ -329,6 +329,30 @@ impl FleetAdmin {
 
     // -- the middleware --
 
+    /// Whether this call may leave this host — be forwarded, or fan out to
+    /// every member — so must first show a credential this host recognizes.
+    ///
+    /// Forwarding sits outside this host's auth layers on purpose (the home
+    /// host runs them itself), so without this an anonymous `GET /metrics`
+    /// would cost every member a request, and a `POST /deployments` would be
+    /// read (16 MiB) and sent on, before anything refused it. Tier and scope
+    /// stay the home host's to judge; only "no credential at all" stops here.
+    /// A hop (already checked by the member that sent it), a call answered
+    /// here, and the routes whose path *is* the credential — a one-time
+    /// transfer URL, a plugin's machine routes — never need one.
+    pub fn may_leave(&self, req: &Request<Body>) -> bool {
+        if !self.hop.forwards() || self.inbound(req.headers()) != Inbound::None {
+            return false;
+        }
+        let path = req.uri().path();
+        match classify(req.method(), path, req.uri().query()) {
+            Route::Local => false,
+            Route::Owned(_) => !path.trim_start_matches('/').starts_with("transfers/"),
+            Route::Plugin(id) => !path.trim_start_matches('/').starts_with(&format!("api/plugins/{id}/machine")),
+            _ => true,
+        }
+    }
+
     /// Answer one admin call: here, by forwarding it once, or by asking
     /// every member.
     pub async fn handle(self: &Arc<Self>, req: Request<Body>, next: axum::middleware::Next) -> Response {
@@ -347,8 +371,8 @@ impl FleetAdmin {
         let route = classify(req.method(), req.uri().path(), req.uri().query());
         match route {
             Route::Local => next.run(req).await,
-            Route::List => self.fan_out(req, next, Merge::List).await,
-            Route::Metrics => self.fan_out(req, next, Merge::Metrics).await,
+            Route::List => self.fan_out(req, next, Merge::List, None).await,
+            Route::Metrics => self.fan_out(req, next, Merge::Metrics, None).await,
             Route::Owned(owner) => match owner.filter(|h| h != &self.host) {
                 Some(host) => self.forward(&host, req).await,
                 None => next.run(req).await,
@@ -376,10 +400,18 @@ impl FleetAdmin {
                     Err(r) => r,
                     Ok(Some(host)) => self.forward(&host, req).await,
                     Ok(None) => {
-                        let one = req.method() == Method::GET
-                            && req.uri().path().trim_matches('/').split('/').count() == 2
-                            && self.registry.get(&id).is_some_and(|d| crate::fleet_placement::spreads(&d.spec));
-                        if one { self.fan_out(req, next, Merge::One).await } else { next.run(req).await }
+                        let spread = (req.method() == Method::GET
+                            && req.uri().path().trim_matches('/').split('/').count() == 2)
+                            .then(|| self.registry.get(&id))
+                            .flatten()
+                            .filter(|d| crate::fleet_placement::spreads(&d.spec));
+                        match spread {
+                            Some(d) => {
+                                let placement = d.spec.placement.clone();
+                                self.fan_out(req, next, Merge::One, placement.as_ref()).await
+                            }
+                            None => next.run(req).await,
+                        }
                     }
                 }
             }
@@ -568,7 +600,7 @@ impl FleetAdmin {
         let mut headers = HeaderMap::new();
         for (name, value) in &parts.headers {
             let n = name.as_str();
-            if HOP_BY_HOP.contains(&n) || n == HOP || n == TOKEN || n == CLIENT || n == "x-forwarded-for" {
+            if HOP_BY_HOP.contains(&n) || n == HOP || n == TOKEN || n == CLIENT || n == CLIENT_SEAL || n == "x-forwarded-for" {
                 continue;
             }
             headers.append(name.clone(), value.clone());
@@ -584,9 +616,10 @@ impl FleetAdmin {
         }
         headers.insert(HeaderName::from_static(HOP), HeaderValue::from_str(&self.host).map_err(|e| e.to_string())?);
         headers.insert(HeaderName::from_static(TOKEN), HeaderValue::from_str(&token).map_err(|e| e.to_string())?);
-        // Only a client this host's own ingress vouched for; never one the
-        // caller claimed. The peer's ingress otherwise judges this host.
-        if let Some(client) = parts.headers.get(CLIENT) {
+        // Only a client this host's own ingress vouched for — its seal checks
+        // out — never one the caller claimed. The peer's ingress otherwise
+        // judges this host.
+        if let Some(client) = self.hop.vouched_client(&parts.headers) {
             headers.insert(HeaderName::from_static("x-forwarded-for"), client.clone());
         }
         rb = rb.headers(headers);
@@ -682,24 +715,35 @@ impl FleetAdmin {
         let rb = self.outbound(&target, parts, false)?.timeout(self.fanout_timeout);
         let resp = rb.send().await.map_err(|e| format!("{host}: {e}"))?;
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let bytes = resp.bytes().await.map_err(|e| format!("{host}: {e}"))?;
-        if bytes.len() > MAX_MERGE {
-            return Err(format!("{host}: answer too large to merge"));
-        }
+        let bytes = read_capped(resp, MAX_MERGE).await.map_err(|e| format!("{host}: {e}"))?;
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         Ok((status, value))
     }
 
     /// Answer here, ask every other live member the same, and merge. A
     /// member that does not answer in time is named, never dropped silently.
-    async fn fan_out(&self, req: Request<Body>, next: axum::middleware::Next, merge: Merge) -> Response {
+    async fn fan_out(&self, mut req: Request<Body>, next: axum::middleware::Next, merge: Merge, only: Option<&crate::config::Placement>) -> Response {
+        let peers: Vec<String> = self
+            .peers()
+            .into_iter()
+            // A spread deployment is asked of the members it runs on: another
+            // holds it as foreign and would answer 503 (its hop is never
+            // forwarded on), which read as a member missing from every answer.
+            .filter(|h| only.is_none_or(|p| p.includes(h)))
+            .collect();
+        if peers.is_empty() {
+            return next.run(req).await;
+        }
+        // A merged answer is not this host's, so neither is its validator:
+        // a 304 from this host (or a peer) for its own part would hide the
+        // others' changes. The merged body gets its own ETag below.
+        let if_none_match = req.headers_mut().remove(header::IF_NONE_MATCH);
+        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
         let head = Head::of(&req);
         let parts = &head;
-        let local = req;
-        let peers = self.peers();
         let asks = futures::future::join_all(peers.iter().map(|h| self.fetch(h, parts)));
-        let (response, answers) = tokio::join!(next.run(local), asks);
-        if peers.is_empty() || !response.status().is_success() {
+        let (response, answers) = tokio::join!(next.run(req), asks);
+        if !response.status().is_success() {
             return response;
         }
         let (rparts, rbody) = response.into_parts();
@@ -728,8 +772,27 @@ impl FleetAdmin {
             Merge::One => merge_one(&self.host, mine, theirs),
             Merge::Metrics => merge_metrics(&self.host, mine, theirs, &unreachable),
         };
-        let mut out = Response::from_parts(rparts, Body::from(serde_json::to_vec(&merged).expect("json serializes")));
+        let body = serde_json::to_vec(&merged).expect("json serializes");
+        let etag = merged_etag(&body);
+        let mut out = Response::from_parts(rparts, Body::empty());
         out.headers_mut().remove(header::CONTENT_LENGTH);
+        out.headers_mut().remove(header::LAST_MODIFIED);
+        if let Ok(v) = HeaderValue::from_str(&etag) {
+            out.headers_mut().insert(header::ETAG, v);
+        }
+        // Only a complete answer can be "not modified": a partial one may be
+        // missing exactly what changed.
+        let unchanged = unreachable.is_empty()
+            && if_none_match
+                .as_ref()
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
+        if unchanged {
+            *out.status_mut() = StatusCode::NOT_MODIFIED;
+            out.headers_mut().remove(header::CONTENT_TYPE);
+        } else {
+            *out.body_mut() = Body::from(body);
+        }
         if !unreachable.is_empty() {
             out.headers_mut().insert(PARTIAL, HeaderValue::from_static("1"));
             if let Ok(v) = HeaderValue::from_str(&unreachable.join(", ")) {
@@ -751,6 +814,33 @@ impl Head {
     fn of(req: &Request<Body>) -> Self {
         Self { method: req.method().clone(), uri: req.uri().clone(), headers: req.headers().clone() }
     }
+}
+
+/// A peer's answer, read only up to `cap` bytes: a member that sends more is
+/// refused as it streams, not after it has all been held in memory.
+async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    use futures::StreamExt;
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return Err("answer too large to merge".into());
+    }
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if out.len() + chunk.len() > cap {
+            return Err("answer too large to merge".into());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// A strong validator for a merged body: its SHA-256.
+fn merged_etag(body: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body);
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("\"fleet-{hex}\"")
 }
 
 /// Read a JSON body for the `sandbox_id` it names, and put it back.
@@ -880,7 +970,10 @@ fn tag(v: &mut Value, key: &str, host: &str) {
 /// its VMs join, tagged with the host, and the counts add.
 fn fold_status(into: &mut Value, from: Value, host: &str) {
     let Some(o) = into.as_object_mut() else { return };
-    let hosts = o.entry("hosts").or_insert_with(|| json!([]));
+    // An entry that came without a `hosts` list (not tagged spread) was
+    // answered by the host it is tagged with; that host is the first.
+    let first = o.get("host").and_then(Value::as_str).map(str::to_string);
+    let hosts = o.entry("hosts").or_insert_with(|| json!(first.into_iter().collect::<Vec<_>>()));
     if let Some(a) = hosts.as_array_mut()
         && !a.iter().any(|h| h == host)
     {
@@ -998,8 +1091,13 @@ pub fn merge_metrics(me: &str, mut mine: Value, theirs: Vec<(String, Value)>, un
                     {
                         // A spread deployment: listed once, by its first host.
                         if let Some(existing) = list.iter_mut().find(|x| deployment_id(x) == Some(id)) {
-                            let hosts = existing.as_object_mut().map(|e| e.entry("hosts").or_insert_with(|| json!([me])));
-                            if let Some(Value::Array(h)) = hosts {
+                            // The entry's own host, not this one: it may have
+                            // been listed first by another member.
+                            let first = existing.get("host").and_then(Value::as_str).unwrap_or(me).to_string();
+                            let hosts = existing.as_object_mut().map(|e| e.entry("hosts").or_insert_with(|| json!([first])));
+                            if let Some(Value::Array(h)) = hosts
+                                && !h.iter().any(|x| x == host.as_str())
+                            {
                                 h.push(Value::from(host.as_str()));
                             }
                         }
@@ -1044,7 +1142,9 @@ pub fn merge_metrics(me: &str, mut mine: Value, theirs: Vec<(String, Value)>, un
 
 // ---- facts ----------------------------------------------------------------
 
-/// The drivers an app-lb can boot, of those the daemon says it supports.
+/// The drivers an app-lb boots through heyvmd, of those the daemon says it
+/// supports. `lxc` is not among them: app-lb runs it through Incus itself, so
+/// heyvmd never lists it, and [`FactsService::lxc`] adds it instead.
 const APP_LB_DRIVERS: &[&str] = &["firecracker", "kvm", "libvirt"];
 
 /// `APP_LB_FLEET_DRIVERS`, when set: the operator's word on what this host
@@ -1082,6 +1182,14 @@ async fn probe_drivers(daemon: &str) -> Option<Vec<String>> {
     )
 }
 
+/// The drivers heyvmd reported, plus `lxc` when this host runs Incus.
+pub fn with_lxc(mut drivers: Vec<String>, lxc: bool) -> Vec<String> {
+    if lxc && !drivers.iter().any(|d| d == "lxc") {
+        drivers.push("lxc".into());
+    }
+    drivers
+}
+
 /// This host's facts, from what it already knows.
 pub fn facts(registry: &Registry, usage: &crate::metrics::HostUsageSnapshot, drivers: Option<Vec<String>>) -> HostFacts {
     let mut vms = BTreeMap::new();
@@ -1115,6 +1223,9 @@ pub struct FactsService {
     pub registry: Arc<Registry>,
     pub metrics: Arc<crate::metrics::Metrics>,
     pub daemon_url: Option<String>,
+    /// This host can run `driver: lxc` (Incus enabled and its socket present):
+    /// added to the drivers heyvmd reports, unless the operator listed them.
+    pub lxc: bool,
 }
 
 #[async_trait::async_trait]
@@ -1134,7 +1245,9 @@ impl pingora_core::services::background::BackgroundService for FactsService {
                 if let Some(url) = &self.daemon_url
                     && let Some(found) = probe_drivers(url).await
                 {
-                    drivers = Some(found);
+                    drivers = Some(with_lxc(found, self.lxc));
+                } else if self.lxc && drivers.is_none() {
+                    drivers = Some(with_lxc(Vec::new(), true));
                 }
             }
             let facts = facts(&self.registry, &self.metrics.host_snapshot(), drivers.clone());

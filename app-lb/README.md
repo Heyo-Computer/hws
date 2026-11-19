@@ -4806,7 +4806,11 @@ per host. With `APP_LB_FLEET_FORWARD=1`:
   the answer carries `x-heyo-fleet-partial: 1` and
   `x-heyo-fleet-unreachable: <hosts>`, and `/metrics` also `partial` and
   `hosts_unreachable`, plus each member's host and daemon readings under
-  `members`. `limit`/`offset` on `/metrics` page each member's list. A single
+  `members`. `limit`/`offset` on `/metrics` page each member's list. A spread
+  deployment restricted to named `hosts` is asked of those hosts only. A merged
+  answer carries its own `ETag` (`"fleet-…"`, over the merged body), and
+  `If-None-Match` on it answers `304` only when every member answered: no
+  member's own validator — or its 304 — stands for the whole. A single
   server's answers are unchanged.
 - **A deployment unknown anywhere is a 404, as before.** A home host that is
   not live answers 503 `fleet_home_unreachable` ("home host us5 unreachable:
@@ -4823,9 +4827,18 @@ the admin deployment's gate), and passes the hop headers to its admin listener
 only; the admin listener checks the token again, in constant time. The admin
 port is never exposed. The client address travels only as the origin
 ingress judged it (`x-heyo-fleet-client`, which that ingress sets and strips
-from clients); a client's own `X-Forwarded-For` is never forwarded.
+from clients, sealed with `x-heyo-fleet-client-seal` — an HMAC of the address
+under the peer token — so the admin listener forwards it only when its own
+ingress named it, not a caller that reached the listener another way); a
+client's own `X-Forwarded-For` is never forwarded.
 
-**Who is allowed.** The peer token says only "a fleet member sent this". The
+**Who is allowed.** Nothing leaves a host — no forward, no fan-out, no body
+sent on — for a caller with no credential this host recognizes (tokens,
+sessions and federation are fleet state): it answers `401` itself, so an
+anonymous caller cannot make one request cost every member one. Tiers left
+ungated locally (`APP_LB_ADMIN_AUTH` off, `APP_LB_DASHBOARD_AUTH=0`) stay ungated, and
+a transfer URL and a plugin's machine routes, whose path is the credential,
+are exempt. The peer token says only "a fleet member sent this". The
 home host re-authorizes the caller's own credential — `Authorization`,
 cookies and `If-Match` are forwarded untouched, and tokens are fleet state — so
 a token without reach is refused there exactly as it would be locally.
@@ -4847,7 +4860,8 @@ are chosen by the caller and follow their deployment.
 ### Placement by capability and capacity
 
 Each host also publishes which VM drivers it boots (`APP_LB_FLEET_DRIVERS`, else
-the daemon's `/capabilities`), its free memory and its idle vCPUs (from the
+the daemon's `/capabilities`, plus `lxc` when Incus is enabled and its socket
+present — app-lb runs `lxc` itself, so the daemon never lists it), its free memory and its idle vCPUs (from the
 daemon's host usage). A `POST /deployments` (or a creating `PUT`) of a **VM
 pool with no `placement`** is pinned to the live, `active` member that says it
 boots the spec's `vm.driver` (`firecracker` when unset) and has the most free

@@ -1089,6 +1089,9 @@ fn main() {
     // actually usable is asked once from the autoscaler's background service,
     // where there is a runtime to await on. A host with no Incus is a fact about
     // the host, not a misconfiguration — a fleet of microVMs never notices.
+    // The same test `Runtime` uses to decide this host has Incus at all;
+    // published with the fleet facts so placement can send `lxc` pools here.
+    let lxc_here = cfg.lxc.enabled && cfg.lxc.socket.exists();
     let runtime = runtime::Runtime::new(vms.clone(), cfg.lxc.clone());
     // Kept for the sweeper, which is built after the last move of `registry`.
     let mount_registry = registry.clone();
@@ -1581,6 +1584,7 @@ fn main() {
             registry: registry.clone(),
             metrics: metrics.clone(),
             daemon_url: Some(vms.client().base_url().to_string()),
+            lxc: lxc_here,
         })
     });
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {

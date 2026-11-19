@@ -192,3 +192,74 @@ fn facts_list_spread_vms_and_room() {
     assert_eq!(f.vms.get("sb-9").map(String::as_str), Some("s"));
     assert!(!f.vms.contains_key("sb-1"), "a pinned deployment's VMs are at its home");
 }
+
+/// A spread deployment that us4 (me) does not run, reported by us5 then us6:
+/// listed under the hosts that run it, never under the host that merged.
+#[test]
+fn a_duplicate_is_listed_under_the_hosts_that_answered_for_it() {
+    let mine = json!({"deployments": [{"id": "a"}], "matched": 1});
+    let theirs = vec![
+        ("us5".to_string(), json!({"deployments": [{"id": "s"}]})),
+        ("us6".to_string(), json!({"deployments": [{"id": "s"}]})),
+    ];
+    let m = merge_metrics("us4", mine, theirs, &[]);
+    let s = m["deployments"].as_array().unwrap().iter().find(|d| d["id"] == "s").unwrap();
+    assert_eq!(s["host"], "us5");
+    assert_eq!(s["hosts"], json!(["us5", "us6"]));
+
+    // The same in a listing, where neither entry was tagged spread.
+    let merged = merge_lists(
+        "us4",
+        json!([]),
+        vec![
+            ("us5".to_string(), json!([{"spec": {"id": "t"}, "ready": 1}])),
+            ("us6".to_string(), json!([{"spec": {"id": "t"}, "ready": 2}])),
+        ],
+    );
+    assert_eq!(merged[0]["hosts"], json!(["us5", "us6"]));
+    assert_eq!(merged[0]["ready"], 3);
+}
+
+/// `lxc` runs through Incus, which heyvmd never lists: a host with Incus
+/// says so itself, and then places lxc pools.
+#[test]
+fn a_host_with_incus_publishes_lxc_and_receives_lxc_pools() {
+    assert_eq!(with_lxc(vec!["firecracker".into()], true), ["firecracker", "lxc"]);
+    assert_eq!(with_lxc(vec!["firecracker".into()], false), ["firecracker"]);
+    assert_eq!(with_lxc(vec!["lxc".into()], true), ["lxc"], "never listed twice");
+    let members = vec![
+        row("us4", "active", facts(&["firecracker", "lxc"], 10)),
+        row("us5", "active", facts(&["firecracker"], 50)),
+    ];
+    assert_eq!(choose_home("us4", &members, "lxc").unwrap(), "us4");
+}
+
+/// A member's answer is refused as it streams past the cap, whether or not
+/// it declared its length.
+#[tokio::test]
+async fn an_oversized_answer_is_refused_without_holding_it_all() {
+    use axum::{Router, routing::get};
+    let app = Router::new()
+        .route("/sized", get(|| async { vec![b'x'; 4096] }))
+        .route("/chunked", get(|| async {
+            let chunks = (0..8).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'y'; 1024])));
+            Body::from_stream(futures::stream::iter(chunks))
+        }))
+        .route("/small", get(|| async { "ok" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let get = |p: &str| reqwest::get(format!("{base}{p}"));
+    assert!(read_capped(get("/sized").await.unwrap(), 1024).await.is_err());
+    assert!(read_capped(get("/chunked").await.unwrap(), 2048).await.is_err());
+    assert_eq!(read_capped(get("/small").await.unwrap(), 1024).await.unwrap(), b"ok");
+    server.abort();
+}
+
+#[test]
+fn a_merged_etag_is_strong_and_follows_the_body() {
+    let a = merged_etag(b"[1]");
+    assert!(a.starts_with("\"fleet-") && a.ends_with('"'), "{a}");
+    assert_eq!(a, merged_etag(b"[1]"));
+    assert_ne!(a, merged_etag(b"[2]"));
+}

@@ -30,6 +30,10 @@ use std::sync::Arc;
 
 pub const HOP: &str = "x-heyo-fleet-hop";
 pub const TOKEN: &str = "x-heyo-fleet-token";
+/// Beside `x-heyo-fleet-client` on a request this host's ingress passes to
+/// its own admin listener: proof that the ingress, not the caller, named the
+/// client ([`FleetHop::seal_client`]).
+pub const CLIENT_SEAL: &str = "x-heyo-fleet-client-seal";
 pub const FORWARD_ENV: &str = "APP_LB_FLEET_FORWARD";
 pub const ADDRESS_ENV: &str = "APP_LB_FLEET_ADDRESS";
 /// How a forwarded request names its backend: the home host picks the VM.
@@ -96,6 +100,43 @@ impl FleetHop {
         (**self.token.load()).clone()
     }
 
+    /// The seal this host's ingress puts beside the client it names to its
+    /// own admin listener: HMAC-SHA256 of the address under the peer token.
+    ///
+    /// The admin listener forwards that client to a peer as `X-Forwarded-For`,
+    /// where it may meet IP-based gates. Anything reaching the admin listener
+    /// some other way — a process on the host, a non-loopback admin address —
+    /// could otherwise name any client it liked. Keyed by the peer token, not a
+    /// per-process secret, because the ingress may run in a forwarding worker.
+    pub fn seal_client(&self, client: &str) -> Option<String> {
+        let token = self.token()?;
+        Some(client_seal(token.as_bytes(), client))
+    }
+
+    /// The client a request's `x-heyo-fleet-client` names, if its seal is this
+    /// fleet's for exactly that value.
+    pub fn vouched_client<'a>(&self, headers: &'a http::HeaderMap) -> Option<&'a http::HeaderValue> {
+        let client = headers.get(crate::fleet_admin::CLIENT)?;
+        let presented = headers.get(CLIENT_SEAL)?.as_bytes();
+        let expected = self.seal_client(client.to_str().ok()?)?;
+        (presented.len() == expected.len() && openssl::memcmp::eq(presented, expected.as_bytes())).then_some(client)
+    }
+}
+
+pub(crate) fn client_seal(key: &[u8], client: &str) -> String {
+    use std::fmt::Write;
+    let pkey = openssl::pkey::PKey::hmac(key).expect("an HMAC key from any bytes");
+    let mut signer = openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), &pkey).expect("an HMAC signer");
+    signer.update(b"x-heyo-fleet-client\n").expect("hmac update");
+    signer.update(client.as_bytes()).expect("hmac update");
+    let mac = signer.sign_to_vec().expect("hmac");
+    mac.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+impl FleetHop {
     pub fn inbound(&self, headers: &http::HeaderMap) -> Inbound {
         let Some(origin) = headers.get(HOP) else {
             return Inbound::None;
@@ -170,6 +211,26 @@ mod tests {
             h.insert(*k, v.parse().unwrap());
         }
         h
+    }
+
+    /// Only a client named with this fleet's seal for exactly that address is
+    /// believed; a claimed one — no seal, a wrong seal, another address's
+    /// seal, another fleet's — is not.
+    #[test]
+    fn only_a_sealed_client_is_vouched_for() {
+        let h = hop(Some("0123456789abcdef0123456789abcdef"));
+        let client = crate::fleet_admin::CLIENT;
+        let seal = h.seal_client("198.51.100.7").unwrap();
+        assert_eq!(seal.len(), 64);
+        let good = headers(&[(client, "198.51.100.7"), (CLIENT_SEAL, &seal)]);
+        assert_eq!(h.vouched_client(&good).unwrap(), "198.51.100.7");
+
+        assert!(h.vouched_client(&headers(&[(client, "198.51.100.7")])).is_none(), "no seal");
+        assert!(h.vouched_client(&headers(&[(client, "10.0.0.1"), (CLIENT_SEAL, &seal)])).is_none(), "another address");
+        assert!(h.vouched_client(&headers(&[(client, "198.51.100.7"), (CLIENT_SEAL, "00")])).is_none(), "a forged seal");
+        let other = hop(Some("ffffffffffffffffffffffffffffffff"));
+        assert!(other.vouched_client(&good).is_none(), "another fleet's seal");
+        assert!(hop(None).vouched_client(&good).is_none(), "no token, nothing vouched");
     }
 
     #[test]

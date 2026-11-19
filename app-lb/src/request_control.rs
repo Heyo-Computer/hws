@@ -250,6 +250,9 @@ pub struct RequestState {
     /// — the hop, with the fleet's token for it to check again
     /// (`fleet_admin`). `Some(None)`: not a hop.
     admin_hop: Option<Option<(String, Arc<str>)>>,
+    /// With `admin_hop`: the seal that proves to the admin listener this host
+    /// named `client` ([`crate::fleet_hop::FleetHop::seal_client`]).
+    admin_client_seal: Option<String>,
     /// The client, as this host judged it: the socket peer, a fleet hop's
     /// vouched client, or a tunnel ingress's dialer's word. Told to a
     /// tunnel's remote app-lb, which has no socket peer of its own.
@@ -301,7 +304,7 @@ impl RequestState {
         let mut out = Vec::new();
         // In a fleet, whatever arrived under the fleet's names goes no further.
         if self.fleet {
-            for name in [crate::fleet_hop::HOP, crate::fleet_hop::TOKEN, crate::fleet_admin::CLIENT] {
+            for name in [crate::fleet_hop::HOP, crate::fleet_hop::TOKEN, crate::fleet_admin::CLIENT, crate::fleet_hop::CLIENT_SEAL] {
                 out.push(HeaderModification::Remove(http::HeaderName::from_static(name)));
             }
         }
@@ -315,6 +318,9 @@ impl RequestState {
             }
             if let Some(ip) = self.client {
                 out.push(HeaderModification::Set(http::HeaderName::from_static(crate::fleet_admin::CLIENT), value(&ip.to_string(), "fleet client")?));
+                if let Some(seal) = &self.admin_client_seal {
+                    out.push(HeaderModification::Set(http::HeaderName::from_static(crate::fleet_hop::CLIENT_SEAL), value(seal, "fleet client seal")?));
+                }
             }
         }
         if let Some(hop) = &self.hop_out {
@@ -760,6 +766,7 @@ impl RequestControl {
         if state.fleet && self.auth.fronts_admin_api(&deployment.spec) {
             let token = self.hop.as_ref().and_then(|h| h.token());
             state.admin_hop = Some(hop_origin.zip(token));
+            state.admin_client_seal = state.client.zip(self.hop.as_ref()).and_then(|(ip, h)| h.seal_client(&ip.to_string()));
         }
         // A tunnel with nothing to forward to is a remote app-lb that is not
         // there: its lease lapsed, or it does not answer. Say so, rather than
@@ -1112,6 +1119,10 @@ mod tests {
             let mods = names(&state.forwarding_modifications(&"/x".parse().unwrap()).unwrap());
             assert!(mods.contains(&"remove x-heyo-fleet-client".to_string()), "{mods:?}");
             assert!(mods.contains(&"set x-heyo-fleet-client=198.51.100.7".to_string()), "the socket peer, not a claim: {mods:?}");
+            // Sealed, so the admin listener can tell this host named it.
+            assert!(mods.contains(&"remove x-heyo-fleet-client-seal".to_string()), "{mods:?}");
+            let seal = crate::fleet_hop::client_seal(b"s3cret", "198.51.100.7");
+            assert!(mods.contains(&format!("set x-heyo-fleet-client-seal={seal}")), "{mods:?}");
             assert!(!mods.iter().any(|m| m.starts_with("set x-heyo-fleet-hop")), "not a hop");
 
             let mut state = RequestState::default();
