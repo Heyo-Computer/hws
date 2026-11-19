@@ -579,6 +579,8 @@ export interface VmStatus {
   in_flight: number;
   healthy: boolean;
   draining: boolean;
+  /** Fleet mode, a `spread` deployment's merged status: the host running this VM. */
+  host?: string;
 }
 
 export interface DeploymentStatus {
@@ -599,6 +601,10 @@ export interface DeploymentStatus {
   site?: SiteRootStatus;
   /** The rolling replacement in progress, or the last one; absent if it never rolled. */
   rollout?: RolloutView;
+  /** Fleet mode, merged answers: the host that answered for this deployment. */
+  host?: string;
+  /** Fleet mode, a `spread` deployment: every host whose VMs are in `vms`. */
+  hosts?: string[];
 }
 
 /** A site's root as the LB host sees it. */

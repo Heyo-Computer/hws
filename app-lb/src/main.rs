@@ -28,6 +28,7 @@ mod dns;
 mod federated;
 mod fleet;
 mod fleet_store;
+mod fleet_admin;
 mod fleet_hop;
 mod fleet_placement;
 mod fleet_pg;
@@ -1088,6 +1089,9 @@ fn main() {
     // actually usable is asked once from the autoscaler's background service,
     // where there is a runtime to await on. A host with no Incus is a fact about
     // the host, not a misconfiguration — a fleet of microVMs never notices.
+    // The same test `Runtime` uses to decide this host has Incus at all;
+    // published with the fleet facts so placement can send `lxc` pools here.
+    let lxc_here = cfg.lxc.enabled && cfg.lxc.socket.exists();
     let runtime = runtime::Runtime::new(vms.clone(), cfg.lxc.clone());
     // Kept for the sweeper, which is built after the last move of `registry`.
     let mount_registry = registry.clone();
@@ -1430,6 +1434,61 @@ fn main() {
         }
     });
 
+    // Fleet mode: hops between members. The peer token is fleet state; the
+    // first host to need one makes it.
+    let fleet_hop = fleet_stores.as_ref().map(|fs| {
+        let forward = obs::env_flag(fleet_hop::FORWARD_ENV, false);
+        let hop = Arc::new(fleet_hop::FleetHop::new(&fs.host, fs.fleet.clone(), forward));
+        let read = {
+            let doc = fs.peer_token.clone();
+            move || {
+                fleet_store::Document::read(&*doc)
+                    .ok()
+                    .flatten()
+                    .and_then(|(b, _)| String::from_utf8(b).ok())
+                    .filter(|t| t.len() >= 32)
+            }
+        };
+        if read().is_none() {
+            match fleet_store::Document::write(&*fs.peer_token, fleet_hop::new_token().as_bytes(), fleet_store::Expect::Absent) {
+                Ok(_) => tracing::info!("made the fleet's peer token"),
+                Err(e) => tracing::warn!(error = %e, "could not make the fleet's peer token; another host's will arrive"),
+            }
+        }
+        hop.set_token(read());
+        let reloaded = hop.clone();
+        fs.fleet.on_reload("peer-token", move || reloaded.set_token(read()));
+        tracing::info!(forward, "fleet hops: accepted from peers{}", if forward { ", and made to them" } else { "" });
+        hop
+    });
+    // One admin API across the fleet: calls about another host's deployment,
+    // VM, operation or plugin go there once, over the same hop as tenant
+    // traffic; listings merge every member's answer.
+    let fleet_admin = fleet_stores.as_ref().zip(fleet_hop.as_ref()).map(|(fs, hop)| {
+        fleet_admin::set_id_host(&fs.host);
+        Arc::new(fleet_admin::FleetAdmin::new(
+            &fs.host,
+            hop.clone(),
+            fs.fleet.clone(),
+            registry.clone(),
+            plugin_host.clone(),
+            &cfg.admin_addr,
+        ))
+    });
+    if let Some(fs) = &fleet_stores {
+        // A plugin's record changed on another host: its home applies it.
+        let host = plugin_host.clone();
+        fs.fleet.on_reload("plugins", move || {
+            let host = host.clone();
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    rt.spawn(async move { host.reconcile().await });
+                }
+                Err(_) => tracing::warn!("a fleet plugin change arrived outside the runtime; it applies at the next start"),
+            }
+        });
+    }
+
     let admin_svc = background_service(
         "admin",
         AdminApi::new(
@@ -1478,38 +1537,12 @@ fn main() {
         .with_images(image_catalog.clone())
         .with_artifact_store(store_slot.clone())
         .with_fleet_store(fleet_stores.as_ref().map(|fs| fs.fleet.clone()))
+        .with_fleet_admin(fleet_admin.clone())
         .with_operations(operations.clone())
         .with_tunnel_dialer(tunnel_dialer.clone())
         .with_transfers(transfers.clone()),
     );
 
-    // Fleet mode: hops between members. The peer token is fleet state; the
-    // first host to need one makes it.
-    let fleet_hop = fleet_stores.as_ref().map(|fs| {
-        let forward = obs::env_flag(fleet_hop::FORWARD_ENV, false);
-        let hop = Arc::new(fleet_hop::FleetHop::new(&fs.host, fs.fleet.clone(), forward));
-        let read = {
-            let doc = fs.peer_token.clone();
-            move || {
-                fleet_store::Document::read(&*doc)
-                    .ok()
-                    .flatten()
-                    .and_then(|(b, _)| String::from_utf8(b).ok())
-                    .filter(|t| t.len() >= 32)
-            }
-        };
-        if read().is_none() {
-            match fleet_store::Document::write(&*fs.peer_token, fleet_hop::new_token().as_bytes(), fleet_store::Expect::Absent) {
-                Ok(_) => tracing::info!("made the fleet's peer token"),
-                Err(e) => tracing::warn!(error = %e, "could not make the fleet's peer token; another host's will arrive"),
-            }
-        }
-        hop.set_token(read());
-        let reloaded = hop.clone();
-        fs.fleet.on_reload("peer-token", move || reloaded.set_token(read()));
-        tracing::info!(forward, "fleet hops: accepted from peers{}", if forward { ", and made to them" } else { "" });
-        hop
-    });
     // Where `spread` deployments' replicas run, fleet-wide.
     let placer = fleet_stores.as_ref().map(|fs| {
         let placer = Arc::new(fleet_placement::Placer::new(
@@ -1544,6 +1577,16 @@ fn main() {
             vms.client().clone(),
         );
     }
+    let facts_svc = fleet_admin.zip(fleet_stores.as_ref()).map(|(admin, fs)| {
+        background_service("fleet-facts", fleet_admin::FactsService {
+            admin,
+            fleet: fs.fleet.clone(),
+            registry: registry.clone(),
+            metrics: metrics.clone(),
+            daemon_url: Some(vms.client().base_url().to_string()),
+            lxc: lxc_here,
+        })
+    });
     let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
         control: Arc::new(request_control::RequestControl::new(
             registry.clone(), metrics.clone(), challenges, auth, guard.clone(),
@@ -1564,6 +1607,9 @@ fn main() {
     let autoscaler_handle = server.add_service(autoscaler_svc);
     if let Some(placer) = placer {
         server.add_service(background_service("fleet-placement", fleet_placement::Service(placer)));
+    }
+    if let Some(facts) = facts_svc {
+        server.add_service(facts);
     }
     if let Some(dialer) = tunnel_dialer {
         server.add_service(background_service("tunnel-dialer", tunnel_dialer::Service(dialer)));

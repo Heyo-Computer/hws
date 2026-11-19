@@ -188,6 +188,10 @@ struct AdminState {
     /// The shared fleet store, in fleet mode. Mutations are refused while it
     /// cannot be written, and a write it refuses answers 409 or 503.
     fleet_store: Option<Arc<crate::fleet_sync::Fleet>>,
+    /// In fleet mode: forwards a call about another host's deployment, VM,
+    /// operation or plugin there, merges listings, and places new pools
+    /// (`fleet_admin`).
+    fleet_admin: Option<Arc<crate::fleet_admin::FleetAdmin>>,
     /// The last pull of the token authority's fleet tokens, if one is bound.
     token_sync: Arc<std::sync::Mutex<TokenSyncStatus>>,
     /// heyvm's image catalog as app-lb manages it; `None` in tests.
@@ -415,6 +419,7 @@ impl AdminApi {
                 tunnels: None,
                 tunnels_per_namespace: crate::tunnel_dialer::per_namespace_limit(),
                 fleet_store: None,
+                fleet_admin: None,
                 token_sync: Default::default(),
                 images: None,
                 artifact_store: Arc::default(),
@@ -486,6 +491,11 @@ impl AdminApi {
 
     pub fn with_fleet_store(mut self, fleet: Option<Arc<crate::fleet_sync::Fleet>>) -> Self {
         self.state.fleet_store = fleet;
+        self
+    }
+
+    pub fn with_fleet_admin(mut self, admin: Option<Arc<crate::fleet_admin::FleetAdmin>>) -> Self {
+        self.state.fleet_admin = admin;
         self
     }
 
@@ -1142,12 +1152,10 @@ async fn authorize(
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string());
-    let browser_auth = if state.gate_admin && state.federated.is_some() && state.auth.is_some() {
-        match browser_login::session(req.headers(), req.method()) {
-            Ok(value) => value,
-            Err(()) => return forbidden("invalid session or cross-origin session request"),
-        }
-    } else { None };
+    let browser_auth = match browser_session(&state, req.headers(), req.method()) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let browser_navigation = req.method() == axum::http::Method::GET
         && !req.headers().contains_key(header::AUTHORIZATION)
         && req.headers().get(header::ACCEPT).and_then(|h| h.to_str().ok()).is_some_and(|h| h.contains("text/html"));
@@ -1195,15 +1203,7 @@ async fn authorize(
     // token never costs a round trip and a local token is always preferred.
     // Header only: the `?app_token=` query is for app-lb's own tokens.
     let now = now_secs();
-    let federated = match (state.federated.as_ref(), state.auth.as_ref(), bearer(header.as_deref())) {
-        (Some(f), Some(_), Some(raw))
-            if !raw.starts_with(crate::federated::LOCAL_TOKEN_PREFIX)
-                && state.tokens.verify(raw, now).is_none() =>
-        {
-            f.resolve(raw).await.map(|g| bind_grant(&state.namespaces, g))
-        }
-        _ => None,
-    };
+    let federated = federated_grant(&state, header.as_deref(), now).await;
 
     let verdict = decide_access(
         state.auth.as_deref(),
@@ -1299,6 +1299,100 @@ fn observe_auth_failure(
             subject: None,
         });
     }
+}
+
+/// The browser session standing in for an `Authorization` header, when
+/// browser sign-in is on. `Err` is a session that is invalid or cross-origin.
+#[allow(clippy::result_large_err)]
+fn browser_session(state: &AdminState, headers: &axum::http::HeaderMap, method: &axum::http::Method) -> Result<Option<String>, Response> {
+    if state.gate_admin && state.federated.is_some() && state.auth.is_some() {
+        browser_login::session(headers, method)
+            .map_err(|()| forbidden("invalid session or cross-origin session request"))
+    } else {
+        Ok(None)
+    }
+}
+
+/// What federation says a bearer this server does not know is. Asked only
+/// when federation and the gate are both on, and never for a local token.
+async fn federated_grant(state: &AdminState, header: Option<&str>, now: u64) -> Option<Arc<crate::federated::Grant>> {
+    match (state.federated.as_ref(), state.auth.as_ref(), bearer(header)) {
+        (Some(f), Some(_), Some(raw))
+            if !raw.starts_with(crate::federated::LOCAL_TOKEN_PREFIX)
+                && state.tokens.verify(raw, now).is_none() =>
+        {
+            f.resolve(raw).await.map(|g| bind_grant(&state.namespaces, g))
+        }
+        _ => None,
+    }
+}
+
+/// Fleet mode: before a call leaves this host (forwarded, or fanned out to
+/// every member), it must carry a credential this host recognizes — tokens,
+/// sessions and federation are fleet state, so this host can tell. Only "no
+/// usable credential" is refused here; tier and scope are the home host's to
+/// judge, and it does. Ungated tiers stay open, as they are locally: reads
+/// follow `gate_view`, everything else `gate_admin`.
+fn fleet_credential_check(state: &AdminState, req: &Request) -> impl std::future::Future<Output = Result<(), Response>> + Send + 'static {
+    let state = state.clone();
+    let prepared = fleet_credential_inputs(&state, req);
+    async move {
+        match prepared {
+            Ok(None) => Ok(()),
+            Ok(Some((header, path, query, peer))) => credential_verdict(&state, header, path, query, peer).await,
+            Err(refused) => Err(refused),
+        }
+    }
+}
+
+type CredentialInputs = (Option<String>, String, Option<String>, Option<std::net::IpAddr>);
+
+/// What [`fleet_credential_check`] decides on; `None` when the tier is ungated.
+#[allow(clippy::result_large_err)]
+fn fleet_credential_inputs(state: &AdminState, req: &Request) -> Result<Option<CredentialInputs>, Response> {
+    let read = matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    if !(if read { state.gate_view } else { state.gate_admin }) {
+        return Ok(None);
+    }
+    // Everything the decision needs, taken before the first await: a
+    // `&Request` held across one would make this middleware's future !Send.
+    let header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or(browser_session(state, req.headers(), req.method())?);
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_owned);
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ConnectInfo(a)| a.ip());
+    Ok(Some((header, path, query, peer)))
+}
+
+async fn credential_verdict(
+    state: &AdminState,
+    header: Option<String>,
+    path: String,
+    query: Option<String>,
+    peer: Option<std::net::IpAddr>,
+) -> Result<(), Response> {
+    let path = path.as_str();
+    let now = now_secs();
+    let federated = federated_grant(state, header.as_deref(), now).await;
+    let verdict = decide_access(
+        state.auth.as_deref(),
+        &state.tokens,
+        &Presented { header: header.as_deref(), matched: None, path, query: query.as_deref(), target_namespace: None, federated },
+        crate::tokens::AdminScope::None,
+        now,
+    );
+    if matches!(verdict, Verdict::Unauthorized) {
+        let scheme = crate::siem::AuthScheme::of(header.as_deref());
+        tracing::warn!(path = %path, scheme = scheme.as_str(), client = ?peer,
+            "admin API request rejected before it left this host: no usable credential");
+        observe_auth_failure(state, peer, path, AuthAction::AdminRejected, scheme);
+        return Err(unauthorized());
+    }
+    Ok(())
 }
 
 async fn require_view_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
@@ -9607,7 +9701,31 @@ fn router(state: AdminState) -> Router {
         .merge(plugin_view)
         .merge(plugin_crud)
         .merge(plugin_machine)
-        .layer(middleware::from_fn_with_state(fleet_layer_state, fleet_admission))
+        .layer(middleware::from_fn_with_state(fleet_layer_state.clone(), fleet_admission))
+        // Outermost: a call that belongs to another host goes there before
+        // this host's admission, gates or store state are consulted. The home
+        // host runs all of them itself.
+        .layer(middleware::from_fn_with_state(fleet_layer_state, fleet_forward))
+}
+
+/// Fleet mode: answer here, forward once to the host that owns the call, or
+/// merge every member's answer (`fleet_admin`).
+async fn fleet_forward(
+    State(state): State<AdminState>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    match state.fleet_admin.clone() {
+        Some(admin) => {
+            if admin.may_leave(&req)
+                && let Err(refused) = fleet_credential_check(&state, &req).await
+            {
+                return refused;
+            }
+            admin.handle(req, next).await
+        }
+        None => next.run(req).await,
+    }
 }
 
 /// A deployment is registered, and changed, on the host that runs it — or
@@ -13668,6 +13786,419 @@ mod tests {
             assert!(f.registry.get("obsolete").is_some());
             assert!(persisted(&f.registry.state_dir()));
             assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+        }
+
+        /// One admin API across the fleet: two admin listeners on loopback,
+        /// each knowing the other as a fleet member, with the hop going
+        /// straight to the peer's admin listener (what its ingress does once
+        /// it has admitted the hop; see `request_control`).
+        mod fleet_forwarding {
+            use super::*;
+            use crate::fleet_admin::{FleetAdmin, PARTIAL, SERVED_BY, UNREACHABLE};
+            use crate::fleet_hop::{FleetHop, HOP, TOKEN};
+            use crate::fleet_pg::{HostFacts, HostRow};
+            use serde_json::{Value, json};
+            use std::collections::HashMap;
+
+            const PEER_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+            fn row(host: &str, age: f64, facts: Option<HostFacts>) -> HostRow {
+                HostRow { host: host.into(), address: Some(format!("{host}.example")), state: "active".into(),
+                    boot_id: "b".into(), age_secs: age, facts }
+            }
+
+            fn facts(drivers: &[&str], free: u64) -> Option<HostFacts> {
+                Some(HostFacts { drivers: Some(drivers.iter().map(|d| d.to_string()).collect()),
+                    memory_free_bytes: Some(free), ..Default::default() })
+            }
+
+            fn spec(id: &str, home: &str) -> DeploymentSpec {
+                serde_json::from_value(json!({
+                    "id": id, "routes": [],
+                    "vm": {"driver": "firecracker", "port": 8080},
+                    "scaling": {"min_replicas": 0, "warm_pool": 0},
+                    "placement": {"mode": "pinned", "home": home}
+                })).unwrap()
+            }
+
+            struct Pair { a: Fixture, b: Fixture, a_url: String, b_url: String }
+
+            /// us4 (`a`) and us5 (`b`); us6 is a live member nobody can reach.
+            async fn pair(us5_live: bool, configure_b: impl FnOnce(&mut Fixture)) -> Pair {
+                pair_with(us5_live, |_| {}, configure_b).await
+            }
+
+            async fn pair_with(us5_live: bool, configure_a: impl FnOnce(&mut Fixture), configure_b: impl FnOnce(&mut Fixture)) -> Pair {
+                let mut a = fixture(true).await;
+                let mut b = fixture(true).await;
+                configure_a(&mut a);
+                configure_b(&mut b);
+                let (la, lb) = (tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                    tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+                let a_url = format!("http://{}", la.local_addr().unwrap());
+                let b_url = format!("http://{}", lb.local_addr().unwrap());
+                let members = vec![
+                    row("us4", 0.0, facts(&["firecracker"], 10)),
+                    row("us5", if us5_live { 0.0 } else { 100.0 }, facts(&["firecracker", "kvm"], 50).map(|mut f| {
+                        f.vms.insert("sb-b".into(), "s".into());
+                        f
+                    })),
+                    row("us6", 0.0, None),
+                ];
+                let peers: HashMap<String, String> = [("us4".to_string(), a_url.clone()), ("us5".to_string(), b_url.clone())].into();
+                // `web` runs on us5; us4 keeps it as foreign.
+                b.registry.upsert(spec("web", "us5"));
+                a.registry.set_foreign_for_test(vec![spec("web", "us5")]);
+                // `s` is spread: both run it, each with its own VMs.
+                for f in [&a, &b] {
+                    let mut s = serde_json::to_value(spec("s", "x")).unwrap();
+                    s["placement"] = json!({"mode": "spread"});
+                    f.registry.upsert(serde_json::from_value(s).unwrap());
+                }
+                for (f, me) in [(&mut a, "us4"), (&mut b, "us5")] {
+                    f.state.plugins = Arc::new(crate::plugins::PluginHost::new(
+                        vec![crate::plugins::obs::ObsPlugin::new(f.state.secrets.clone())],
+                        crate::plugins::PluginStore::new(f.root.join("fleet-plugins")),
+                    ).with_host(Some(me.into())));
+                    let pg = crate::fleet_pg::PgStore::open_in("postgres://u@127.0.0.1:9/x", me, std::time::Duration::from_secs(1), "fleet").unwrap();
+                    let fleet = crate::fleet_sync::Fleet::new(pg, "/nonexistent/m.json", vec![0; 32]);
+                    fleet.set_members(members.clone());
+                    let hop = Arc::new(FleetHop::new(me, fleet.clone(), true));
+                    hop.set_token(Some(PEER_TOKEN.into()));
+                    f.state.fleet_admin = Some(Arc::new(FleetAdmin::new(me, hop, fleet, f.registry.clone(),
+                        f.state.plugins.clone(), "127.0.0.1:9090").direct(peers.clone())));
+                }
+                for (l, state) in [(la, a.state.clone()), (lb, b.state.clone())] {
+                    tokio::spawn(async move {
+                        axum::serve(l, router(state).into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap()
+                    });
+                }
+                Pair { a, b, a_url, b_url }
+            }
+
+            async fn send(url: &str, method: &str, path: &str, headers: &[(&str, &str)], body: Option<Value>) -> (StatusCode, reqwest::header::HeaderMap, Value) {
+                let client = reqwest::Client::new();
+                let mut rb = client.request(method.parse().unwrap(), format!("{url}{path}"));
+                for (k, v) in headers { rb = rb.header(*k, *v); }
+                if let Some(b) = body { rb = rb.json(&b); }
+                let r = rb.send().await.unwrap();
+                let status = StatusCode::from_u16(r.status().as_u16()).unwrap();
+                let headers = r.headers().clone();
+                let body = r.bytes().await.unwrap();
+                (status, headers, serde_json::from_slice(&body).unwrap_or(Value::Null))
+            }
+
+            fn served_by(h: &reqwest::header::HeaderMap) -> Option<&str> {
+                h.get(SERVED_BY).and_then(|v| v.to_str().ok())
+            }
+
+            #[tokio::test]
+            async fn a_foreign_deployment_is_read_changed_scaled_and_removed_through_any_host() {
+                let p = pair(true, |_| {}).await;
+                let (status, h, body) = send(&p.a_url, "GET", "/deployments/web", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(served_by(&h), Some("us5"));
+                assert_eq!(body["spec"]["id"], "web");
+
+                let (status, h, body) = send(&p.a_url, "PATCH", "/deployments/web/scaling", &[], Some(json!({"max_replicas": 7}))).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(served_by(&h), Some("us5"));
+                assert_eq!(p.b.registry.get("web").unwrap().spec.scaling.max_replicas, 7, "applied by the home host");
+
+                let mut changed = serde_json::to_value(spec("web", "us5")).unwrap();
+                changed["scaling"]["max_replicas"] = json!(3);
+                let (status, h, body) = send(&p.a_url, "PUT", "/deployments/web", &[], Some(changed)).await;
+                assert!(status.is_success(), "{status} {body}");
+                assert_eq!(served_by(&h), Some("us5"));
+                assert_eq!(p.b.registry.get("web").unwrap().spec.scaling.max_replicas, 3);
+
+                // A VM-bound call is the home host's to answer, refusal included.
+                let (_, h, _) = send(&p.a_url, "POST", "/deployments/web/exec", &[], Some(json!({"command": "true", "wake": false}))).await;
+                assert_eq!(served_by(&h), Some("us5"));
+
+                let (status, h, body) = send(&p.a_url, "DELETE", "/deployments/web", &[], None).await;
+                assert!(status.is_success(), "{status} {body}");
+                assert_eq!(served_by(&h), Some("us5"));
+                assert!(p.b.registry.get("web").is_none());
+
+                // A deployment no host has is this host's 404, as ever.
+                let (status, h, _) = send(&p.a_url, "GET", "/deployments/nowhere", &[], None).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(served_by(&h), None);
+                drop(p.a);
+            }
+
+            #[tokio::test]
+            async fn the_home_host_re_authorizes_the_callers_own_credential() {
+                let p = pair(true, |b| {
+                    b.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
+                    b.state.gate_admin = true;
+                }).await;
+                let (_, narrow) = p.b.state.tokens.mint(crate::tokens::NewToken {
+                    tunnel: false, fleet: false, name: "narrow".into(), admin: crate::tokens::AdminScope::Admin,
+                    namespace: None, deployments: vec!["other".into()], expires_in_secs: None,
+                }, now_secs()).unwrap();
+                let bearer = format!("Bearer {narrow}");
+                let (status, h, _) = send(&p.a_url, "GET", "/deployments/web", &[("authorization", &bearer)], None).await;
+                assert_eq!(served_by(&h), Some("us5"));
+                assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED), "{status}: a token without reach stays refused");
+                let (status, _, _) = send(&p.a_url, "PATCH", "/deployments/web/scaling", &[("authorization", &bearer)], Some(json!({"max_replicas": 9}))).await;
+                assert!(!status.is_success(), "{status}");
+                assert_ne!(p.b.registry.get("web").unwrap().spec.scaling.max_replicas, 9);
+                let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("operator:password"));
+                let (status, h, body) = send(&p.a_url, "GET", "/deployments/web", &[("authorization", &basic)], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(served_by(&h), Some("us5"));
+            }
+
+            #[tokio::test]
+            async fn a_forwarded_call_is_never_forwarded_again_and_a_forged_hop_is_refused() {
+                let p = pair(true, |_| {}).await;
+                let (status, _, body) = send(&p.a_url, "GET", "/deployments/web", &[(HOP, "us5"), (TOKEN, PEER_TOKEN)], None).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+                assert_eq!(body["code"], "fleet_hop_loop");
+                let (status, _, _) = send(&p.a_url, "GET", "/deployments/web", &[(HOP, "us5"), (TOKEN, "wrong")], None).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                let (status, _, _) = send(&p.a_url, "GET", "/deployments", &[(HOP, "us5")], None).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "a hop header without the token");
+                // A hop answers locally only: no fan-out.
+                let (status, h, body) = send(&p.b_url, "GET", "/deployments", &[(HOP, "us4"), (TOKEN, PEER_TOKEN)], None).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(h.get(PARTIAL).is_none());
+                assert!(body.as_array().unwrap().iter().all(|d| d.get("host").is_none()), "{body}");
+            }
+
+            #[tokio::test]
+            async fn an_unreachable_home_host_is_a_clear_503() {
+                let p = pair(false, |_| {}).await;
+                let (status, _, body) = send(&p.a_url, "GET", "/deployments/web", &[], None).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(body["code"], "fleet_home_unreachable");
+                assert!(body["error"].as_str().unwrap().contains("home host us5 unreachable"), "{body}");
+            }
+
+            #[tokio::test]
+            async fn listings_merge_every_member_and_name_the_missing_ones() {
+                let p = pair(true, |_| {}).await;
+                let (status, h, body) = send(&p.a_url, "GET", "/deployments", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let list = body.as_array().unwrap();
+                let web = list.iter().find(|d| d["spec"]["id"] == "web").expect("us5's deployment listed on us4");
+                assert_eq!(web["host"], "us5");
+                let obsolete = list.iter().find(|d| d["spec"]["id"] == "obsolete").unwrap();
+                assert_eq!(obsolete["host"], "us4");
+                assert_eq!(h.get(PARTIAL).unwrap(), "1");
+                assert!(h.get(UNREACHABLE).unwrap().to_str().unwrap().contains("us6"));
+
+                let (status, _, body) = send(&p.a_url, "GET", "/metrics?summary=true", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["partial"], true);
+                assert_eq!(body["hosts_unreachable"][0], "us6");
+                let hosts: Vec<&str> = body["members"].as_array().unwrap().iter().map(|m| m["host"].as_str().unwrap()).collect();
+                assert_eq!(hosts, ["us4", "us5"]);
+                let ids: Vec<(&str, &str)> = body["deployments"].as_array().unwrap().iter()
+                    .map(|d| (d["id"].as_str().unwrap(), d["host"].as_str().unwrap())).collect();
+                assert!(ids.contains(&("web", "us5")), "{ids:?}");
+            }
+
+            #[tokio::test]
+            async fn a_new_pool_is_placed_on_a_capable_host_with_room_and_an_incapable_home_is_refused() {
+                let p = pair(true, |_| {}).await;
+                let new = json!({"id": "placed", "routes": [], "vm": {"driver": "firecracker", "port": 8080},
+                    "scaling": {"min_replicas": 0, "warm_pool": 0}});
+                let (status, h, body) = send(&p.a_url, "POST", "/deployments", &[], Some(new)).await;
+                assert!(status.is_success(), "{status} {body}");
+                assert_eq!(served_by(&h), Some("us5"), "us5 has more free memory");
+                let placed = p.b.registry.get("placed").expect("registered on us5");
+                assert_eq!(placed.spec.placement.as_ref().and_then(|p| p.home.as_deref()), Some("us5"));
+                assert!(p.a.registry.get("placed").is_none());
+
+                let pinned = json!({"id": "pinned", "routes": [], "vm": {"driver": "kvm", "port": 8080},
+                    "placement": {"mode": "pinned", "home": "us4"}});
+                let (status, _, body) = send(&p.a_url, "POST", "/deployments", &[], Some(pinned)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert_eq!(body["code"], "driver_unsupported");
+
+                let spread = json!({"id": "everywhere", "routes": [], "vm": {"driver": "kvm", "port": 8080},
+                    "placement": {"mode": "spread"}});
+                let (status, _, body) = send(&p.a_url, "POST", "/deployments", &[], Some(spread)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert!(body["error"].as_str().unwrap().contains("us4"), "{body}");
+
+                // An explicit capable home elsewhere is registered there.
+                let there = json!({"id": "there", "routes": [], "vm": {"driver": "kvm", "port": 8080},
+                    "scaling": {"min_replicas": 0, "warm_pool": 0},
+                    "placement": {"mode": "pinned", "home": "us5"}});
+                let (status, h, body) = send(&p.a_url, "POST", "/deployments", &[], Some(there)).await;
+                assert!(status.is_success(), "{status} {body}");
+                assert_eq!(served_by(&h), Some("us5"));
+                assert!(p.b.registry.get("there").is_some());
+            }
+
+            #[tokio::test]
+            async fn plugin_surfaces_minted_ids_and_named_vms_go_to_their_host() {
+                let p = pair(true, |_| {}).await;
+                let record = crate::plugins::PluginRecord { enabled: true, home: Some("us5".into()), ..Default::default() };
+                for f in [&p.a, &p.b] {
+                    f.state.plugins.store().put("obs", record.clone()).unwrap();
+                }
+                let (status, h, body) = send(&p.a_url, "GET", "/api/plugins/obs", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(served_by(&h), Some("us5"));
+                // Not forwarded: us5's own copy answers plainly.
+                let (_, h, _) = send(&p.b_url, "GET", "/api/plugins/obs", &[], None).await;
+                assert_eq!(served_by(&h), None);
+
+                for path in ["/jobs/us5~job-0001", "/transfers/us5~token", "/deployments/obsolete/operations/us5~op_1"] {
+                    let (_, h, _) = send(&p.a_url, "GET", path, &[], None).await;
+                    assert_eq!(served_by(&h), Some("us5"), "{path}");
+                }
+                // Old, unscoped ids are this host's.
+                let (_, h, _) = send(&p.a_url, "GET", "/jobs/job-0001", &[], None).await;
+                assert_eq!(served_by(&h), None);
+            }
+
+            #[tokio::test]
+            async fn a_spread_deployments_vm_is_acted_on_where_it_runs_and_its_status_merges() {
+                let p = pair(true, |_| {}).await;
+                // us5 published sb-b among its VMs: the call goes there.
+                let (_, h, _) = send(&p.a_url, "DELETE", "/deployments/s/vms/sb-b", &[], None).await;
+                assert_eq!(served_by(&h), Some("us5"));
+                let (_, h, _) = send(&p.a_url, "POST", "/deployments/s/exec", &[], Some(json!({"command": "true", "sandbox_id": "sb-b", "wake": false}))).await;
+                assert_eq!(served_by(&h), Some("us5"), "a VM named in the body");
+                let (_, h, _) = send(&p.a_url, "GET", "/deployments/s/files?path=/x&sandbox_id=sb-b", &[], None).await;
+                assert_eq!(served_by(&h), Some("us5"), "a VM named in the query");
+                // Without a named VM it is this host's own pool.
+                let (_, h, _) = send(&p.a_url, "POST", "/deployments/s/exec", &[], Some(json!({"command": "true", "wake": false}))).await;
+                assert_eq!(served_by(&h), None);
+                let (status, h, body) = send(&p.a_url, "GET", "/deployments/s", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["hosts"], json!(["us4", "us5"]));
+                let etag = h.get(header::ETAG.as_str()).and_then(|v| v.to_str().ok()).unwrap_or_default();
+                assert!(etag.starts_with("\"fleet-"), "the merged body's own validator, not this host's: {etag}");
+            }
+
+            /// With a gate on, nothing leaves a host for a caller with no
+            /// credential: no fan-out, no forward, no body sent on. A caller
+            /// with one is forwarded as before, and a transfer URL — whose path
+            /// is its credential — still goes to the host that minted it.
+            #[tokio::test]
+            async fn an_anonymous_call_never_leaves_a_gated_host() {
+                let gate = |f: &mut Fixture| {
+                    f.state.auth = Some(Arc::new(DashboardAuth::new("operator", "password")));
+                    f.state.gate_admin = true;
+                    f.state.gate_view = true;
+                };
+                let p = pair_with(true, gate, gate).await;
+                for (method, path) in [("GET", "/deployments"), ("GET", "/metrics"), ("GET", "/deployments/web"), ("DELETE", "/deployments/web")] {
+                    let (status, h, _) = send(&p.a_url, method, path, &[], None).await;
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+                    assert_eq!(served_by(&h), None, "{method} {path} reached a peer");
+                    assert!(h.get(PARTIAL).is_none(), "{method} {path} fanned out");
+                }
+                let new = json!({"id": "sneaky", "routes": [], "vm": {"driver": "firecracker", "port": 8080}});
+                let (status, _, _) = send(&p.a_url, "POST", "/deployments", &[], Some(new)).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert!(p.b.registry.get("sneaky").is_none() && p.a.registry.get("sneaky").is_none());
+                assert!(p.b.registry.get("web").is_some(), "the anonymous DELETE never arrived");
+
+                let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("operator:password"));
+                let (status, h, body) = send(&p.a_url, "GET", "/deployments/web", &[("authorization", &basic)], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(served_by(&h), Some("us5"));
+
+                let (_, h, _) = send(&p.a_url, "GET", "/transfers/us5~token", &[], None).await;
+                assert_eq!(served_by(&h), Some("us5"), "a transfer URL carries its own credential");
+            }
+
+            /// A spread deployment on named hosts is asked of those hosts only
+            /// (us6 holds it as foreign and is never asked), so a complete
+            /// answer is not marked partial — and only a complete answer can be
+            /// "not modified", by its own merged ETag.
+            #[tokio::test]
+            async fn a_spread_on_named_hosts_merges_completely_and_answers_not_modified() {
+                let p = pair(true, |_| {}).await;
+                for f in [&p.a, &p.b] {
+                    let mut t = serde_json::to_value(spec("t", "x")).unwrap();
+                    t["placement"] = json!({"mode": "spread", "hosts": ["us4", "us5"]});
+                    f.registry.upsert(serde_json::from_value(t).unwrap());
+                }
+                let (status, h, body) = send(&p.a_url, "GET", "/deployments/t", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert!(h.get(PARTIAL).is_none(), "{:?}", h.get(UNREACHABLE));
+                assert_eq!(body["hosts"], json!(["us4", "us5"]));
+                let etag = h.get(header::ETAG.as_str()).unwrap().to_str().unwrap().to_string();
+
+                let (status, _, _) = send(&p.a_url, "GET", "/deployments/t", &[("if-none-match", &etag)], None).await;
+                assert_eq!(status, StatusCode::NOT_MODIFIED);
+                let (status, _, body) = send(&p.a_url, "GET", "/deployments/t", &[("if-none-match", "\"stale\"")], None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+
+                // With us6 in the spread and unreachable, never "not modified".
+                let (_, h, _) = send(&p.a_url, "GET", "/deployments/s", &[], None).await;
+                let partial_etag = h.get(header::ETAG.as_str()).unwrap().to_str().unwrap().to_string();
+                assert_eq!(h.get(PARTIAL).unwrap(), "1");
+                let (status, _, _) = send(&p.a_url, "GET", "/deployments/s", &[("if-none-match", &partial_etag)], None).await;
+                assert_eq!(status, StatusCode::OK);
+            }
+
+            /// A WebSocket (the shell) is forwarded as an upgrade, byte for byte.
+            #[tokio::test]
+            async fn a_websocket_is_forwarded_to_the_home_host() {
+                use axum::extract::ws::{Message, WebSocketUpgrade};
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let peer = Router::new().route("/deployments/web/shell", get(|headers: axum::http::HeaderMap, ws: WebSocketUpgrade| async move {
+                    assert_eq!(headers.get(HOP).unwrap(), "us4");
+                    assert_eq!(headers.get(TOKEN).unwrap(), PEER_TOKEN);
+                    ws.on_upgrade(|mut socket| async move {
+                        while let Some(Ok(Message::Text(t))) = socket.recv().await {
+                            let _ = socket.send(Message::Text(format!("echo:{t}"))).await;
+                        }
+                    })
+                }));
+                let lp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let peer_url = format!("http://{}", lp.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(lp, peer).await.unwrap() });
+
+                let mut a = fixture(true).await;
+                a.registry.set_foreign_for_test(vec![spec("web", "us5")]);
+                let pg = crate::fleet_pg::PgStore::open_in("postgres://u@127.0.0.1:9/x", "us4", std::time::Duration::from_secs(1), "fleet").unwrap();
+                let fleet = crate::fleet_sync::Fleet::new(pg, "/nonexistent/m.json", vec![0; 32]);
+                fleet.set_members(vec![row("us4", 0.0, None), row("us5", 0.0, None)]);
+                let hop = Arc::new(FleetHop::new("us4", fleet.clone(), true));
+                hop.set_token(Some(PEER_TOKEN.into()));
+                a.state.fleet_admin = Some(Arc::new(FleetAdmin::new("us4", hop, fleet, a.registry.clone(), a.state.plugins.clone(), "127.0.0.1:9090")
+                    .direct([("us5".to_string(), peer_url)].into())));
+                let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let a_addr = la.local_addr().unwrap();
+                let state = a.state.clone();
+                tokio::spawn(async move { axum::serve(la, router(state).into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap() });
+
+                let mut s = tokio::net::TcpStream::connect(a_addr).await.unwrap();
+                s.write_all(b"GET /deployments/web/shell HTTP/1.1\r\nHost: us.heyo.work\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut b = [0u8; 1];
+                    s.read_exact(&mut b).await.unwrap();
+                    head.push(b[0]);
+                }
+                let head = String::from_utf8(head).unwrap();
+                assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+                assert!(head.to_ascii_lowercase().contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{head}");
+                // A masked text frame, as a client sends.
+                let mask = [1u8, 2, 3, 4];
+                let payload: Vec<u8> = b"hi".iter().enumerate().map(|(i, b)| b ^ mask[i % 4]).collect();
+                let mut frame = vec![0x81, 0x80 | payload.len() as u8];
+                frame.extend_from_slice(&mask);
+                frame.extend_from_slice(&payload);
+                s.write_all(&frame).await.unwrap();
+                let mut hdr = [0u8; 2];
+                s.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0], 0x81);
+                let mut text = vec![0u8; (hdr[1] & 0x7f) as usize];
+                s.read_exact(&mut text).await.unwrap();
+                assert_eq!(text, b"echo:hi");
+            }
         }
     }
 

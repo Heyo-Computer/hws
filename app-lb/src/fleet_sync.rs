@@ -294,6 +294,9 @@ pub struct Fleet {
     identity: Mutex<Option<Identity>>,
     /// The members as last read, and when.
     members: Mutex<(Option<Instant>, Vec<crate::fleet_pg::HostRow>)>,
+    /// What this host publishes with its heartbeat (`fleet_admin::facts`),
+    /// as JSON; `None` until something has.
+    facts: Mutex<Option<String>>,
     synced_at: AtomicU64,
 }
 
@@ -322,6 +325,7 @@ impl Fleet {
             duties: Mutex::new(Vec::new()),
             identity: Mutex::new(None),
             members: Mutex::new((None, Vec::new())),
+            facts: Mutex::new(None),
             synced_at: AtomicU64::new(0),
         })
     }
@@ -335,6 +339,12 @@ impl Fleet {
             address,
             boot_id: id.iter().map(|b| format!("{b:02x}")).collect(),
         });
+    }
+
+    /// Publish `facts` (a [`crate::fleet_pg::HostFacts`]) with the next
+    /// heartbeats.
+    pub fn set_facts(&self, facts: &crate::fleet_pg::HostFacts) {
+        *lock(&self.facts) = serde_json::to_string(facts).ok();
     }
 
     /// `host`, while its heartbeat is live.
@@ -399,10 +409,11 @@ impl Fleet {
     /// Heartbeat this host and re-read the members.
     async fn membership(&self) {
         let identity = lock(&self.identity).clone();
+        let facts = lock(&self.facts).clone();
         if let Some(id) = identity
             && let Err(e) = self
                 .pg
-                .heartbeat(&id.host, id.address.as_deref(), &id.boot_id)
+                .heartbeat(&id.host, id.address.as_deref(), &id.boot_id, facts.as_deref())
                 .await
         {
             tracing::debug!(error = %e, "fleet heartbeat failed");
@@ -1609,6 +1620,34 @@ mod tests {
             other.unseal("acme-account", DOC_KEY, &sealed).is_err(),
             "another key"
         );
+    }
+
+    /// Facts a host publishes with its heartbeat reach every member, and
+    /// placement reads them there: against Postgres, two hosts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_facts_reach_every_member_and_steer_placement() {
+        let pg_a = pg_or_skip!("facts", "us4/1");
+        let (a_dir, b_dir) = (Dir::new("fa"), Dir::new("fb"));
+        let a = Fleet::new(pg_a.clone(), snapshot_meta_path(&a_dir.state()), KEY.to_vec());
+        let b = Fleet::new(peer(&pg_a, "us5/1"), snapshot_meta_path(&b_dir.state()), KEY.to_vec());
+        a.set_identity("us4", Some("198.51.100.4".into()));
+        b.set_identity("us5", Some("198.51.100.5".into()));
+        let mut fa = crate::fleet_pg::HostFacts { drivers: Some(vec!["firecracker".into()]), memory_free_bytes: Some(10), ..Default::default() };
+        fa.vms.insert("sb-a".into(), "web".into());
+        a.set_facts(&fa);
+        b.set_facts(&crate::fleet_pg::HostFacts { drivers: Some(vec!["libvirt".into()]), memory_free_bytes: Some(99), ..Default::default() });
+        a.membership().await;
+        b.membership().await;
+        a.membership().await;
+        let seen_by_b = b.live_members();
+        assert_eq!(seen_by_b.len(), 2);
+        b.membership().await;
+        let members = b.live_members();
+        let us4 = members.iter().find(|m| m.host == "us4").unwrap();
+        assert_eq!(us4.facts.as_ref(), Some(&fa));
+        assert_eq!(crate::fleet_admin::choose_home("us5", &members, "firecracker").unwrap(), "us4");
+        assert_eq!(crate::fleet_admin::choose_home("us5", &members, "libvirt").unwrap(), "us5");
+        assert!(crate::fleet_admin::choose_home("us5", &members, "kvm").is_err());
     }
 
     #[test]

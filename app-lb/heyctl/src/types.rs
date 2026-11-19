@@ -54,6 +54,12 @@ pub struct DeploymentStatus {
     /// The rolling replacement in progress, or the last one. Absent for a
     /// deployment that has never rolled.
     pub rollout: Option<RolloutView>,
+    /// In a fleet whose admin API merges every member's answer: the host
+    /// that answered for this deployment. Absent from a single server.
+    pub host: Option<String>,
+    /// In a fleet, for a `spread` deployment: every host whose VMs are in
+    /// `vms`. Empty otherwise.
+    pub hosts: Vec<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -162,6 +168,9 @@ pub struct VmStatus {
     pub in_flight: usize,
     pub healthy: bool,
     pub draining: bool,
+    /// In a fleet, for a `spread` deployment's merged status: the host
+    /// running this VM.
+    pub host: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }

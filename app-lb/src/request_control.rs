@@ -245,6 +245,14 @@ pub struct RequestState {
     fleet: bool,
     /// This request goes to its deployment's home host, once.
     hop_out: Option<HopOut>,
+    /// The deployment fronts this host's admin API, in a fleet: the admin
+    /// listener is told the client this host judged, and — for a valid hop
+    /// — the hop, with the fleet's token for it to check again
+    /// (`fleet_admin`). `Some(None)`: not a hop.
+    admin_hop: Option<Option<(String, Arc<str>)>>,
+    /// With `admin_hop`: the seal that proves to the admin listener this host
+    /// named `client` ([`crate::fleet_hop::FleetHop::seal_client`]).
+    admin_client_seal: Option<String>,
     /// The client, as this host judged it: the socket peer, a fleet hop's
     /// vouched client, or a tunnel ingress's dialer's word. Told to a
     /// tunnel's remote app-lb, which has no socket peer of its own.
@@ -296,8 +304,23 @@ impl RequestState {
         let mut out = Vec::new();
         // In a fleet, whatever arrived under the fleet's names goes no further.
         if self.fleet {
-            for name in [crate::fleet_hop::HOP, crate::fleet_hop::TOKEN] {
+            for name in [crate::fleet_hop::HOP, crate::fleet_hop::TOKEN, crate::fleet_admin::CLIENT, crate::fleet_hop::CLIENT_SEAL] {
                 out.push(HeaderModification::Remove(http::HeaderName::from_static(name)));
+            }
+        }
+        // Except to this host's own admin listener, which answers admin calls
+        // forwarded by peers and forwards its own: it needs the hop and the
+        // client, and checks the token itself.
+        if let (Some(admin), None) = (&self.admin_hop, &self.hop_out) {
+            if let Some((origin, token)) = admin {
+                out.push(HeaderModification::Set(http::HeaderName::from_static(crate::fleet_hop::HOP), value(origin, "fleet hop")?));
+                out.push(HeaderModification::Set(http::HeaderName::from_static(crate::fleet_hop::TOKEN), value(token, "fleet token")?));
+            }
+            if let Some(ip) = self.client {
+                out.push(HeaderModification::Set(http::HeaderName::from_static(crate::fleet_admin::CLIENT), value(&ip.to_string(), "fleet client")?));
+                if let Some(seal) = &self.admin_client_seal {
+                    out.push(HeaderModification::Set(http::HeaderName::from_static(crate::fleet_hop::CLIENT_SEAL), value(seal, "fleet client seal")?));
+                }
             }
         }
         if let Some(hop) = &self.hop_out {
@@ -596,12 +619,14 @@ impl RequestControl {
         // as the client it carries.
         let hopped;
         state.fleet = self.hop.is_some();
+        let mut hop_origin = None;
         let head = match self.hop.as_ref().map(|h| h.inbound(&head.headers)) {
             Some(crate::fleet_hop::Inbound::Refused) => {
                 tracing::warn!(peer = ?head.peer, "refused a fleet hop without the fleet's token");
                 return RequestDecision::Respond(ResponseData::plain(403, "fleet hop refused\n"));
             }
-            Some(crate::fleet_hop::Inbound::Valid { client, .. }) => {
+            Some(crate::fleet_hop::Inbound::Valid { client, origin }) => {
+                hop_origin = Some(origin);
                 state.hop_in = true;
                 let mut copy = head.clone();
                 if let Some(ip) = client { copy.peer = Some(SocketAddr::new(ip, 0)); }
@@ -738,6 +763,11 @@ impl RequestControl {
             return RequestDecision::Respond(ResponseData { status: 200, body: doc, content_type: "application/rss+xml; charset=utf-8", headers: vec![], cache_control: Some("public, max-age=300") });
         }
         if let Some(spec) = deployment.spec.site.clone() { state.set_deployment(deployment); return RequestDecision::ServeSite { spec, path }; }
+        if state.fleet && self.auth.fronts_admin_api(&deployment.spec) {
+            let token = self.hop.as_ref().and_then(|h| h.token());
+            state.admin_hop = Some(hop_origin.zip(token));
+            state.admin_client_seal = state.client.zip(self.hop.as_ref()).and_then(|(ip, h)| h.seal_client(&ip.to_string()));
+        }
         // A tunnel with nothing to forward to is a remote app-lb that is not
         // there: its lease lapsed, or it does not answer. Say so, rather than
         // the bare 500 a failed upstream selection becomes.
@@ -971,6 +1001,12 @@ mod tests {
             };
             write("local", "us4");
             write("theirs", "us5");
+            // This host's admin deployment, fronting its admin listener.
+            let admin = serde_json::json!({
+                "spec": {"id": "admin-us4", "routes": [{"host": "us.example"}], "upstreams": ["127.0.0.1:9090"],
+                         "placement": {"mode": "pinned", "home": "us4"}}
+            });
+            std::fs::write(fleet_dir.join("admin-us4.json"), serde_json::to_vec(&admin).unwrap()).unwrap();
             let fleet_records: Arc<dyn crate::fleet_store::Collection> = Arc::new(
                 crate::fleet_store::FileCollection::new(&fleet_dir, ".json", crate::fleet_store::FileOptions::PLAIN),
             );
@@ -985,7 +1021,7 @@ mod tests {
                 registry,
                 Arc::new(Metrics::new()),
                 Arc::new(crate::acme::ChallengeTable::new()),
-                Arc::new(crate::auth::Authenticator::new(vec![7; 32], secrets.clone(), None, None)),
+                Arc::new(crate::auth::Authenticator::with_admin_addr(vec![7; 32], secrets.clone(), None, None, Some("127.0.0.1:9090".into()))),
                 Arc::new(crate::guard::Guard::new(dir.path().join("guard"), true)),
                 Arc::new(Feed::new()),
                 Arc::new(crate::auth_providers::AuthProviderStore::new(dir.path().join("providers"))),
@@ -1069,6 +1105,39 @@ mod tests {
             assert!(mods.contains(&"remove x-auth-request-email".to_string()), "{mods:?}");
             assert!(mods.contains(&"remove x-heyo-fleet-token".to_string()));
             assert!(!mods.iter().any(|m| m.starts_with("set x-heyo-fleet")));
+        }
+
+        /// The admin listener forwards admin calls itself (`fleet_admin`), so
+        /// what reaches it says who the client is — as this host judged it —
+        /// and, for a peer's hop, carries the hop for it to check again.
+        #[tokio::test]
+        async fn this_hosts_admin_listener_is_told_the_client_and_the_hop() {
+            let f = fixture(true);
+            let mut state = RequestState::default();
+            let claimed = [(crate::fleet_admin::CLIENT, "10.0.0.1"), ("x-forwarded-for", "10.0.0.2")];
+            assert!(matches!(f.control.decide(&head("us.example", &claimed), &mut state).await, RequestDecision::Proxy));
+            let mods = names(&state.forwarding_modifications(&"/x".parse().unwrap()).unwrap());
+            assert!(mods.contains(&"remove x-heyo-fleet-client".to_string()), "{mods:?}");
+            assert!(mods.contains(&"set x-heyo-fleet-client=198.51.100.7".to_string()), "the socket peer, not a claim: {mods:?}");
+            // Sealed, so the admin listener can tell this host named it.
+            assert!(mods.contains(&"remove x-heyo-fleet-client-seal".to_string()), "{mods:?}");
+            let seal = crate::fleet_hop::client_seal(b"s3cret", "198.51.100.7");
+            assert!(mods.contains(&format!("set x-heyo-fleet-client-seal={seal}")), "{mods:?}");
+            assert!(!mods.iter().any(|m| m.starts_with("set x-heyo-fleet-hop")), "not a hop");
+
+            let mut state = RequestState::default();
+            let hop = [(HOP, "us5"), (TOKEN, "s3cret"), ("x-forwarded-for", "203.0.113.9")];
+            assert!(matches!(f.control.decide(&head("us.example", &hop), &mut state).await, RequestDecision::Proxy));
+            let mods = names(&state.forwarding_modifications(&"/x".parse().unwrap()).unwrap());
+            assert!(mods.contains(&"set x-heyo-fleet-hop=us5".to_string()), "{mods:?}");
+            assert!(mods.contains(&"set x-heyo-fleet-token=s3cret".to_string()));
+            assert!(mods.contains(&"set x-heyo-fleet-client=203.0.113.9".to_string()));
+
+            // Any other deployment never sees the fleet's headers.
+            let mut state = RequestState::default();
+            assert!(matches!(f.control.decide(&head("local.example", &hop), &mut state).await, RequestDecision::Proxy));
+            let mods = names(&state.forwarding_modifications(&"/x".parse().unwrap()).unwrap());
+            assert!(!mods.iter().any(|m| m.starts_with("set x-heyo-fleet")), "{mods:?}");
         }
 
         #[tokio::test]

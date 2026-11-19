@@ -286,6 +286,24 @@ impl Placer {
             .is_none_or(|(_, first)| first == self.host)
     }
 
+    /// Whether this host issues the certificate for a name that deployments
+    /// on `others` route too — a host-scoped deployment per host on one
+    /// shared name, such as each host's admin deployment on the fleet's
+    /// admin name. The same rule as a spread deployment's: the first live
+    /// host by name, active ones first, among this host and `others`.
+    /// Exactly one issuer, so the hosts never race orders for one name.
+    pub fn issues_shared_name(&self, others: &[String]) -> bool {
+        let mut hosts: Vec<(bool, String)> = self
+            .fleet
+            .live_members()
+            .into_iter()
+            .filter(|m| m.state != MAINTENANCE && m.host != self.host && others.contains(&m.host))
+            .map(|m| (m.state != ACTIVE, m.host))
+            .collect();
+        hosts.push((self.state() != ACTIVE, self.host.clone()));
+        hosts.into_iter().min().is_none_or(|(_, first)| first == self.host)
+    }
+
     /// Report, read, and — holding the lease — plan.
     async fn sync(&self) {
         self.report().await;
@@ -655,6 +673,7 @@ mod tests {
             state: "active".into(),
             boot_id: "b".into(),
             age_secs: 0.0,
+            facts: None,
         }
     }
 
@@ -800,6 +819,30 @@ mod tests {
         spec.placement = None;
         assert_eq!(target(&spec, 5), None);
         assert!(placer.issues_certificate(&spec));
+    }
+
+    /// A name several hosts' pinned deployments route (each host's admin
+    /// deployment on the shared admin name) has one issuer: the first live,
+    /// active host by name.
+    #[test]
+    fn a_shared_name_has_exactly_one_issuer() {
+        let pg = crate::fleet_pg::PgStore::open_in("postgres://u@127.0.0.1:9/x", "us4", Duration::from_secs(1), "fleet").unwrap();
+        let fleet = Fleet::new(pg, "/nonexistent/m.json", vec![0; 32]);
+        let registry = Arc::new(Registry::new(std::env::temp_dir().join(format!("shared-name-{}.json", std::process::id()))));
+        let at = |me: &str| Placer::new(me, fleet.clone(), registry.clone(), true);
+        fleet.set_members(vec![member("us4"), member("us5")]);
+        let others = |me: &str| ["us1", "us4", "us5"].iter().filter(|h| **h != me).map(|h| h.to_string()).collect::<Vec<_>>();
+        assert!(at("us4").issues_shared_name(&others("us4")), "us1 is not live");
+        assert!(!at("us5").issues_shared_name(&others("us5")));
+        let mut us1 = member("us1");
+        us1.state = MAINTENANCE.into();
+        fleet.set_members(vec![us1, member("us4"), member("us5")]);
+        assert!(at("us4").issues_shared_name(&others("us4")), "a host in maintenance never issues");
+        let mut draining = member("us4");
+        draining.state = DRAINING.into();
+        fleet.set_members(vec![draining, member("us5")]);
+        assert!(at("us5").issues_shared_name(&others("us5")), "an active host before a draining one");
+        assert!(at("us4").issues_shared_name(&[]), "a name nobody else routes");
     }
 
     #[test]
