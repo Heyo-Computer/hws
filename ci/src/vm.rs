@@ -48,6 +48,7 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -81,10 +82,28 @@ const POLL_SLACK: Duration = Duration::from_secs(30);
 ///
 /// A fresh connection is a fresh iroh stream, so a reset of that kind is gone
 /// on the first retry. A tunnel that is actually dead fails every attempt the
-/// same way and is reported after the last one — the caller then evicts it
-/// (`DispatchError::is_tunnel_failure`), which retrying cannot substitute for.
+/// same way; for that, see [`TUNNEL_OUTAGE_BUDGET`].
 const TRANSPORT_RETRIES: u32 = 2;
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// How long one request on the exec route keeps redialing a dead tunnel before
+/// the failure is reported (and the caller evicts the tunnel and fails the
+/// job, as before).
+///
+/// When the quick retries above are spent, the tunnel itself is the suspect:
+/// the relay dropped it, or the daemon restarted. Both heal — a relay path is
+/// re-established in seconds, a heyvmd restart takes well under a minute and
+/// keeps running VMs — and the operation being polled runs on regardless. Five
+/// minutes covers both with room, and is short against the builds it saves:
+/// the case that prompted this was a 75-minute app-lb release whose build had
+/// finished (exit 0, in the guest console) when the job was marked failed.
+///
+/// Only where the connection can redial ([`crate::runners::Redial`]); a direct
+/// URL fails after the quick retries exactly as it always has.
+const TUNNEL_OUTAGE_BUDGET: Duration = Duration::from_secs(300);
+/// First wait before a redial, doubled per failed attempt up to the max.
+const REDIAL_DELAY_MIN: Duration = Duration::from_secs(1);
+const REDIAL_DELAY_MAX: Duration = Duration::from_secs(30);
 
 /// Base64 bytes per upload exec. See [`Vm::upload_bytes`] for where this number
 /// comes from — it is measured against a real guest, not chosen.
@@ -553,12 +572,7 @@ impl Vms {
                 source: e,
             })?;
         let lock = self.lock_for(&sandbox_id).await;
-        Ok(Vm {
-            sandbox,
-            id: sandbox_id,
-            lock,
-            _connection: connection,
-        })
+        Ok(Vm::new(sandbox, sandbox_id, lock, connection))
     }
 
     /// Allocate a VM identity. Persist ownership before calling ensure_running:
@@ -606,26 +620,84 @@ impl Vms {
 
         let id = sandbox.sandbox_id().to_string();
         let lock = self.lock_for(&id).await;
-        let vm = Vm { sandbox, id, lock, _connection: connection };
-        Ok(vm)
+        Ok(Vm::new(sandbox, id, lock, connection))
     }
 }
 
 /// One VM on one runner.
 pub struct Vm {
-    sandbox: Sandbox,
+    /// Swapped, never mutated in place, when [`Self::redial`] replaces a dead
+    /// tunnel: a request already in flight keeps the handle it loaded.
+    sandbox: ArcSwap<Sandbox>,
     id: String,
     lock: Arc<Mutex<()>>,
-    _connection: crate::runners::Connection,
+    /// Owns the forwarding listener `sandbox` points at, and carries the
+    /// redial. Replaced together with `sandbox`.
+    connection: std::sync::Mutex<crate::runners::Connection>,
+    /// [`TUNNEL_OUTAGE_BUDGET`], unless a test shortened it.
+    outage_budget: Duration,
 }
 
 impl Vm {
+    fn new(
+        sandbox: Sandbox,
+        id: String,
+        lock: Arc<Mutex<()>>,
+        connection: crate::runners::Connection,
+    ) -> Self {
+        Self {
+            sandbox: ArcSwap::from_pointee(sandbox),
+            id,
+            lock,
+            connection: std::sync::Mutex::new(connection),
+            outage_budget: TUNNEL_OUTAGE_BUDGET,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_outage_budget(mut self, budget: Duration) -> Self {
+        self.outage_budget = budget;
+        self
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    /// The current handle. Load it per request: a redial may replace it
+    /// between two.
+    fn sandbox(&self) -> Arc<Sandbox> {
+        self.sandbox.load_full()
+    }
+
+    fn can_redial(&self) -> bool {
+        self.connection.lock().unwrap().redial.is_some()
+    }
+
+    /// Replace the tunnel this handle rides on with a freshly dialed one.
+    ///
+    /// Does not take the sandbox lock: it changes how this process reaches the
+    /// daemon, not anything on the daemon, and `exec` calls it while holding
+    /// that lock.
+    async fn redial(&self) -> Result<(), String> {
+        let (redial, dead) = {
+            let connection = self.connection.lock().unwrap();
+            (
+                connection.redial.clone(),
+                connection.options.base_url.clone().unwrap_or_default(),
+            )
+        };
+        let redial = redial.ok_or_else(|| "this connection has no tunnel to redial".to_string())?;
+        let fresh = redial(dead).await?;
+        let sandbox = Sandbox::connect(self.id.clone(), fresh.options.clone())
+            .map_err(|e| format!("connecting to the sandbox over the new tunnel: {e}"))?;
+        self.sandbox.store(Arc::new(sandbox));
+        *self.connection.lock().unwrap() = fresh;
+        Ok(())
+    }
+
     pub async fn info(&self) -> Result<SandboxInfo, VmError> {
-        self.sandbox.info().await.map_err(|e| VmError::Daemon {
+        self.sandbox().info().await.map_err(|e| VmError::Daemon {
             sandbox: self.id.clone(),
             what: "reading sandbox info",
             source: e,
@@ -656,7 +728,7 @@ impl Vm {
         // as `execute` does.
         if matches!(info.status, SandboxStatus::Stopped | SandboxStatus::Paused) {
             let _guard = self.lock.lock().await;
-            self.sandbox.start().await.map_err(|e| VmError::Daemon {
+            self.sandbox().start().await.map_err(|e| VmError::Daemon {
                 sandbox: self.id.clone(),
                 what: "starting the sandbox",
                 source: e,
@@ -664,7 +736,7 @@ impl Vm {
         }
 
         let info = self
-            .sandbox
+            .sandbox()
             .wait_for_ready(timeout)
             .await
             .map_err(|e| VmError::Daemon {
@@ -782,6 +854,11 @@ impl Vm {
     /// [`TRANSPORT_RETRIES`] times. Only for requests that are safe to repeat —
     /// see the constant for why both of this route's are.
     ///
+    /// When those are spent on a *transport* failure and the connection can
+    /// redial, the tunnel is replaced and the request re-sent, with backoff,
+    /// for up to [`TUNNEL_OUTAGE_BUDGET`] of continuous failure. A 502/503/504
+    /// is never redialed: the daemon answered, so the tunnel works.
+    ///
     /// `deadline` is the poll loop's: a retry that could not land before it is
     /// not attempted, so the loop's own timeout is still the one that fires.
     async fn daemon_request<T: serde::de::DeserializeOwned>(
@@ -793,9 +870,12 @@ impl Vm {
         deadline: Option<Instant>,
     ) -> Result<T, VmError> {
         let mut attempt = 0;
+        let mut outage_since: Option<Instant> = None;
+        let mut redial_delay = REDIAL_DELAY_MIN;
+        let lands_in_time = |delay: Duration| deadline.is_none_or(|d| Instant::now() + delay < d);
         loop {
             let result = self
-                .sandbox
+                .sandbox()
                 .client()
                 .request(
                     method.clone(),
@@ -808,28 +888,61 @@ impl Vm {
                 )
                 .await;
             let e = match result {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    if let Some(since) = outage_since {
+                        tracing::info!(
+                            sandbox = %self.id,
+                            outage_secs = since.elapsed().as_secs(),
+                            "{what} reached the daemon again over a redialed tunnel"
+                        );
+                    }
+                    return Ok(v);
+                }
                 Err(e) => e,
             };
-            let retry_lands_in_time =
-                deadline.is_none_or(|d| Instant::now() + TRANSPORT_RETRY_DELAY < d);
-            let retryable = is_transport(&e)
-                || matches!(&e, HeyoError::Api { status: 502 | 503 | 504, .. });
-            if !retryable || attempt >= TRANSPORT_RETRIES || !retry_lands_in_time {
-                return Err(VmError::Daemon {
-                    sandbox: self.id.clone(),
-                    what,
-                    source: e,
-                });
+            let transport = is_transport(&e);
+            let retryable =
+                transport || matches!(&e, HeyoError::Api { status: 502 | 503 | 504, .. });
+            let fail = |e| VmError::Daemon { sandbox: self.id.clone(), what, source: e };
+            if !retryable {
+                return Err(fail(e));
             }
-            attempt += 1;
+            if attempt < TRANSPORT_RETRIES && lands_in_time(TRANSPORT_RETRY_DELAY) {
+                attempt += 1;
+                tracing::warn!(
+                    sandbox = %self.id,
+                    attempt,
+                    of = TRANSPORT_RETRIES,
+                    "{what} hit a transient transport or dependency error, retrying: {e}"
+                );
+                tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
+                continue;
+            }
+
+            // The quick retries are spent. On a transport failure the tunnel
+            // itself is the suspect: replace it and carry on, within budget.
+            let since = *outage_since.get_or_insert_with(Instant::now);
+            if !transport
+                || !self.can_redial()
+                || since.elapsed() + redial_delay > self.outage_budget
+                || !lands_in_time(redial_delay)
+            {
+                return Err(fail(e));
+            }
             tracing::warn!(
                 sandbox = %self.id,
-                attempt,
-                of = TRANSPORT_RETRIES,
-                "{what} hit a transient transport or dependency error, retrying: {e}"
+                outage_secs = since.elapsed().as_secs(),
+                budget_secs = self.outage_budget.as_secs(),
+                "{what} lost the daemon tunnel ({e}); redialing in {redial_delay:?}"
             );
-            tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
+            tokio::time::sleep(redial_delay).await;
+            redial_delay = (redial_delay * 2).min(REDIAL_DELAY_MAX);
+            match self.redial().await {
+                // The new tunnel gets its own quick retries.
+                Ok(()) => attempt = 0,
+                // A failed dial is one more failed attempt; the budget bounds it.
+                Err(reason) => tracing::warn!(sandbox = %self.id, "redial failed: {reason}"),
+            }
         }
     }
 
@@ -1174,7 +1287,7 @@ impl Vm {
     pub async fn logs(&self, limit: usize) -> Result<String, VmError> {
         let path = format!("/sandboxes/{}/logs", encode_segment(&self.id));
         let response: LogsResponse = self
-            .sandbox
+            .sandbox()
             .client()
             .request(
                 Method::GET,
@@ -1195,15 +1308,24 @@ impl Vm {
         Ok(render_log_lines(&response.logs, response.total))
     }
 
+    /// One redial on a transport failure, then one more try. Renewal runs on a
+    /// short per-pass timeout beside the build it keeps alive; a dead tunnel
+    /// left in place here fails every pass until the TTL lapses and the daemon
+    /// reaps the VM mid-build. The redial also evicts the dead tunnel from the
+    /// runner cache, so the next pass and the next job dial fresh.
     pub async fn renew_ttl(&self, ttl: Duration) -> Result<(), VmError> {
-        self.sandbox
-            .set_ttl(ttl.as_secs())
-            .await
-            .map_err(|e| VmError::Daemon {
-                sandbox: self.id.clone(),
-                what: "renewing the TTL",
-                source: e,
-            })
+        let fail = |e| VmError::Daemon { sandbox: self.id.clone(), what: "renewing the TTL", source: e };
+        match self.sandbox().set_ttl(ttl.as_secs()).await {
+            Ok(()) => Ok(()),
+            Err(e) if is_transport(&e) && self.can_redial() => match self.redial().await {
+                Ok(()) => self.sandbox().set_ttl(ttl.as_secs()).await.map_err(fail),
+                Err(reason) => {
+                    tracing::warn!(sandbox = %self.id, "TTL renewal could not redial: {reason}");
+                    Err(fail(e))
+                }
+            },
+            Err(e) => Err(fail(e)),
+        }
     }
 
     /// What the daemon says this VM was given.
@@ -1216,7 +1338,7 @@ impl Vm {
     /// optional and an absent one is *unreported*, never a default: a daemon
     /// that says nothing must not be read as saying `small`.
     pub async fn size(&self) -> Result<VmSize, VmError> {
-        self.sandbox
+        self.sandbox()
             .client()
             .request::<VmSize>(
                 reqwest::Method::GET,
@@ -1249,7 +1371,7 @@ impl Vm {
     /// back stopped; an older daemon boots it, and the caller parks it again.)
     pub async fn resize(&self, class: SandboxSize, timeout: Duration) -> Result<(), VmError> {
         let _guard = self.lock.lock().await;
-        self.sandbox
+        self.sandbox()
             .client()
             .request::<serde_json::Value>(
                 reqwest::Method::POST,
@@ -1280,7 +1402,7 @@ impl Vm {
     /// against that is how a step ends with "no VM handle found".
     pub async fn stop(&self) -> Result<(), VmError> {
         let _guard = self.lock.lock().await;
-        self.sandbox.stop().await.map_err(|e| VmError::Daemon {
+        self.sandbox().stop().await.map_err(|e| VmError::Daemon {
             sandbox: self.id.clone(),
             what: "stopping the sandbox",
             source: e,
@@ -1290,7 +1412,7 @@ impl Vm {
     /// Delete the VM. A 404 is success — the SDK already treats it that way.
     pub async fn destroy(&self) -> Result<(), VmError> {
         let _guard = self.lock.lock().await;
-        self.sandbox.kill().await.map_err(|e| VmError::Daemon {
+        self.sandbox().kill().await.map_err(|e| VmError::Daemon {
             sandbox: self.id.clone(),
             what: "destroying the sandbox",
             source: e,
@@ -1931,6 +2053,149 @@ mod tests {
                 assert!(result.is_err(), "HTTP {status} must stop without reaching the later success");
             }
         }
+    }
+
+    /// A daemon whose tunnel "dies" once the operation is running: `POST`
+    /// enqueues, and every `GET` drops the connection mid-request — the
+    /// handler panics, so the client sees `connection closed before message
+    /// completed`, the error that failed a finished app-lb build on us2.
+    async fn dying_daemon() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Json, Router, routing::{get, post}};
+        let app = Router::new()
+            .route("/sandboxes/{id}/exec-operations", post(|| async {
+                Json(serde_json::json!({"status":"running"}))
+            }))
+            .route("/sandboxes/{id}/exec-operations/{operation}", get(|| async {
+                panic!("the tunnel dropped mid-poll");
+                #[allow(unreachable_code)]
+                Json(serde_json::json!({}))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        (base, tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); }))
+    }
+
+    /// The same daemon reached over a new tunnel: the operation finished while
+    /// nobody was polling. Counts re-sent `POST`s, which must stay at zero —
+    /// the step must be resumed, never run a second time.
+    async fn same_daemon_new_tunnel(
+        polled: Arc<std::sync::Mutex<Vec<String>>>,
+        posts: Arc<AtomicU64>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Json, Router, extract::Path, routing::{get, post}};
+        let app = Router::new()
+            .route("/sandboxes/{id}/exec-operations", post(move || {
+                let posts = posts.clone();
+                async move {
+                    posts.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"status":"running"}))
+                }
+            }))
+            .route("/sandboxes/{id}/exec-operations/{operation}", get(
+                move |Path((_, operation)): Path<(String, String)>| {
+                    let polled = polled.clone();
+                    async move {
+                        polled.lock().unwrap().push(operation);
+                        Json(serde_json::json!({"status":"completed",
+                            "result":{"output":"finished on the new tunnel", "exit_code":0}}))
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        (base, tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); }))
+    }
+
+    fn direct(base: &str) -> HeyoClientOptions {
+        HeyoClientOptions { base_url: Some(base.to_string()), api_key: None, timeout: None }
+    }
+
+    #[tokio::test]
+    async fn exec_resumes_the_same_operation_over_a_redialed_tunnel() {
+        use super::*;
+        let (dead, dying) = dying_daemon().await;
+        let polled = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let posts = Arc::new(AtomicU64::new(0));
+        let (fresh, healthy) = same_daemon_new_tunnel(polled.clone(), posts.clone()).await;
+
+        let redials = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = redials.clone();
+        let fresh_url = fresh.clone();
+        let redial: crate::runners::Redial = Arc::new(move |gone: String| {
+            seen.lock().unwrap().push(gone);
+            let options = direct(&fresh_url);
+            Box::pin(async move { Ok(crate::runners::Connection::from(options)) })
+        });
+        let mut connection = crate::runners::Connection::from(direct(&dead));
+        connection.redial = Some(redial);
+        let vm = Vms::new().open(connection, "sb-redial".into()).await.unwrap();
+
+        let output = vm
+            .exec("op-resumed", "cargo build --release", &HashMap::new(), Duration::from_secs(60))
+            .await
+            .expect("a finished step must survive its tunnel dying mid-poll");
+        dying.abort();
+        healthy.abort();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.output, "finished on the new tunnel");
+        assert_eq!(*redials.lock().unwrap(), vec![dead.clone()], "one redial, naming the dead tunnel");
+        assert_eq!(*polled.lock().unwrap(), vec!["op-resumed".to_string()], "the same operation is polled");
+        assert_eq!(posts.load(Ordering::SeqCst), 0, "the step must not be started again");
+    }
+
+    /// Without a redial — a direct URL — nothing changes: the quick retries,
+    /// then the transport error the dispatcher evicts on.
+    #[tokio::test]
+    async fn exec_without_a_redial_still_fails_after_the_quick_retries() {
+        use super::*;
+        let (dead, dying) = dying_daemon().await;
+        let vm = Vms::new().open(direct(&dead), "sb-direct".into()).await.unwrap();
+        let started = Instant::now();
+        let err = vm
+            .exec("op-direct", "true", &HashMap::new(), Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        dying.abort();
+        assert!(err.is_transport(), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+    }
+
+    /// A runner that stays unreachable is given up on after the outage budget,
+    /// as a transport error, so the job fails and the tunnel is evicted as
+    /// before rather than the step hanging until its own timeout.
+    #[tokio::test]
+    async fn exec_gives_up_on_an_unreachable_runner_after_the_outage_budget() {
+        use super::*;
+        let (dead, dying) = dying_daemon().await;
+        let attempts = Arc::new(AtomicU64::new(0));
+        let counted = attempts.clone();
+        let redial: crate::runners::Redial = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("iroh connect failed: no route".to_string()) })
+        });
+        let mut connection = crate::runners::Connection::from(direct(&dead));
+        connection.redial = Some(redial);
+        // The real budget is minutes; the logic is the same at seconds.
+        let budget = Duration::from_secs(4);
+        let vm = Vms::new()
+            .open(connection, "sb-gone".into())
+            .await
+            .unwrap()
+            .with_outage_budget(budget);
+
+        let started = Instant::now();
+        let err = vm
+            .exec("op-gone", "true", &HashMap::new(), Duration::from_secs(4 * 3600))
+            .await
+            .unwrap_err();
+        dying.abort();
+        let waited = started.elapsed();
+        assert!(err.is_transport(), "{err}");
+        // Redials after 1s and 2s fit in 4s; the next (4s) would not.
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "redial attempts");
+        assert!(waited <= budget + Duration::from_secs(3), "waited {waited:?}");
+        assert!(waited >= Duration::from_secs(3), "gave up after only {waited:?}");
     }
 
     #[test]

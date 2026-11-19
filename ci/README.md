@@ -1316,6 +1316,20 @@ cached connection makes subsequent work redial without closing the listener
 under other active jobs. This does not recover a genuinely broken remote link
 or replay a command whose outcome is unknown.
 
+A tunnel that dies *while a step runs* no longer fails the job. The step's exec
+operation keeps running on the daemon whether or not anybody polls it, so once
+the two quick retries on the old connection are spent, the VM handle redials
+the runner — evicting the cached tunnel only if it is still the dead one, so
+concurrent jobs share one fresh tunnel instead of evicting each other's — and
+resumes polling the *same* operation id. Nothing is re-posted, and the step is
+never run twice. Redials back off from 1s to 30s, and give up after five minutes
+of continuous failure with the same transport error, eviction and job failure
+as before. A daemon's 502/503/504 is never redialed: an answer means the tunnel
+works. TTL renewal redials once on a transport failure, so a dead cached tunnel
+cannot leave a long build's VM to expire, and the redial evicts the tunnel for
+every later pass and job. Direct (local-runner) connections have no tunnel and
+keep the quick retries only.
+
 ### A VM being created is on the page too
 
 A row appears as `building` **before** the create is attempted, not once it

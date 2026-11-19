@@ -224,7 +224,7 @@ async fn main() {
     let secrets_client = secrets::Secrets::new(&config);
     let objects = Arc::new(objects::Workflows::new(&config));
     let tenants = Arc::new(tenants::Tenants::new(&config));
-    let runners = Arc::new(Runners::new(config.clone()));
+    let runners = Runners::new(config.clone());
     // The first read of the pool is awaited so a network that does not exist is
     // reported now rather than by the first job. Which failures are fatal is the
     // distinction that matters: naming a network wrongly is a configuration

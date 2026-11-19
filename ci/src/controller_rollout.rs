@@ -756,7 +756,7 @@ mod tests {
             executor: Arc::new(crate::executor::ExecutorInstance::register(f.store.pool().clone(), &format!("{base}/deployments/ci-test")).await.unwrap()),
             pool: crate::pool::Pool::new(f.store.pool().clone()), images: crate::image::Catalog::new(f.store.pool().clone()),
             bus: Arc::new(crate::bus::Bus::connect(&config.nats, &config.nats_prefix).await.unwrap()),
-            runners: Arc::new(crate::runners::Runners::new(config.clone())),
+            runners: crate::runners::Runners::new(config.clone()),
             vms: Arc::new(crate::vm::Vms::new()), secrets: crate::secrets::Secrets::unconfigured(),
             artifacts: Arc::from(crate::artifacts::sink_for(&config).unwrap()),
             objects: Arc::new(crate::objects::Workflows::new(&config)),
