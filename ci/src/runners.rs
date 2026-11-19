@@ -62,13 +62,37 @@ use tokio::sync::Mutex;
 pub struct Connection {
     pub options: HeyoClientOptions,
     pub(crate) _tunnel: Option<Arc<HeyoClient>>,
+    /// How a VM handle opened on this connection gets a new one when the
+    /// tunnel underneath dies mid-operation. `None` for a direct URL (a local
+    /// runner, a test), where there is no tunnel to replace.
+    pub(crate) redial: Option<Redial>,
 }
 
 impl From<HeyoClientOptions> for Connection {
     fn from(options: HeyoClientOptions) -> Self {
-        Self { options, _tunnel: None }
+        Self { options, _tunnel: None, redial: None }
     }
 }
+
+/// Replace a dead tunnel to one runner: given the base URL that stopped
+/// answering, return a connection over a freshly dialed tunnel.
+///
+/// A closure rather than a `Runners` handle so the VM layer stays ignorant of
+/// tunnels and credentials — the seam [`Runners::options_for`] documents — and
+/// so a test can hand a `Vm` a route to a second fake daemon.
+///
+/// **Why a VM needs this at all.** A step's exec operation runs on the daemon
+/// whether or not anybody is polling it. A tunnel that dropped while a build
+/// was in its seventh minute used to fail the job after two quick retries on
+/// the same dead local port, although the build went on to finish with exit
+/// 0; the eviction in `run_job` only spared the *next* job. With a redial the
+/// poll resumes against the same operation id on the new tunnel and reads the
+/// result the daemon kept.
+pub(crate) type Redial = Arc<
+    dyn Fn(String) -> futures::future::BoxFuture<'static, Result<Connection, String>>
+        + Send
+        + Sync,
+>;
 
 /// Pick the daemon a name or id refers to.
 ///
@@ -359,17 +383,22 @@ pub struct Runners {
     /// does not change operating systems between jobs. `None` is a daemon that
     /// answered without the field: an older build, treated as "cannot tell".
     capabilities: std::sync::Mutex<HashMap<String, Option<Arc<Vec<String>>>>>,
+    /// This value's own `Arc`, so a [`Connection`] can carry a [`Redial`] back
+    /// to it. Weak: a connection held past shutdown must not keep the runner
+    /// set alive, and its redial then fails instead of dialing.
+    me: std::sync::Weak<Runners>,
 }
 
 impl Runners {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self {
+    pub fn new(config: Arc<Config>) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
             config,
             snapshot: ArcSwap::from_pointee(Pool::default()),
             tunnels: Mutex::new(HashMap::new()),
             failures: std::sync::Mutex::new(HashMap::new()),
             capabilities: std::sync::Mutex::new(HashMap::new()),
-        }
+            me: me.clone(),
+        })
     }
 
     /// Each runner's most recent tunnel failure, if it has not carried traffic
@@ -891,14 +920,62 @@ impl Runners {
             }.into());
         }
         let client = self.client_for(runner_id).await?;
-        Ok(Connection {
+        Ok(self.tunnel_connection(runner_id, client))
+    }
+
+    /// A [`Connection`] over `client`'s tunnel, with a redial back here.
+    ///
+    /// Synchronous on purpose: the redial's future awaits
+    /// [`Self::replace_tunnel`], and if building the closure happened inside an
+    /// `async fn` that future awaits, proving it `Send` would be circular.
+    fn tunnel_connection(&self, runner_id: &str, client: HeyoClient) -> Connection {
+        let me = self.me.clone();
+        let runner = runner_id.to_string();
+        let redial: Redial = Arc::new(move |dead: String| {
+            let me = me.clone();
+            let runner = runner.clone();
+            Box::pin(async move {
+                let runners = me
+                    .upgrade()
+                    .ok_or_else(|| "the CI service is shutting down".to_string())?;
+                runners.replace_tunnel(&runner, &dead).await.map_err(|e| e.to_string())
+            })
+        });
+        Connection {
             options: HeyoClientOptions {
                 api_key: Some(self.config.heyvm.api_key.clone()),
                 base_url: Some(client.base_url().to_string()),
                 timeout: None,
             },
             _tunnel: Some(Arc::new(client)),
-        })
+            redial: Some(redial),
+        }
+    }
+
+    /// A connection over a tunnel other than the one at `dead`, dialing one if
+    /// the cache still holds `dead`.
+    ///
+    /// Evicts only when the cached tunnel *is* the dead one. Every job on a
+    /// runner shares its tunnel, so when it drops they all notice at once; the
+    /// first to get here redials, and the rest must pick up its fresh tunnel
+    /// rather than evict it and dial again — five builds on one runner would
+    /// otherwise churn through five tunnels, each killing the last.
+    pub(crate) async fn replace_tunnel(
+        &self,
+        runner_id: &str,
+        dead: &str,
+    ) -> Result<Connection, RunnerError> {
+        {
+            let mut tunnels = self.tunnels.lock().await;
+            if tunnels.get(runner_id).is_some_and(|c| c.base_url() == dead) {
+                tunnels.remove(runner_id);
+                tracing::info!(runner = runner_id, "evicted a dead daemon tunnel to redial");
+            }
+        }
+        // Not `options_for`: see `tunnel_connection`. A redial only exists for
+        // tunnel connections, so the local-runner branch cannot apply here.
+        let client = self.client_for(runner_id).await?;
+        Ok(self.tunnel_connection(runner_id, client))
     }
 
     /// Join a daemon host to a network — what `heyvm network add-host` does.
@@ -1055,6 +1132,14 @@ impl Runners {
         if self.tunnels.lock().await.remove(runner_id).is_some() {
             tracing::info!(runner = runner_id, "evicted the daemon tunnel");
         }
+    }
+
+    /// Seed the cache with `client` as `runner_id`'s tunnel and return a
+    /// connection over it, as `options_for` would after a real dial.
+    #[cfg(test)]
+    pub(crate) async fn options_for_tunnel_test(&self, runner_id: &str, client: HeyoClient) -> Connection {
+        self.tunnels.lock().await.insert(runner_id.to_string(), client);
+        self.options_for(runner_id).await.expect("a cached tunnel needs no dial")
     }
 
     #[cfg(test)]
@@ -1756,6 +1841,12 @@ mod tests {
     fn test_config() -> Config {
         unsafe {
             std::env::set_var("CI_HEYO_API_KEY", "test-key");
+            // Required by `Config::from_env`; without it these tests passed
+            // only when another test had happened to set it first. Only a
+            // default: some tests set their own before calling this.
+            if std::env::var_os("CI_NETWORK").is_none() {
+                std::env::set_var("CI_NETWORK", "test-net");
+            }
             std::env::set_var("CI_DATABASE_URL", "postgres://localhost/ci_test");
             std::env::set_var("CI_WEBHOOK_SECRET", "0123456789abcdef");
         }
@@ -1862,7 +1953,43 @@ mod tests {
         assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "transport failure must force a fresh connection");
     }
 
-    fn test_runners(allow_unauthenticated: bool) -> Runners {
+    /// Every job on a runner shares its tunnel, so a drop is noticed by all of
+    /// them at once. Only the tunnel that actually died may be evicted: a job
+    /// arriving after another already redialed must pick up the fresh tunnel,
+    /// not throw it away and dial again.
+    #[tokio::test]
+    async fn a_redial_evicts_only_the_tunnel_that_died() {
+        let mut config = test_config();
+        config.heyvm.local_runner = None;
+        // A ticket fetch that fails at once, so a real dial ends quickly.
+        config.heyvm.base_url = Some("http://127.0.0.1:1".into());
+        let runners = Runners::new(Arc::new(config));
+        let client = |port| HeyoClient::new(HeyoClientOptions {
+            api_key: Some("test-key".into()),
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+            timeout: None,
+        }).unwrap();
+
+        let connection = runners.options_for_tunnel_test("hd-test", client(31001)).await;
+        assert!(connection.redial.is_some(), "a tunnel connection must be able to redial");
+
+        // Somebody else already replaced 31000 with 31001: reuse it.
+        let reused = runners.replace_tunnel("hd-test", "http://127.0.0.1:31000").await.unwrap();
+        assert_eq!(reused.options.base_url.as_deref(), Some("http://127.0.0.1:31001"));
+        assert!(runners.tunnels.lock().await.contains_key("hd-test"));
+
+        // 31001 itself died: evicted, and the redial goes to the control plane.
+        assert!(runners.replace_tunnel("hd-test", "http://127.0.0.1:31001").await.is_err());
+        assert!(!runners.tunnels.lock().await.contains_key("hd-test"), "the dead tunnel stayed cached");
+
+        // A redial outliving the runner set fails instead of dialing.
+        let redial = connection.redial.clone().unwrap();
+        drop(runners);
+        let err = redial("http://127.0.0.1:31001".into()).await.err().unwrap();
+        assert!(err.contains("shutting down"), "{err}");
+    }
+
+    fn test_runners(allow_unauthenticated: bool) -> Arc<Runners> {
         unsafe {
             std::env::set_var("CI_HEYO_API_KEY", "test-key");
             std::env::set_var("CI_NETWORK", "test-net");

@@ -2070,7 +2070,7 @@ mod tests {
     /// A pool that has never refreshed. No network call is made — `Runners`
     /// only dials when `refresh` or `client_for` is called.
     fn test_runners(config: Arc<Config>) -> Arc<Runners> {
-        Arc::new(Runners::new(config))
+        Runners::new(config)
     }
 
     /// A router wired to a real database.
