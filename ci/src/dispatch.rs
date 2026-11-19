@@ -6929,7 +6929,7 @@ mod tests {
         .expect("store");
         store.migrate().await.expect("migrations");
 
-        let runners = Arc::new(Runners::new(config.clone()));
+        let runners = Runners::new(config.clone());
         runners.refresh().await.expect("local runner resolves");
 
         let bus = Arc::new(

@@ -1077,7 +1077,7 @@ mod tests {
                 Json(ready_source("source_1"))
             }))
             .with_state(weak.clone());
-        let connection = crate::runners::Connection { options: http_options(app).await, _tunnel: Some(owner) };
+        let connection = crate::runners::Connection { options: http_options(app).await, _tunnel: Some(owner), redial: None };
         let prepared = prepare_remote(connection, &prepare_request(), Duration::from_secs(1)).await.unwrap();
         assert_eq!(prepared.source_id, "source_1");
         assert_eq!(prepared.image.unwrap().name, "ci-img-aabbccddee11");
