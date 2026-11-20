@@ -176,7 +176,10 @@ test(
     const walk = (d: string) => {
       for (const entry of readdirSync(d)) {
         const p = join(d, entry);
-        if (statSync(p).isDirectory()) walk(p);
+        // `plugins/` holds plugin configurations, not deployment specs.
+        if (statSync(p).isDirectory()) {
+          if (p !== join(dir, "plugins")) walk(p);
+        }
         else if (entry.endsWith(".json")) files.push(p);
       }
     };

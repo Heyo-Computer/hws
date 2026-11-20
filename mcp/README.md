@@ -238,6 +238,14 @@ deployed and no secret lives in this directory.
 
 ## Running it as a deployment, behind heyo's JWT gate
 
+> **Gating your own deployment on Heyo sign-in?** You need none of this. Write
+> `"auth": {"provider_ref": "heyo"}` (or `heyctl set auth <id> --provider-ref heyo`):
+> every namespace on a fleet with Heyo auth already has a `heyo` provider that
+> verifies against the auth service's key set and signs browsers in. No signing
+> secret, no JWKS URL. See [docs/app-lb-auth.md](../docs/app-lb-auth.md).
+
+What follows is the operator setup for `mcp.us2`, which runs the fleet and
+the auth service and so holds the auth service's HMAC signing secret.
 `deploy/heyo-mcp.json` registers this with app-lb as a static (`proxy_pass`)
 deployment — a host process, like app-obs — gated on JWTs issued by the Heyo
 auth API:

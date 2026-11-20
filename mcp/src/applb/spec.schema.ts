@@ -134,6 +134,10 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
         }
       ]
     },
+    "rollout": {
+      "description": "How a change to the VM template replaces the running replicas.",
+      "$ref": "#/$defs/RolloutPolicy"
+    },
     "routes": {
       "description": "Which requests reach this deployment, most specific rule winning.",
       "type": "array",
@@ -161,6 +165,17 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "anyOf": [
         {
           "$ref": "#/$defs/SiteSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tunnel": {
+      "description": "A *tunnel*: the backend is another app-lb, which the internet cannot reach, named by its iroh node id.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TunnelSpec"
         },
         {
           "type": "null"
@@ -347,7 +362,6 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
           "enum": [
             "firecracker",
             "kvm",
-            "libvirt",
             "firecracker_containerd"
           ]
         },
@@ -355,6 +369,11 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
           "description": "A system container under Incus, booted from an OCI image.",
           "type": "string",
           "const": "lxc"
+        },
+        {
+          "description": "A QEMU VM under libvirt, on user-mode (SLIRP) networking.",
+          "type": "string",
+          "const": "libvirt"
         }
       ]
     },
@@ -427,6 +446,11 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
           "description": "Stop it: the sandbox stays, keeping its data disk, and a later request or `exec` resumes it instead of booting a fresh one.",
           "type": "string",
           "const": "retain"
+        },
+        {
+          "description": "Capture RAM and writable disks on the same host (Firecracker only).",
+          "type": "string",
+          "const": "suspend"
         }
       ]
     },
@@ -439,6 +463,11 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "type": "object",
       "additionalProperties": true,
       "description": "Where a deployment runs when several app-lb hosts share one fleet store (`docs/design/fleet-shared-state.md` § 4). (Call applb_spec_schema with block \"Placement\" for the full shape; everything it accepted is still accepted.)"
+    },
+    "RolloutPolicy": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "How a change to the VM template (or `POST /deployments/:id/restart`) replaces running replicas. (Call applb_spec_schema with block \"RolloutPolicy\" for the full shape; everything it accepted is still accepted.)"
     },
     "RouteRedirect": {
       "type": "object",
@@ -484,6 +513,13 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
         "strip_prefix": {
           "description": "Remove `path_prefix` before forwarding to the upstream.",
           "type": "boolean"
+        },
+        "upstream_host": {
+          "description": "The `Host` the upstream receives for requests this rule matches, in place of the one the client sent, e.g.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -602,6 +638,11 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "additionalProperties": true,
       "description": "A static *site*: a directory on this host, served straight off disk. (Call applb_spec_schema with block \"SiteSpec\" for the full shape; everything it accepted is still accepted.)"
     },
+    "TunnelSpec": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Where a tunnel deployment's backend is: an app-lb behind NAT that registered itself through `PUT /namespaces/:ns/tunnels/:name` (`docs/design/app-lb-namespace-tunnels.md`). (Call applb_spec_schema with block \"TunnelSpec\" for the full shape; everything it accepted is still accepted.)"
+    },
     "UpdateSpec": {
       "type": "object",
       "additionalProperties": true,
@@ -621,7 +662,7 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
           "minimum": 0
         },
         "driver": {
-          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system container from an OCI image).",
+          "description": "`firecracker` or `kvm` (a heyvm microVM), `libvirt` (a heyvm QEMU VM, reached through forwarded host ports) or `lxc` (an Incus system container from an OCI image).",
           "$ref": "#/$defs/Driver"
         },
         "env_vars": {
@@ -827,6 +868,10 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       ]
     },
+    "rollout": {
+      "description": "How a change to the VM template replaces the running replicas. See\n[`RolloutPolicy`]: rolling by default, so an edit never empties the\npool or cuts off in-flight requests. Omitted from the wire when it is\nthe default, so existing specs (and their ETags) are unchanged.",
+      "$ref": "#/$defs/RolloutPolicy"
+    },
     "routes": {
       "description": "Which requests reach this deployment, most specific rule winning.\n\nMay be empty only for a `vm` deployment, which is then reachable by exec\nand shell but takes no HTTP traffic. A static deployment and a site are\nreachable only through the proxy, so both need at least one.",
       "type": "array",
@@ -854,6 +899,17 @@ export const DEPLOYMENT_SPEC_FULL = {
       "anyOf": [
         {
           "$ref": "#/$defs/SiteSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tunnel": {
+      "description": "A *tunnel*: the backend is another app-lb, which the internet cannot\nreach, named by its iroh node id. This app-lb dials it and bridges\nmatched requests to it. See [`TunnelSpec`]. The fourth kind of\ndeployment, exclusive with `vm`, `upstreams` and `site`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TunnelSpec"
         },
         {
           "type": "null"
@@ -975,7 +1031,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       ]
     },
     "AuthGate": {
-      "description": "An optional sign-in gate in front of a deployment.\n\nOrthogonal to the backend kind on purpose: a managed VM pool and a static\n`proxy_pass` target are gated identically, because this happens in the proxy\nbefore either is reached. The application behind it needs to know nothing\nabout OAuth — it sees only requests that got past the gate, optionally with\nthe caller's identity in headers.\n\nThe client *secret* is a [`SecretRef`], not a value, for the same reason a\nbuild's git token is: the admin API echoes specs back and the state file\nholds them in the clear.",
+      "description": "An optional sign-in gate in front of a deployment. For Heyo sign-in the whole\nblock is `{\"provider_ref\": \"heyo\"}`: the `heyo` provider is installed in\nevery namespace on a fleet with Heyo auth, so there is no secret, key set\nURL or `jwt` block to supply.\n\nOrthogonal to the backend kind on purpose: a managed VM pool and a static\n`proxy_pass` target are gated identically, because this happens in the proxy\nbefore either is reached. The application behind it needs to know nothing\nabout OAuth — it sees only requests that got past the gate, optionally with\nthe caller's identity in headers.\n\nThe client *secret* is a [`SecretRef`], not a value, for the same reason a\nbuild's git token is: the admin API echoes specs back and the state file\nholds them in the clear.",
       "type": "object",
       "properties": {
         "allowed_domains": {
@@ -1049,7 +1105,7 @@ export const DEPLOYMENT_SPEC_FULL = {
           "default": "google"
         },
         "provider_ref": {
-          "description": "Inherit the *identity* half of this gate from a named provider declared on\nthe deployment's namespace. See [`AuthProviderSpec`].\n\nWhen set, this gate carries only the route-scoped fields — `public_paths`,\n`session_scope`, `base_path`, `cookie_name`, `redirect_url`,\n`forward_identity`, `session_ttl_secs` — and the provider supplies who may\nenter and how they are verified (`provider`, `client_id`, `client_secret`,\n`allowed_domains`, `allowed_emails`, `jwt`, `cookie_domain`). Setting any\nof those inline *and* a reference is refused\n([`SpecError::ProviderRefWithInlineIdentity`]) rather than silently\noverridden, because whoever wrote them believes they take effect.\n\nResolution is live: app-lb looks the provider up on every gated request,\nso rotating the client secret or tightening the allow-list on the provider\npropagates to every deployment that names it — and, because the resolved\ngate's [`policy_fingerprint`](Self::policy_fingerprint) changes with it,\nre-signs the sessions issued under the old policy. A reference that names\nno provider in the namespace is refused at registration, and if one is\nremoved out from under a live deployment the gate fails *closed*.",
+          "description": "Inherit the *identity* half of this gate from a named provider declared on\nthe deployment's namespace. `\"heyo\"` is Heyo sign-in and needs nothing\nelse. See [`AuthProviderSpec`].\n\nThe `heyo` provider is installed by the `auth-heyo` plugin wherever\napp-lb runs with `APP_LB_AUTH_URL`. It verifies Heyo gate tokens against\nthe auth service's published key set and signs browsers in through the\nauth service, so a deployment gated with `{\"provider_ref\": \"heyo\"}`\ncarries no secret and no key set URL. Narrow who gets in with `require`\non the provider (`accountId`, or `namespace`), not on this gate.\n\nWhen set, this gate carries only the route-scoped fields — `public_paths`,\n`session_scope`, `base_path`, `cookie_name`, `redirect_url`,\n`forward_identity`, `session_ttl_secs` — and the provider supplies who may\nenter and how they are verified (`provider`, `client_id`, `client_secret`,\n`allowed_domains`, `allowed_emails`, `jwt`, `cookie_domain`). Setting any\nof those inline *and* a reference is refused\n([`SpecError::ProviderRefWithInlineIdentity`]) rather than silently\noverridden, because whoever wrote them believes they take effect.\n\nResolution is live: app-lb looks the provider up on every gated request,\nso rotating the client secret or tightening the allow-list on the provider\npropagates to every deployment that names it — and, because the resolved\ngate's [`policy_fingerprint`](Self::policy_fingerprint) changes with it,\nre-signs the sessions issued under the old policy. A reference that names\nno provider in the namespace is refused at registration, and if one is\nremoved out from under a live deployment the gate fails *closed*.",
           "type": [
             "string",
             "null"
@@ -1231,14 +1287,13 @@ export const DEPLOYMENT_SPEC_FULL = {
       ]
     },
     "Driver": {
-      "description": "Which runtime boots a deployment's replicas.\n\napp-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every\ndriver is a heyvm one: `lxc` is a system container app-lb creates on this\nhost through Incus, and the SDK has no name for it. The spellings are\ndeliberately identical to the SDK's, so a spec written against either\ndeserializes the same and the wire fixtures are unchanged.\n\n`Libvirt` and `FirecrackerContainerd` exist here only so that a spec naming\none still *deserializes* and is then refused by\n[`DeploymentSpec::validate`] with an explanation. Dropping the variants\nwould turn a good error message into an opaque serde failure.",
+      "description": "Which runtime boots a deployment's replicas.\n\napp-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every\ndriver is a heyvm one: `lxc` is a system container app-lb creates on this\nhost through Incus, and the SDK has no name for it. The spellings are\ndeliberately identical to the SDK's, so a spec written against either\ndeserializes the same and the wire fixtures are unchanged.\n\n`Libvirt` is a heyvm driver whose guest has no routable IP: it is reached\nthrough the host ports QEMU forwards to it, which the daemon reports as\n`port_mappings` (see [`crate::vm::routable_addr`]).\n\n`FirecrackerContainerd` exists here only so that a spec naming it still\n*deserializes* and is then refused by [`DeploymentSpec::validate`] with an\nexplanation. Dropping the variant would turn a good error message into an\nopaque serde failure.",
       "oneOf": [
         {
           "type": "string",
           "enum": [
             "firecracker",
             "kvm",
-            "libvirt",
             "firecracker_containerd"
           ]
         },
@@ -1246,6 +1301,11 @@ export const DEPLOYMENT_SPEC_FULL = {
           "description": "A system container under Incus, booted from an OCI image. Not a heyvm\ndriver: app-lb talks to Incus itself, so [`Driver::heyvm`] is `None`.",
           "type": "string",
           "const": "lxc"
+        },
+        {
+          "description": "A QEMU VM under libvirt, on user-mode (SLIRP) networking. Reached\nthrough host ports the daemon forwards rather than a guest IP, so it\nneeds a daemon on this host, like every other heyvm driver here.",
+          "type": "string",
+          "const": "libvirt"
         }
       ]
     },
@@ -1373,6 +1433,11 @@ export const DEPLOYMENT_SPEC_FULL = {
           "description": "Stop it: the sandbox stays, keeping its data disk, and a later request or\n`exec` resumes it instead of booting a fresh one.",
           "type": "string",
           "const": "retain"
+        },
+        {
+          "description": "Capture RAM and writable disks on the same host (Firecracker only).\nAcknowledgment means local capture, not host-loss durability.",
+          "type": "string",
+          "const": "suspend"
         }
       ]
     },
@@ -1393,7 +1458,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       }
     },
     "JwtSpec": {
-      "description": "How a gate verifies a JWT, and which ones it lets past.\n\nThe block exists because a JWT gate is configuration all the way down. app-lb\ndid not issue the token and cannot ask anyone about it, so every question —\nwhich key, which algorithm, which issuer, which claim is the user, which\nclaims must hold — is something the spec has to answer. The upside of that is\nversatility: the Heyo auth API and an Auth0 tenant differ only in this block.\n\nA gate for the Heyo auth API is:\n\n```jsonc\n\"auth\": {\n  \"provider\": \"jwt\",\n  \"jwt\": {\n    \"secret\":     {\"secret\": \"heyo-auth\", \"key\": \"jwt_secret\"},\n    \"algorithms\": [\"HS256\"],\n    \"issuer\":     \"auth-service\",\n    \"audience\":   \"heyo-app\",\n    \"subject_claim\": \"userId\",\n    \"require\":    {\"role\": [\"user\", \"admin\"]}\n  }\n}\n```\n\nand the same gate in front of an OIDC provider is the same block with\n`jwks_url`, `RS256` and the default `sub`.\n\n## The allow-list is `require`, not `allowed_emails`\n\n[`AuthGate::allowed_domains`] and [`AuthGate::allowed_emails`] describe a\n*Google* identity: the domain is matched on the `hd` claim precisely because\nan email suffix proves nothing there. Neither statement transfers to a token\nfrom your own issuer, where the claims mean what that issuer says they mean —\nso a gate that accepts `jwt` without also accepting `google` is refused if it\nsets them, rather than appearing to restrict something it does not.\n\n`require` is the equivalent and it is more general: any claim, against a\nvalue or a set of them. An empty `require` admits any token the issuer signed\nfor this audience, which — unlike Google's empty allow-list, where the\npopulation is everyone with a Google account — is exactly \"a signed-in user\nof this product\", and a reasonable thing to want.\n\n## What is not here\n\nThere is no claim forwarding. The gate puts `x-auth-request-{email,user,name}`\nupstream like any other, and beyond that the application can read the token\nitself: it is still in the `Authorization` header the request arrived with,\nsigned, and the app already trusts the issuer or it would not be behind this\ngate. Copying claims into headers would only give it a second, weaker copy.",
+      "description": "How a gate verifies a JWT from an issuer of your own (Auth0, Okta, Cognito,\nKeycloak, your own service), and which ones it lets past. Not needed for Heyo\nsign-in: use `\"auth\": {\"provider_ref\": \"heyo\"}` instead.\n\nThe block exists because a JWT gate is configuration all the way down. app-lb\ndid not issue the token and cannot ask anyone about it, so every question —\nwhich key, which algorithm, which issuer, which claim is the user, which\nclaims must hold — is something the spec has to answer. The upside of that is\nversatility: any OIDC provider fits this block.\n\nA gate in front of an OIDC provider is:\n\n```jsonc\n\"auth\": {\n  \"provider\": \"jwt\",\n  \"jwt\": {\n    \"jwks_url\":   \"https://example.auth0.com/.well-known/jwks.json\",\n    \"algorithms\": [\"RS256\"],\n    \"issuer\":     \"https://example.auth0.com/\",\n    \"audience\":   \"my-api\"\n  }\n}\n```\n\n## Heyo sign-in does not use this block\n\nA tenant deployment gated on Heyo accounts names the namespace's `heyo`\nprovider (`\"provider_ref\": \"heyo\"`), which already holds the right key set,\nissuer, audience and browser sign-in. Writing a `jwt` block by hand for the\nHeyo auth service is only for an operator running both the fleet and the\nauth service: its `HS256` signing secret also *mints* tokens, and any admin\nof the namespace can read secrets stored there.\n\n## The allow-list is `require`, not `allowed_emails`\n\n[`AuthGate::allowed_domains`] and [`AuthGate::allowed_emails`] describe a\n*Google* identity: the domain is matched on the `hd` claim precisely because\nan email suffix proves nothing there. Neither statement transfers to a token\nfrom your own issuer, where the claims mean what that issuer says they mean —\nso a gate that accepts `jwt` without also accepting `google` is refused if it\nsets them, rather than appearing to restrict something it does not.\n\n`require` is the equivalent and it is more general: any claim, against a\nvalue or a set of them. An empty `require` admits any token the issuer signed\nfor this audience, which — unlike Google's empty allow-list, where the\npopulation is everyone with a Google account — is exactly \"a signed-in user\nof this product\", and a reasonable thing to want.\n\n## What is not here\n\nThere is no claim forwarding. The gate puts `x-auth-request-{email,user,name}`\nupstream like any other, and beyond that the application can read the token\nitself: it is still in the `Authorization` header the request arrived with,\nsigned, and the app already trusts the issuer or it would not be behind this\ngate. Copying claims into headers would only give it a second, weaker copy.",
       "type": "object",
       "properties": {
         "algorithms": {
@@ -1488,7 +1553,7 @@ export const DEPLOYMENT_SPEC_FULL = {
           "additionalProperties": true
         },
         "secret": {
-          "description": "The HMAC shared secret, as a reference into the secret store. For the\n`HS*` algorithms, and the shape the Heyo auth API uses (`JWT_SECRET`).\n\nA reference rather than a literal for the usual reason, and one specific\nto this: the same value verifies *and mints* tokens, so a spec carrying it\nwould hand anyone who can read a deployment the ability to issue\nidentities.",
+          "description": "The HMAC shared secret, as a reference into the secret store. For the\n`HS*` algorithms. Not needed to gate on Heyo sign-in: use\n`\"provider_ref\": \"heyo\"`, which holds no secret.\n\nA reference rather than a literal for the usual reason, and one specific\nto this: the same value verifies *and mints* tokens, so a spec carrying it\nwould hand anyone who can read a deployment the ability to issue\nidentities.",
           "anyOf": [
             {
               "$ref": "#/$defs/SecretRef"
@@ -1629,6 +1694,26 @@ export const DEPLOYMENT_SPEC_FULL = {
         "spread"
       ]
     },
+    "PreStop": {
+      "description": "A command run inside a replica before it is stopped. See\n[`RolloutPolicy::pre_stop`].",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Run through `sh -c` in the guest. Its exit status is logged and never\nblocks the stop.",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "description": "How long the command may run before the stop proceeds without it.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "command"
+      ]
+    },
     "Providers": {
       "description": "One provider, or several. A single provider is written as a bare string so a gate authored before app-tokens existed round-trips unchanged.",
       "anyOf": [
@@ -1686,6 +1771,90 @@ export const DEPLOYMENT_SPEC_FULL = {
         "backend_server_id",
         "environment",
         "auth"
+      ]
+    },
+    "RolloutPolicy": {
+      "description": "How a change to the VM template (or `POST /deployments/:id/restart`)\nreplaces running replicas.\n\nEvery replica carries the *revision* of the template it was booted from.\nAfter an edit, replicas of an older revision are \"stale\"; the autoscaler\nreplaces them under this policy without ever emptying the pool:\n\n* `rolling` keeps at most `target + max_surge` replicas taking traffic and\n  at least `target - max_unavailable` available. A stale replica is drained\n  (no new requests; in-flight ones and open WebSockets finish) only once\n  enough fresh replicas have been healthy for `min_ready_secs`.\n* `recreate` drains every stale replica, waits for them to stop, then boots.\n\nA drained replica is stopped gracefully once idle or after\n`drain_timeout_secs`: `pre_stop` runs first, then the daemon is asked to\nstop the guest with `stop_grace_secs` of SIGTERM grace before it is killed.\n\n`max_surge` and `max_unavailable` default per deployment: `1`/`0` for an\nordinary pool, and `0`/`1` for single-writer state (`vm.workspace`, or\n`scaling.idle_action` `retain`/`suspend`), where two replicas side by side\nwould each own a divergent copy. An explicit `max_surge` above 0 on such a\ndeployment is refused.",
+      "type": "object",
+      "properties": {
+        "drain_timeout_secs": {
+          "description": "How long a drained old replica may keep serving in-flight work before\nit is stopped anyway. Absent means `scaling.drain_timeout_secs`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_surge": {
+          "description": "Extra replicas allowed above the target while rolling. Absent means 1\n(0 for single-writer state).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_unavailable": {
+          "description": "Replicas allowed below the target while rolling. Absent means 0 (1 for\nsingle-writer state). `max_surge` and `max_unavailable` cannot both be 0.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_ready_secs": {
+          "description": "How long a new replica must stay healthy before it counts as available\nand an old one may be drained against it.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "pre_stop": {
+          "description": "Run before every graceful stop: rollout drains, scale-down and delete.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PreStop"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "progress_deadline_secs": {
+          "description": "With no replica replaced and none becoming ready for this long, the\nrollout pauses: nothing more is created and the remaining old replicas\nkeep serving. A new edit (including reverting) starts a new rollout.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 600,
+          "minimum": 0
+        },
+        "stop_grace_secs": {
+          "description": "SIGTERM grace the daemon gives the guest before killing it. A daemon\nwithout the graceful terminate route kills immediately.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 10,
+          "minimum": 0
+        },
+        "strategy": {
+          "$ref": "#/$defs/RolloutStrategy",
+          "default": "rolling"
+        }
+      }
+    },
+    "RolloutStrategy": {
+      "description": "How a VM-template change replaces a running pool.",
+      "oneOf": [
+        {
+          "description": "Replace replicas a few at a time, keeping capacity up: new replicas\nboot and pass their health check before old ones are drained.",
+          "type": "string",
+          "const": "rolling"
+        },
+        {
+          "description": "Drain every old replica first, then boot the new ones. For workloads\nthat cannot run two versions side by side; costs a gap in capacity.",
+          "type": "string",
+          "const": "recreate"
+        }
       ]
     },
     "RootfsMode": {
@@ -1768,6 +1937,13 @@ export const DEPLOYMENT_SPEC_FULL = {
         "strip_prefix": {
           "description": "Remove `path_prefix` before forwarding to the upstream. Off by default,\npreserving the original pass-through behavior for existing specs.",
           "type": "boolean"
+        },
+        "upstream_host": {
+          "description": "The `Host` the upstream receives for requests this rule matches, in\nplace of the one the client sent, e.g. `api.example.com` or\n`api.example.com:8443`. For a backend that decides what to do by its own\nhostname, mounted under another site's path: the client's host still\nchooses the route, and arrives upstream as `X-Forwarded-Host`.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -1951,6 +2127,47 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       }
     },
+    "TunnelSpec": {
+      "description": "Where a tunnel deployment's backend is: an app-lb behind NAT that\nregistered itself through `PUT /namespaces/:ns/tunnels/:name`\n(`docs/design/app-lb-namespace-tunnels.md`).\n\nNo address is ever given: a node id is a public key iroh authenticates on\nconnect, so a namespace cannot aim this at the public host's loopback or\nprivate network the way a static upstream list can.",
+      "type": "object",
+      "properties": {
+        "epoch": {
+          "description": "The remote's endpoint incarnation, new each time it comes up. A change\nmeans the connections to the old one are dead, however alive they\nlook: they are dropped and dialed again at once.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lease_secs": {
+          "description": "How long a registration stays live without a refresh. Past it the\ntunnel is offline (no backend) but stays registered.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 300,
+          "minimum": 0
+        },
+        "node_id": {
+          "description": "The remote app-lb's iroh endpoint id (64 hex characters).",
+          "type": "string"
+        },
+        "relay_url": {
+          "description": "The relay it is reachable through, as it reported it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "renewed_at": {
+          "description": "When the remote last registered, stamped by app-lb.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "node_id"
+      ]
+    },
     "UpdateSpec": {
       "description": "How a *static* (proxy_pass) deployment's backend is updated: a working\ndirectory on the app-lb host, and commands to run in it.\n\nThe managed counterpart of this is [`BuildSpec`], and the asymmetry is the\npoint. A managed deployment's backend is a microVM app-lb owns, so updating\nit means producing a new image. A static deployment's backend is a process\nsomebody else runs — usually on this same host, under supervisord or systemd\n— so updating it means doing on the host what a person would otherwise ssh in\nand do: pull, build, restart.\n\nNothing in the spec changes when this runs. The upstreams are the same\naddresses; what moved is the code answering on them. That is why the job\nre-probes those addresses afterwards: \"the commands exited 0\" is not the same\nclaim as \"the service is serving\".",
       "type": "object",
@@ -2036,7 +2253,7 @@ export const DEPLOYMENT_SPEC_FULL = {
           "minimum": 0
         },
         "driver": {
-          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system\ncontainer from an OCI image). `libvirt` and `firecracker_containerd`\nare rejected at registration.",
+          "description": "`firecracker` or `kvm` (a heyvm microVM), `libvirt` (a heyvm QEMU VM,\nreached through forwarded host ports) or `lxc` (an Incus system\ncontainer from an OCI image). `firecracker_containerd` is rejected at\nregistration.",
           "$ref": "#/$defs/Driver"
         },
         "env_from": {

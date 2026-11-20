@@ -242,7 +242,10 @@ const exampleFiles = [];
 const walkExamples = (dir) => {
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
-    if (statSync(full).isDirectory()) walkExamples(full);
+    // `plugins/` holds plugin configurations, not deployment specs.
+    if (statSync(full).isDirectory()) {
+      if (full !== join(examplesDir, "plugins")) walkExamples(full);
+    }
     else if (entry.endsWith(".json")) exampleFiles.push(full);
   }
 };
