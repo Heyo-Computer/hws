@@ -133,7 +133,7 @@ if ! none "$alloc"; then aws ec2 release-address --allocation-id "$alloc"; step 
 if ! none "$sg"; then
     # A terminated instance's interface can hold the group for a little while.
     n=0
-    until aws ec2 delete-security-group --group-id "$sg" 2>/dev/null; do
+    until aws ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1; do
         n=$((n + 1)); [ "$n" -lt 24 ] || die "could not delete $sg"; sleep 5
     done
     step "deleted $sg"
