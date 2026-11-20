@@ -1039,6 +1039,8 @@ heyctl create deployment docs --host docs.example.com \
 | `spa` | `false` | Serve `index` for any unmatched path, with a 200 |
 | `spa_routes` | *(all paths)* | With `spa`, the only paths that fall back to `index`; the rest 404 |
 | `cache_control` | `public, max-age=300` | `Cache-Control` on served files |
+| `markdown` | *(none)* | File relative to `root` served when a successful HTML page request explicitly prefers `text/markdown` |
+| `link` | *(none)* | `Link` response header on HTML pages and their markdown alternates |
 
 What you get: an index, a custom 404, content types, `ETag` with `304` on
 `If-None-Match`, `Accept-Ranges` and byte ranges (so a paused download or a
@@ -1083,6 +1085,36 @@ An extensionless path that matches no file is tried as `<path>.html` before
 any fallback, so `/pricing` serves `pricing.html`. That is also how a
 single-page app gives one route its own `<title>` and meta tags in the HTML the
 server sends: build a copy of the shell as `signup.html`.
+
+**Agent discovery.** Keep the existing static deployment and opt in with:
+
+```jsonc
+"site": {
+  "root": "/srv/heyo-marketing",
+  "markdown": "llms.txt",
+  "link": "<https://agents.heyo.computer/llms.txt?src=link-header>; rel=\"alternate\"; type=\"text/plain\"; title=\"llms.txt\""
+}
+```
+
+Merge these two optional fields into the existing site block; retain its other
+settings. Deploy the site's `llms.txt` before enabling `markdown`. These fields
+require an app-lb release that supports them; older releases ignore unknown
+fields, so saving a spec alone does not prove the feature is active.
+
+GET and HEAD requests explicitly preferring `text/markdown` receive the alternate
+with `Content-Type: text/markdown; charset=utf-8`. Accept quality values and
+HTML wildcards are respected; equal qualities follow header order. A wildcard
+alone keeps HTML. Both representations include `Vary: Accept`, including 304
+and range responses, and use distinct ETags. A missing alternate or a symlink
+outside the site produces an uncacheable 503 for markdown requests; HTML stays
+available. Assets, direct `/llms.txt` requests, redirects, and 404 statuses keep
+their normal behavior. No user-agent detection or vendor-specific code is used.
+
+For the US2 marketing rollout, this setting belongs on `heyo-marketing`, not the
+separate `marketing` preview deployment. Retail signup is a separate site and
+needs its own `llms.txt` and settings. Test the built artifact and these settings
+on a disposable local site first; this example does not perform a deployment or
+modify either live deployment.
 
 **Deploying one.** A site takes an `update` block, the same as a static
 deployment — commands run in a directory on the app-lb host:

@@ -4347,6 +4347,14 @@ pub struct SiteSpec {
     /// client will not ask again until it expires.
     #[serde(default = "default_site_cache_control")]
     pub cache_control: String,
+    /// Markdown alternate for successful HTML pages, relative to `root`.
+    /// GET/HEAD requests explicitly preferring text/markdown receive this file
+    /// with Vary: Accept. Assets, redirects and 404s are not rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+    /// Link response header on HTML pages and their markdown alternates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 fn default_site_index() -> String {
@@ -4372,8 +4380,11 @@ impl SiteSpec {
         if !std::path::Path::new(root).is_absolute() {
             return Err(SpecError::RelativeSiteRoot(root.to_string()));
         }
-        for (field, value) in [("index", Some(&self.index)), ("not_found", self.not_found.as_ref())]
-        {
+        for (field, value) in [
+            ("index", Some(&self.index)),
+            ("not_found", self.not_found.as_ref()),
+            ("markdown", self.markdown.as_ref()),
+        ] {
             let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) else {
                 continue;
             };
@@ -4385,6 +4396,23 @@ impl SiteSpec {
                     value: value.to_string(),
                 });
             }
+        }
+        if self
+            .markdown
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
+        {
+            return Err(SpecError::BadSitePath {
+                field: "markdown",
+                value: self.markdown.clone().unwrap(),
+            });
+        }
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|value| http::HeaderValue::from_str(value).is_err())
+        {
+            return Err(SpecError::BadSiteLink);
         }
         if self.spa && self.index.trim().is_empty() {
             return Err(SpecError::SpaWithoutIndex);
@@ -4473,6 +4501,8 @@ pub enum SpecError {
         field: &'static str,
         value: String,
     },
+    /// A Link header containing invalid HTTP header bytes.
+    BadSiteLink,
     /// `spa` needs an `index` to fall back *to*.
     SpaWithoutIndex,
     /// `spa_routes` narrows a fallback that `spa` is not turning on.
@@ -4772,6 +4802,7 @@ impl std::fmt::Display for SpecError {
                 f,
                 "site.{field} must be a path inside the site root, got {value:?}"
             ),
+            Self::BadSiteLink => write!(f, "site.link must be a valid HTTP header value"),
             Self::SpaWithoutIndex => {
                 write!(f, "site.spa needs a site.index to fall back to")
             }
@@ -8760,6 +8791,8 @@ mod tests {
                 spa: false,
                 spa_routes: vec![],
                 cache_control: "public, max-age=300".into(),
+                markdown: None,
+                link: None,
             });
             s
         }
@@ -8922,14 +8955,22 @@ mod tests {
             );
         }
 
-        /// `index` and `not_found` are joined onto the root, so a climbing or
+        /// Site files are joined onto the root, so a climbing or
         /// rooted value would read a file the site never meant to expose.
         #[test]
         fn the_index_and_404_page_cannot_escape_the_root() {
-            for (field, value) in [("index", "../../etc/passwd"), ("not_found", "/etc/passwd")] {
+            for (field, value) in [
+                ("index", "../../etc/passwd"),
+                ("not_found", "/etc/passwd"),
+                ("markdown", "../private.txt"),
+                ("markdown", "/private.txt"),
+                ("markdown", ""),
+                ("markdown", "llms\0.txt"),
+            ] {
                 let mut s = site_spec();
                 match field {
                     "index" => s.site.as_mut().unwrap().index = value.into(),
+                    "markdown" => s.site.as_mut().unwrap().markdown = Some(value.into()),
                     _ => s.site.as_mut().unwrap().not_found = Some(value.into()),
                 }
                 assert_eq!(
@@ -8940,6 +8981,17 @@ mod tests {
                     }),
                 );
             }
+        }
+
+        #[test]
+        fn site_link_cannot_inject_response_headers() {
+            let mut s = site_spec();
+            s.site.as_mut().unwrap().link =
+                Some("<https://example.com/llms.txt>; rel=alternate".into());
+            assert_eq!(s.validate(), Ok(()));
+            s.site.as_mut().unwrap().link =
+                Some("<https://example.com>\r\nSet-Cookie: injected=1".into());
+            assert_eq!(s.validate(), Err(SpecError::BadSiteLink));
         }
 
         #[test]

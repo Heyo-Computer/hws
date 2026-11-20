@@ -1171,6 +1171,8 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
         };
         output::field("Unmatched paths", &unmatched);
         output::field("Cache-Control", &site.cache_control);
+        output::field("Markdown alternate", site.markdown.as_deref().unwrap_or("disabled"));
+        output::field("Link", site.link.as_deref().unwrap_or("none"));
     }
 
     if d.spec.is_static() {

@@ -295,6 +295,56 @@ pub(crate) fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Resolve the configured alternate without directory, clean-URL or SPA
+/// fallbacks. A missing file or a symlink outside the site is not an alternate.
+pub fn markdown_file(spec: &SiteSpec) -> Option<PathBuf> {
+    let root = Path::new(&spec.root).canonicalize().ok()?;
+    let file = root.join(spec.markdown.as_ref()?).canonicalize().ok()?;
+    (file.starts_with(&root) && file.is_file()).then_some(file)
+}
+
+/// Explicit markdown opt-in, respecting quality and the most specific HTML
+/// range. A wildcard alone keeps HTML; equal qualities follow header order.
+pub fn prefers_markdown(accept: &str) -> bool {
+    let mut markdown = None;
+    let mut html: Option<(u8, f32, usize)> = None;
+    for (position, range) in accept.split(',').enumerate() {
+        let mut parts = range.split(';');
+        let media = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let quality = parts
+            .find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                name.trim().eq_ignore_ascii_case("q").then(|| {
+                    value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|q| (0.0..=1.0).contains(q))
+                        .unwrap_or(0.0)
+                })
+            })
+            .unwrap_or(1.0);
+        if media == "text/markdown" && markdown.is_none() {
+            markdown = Some((quality, position));
+        }
+        let specificity = match media.as_str() {
+            "text/html" => 2,
+            "text/*" => 1,
+            "*/*" => 0,
+            _ => continue,
+        };
+        if html.is_none_or(|(previous, _, _)| specificity > previous) {
+            html = Some((specificity, quality, position));
+        }
+    }
+    let Some((quality, position)) = markdown else {
+        return false;
+    };
+    let (_, html_quality, html_position) = html.unwrap_or((0, 0.0, usize::MAX));
+    quality > 0.0
+        && (quality > html_quality || (quality == html_quality && position < html_position))
+}
+
 /// `Content-Type` for a filename.
 ///
 /// A short table rather than a mime database: this is a static file server for
@@ -427,6 +477,8 @@ mod tests {
             spa: false,
             spa_routes: vec![],
             cache_control: "public, max-age=300".into(),
+            markdown: None,
+            link: None,
         }
     }
 
@@ -718,6 +770,8 @@ mod tests {
             spa: false,
             spa_routes: vec![],
             cache_control: String::new(),
+            markdown: None,
+            link: None,
         };
         let missing = root_status(&spec(&dir));
         assert_eq!(missing.status, "missing");

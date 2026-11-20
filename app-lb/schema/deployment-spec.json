@@ -1351,6 +1351,20 @@
           "type": "string",
           "default": "index.html"
         },
+        "link": {
+          "description": "Link response header on HTML pages and their markdown alternates.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "markdown": {
+          "description": "Markdown alternate for successful HTML pages, relative to `root`.\nGET/HEAD requests explicitly preferring text/markdown receive this file\nwith Vary: Accept. Assets, redirects and 404s are not rewritten.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "not_found": {
           "description": "Body for a 404, relative to `root`. Absent means a plain-text 404.",
           "type": [

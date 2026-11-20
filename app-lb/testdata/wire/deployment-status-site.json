@@ -27,7 +27,9 @@
       "index": "index.html",
       "not_found": "404.html",
       "spa": true,
-      "cache_control": "public, max-age=300"
+      "cache_control": "public, max-age=300",
+      "markdown": "llms.txt",
+      "link": "<https://agents.example.com/llms.txt>; rel=\"alternate\"; type=\"text/plain\""
     },
     "update": {
       "working_dir": "/srv/docs",
