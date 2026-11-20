@@ -47,7 +47,7 @@ if [ -n "$(git -C "$repo" status --porcelain)" ]; then
 fi
 info "building from $revision in $REGION"
 
-set -- -var "region=$REGION" -var "git_revision=$revision" "$@"
+set -- -var "region=$REGION" -var "git_revision=$revision" "$@" .
 rm -f "$here/packer-manifest.json"
 
 if command -v packer >/dev/null 2>&1; then
