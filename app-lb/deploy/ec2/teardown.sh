@@ -49,9 +49,9 @@ oneline() { printf '%s' "$1" | tr '\t\n' '  ' | sed 's/^ *//; s/ *$//; s/  */ /g
 
 confirm() {
     [ "$YES" = 1 ] && return 0
-    [ -r /dev/tty ] || die "not a terminal; re-run with --yes to delete"
     printf 'Delete all of the above? [y/N] ' >&2
-    read -r answer </dev/tty
+    answer=""
+    { read -r answer </dev/tty; } 2>/dev/null || { printf '\n' >&2; die "no terminal to ask on; re-run with --yes to delete"; }
     case "$answer" in y|Y|yes) ;; *) die "nothing deleted" ;; esac
 }
 
