@@ -325,8 +325,9 @@ pub enum AcmeError {
     NoDnsProvider,
     /// Publishing or checking the challenge record failed.
     Dns(crate::dns::DnsError),
-    /// The order finished in a state other than valid.
-    Order(OrderStatus),
+    /// The order finished in a state other than valid, with the CA's reason
+    /// for each challenge that failed.
+    Order(OrderStatus, Vec<String>),
     /// A fleet member the name resolves to could not answer the challenge.
     Fleet(String),
 }
@@ -345,7 +346,12 @@ impl std::fmt::Display for AcmeError {
                  configured — set APP_LB_ROUTE53_ZONE_ID"
             ),
             Self::Dns(e) => write!(f, "{e}"),
-            Self::Order(s) => write!(f, "order ended in state {s:?}"),
+            Self::Order(s, reasons) if reasons.is_empty() => {
+                write!(f, "order ended in state {s:?}")
+            }
+            Self::Order(s, reasons) => {
+                write!(f, "order ended in state {s:?}: {}", reasons.join("; "))
+            }
             Self::Fleet(e) => write!(f, "{e}"),
         }
     }
@@ -781,12 +787,31 @@ impl AcmeManager {
             next_attempt_secs: 0,
             delay_secs: BACKOFF_START.as_secs(),
         });
-        entry.next_attempt_secs = now_secs().saturating_add(entry.delay_secs);
-        entry.delay_secs = (entry.delay_secs * 2).min(BACKOFF_MAX.as_secs());
-        tracing::debug!(host, retry_in_secs = entry.delay_secs, "backing off");
+        let wait = entry.delay_secs;
+        entry.next_attempt_secs = now_secs().saturating_add(wait);
+        entry.delay_secs = (wait * 2).min(BACKOFF_MAX.as_secs());
+        tracing::info!(host, retry_in_secs = wait, "backing off");
         let snapshot = backoff.clone();
         drop(backoff);
         self.persist_backoff(&snapshot);
+    }
+
+    /// How long until the earliest cooldown still running ends.
+    ///
+    /// The service loop sleeps on this. Without it a failed host is retried
+    /// only at the next [`TICK`] or registry change, so a backoff of a minute
+    /// meant a wait of up to twelve hours. Expired entries are skipped: they
+    /// belong to hosts the last sweep already retried, or no longer wants, and
+    /// counting them would wake the loop continuously.
+    fn next_retry_in(&self) -> Option<Duration> {
+        let backoff = self.backoff.lock().ok()?;
+        let now = now_secs();
+        backoff
+            .values()
+            .filter(|b| !b.expired(now))
+            .map(|b| b.next_attempt_secs - now)
+            .min()
+            .map(Duration::from_secs)
     }
 
     fn record_success(&self, host: &str) {
@@ -1046,6 +1071,28 @@ impl AcmeManager {
         result
     }
 
+    /// Why the CA rejected an order, from each failed challenge's problem
+    /// document — "order ended in state Invalid" alone says nothing about which
+    /// name failed or what the CA saw. Best-effort: a failed lookup just means
+    /// a less useful log line.
+    async fn rejections(order: &mut instant_acme::Order) -> Vec<String> {
+        let mut reasons = Vec::new();
+        let mut authorizations = order.authorizations();
+        while let Some(Ok(authorization)) = authorizations.next().await {
+            let identifier = authorization.identifier().to_string();
+            for challenge in &authorization.challenges {
+                if let Some(problem) = &challenge.error {
+                    reasons.push(format!(
+                        "{identifier} ({:?}): {}",
+                        challenge.r#type,
+                        problem.detail.as_deref().unwrap_or("no detail"),
+                    ));
+                }
+            }
+        }
+        reasons
+    }
+
     /// Wait for validation, finalize, and install the issued chain.
     async fn finish_order(
         &self,
@@ -1054,7 +1101,8 @@ impl AcmeManager {
     ) -> Result<(), AcmeError> {
         let status = order.poll_ready(&POLL).await?;
         if status != OrderStatus::Ready {
-            return Err(AcmeError::Order(status));
+            let reasons = Self::rejections(order).await;
+            return Err(AcmeError::Order(status, reasons));
         }
 
         // `finalize` generates the keypair and CSR and hands back the private
@@ -1112,9 +1160,17 @@ impl BackgroundService for AcmeManager {
         }
 
         loop {
+            let retry = self.next_retry_in();
+            let retry_due = async {
+                match retry {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 _ = ticker.tick() => self.reconcile().await,
                 _ = self.signal.notified() => self.reconcile().await,
+                _ = retry_due => self.reconcile().await,
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("ACME manager shutting down");
@@ -1506,6 +1562,30 @@ mod tests {
             "unbounded growth would strand a host forever",
         );
         let _ = std::fs::remove_dir_all(&manager.config.dir);
+    }
+
+    #[test]
+    fn the_next_retry_is_the_earliest_running_cooldown() {
+        let manager = manager("next-retry", registry_with(vec![]));
+        assert_eq!(manager.next_retry_in(), None, "nothing cooling down");
+
+        manager.record_failure("a.example.com");
+        let wait = manager.next_retry_in().expect("a cooldown is running");
+        assert!(
+            wait <= BACKOFF_START && wait >= BACKOFF_START - Duration::from_secs(2),
+            "wakes when the first cooldown ends, got {wait:?}"
+        );
+
+        // A cooldown that has ended no longer schedules a wake-up; otherwise a
+        // host nobody wants any more would spin the loop.
+        manager
+            .backoff
+            .lock()
+            .unwrap()
+            .get_mut("a.example.com")
+            .unwrap()
+            .next_attempt_secs = now_secs().saturating_sub(1);
+        assert_eq!(manager.next_retry_in(), None);
     }
 
     #[test]
