@@ -41,8 +41,12 @@ or ci on us5, so those tools report themselves unconfigured.
 heyctl --context us5 apply -f .heyo/regions/us5/remote.json
 heyctl --context us5 build remote --wait
 heyctl --context us5 apply -f .heyo/regions/us5/heyo-mcp.json
-heyctl --context us5 build heyo-mcp --wait
+heyctl --context us5 pull heyo-mcp --wait
 ```
+
+`heyo-mcp` pulls a prebuilt image, `heyo/heyo-mcp:<sha>`, from the global
+store through the hub instead of building on this host. How to release a new
+one is in `mcp/deploy/vm.md`.
 
 This does not make us5 part of the us3/eu1 two-region acceptance in
 `AGENTS.md`.
