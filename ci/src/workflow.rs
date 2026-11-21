@@ -1742,6 +1742,13 @@ mod repo_workflow {
         // The same admission ci applies to CI_RELEASE_POLICIES.
         let policy = crate::release_policy::select(Some(raw), REPO).unwrap().expect("the policy names this repository");
         assert!(crate::release_policy::select(Some(raw), "https://github.com/Heyo-Computer/other.git").unwrap().is_none());
+        // Checkout finds the planned workflow in the submitted source
+        // descriptor, which holds only files the client sends from
+        // .ci/workflows/. A path outside it fails every release job at checkout.
+        assert!(policy.workflow_path.starts_with(".ci/workflows/") && policy.workflow_path.ends_with(".yml"),
+            "workflow_path {} is not a submitted workflow file", policy.workflow_path);
+        assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(&policy.workflow_path).is_file(),
+            "workflow_path {} does not exist in the repository", policy.workflow_path);
         let wf = Workflow::parse(&policy.workflow_path, &policy.workflow).unwrap();
         assert_eq!(wf.on, ["release"]);
         let plan = crate::plan::Plan::build(&wf).unwrap();

@@ -32,7 +32,12 @@
 # The `changed()` lists match app-lb.yml's submit paths exactly, so a release
 # never asks for a bundle that validation did not build.
 https://github.com/Heyo-Computer/heyo-public.git:
-  workflow_path: .ci/release-policies/production-release.yml
+  # Must name a workflow file the git-submit client sends (one under
+  # .ci/workflows/): checkout looks the planned workflow up in the submitted
+  # source descriptor and verifies the tree against it. The policy's text below
+  # is what runs; that file's own contents are ignored here, as staging's
+  # policy does with the same path.
+  workflow_path: .ci/workflows/regional-release.yml
   workflow: |
     name: production-release
     on: release
