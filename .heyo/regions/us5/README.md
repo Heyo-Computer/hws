@@ -46,3 +46,42 @@ heyctl --context us5 build heyo-mcp --wait
 
 This does not make us5 part of the us3/eu1 two-region acceptance in
 `AGENTS.md`.
+
+## app-lb releases
+
+app-lb on us4 and us5 is replaced by the production CI controller
+(ci.us2.heyo.work) on every release that changes it. The controller runs the
+operator policy `.ci/release-policies/us2-production.yml`, not the repo's
+`regional-release.yml`, which the staging controller (ci.us3) coordinates
+for us3 and eu1. The steps are:
+
+1. `merge`: fast-forward main to the validated source.
+2. `hub`: publish the validated tarball as `heyo/app-lb:<sha>` and `latest`
+   with `.ci/publish-hub.py`.
+3. `us4`, then `us5`: run `ci/rollout-host-app-lb`, so each host installs
+   those exact bytes, verified by digest, and is done only when its public
+   healthz reports the new revision.
+
+Each host is enrolled once, by hand. The enrollment is a root-owned
+`/etc/app-lb/host-update.json` (supervisor program `app-lb`, store
+`https://art.us2.heyo.work`, health `https://admin.<host>.heyo.work/healthz`,
+deployment `app-lb-admin-<host>`, and every supervisor and env file listed in
+`config_files`), plus `APP_LB_HOST_UPDATE_CONFIG` in `/etc/app-lb/env`. us4
+and us5 were enrolled on 2026-11-21. Editing any listed file, or swapping the
+binary by hand, changes the hashes a rollout checks first, so do that between
+releases, never during one.
+
+The controller needs these in its HeyoSecret (sec2.us2):
+
+- `ci-controller/host-app-lb-targets` with entries `app-lb-us4` and
+  `app-lb-us5` (repository `https://github.com/Heyo-Computer/heyo-public.git`).
+- the workflow secrets `GIT_AUTH_TOKEN`, `ART_API_KEY` (the store key), and
+  `APP_LB_US_FLEET_TOKEN` (one app-lb token for both hosts, which share fleet
+  state, scoped to `app-lb-admin-us4` and `app-lb-admin-us5`).
+
+On us2, the policy is `/etc/ci/release-policies.yml`, exported as
+`CI_RELEASE_POLICIES` by `/usr/local/sbin/ci-with-release-policy`, which is
+what supervisor's `ci` program runs.
+
+Rollback on a host is `/usr/local/bin/app-lb` from the previous release,
+which the rollout keeps as `.previous` in `/var/lib/app-lb-host-update/`.

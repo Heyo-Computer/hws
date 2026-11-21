@@ -1,0 +1,110 @@
+# Operator release policy for the production CI controller (ci.us2.heyo.work).
+#
+# ci reads this from CI_RELEASE_POLICIES, never from the submitted checkout:
+# for a repository listed here, the policy's `workflow` replaces every
+# `on: release` file in the repo. So production releases do not depend on
+# .ci/workflows/regional-release.yml, which the staging controller (ci.us3)
+# coordinates under its own policy for us3 and eu1.
+#
+# Installed on us2 as /etc/ci/release-policies.yml (root, 0600).
+# /usr/local/sbin/ci-with-release-policy exports that file as
+# CI_RELEASE_POLICIES and execs /usr/local/bin/ci, and supervisor's `ci`
+# program runs the wrapper. To change the policy, edit this file, copy it there,
+# and restart `ci` between runs. `ci/src/workflow.rs` checks that this file
+# passes the same admission ci applies.
+#
+# What a release does, after every submission validation has passed:
+#
+#   merge  ci/merge-release fast-forwards main to the validated source.
+#   hub    publishes the validated app-lb tarball as heyo/app-lb:<sha> and
+#          heyo/app-lb:latest (.ci/publish-hub.py).
+#   us4    ci/rollout-host-app-lb replaces app-lb on us4 and waits for
+#          https://admin.us4.heyo.work/healthz to report the new revision.
+#   us5    the same on us5, only after us4 succeeded.
+#
+# Each host downloads the blob by digest from art.us2 (the global store
+# hub.heyo.work serves), so the hub and production hold the same bytes.
+#
+# Needs, in this controller's HeyoSecret (sec2.us2):
+#   ci-controller/host-app-lb-targets   entries app-lb-us4 and app-lb-us5
+#   workflow secrets GIT_AUTH_TOKEN, ART_API_KEY, APP_LB_US_FLEET_TOKEN
+#
+# The `changed()` lists match app-lb.yml's submit paths exactly, so a release
+# never asks for a bundle that validation did not build.
+https://github.com/Heyo-Computer/heyo-public.git:
+  workflow_path: .ci/release-policies/production-release.yml
+  workflow: |
+    name: production-release
+    on: release
+
+    jobs:
+      merge:
+        vm: &release_vm
+          driver: firecracker
+          build:
+            dockerfile: .ci/image/ci/Dockerfile
+            context: .ci/image/ci
+            size_mb: 6144
+          size_class: small
+          disk_size_gb: 10
+          ttl_seconds: 7200
+        steps:
+          - uses: ci/merge-release
+            with:
+              manifests: '[]'
+              token: ${{ secrets.GIT_AUTH_TOKEN }}
+
+      hub:
+        needs: [merge]
+        vm: *release_vm
+        timeout-minutes: 20
+        steps:
+          - uses: ci/checkout-release
+            if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
+          - uses: ci/download-artifact
+            if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
+            with:
+              workflow: .ci/workflows/app-lb.yml
+              name: app-lb
+              path: app-lb-release.tar.gz
+          - name: Publish app-lb to the hub
+            if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
+            env:
+              ART_API_KEY: ${{ secrets.ART_API_KEY }}
+              CI_RUN_ID: ${{ ci.run_id }}
+            run: |
+              set -eu
+              python3 .ci/publish-hub.py app-lb-release.tar.gz \
+                --store https://art.us2.heyo.work \
+                --repo heyo/app-lb --name app-lb \
+                --description "app-lb: the Heyo load balancer and deployment controller, plus heyctl (its CLI), with the supervisor config and SHA256SUMS."
+
+      us4:
+        needs: [hub]
+        vm: *release_vm
+        timeout-minutes: 30
+        steps:
+          - name: Replace app-lb on us4
+            if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
+            uses: ci/rollout-host-app-lb
+            timeout-minutes: 20
+            with:
+              target: app-lb-us4
+              token: ${{ secrets.APP_LB_US_FLEET_TOKEN }}
+              workflow: .ci/workflows/app-lb.yml
+              artifact: app-lb
+
+      us5:
+        needs: [us4]
+        vm: *release_vm
+        timeout-minutes: 30
+        steps:
+          - name: Replace app-lb on us5
+            if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
+            uses: ci/rollout-host-app-lb
+            timeout-minutes: 20
+            with:
+              target: app-lb-us5
+              token: ${{ secrets.APP_LB_US_FLEET_TOKEN }}
+              workflow: .ci/workflows/app-lb.yml
+              artifact: app-lb
