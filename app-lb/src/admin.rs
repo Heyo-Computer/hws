@@ -5938,7 +5938,7 @@ async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String
         else { discovery_status_locked(&state.registry, &id) };
     match status {
         Ok(mut status) => {
-            if let Some(deployment) = (if target.staged { state.registry.staged(&id) } else { state.registry.get(&id) }) {
+            if let Some(deployment) = if target.staged { state.registry.staged(&id) } else { state.registry.get(&id) } {
                 if let Some(spec) = deployment.spec.discovery.as_ref().and_then(|d| d.regional.as_ref()) {
                     let ready = state.secrets.resolve(&spec.auth).is_ok_and(|token|
                         !token.is_empty() && http::HeaderValue::from_str(&token).is_ok())
