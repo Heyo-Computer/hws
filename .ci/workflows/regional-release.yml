@@ -81,80 +81,6 @@ jobs:
           workflow: .ci/workflows/orchestrator.yml
           artifact: orchestrator-linux
 
-  # The US production fleet (us4 + us5), on its own branch of this graph: it
-  # needs only `merge`, so a us3/eu1 failure does not hold production back and
-  # a production failure does not hold up the two-region acceptance work.
-  #
-  # `hub` publishes the exact validated app-lb tarball as heyo/app-lb:<sha> and
-  # moves heyo/app-lb:latest. The rollouts then install those same bytes:
-  # each host downloads the blob by digest from the store it is mapped to
-  # (art.us2, the global store hub.heyo.work serves), so what the hub lists is
-  # what production runs.
-  #
-  # us4 and us5 share fleet state, so one app-lb token is valid on both and
-  # both jobs use it (APP_LB_US_FLEET_TOKEN, a token scoped to the two
-  # app-lb-admin-us* deployments). The targets `app-lb-us4` and `app-lb-us5`
-  # live in the operator mapping (HeyoSecret ci-controller/host-app-lb-targets),
-  # and each host carries the matching /etc/app-lb/host-update.json.
-  #
-  # The `changed()` lists match app-lb.yml's submit paths exactly, as the us3
-  # and eu1 steps do, so a release never asks for a bundle that validation did
-  # not build. A change to .ci/publish-hub.py alone therefore publishes nothing.
-  hub:
-    needs: [merge]
-    vm: *release_vm
-    timeout-minutes: 20
-    steps:
-      - uses: ci/checkout-release
-        if: ${{ changed('app-lb/**', '.ci/workflows/app-lb.yml', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
-      - uses: ci/download-artifact
-        if: ${{ changed('app-lb/**', '.ci/workflows/app-lb.yml', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
-        with:
-          workflow: .ci/workflows/app-lb.yml
-          name: app-lb
-          path: app-lb-release.tar.gz
-      - name: Publish app-lb to the hub
-        if: ${{ changed('app-lb/**', '.ci/workflows/app-lb.yml', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
-        env:
-          ART_API_KEY: ${{ secrets.ART_API_KEY }}
-          CI_RUN_ID: ${{ ci.run_id }}
-        run: |
-          set -eu
-          python3 .ci/publish-hub.py app-lb-release.tar.gz \
-            --store https://art.us2.heyo.work \
-            --repo heyo/app-lb --name app-lb \
-            --description "app-lb: the Heyo load balancer and deployment controller, plus heyctl (its CLI), with the supervisor config and SHA256SUMS."
-
-  us4:
-    needs: [hub]
-    vm: *release_vm
-    timeout-minutes: 30
-    steps:
-      - name: Verify us4 host app-lb replacement
-        if: ${{ changed('app-lb/**', '.ci/workflows/app-lb.yml', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
-        uses: ci/rollout-host-app-lb
-        timeout-minutes: 20
-        with:
-          target: app-lb-us4
-          token: ${{ secrets.APP_LB_US_FLEET_TOKEN }}
-          workflow: .ci/workflows/app-lb.yml
-          artifact: app-lb
-
-  us5:
-    needs: [us4]
-    vm: *release_vm
-    timeout-minutes: 30
-    steps:
-      - name: Verify us5 host app-lb replacement
-        if: ${{ changed('app-lb/**', '.ci/workflows/app-lb.yml', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
-        uses: ci/rollout-host-app-lb
-        timeout-minutes: 20
-        with:
-          target: app-lb-us5
-          token: ${{ secrets.APP_LB_US_FLEET_TOKEN }}
-          workflow: .ci/workflows/app-lb.yml
-          artifact: app-lb
-
   poolers:
     needs: [eu1]
     vm: *release_vm
@@ -180,10 +106,8 @@ jobs:
           export PG_FC_REVISION="$(git rev-parse HEAD)"
           python3 pg-fc/deploy/rollout_poolers.py pg-fc-release.tar.gz
 
-  # Last, after both branches: the validator requires controller replacement
-  # to depend on every other release job.
   controller:
-    needs: [poolers, us5]
+    needs: [poolers]
     vm: *release_vm
     timeout-minutes: 30
     steps:
