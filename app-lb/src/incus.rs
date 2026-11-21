@@ -452,17 +452,6 @@ impl Incus {
         }
     }
 
-    /// Stop a container and keep it, for a sandbox this LB is not sure it
-    /// owns (`Runtime::stop_unknown`). Missing or already stopped counts as
-    /// stopped, as it does for `kill`.
-    pub async fn stop_kept(&self, name: &str) -> Result<(), IncusError> {
-        match self.stop(name, true).await {
-            Ok(()) | Err(IncusError::Api { status: 404, .. }) => Ok(()),
-            Err(IncusError::Api { message, .. }) if message.contains("already stopped") => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     async fn stop(&self, name: &str, force: bool) -> Result<(), IncusError> {
         let body = json!({"action": "stop", "timeout": 30, "force": force});
         self.request_awaited(

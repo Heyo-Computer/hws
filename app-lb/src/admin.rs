@@ -8241,12 +8241,6 @@ async fn get_secret(
     }
 }
 
-#[derive(Deserialize)]
-struct ForceParams {
-    #[serde(default)]
-    force: bool,
-}
-
 /// `DELETE /secrets/:id[?force=true]`.
 ///
 /// Refused while a deployment's build still references it: the failure would

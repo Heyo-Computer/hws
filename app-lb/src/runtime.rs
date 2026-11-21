@@ -184,26 +184,6 @@ impl Runtime {
     /// one can hold a given id, `kill` treats an unknown sandbox as already
     /// destroyed on both, and the alternative — guessing — leaks whichever one
     /// guessed wrong.
-    /// Stop a sandbox whose runtime is not known, keeping its disk.
-    ///
-    /// For sandboxes named for a deployment this LB does not have — see
-    /// `Autoscaler::leave_unowned`. Asks both runtimes, for the reason
-    /// [`kill_unknown`](Self::kill_unknown) does.
-    pub async fn stop_unknown(&self, sandbox_id: &str) -> Result<(), VmError> {
-        let heyvm = self.heyvm.suspend(sandbox_id).await;
-        let lxc = match &self.lxc {
-            Some(incus) => incus
-                .stop_kept(sandbox_id)
-                .await
-                .map_err(|e| VmError::Runtime(e.to_string())),
-            None => Ok(()),
-        };
-        match (heyvm, lxc) {
-            (Ok(()), _) | (_, Ok(())) => Ok(()),
-            (Err(e), Err(_)) => Err(e),
-        }
-    }
-
     pub async fn kill_unknown(&self, sandbox_id: &str) -> Result<(), VmError> {
         let heyvm = self.heyvm.kill(sandbox_id).await;
         let lxc = match &self.lxc {
