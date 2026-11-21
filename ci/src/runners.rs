@@ -1038,7 +1038,7 @@ impl Runners {
                 reason: format!("could not build a daemon client: {e}"),
             }
         })?;
-        let response = client
+        let response = match client
             .raw_request(
                 Method::GET,
                 "/capabilities",
@@ -1049,10 +1049,22 @@ impl Runners {
                 },
             )
             .await
-            .map_err(|e| RunnerError::Unreachable {
-                runner: runner_id.to_string(),
-                reason: format!("GET /capabilities failed: {e}"),
-            })?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                // Placement fails before a VM exists, so its transport recovery
+                // cannot evict this tunnel. Let the next placement dial again,
+                // without discarding a replacement another job already opened.
+                let mut tunnels = self.tunnels.lock().await;
+                if tunnels.get(runner_id).is_some_and(|c| c.base_url() == client.base_url()) {
+                    tunnels.remove(runner_id);
+                }
+                return Err(RunnerError::Unreachable {
+                    runner: runner_id.to_string(),
+                    reason: format!("GET /capabilities failed: {e}"),
+                });
+            }
+        };
         let drivers: Option<Arc<Vec<String>>> = if response.status().is_success() {
             response
                 .json::<serde_json::Value>()
@@ -1951,6 +1963,32 @@ mod tests {
         runners.tunnels.lock().await.insert("hd-local".into(), HeyoClient::new(runners.client_options()).unwrap());
         assert!(runners.free_disk_bytes("hd-local").await.is_err());
         assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "transport failure must force a fresh connection");
+    }
+
+    #[tokio::test]
+    async fn failed_capability_probe_refreshes_the_connection_on_next_placement() {
+        use axum::{Json, Router, http::StatusCode, routing::get};
+        let app = Router::new().route("/me/daemons/hd-test/connection-ticket", get(|| async {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"fresh ticket requested"})))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.heyvm.local_runner = None;
+        config.heyvm.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let runners = Runners::new(Arc::new(config));
+        let dead = HeyoClient::new(HeyoClientOptions {
+            api_key: Some("test-key".into()),
+            base_url: Some("http://127.0.0.1:1".into()),
+            timeout: None,
+        }).unwrap();
+        runners.options_for_tunnel_test("hd-test", dead).await;
+
+        let first = runners.supported_drivers("hd-test").await.unwrap_err();
+        assert!(first.to_string().contains("GET /capabilities failed"), "{first}");
+        let next = runners.supported_drivers("hd-test").await.unwrap_err();
+        assert!(next.to_string().contains("fresh ticket requested"), "{next}");
+        server.abort();
     }
 
     /// Every job on a runner shares its tunnel, so a drop is noticed by all of
