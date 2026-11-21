@@ -1743,14 +1743,30 @@ mod repo_workflow {
         let plan = crate::plan::Plan::build(&wf).unwrap();
         crate::submission::validate_release_plan(&plan).unwrap();
         assert_eq!(plan.jobs.iter().map(|j| j.base_id.as_str()).collect::<Vec<_>>(),
-            ["merge", "us3", "eu1", "poolers", "controller"]);
-        for (i, predecessor) in [(1, "merge"), (2, "us3"), (3, "eu1"), (4, "poolers")] {
-            assert_eq!(plan.jobs[i].needs, [predecessor]);
-            assert!(plan.jobs[i].condition.is_none(), "do not skip a dependency stage");
+            ["merge", "us3", "hub", "eu1", "us4", "us5", "poolers", "controller"]);
+        let job = |id: &str| plan.jobs.iter().find(|j| j.base_id == id).unwrap();
+        for (id, predecessors) in [("us3", &["merge"][..]), ("eu1", &["us3"]), ("poolers", &["eu1"]),
+            ("hub", &["merge"]), ("us4", &["hub"]), ("us5", &["us4"]), ("controller", &["poolers", "us5"])] {
+            assert_eq!(job(id).needs, predecessors, "{id}");
+            assert!(job(id).condition.is_none(), "do not skip a dependency stage");
+        }
+        // The US fleet publishes the validated tarball to the hub, then rolls
+        // us4 and us5 in order with one fleet token.
+        let hub = &job("hub").steps;
+        assert_eq!(hub[0].uses.as_deref(), Some("ci/checkout-release"));
+        assert_eq!(hub[1].uses.as_deref(), Some("ci/download-artifact"));
+        assert_eq!(hub[1].with["workflow"], ".ci/workflows/app-lb.yml");
+        assert_eq!(hub[1].with["name"], "app-lb");
+        assert!(hub[2].run.as_deref().unwrap().contains("python3 .ci/publish-hub.py app-lb-release.tar.gz"));
+        for region in ["us4", "us5"] {
+            let steps = &job(region).steps;
+            assert_eq!(steps[0].uses.as_deref(), Some("ci/rollout-host-app-lb"));
+            assert_eq!(steps[0].with["target"], format!("app-lb-{region}"));
+            assert_eq!(steps[0].with["token"], "${{ secrets.APP_LB_US_FLEET_TOKEN }}");
         }
         let preflight = include_str!("../../.ci/diagnostics/regional-rollout-preflight.yml");
-        for (i, region, deployment) in [(1, "us3", "orchestrator-us3"), (2, "eu1", "orchestrator-eu1")] {
-            let steps = &plan.jobs[i].steps;
+        for (region, deployment) in [("us3", "orchestrator-us3"), ("eu1", "orchestrator-eu1")] {
+            let steps = &job(region).steps;
             assert_eq!(steps[0].uses.as_deref(), Some("ci/rollout-host-app-lb"));
             assert_eq!(steps[0].with["target"], format!("app-lb-{region}"));
             assert_eq!(steps[1].uses.as_deref(), Some("ci/rollout-service"));
@@ -1761,13 +1777,13 @@ mod repo_workflow {
             assert_eq!(steps[1].with["mount-path"], "/opt/orchestrator-release",
                 "reuse the registered private release mount instead of adding an unauthenticated mount");
         }
-        let poolers = &plan.jobs[3].steps;
+        let poolers = &job("poolers").steps;
         assert_eq!(poolers[0].uses.as_deref(), Some("ci/checkout-release"));
         assert_eq!(poolers[1].uses.as_deref(), Some("ci/download-artifact"));
         assert_eq!(poolers[1].with["workflow"], ".ci/workflows/pg-fc.yml");
         assert_eq!(poolers[1].with["name"], "pg-fc");
         assert!(poolers[2].run.as_deref().unwrap().contains("python3 pg-fc/deploy/rollout_poolers.py pg-fc-release.tar.gz"));
-        assert_eq!(plan.jobs[4].steps.last().unwrap().uses.as_deref(), Some("ci/deploy-controller"));
+        assert_eq!(job("controller").steps.last().unwrap().uses.as_deref(), Some("ci/deploy-controller"));
 
         // Exercise asymmetric changes: a shared parser affects CI and app-lb,
         // release-mount extraction affects app-lb and its mounted service, while

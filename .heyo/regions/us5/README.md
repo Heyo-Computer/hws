@@ -46,3 +46,32 @@ heyctl --context us5 build heyo-mcp --wait
 
 This does not make us5 part of the us3/eu1 two-region acceptance in
 `AGENTS.md`.
+
+## app-lb releases
+
+app-lb on us4 and us5 is replaced by `.ci/workflows/regional-release.yml` on
+every release that changes it. The `hub` job publishes the validated tarball as
+`heyo/app-lb:<sha>` (and `latest`) with `.ci/publish-hub.py`. `us4` and then
+`us5` run `ci/rollout-host-app-lb`, and each host installs those exact bytes,
+verified by digest.
+
+Each host is enrolled once, by hand. The enrollment is a root-owned
+`/etc/app-lb/host-update.json` (supervisor program `app-lb`, store
+`https://art.us2.heyo.work`, health `https://admin.<host>.heyo.work/healthz`,
+deployment `app-lb-admin-<host>`, and every supervisor and env file listed in
+`config_files`), plus `APP_LB_HOST_UPDATE_CONFIG` in `/etc/app-lb/env`. us4
+and us5 were enrolled on 2026-11-21. Editing any listed file, or swapping the
+binary by hand, changes the hashes a rollout checks first. The next release
+then reads the new state, so do that between releases, never during one.
+
+CI needs these in HeyoSecret:
+
+- `ci-controller/host-app-lb-targets` with entries `app-lb-us4` and
+  `app-lb-us5`, shaped like the us3 entry.
+- the workflow secret `APP_LB_US_FLEET_TOKEN`, one app-lb token for both hosts
+  (they share fleet state), scoped to `app-lb-admin-us4` and
+  `app-lb-admin-us5`.
+- the workflow secret `ART_API_KEY`, the store key (`artifacts/api-key`).
+
+Rollback on a host is `/usr/local/bin/app-lb` from the previous release,
+which the rollout keeps as `.previous` in `/var/lib/app-lb-host-update/`.
