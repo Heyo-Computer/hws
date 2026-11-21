@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Publish a validated release tarball to the hub as `<repo>:<revision>` and `<repo>:latest`.
 
+A manual tool for a tarball in hand. The production release policy's `hub` job
+does not use it: that job tags the validated artifact by digest without
+transferring it (.ci/release-policies/us2-production.yml).
+
     ART_API_KEY=… python3 .ci/publish-hub.py \
         --store https://art.us2.heyo.work --repo heyo/app-lb --name app-lb \
         --description "app-lb: …" app-lb-release.tar.gz

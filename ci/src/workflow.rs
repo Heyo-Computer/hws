@@ -1759,12 +1759,22 @@ mod repo_workflow {
             assert_eq!(job(id).needs, [predecessor], "{id}");
             assert!(job(id).condition.is_none(), "do not skip a dependency stage");
         }
+        // hub names the validated artifact by digest: no transfer into the VM
+        // and no checkout, so it depends on neither the runner's copy path nor
+        // the VM reaching GitHub.
         let hub = &job("hub").steps;
-        assert_eq!(hub[0].uses.as_deref(), Some("ci/checkout-release"));
-        assert_eq!(hub[1].uses.as_deref(), Some("ci/download-artifact"));
-        assert_eq!(hub[1].with["workflow"], ".ci/workflows/app-lb.yml");
-        assert_eq!(hub[1].with["name"], "app-lb");
-        assert!(hub[2].run.as_deref().unwrap().contains("python3 .ci/publish-hub.py app-lb-release.tar.gz"));
+        assert_eq!(hub.len(), 2);
+        assert!(hub.iter().all(|s| s.uses.as_deref() != Some("ci/checkout-release")));
+        assert_eq!(hub[0].uses.as_deref(), Some("ci/download-artifact"));
+        assert_eq!(hub[0].id.as_deref(), Some("artifact"));
+        assert_eq!(hub[0].with["workflow"], ".ci/workflows/app-lb.yml");
+        assert_eq!(hub[0].with["name"], "app-lb");
+        assert_eq!(hub[0].with["transfer"], "false");
+        assert_eq!(hub[1].env["DIGEST"], "${{ steps.artifact.outputs.digest }}");
+        assert_eq!(hub[1].env["REVISION"], "${{ ci.sha }}");
+        let script = hub[1].run.as_deref().unwrap();
+        assert!(script.contains("/manifests") && script.contains("\"latest\""), "tags by manifest, including latest");
+        assert!(!script.contains("${{"), "values reach the script through env, not interpolation");
         for region in ["us4", "us5"] {
             let step = &job(region).steps[0];
             assert_eq!(step.uses.as_deref(), Some("ci/rollout-host-app-lb"));

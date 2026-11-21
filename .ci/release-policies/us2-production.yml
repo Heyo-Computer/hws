@@ -16,8 +16,9 @@
 # What a release does, after every submission validation has passed:
 #
 #   merge  ci/merge-release fast-forwards main to the validated source.
-#   hub    publishes the validated app-lb tarball as heyo/app-lb:<sha> and
-#          heyo/app-lb:latest (.ci/publish-hub.py).
+#   hub    tags the validated app-lb tarball, by digest, as heyo/app-lb:<sha>
+#          and heyo/app-lb:latest. No transfer and no checkout: ci returns its
+#          record of the artifact and the job talks only to the store.
 #   us4    ci/rollout-host-app-lb replaces app-lb on us4 and waits for
 #          https://admin.us4.heyo.work/healthz to report the new revision.
 #   us5    the same on us5, only after us4 succeeded.
@@ -59,30 +60,66 @@ https://github.com/Heyo-Computer/heyo-public.git:
               manifests: '[]'
               token: ${{ secrets.GIT_AUTH_TOKEN }}
 
+      # Tags the validated tarball by digest. Nothing is transferred into this
+      # VM and nothing is checked out: `transfer: 'false'` returns ci's own
+      # record of the artifact (sha256, size), and the script below only talks
+      # to the store. The hosts still download those exact bytes and verify
+      # dist/REVISION and SHA256SUMS before installing.
       hub:
         needs: [merge]
         vm: *release_vm
-        timeout-minutes: 20
+        timeout-minutes: 10
         steps:
-          - uses: ci/checkout-release
-            if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
-          - uses: ci/download-artifact
+          - id: artifact
+            uses: ci/download-artifact
             if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
             with:
               workflow: .ci/workflows/app-lb.yml
               name: app-lb
-              path: app-lb-release.tar.gz
-          - name: Publish app-lb to the hub
+              transfer: 'false'
+          - name: Tag app-lb on the hub by digest
             if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
             env:
               ART_API_KEY: ${{ secrets.ART_API_KEY }}
+              STORE: https://art.us2.heyo.work
+              REPO: heyo/app-lb
+              DIGEST: ${{ steps.artifact.outputs.digest }}
+              SIZE: ${{ steps.artifact.outputs.size }}
+              REVISION: ${{ ci.sha }}
               CI_RUN_ID: ${{ ci.run_id }}
             run: |
-              set -eu
-              python3 .ci/publish-hub.py app-lb-release.tar.gz \
-                --store https://art.us2.heyo.work \
-                --repo heyo/app-lb --name app-lb \
-                --description "app-lb: the Heyo load balancer and deployment controller, plus heyctl (its CLI), with the supervisor config and SHA256SUMS."
+              python3 - <<'PY'
+              import json, os, re, sys, urllib.error, urllib.parse, urllib.request
+              e = os.environ
+              store, repo, digest, size, rev = e["STORE"].rstrip("/"), e["REPO"], e["DIGEST"], int(e["SIZE"]), e["REVISION"]
+              if not re.fullmatch(r"[0-9a-f]{64}", digest) or not re.fullmatch(r"[0-9a-f]{40}", rev):
+                  sys.exit(f"bad digest {digest!r} or revision {rev!r}")
+              def call(method, path, body=None, ctype=None):
+                  req = urllib.request.Request(store + path, data=body, method=method, headers={"x-api-key": e["ART_API_KEY"]})
+                  if ctype: req.add_header("content-type", ctype)
+                  try:
+                      with urllib.request.urlopen(req, timeout=60) as r: return r.status, r.headers, r.read()
+                  except urllib.error.HTTPError as err: return err.code, err.headers, err.read()
+              st, hdr, _ = call("HEAD", f"/blobs/{digest}")
+              if st != 200 or int(hdr.get("content-length", -1)) != size:
+                  sys.exit(f"store does not hold blob {digest} of {size} bytes (HEAD {st}, {hdr.get('content-length')})")
+              manifest = {"schema": 1, "kind": "generic", "entries": [{"name": "app-lb", "digest": digest, "size": size}],
+                          "annotations": {"heyo.revision": rev, "ci.run": e.get("CI_RUN_ID", "")}}
+              st, _, body = call("PUT", "/manifests", json.dumps(manifest).encode(), "application/json")
+              if st >= 300: sys.exit(f"manifest PUT answered {st}: {body[:300]!r}")
+              mdigest = json.loads(body)["digest"]
+              for tag in (rev[:7], "latest"):
+                  st, _, body = call("PUT", "/tags/" + urllib.parse.quote(f"{repo}:{tag}", safe="/:"), mdigest.encode(), "text/plain")
+                  if st >= 300: sys.exit(f"tagging {repo}:{tag} answered {st}: {body[:300]!r}")
+                  print(f"{repo}:{tag} -> {mdigest}")
+              desc = ("app-lb: the Heyo load balancer and deployment controller, plus heyctl (its CLI), with the supervisor config and SHA256SUMS.\n"
+                      f"Built by heyo-public CI from {rev}. Linux x86_64. Source: Heyo-Computer/hws.")
+              st, _, body = call("PUT", "/repos/" + urllib.parse.quote(repo, safe="/"), json.dumps({"public": True, "description": desc}).encode(), "application/json")
+              if st >= 300: sys.exit(f"repository PUT answered {st}: {body[:300]!r}")
+              st, _, body = call("GET", "/tags/" + urllib.parse.quote(f"{repo}:{rev[:7]}", safe="/:"))
+              if st != 200 or mdigest not in body.decode(errors="replace"): sys.exit(f"read-back of {repo}:{rev[:7]} failed ({st})")
+              print(f"published {repo}:{rev[:7]} (blob {digest}, {size} bytes)")
+              PY
 
       us4:
         needs: [hub]

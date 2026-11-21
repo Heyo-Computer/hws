@@ -61,7 +61,8 @@ for us3 and eu1. The steps are:
 
 1. `merge`: fast-forward main to the validated source.
 2. `hub`: publish the validated tarball as `heyo/app-lb:<sha>` and `latest`
-   with `.ci/publish-hub.py`.
+   by digest, with no transfer into the job's VM and no checkout (see the
+   policy's `hub` job).
 3. `us4`, then `us5`: run `ci/rollout-host-app-lb`, so each host installs
    those exact bytes, verified by digest, and is done only when its public
    healthz reports the new revision.
