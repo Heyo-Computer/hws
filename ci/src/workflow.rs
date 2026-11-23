@@ -1753,9 +1753,9 @@ mod repo_workflow {
         assert_eq!(wf.on, ["release"]);
         let plan = crate::plan::Plan::build(&wf).unwrap();
         crate::submission::validate_release_plan(&plan).unwrap();
-        assert_eq!(plan.jobs.iter().map(|j| j.base_id.as_str()).collect::<Vec<_>>(), ["merge", "hub", "us4", "us5"]);
+        assert_eq!(plan.jobs.iter().map(|j| j.base_id.as_str()).collect::<Vec<_>>(), ["merge", "hub", "us4", "us5", "us1"]);
         let job = |id: &str| plan.jobs.iter().find(|j| j.base_id == id).unwrap();
-        for (id, predecessor) in [("hub", "merge"), ("us4", "hub"), ("us5", "us4")] {
+        for (id, predecessor) in [("hub", "merge"), ("us4", "hub"), ("us5", "us4"), ("us1", "us5")] {
             assert_eq!(job(id).needs, [predecessor], "{id}");
             assert!(job(id).condition.is_none(), "do not skip a dependency stage");
         }
@@ -1775,7 +1775,7 @@ mod repo_workflow {
         let script = hub[1].run.as_deref().unwrap();
         assert!(script.contains("/manifests") && script.contains("\"latest\""), "tags by manifest, including latest");
         assert!(!script.contains("${{"), "values reach the script through env, not interpolation");
-        for region in ["us4", "us5"] {
+        for region in ["us4", "us5", "us1"] {
             let step = &job(region).steps[0];
             assert_eq!(step.uses.as_deref(), Some("ci/rollout-host-app-lb"));
             assert_eq!(step.with["target"], format!("app-lb-{region}"));
