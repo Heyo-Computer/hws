@@ -700,6 +700,26 @@ Done 2026-10-14. us5 and us4 are members of one fleet, and the fleet database's 
 - Before phase 5, rollback means not enabling the change.
 - After phase 5, restart us5 in file mode on its kept files, then replay into them any changes made since the switch, using the change feed.
 
+#### Capacity-aware placement as built (2026-11-23)
+
+Added before us1 (8 cores, 62 GB) joins us4 (32 cores, 91 GB) and us5 (56 cores, 125 GB). An even split by count would give the smallest host the same share as the largest.
+
+- **Each host reports its capacity (migration 4).** `hosts` gains nullable columns: `cpus`, `mem_total_mb`, `mem_free_mb`, `at_capacity` and `capacity_at`. A host writes only its own row, beside its heartbeat, and never through the change feed.
+  - It writes when the numbers move by more than 5% of memory, when `at_capacity` flips, and at least every 30 s.
+  - The numbers come from the autoscaler's existing `/system/usage` poll.
+  - A host is at capacity for 5 min after its daemon refuses a create for capacity (heyvmd's "host memory capacity unavailable"), or while it has less than 1 GiB of memory available.
+  - A report older than 120 s counts as no report.
+- **Weighted spread.** When every eligible host has a report, `assign()` splits replicas in proportion to each host's total memory, by largest remainder, using the same host order as before.
+  - A host at capacity gets no new share: it keeps at most the replicas it has ready, and the rest go to the others by weight. If every host is at capacity, the plain weighted split applies.
+  - If any eligible host has no report (an older binary, a stale report), the split is the even split, byte for byte. Equal weights give exactly that split too.
+  - Draining and make-before-break are unchanged.
+- **Capacity-chosen home for new pinned deployments (opt-in).** With `APP_LB_FLEET_PLACE_BY_CAPACITY=1` on the host that takes a `POST /deployments`, a new deployment that says nothing about placement is pinned to the live, active host with the most free memory that is not at capacity.
+  - **Eligibility:** only a plain VM pool qualifies. No build, site, update script, tunnel, discovery, gateway, static upstreams or mounts, and no local artifact or workspace store. Anything the receiving host would prepare locally stays where it was registered.
+  - **No usable report:** if no host has one, the old rule applies, so the deployment runs on the host that took the request.
+  - **The receiving host** writes only the fleet record (create-only), keeps the spec as foreign, and answers with the deployment's status. It never runs or persists anything of its own for it. The one-daemon rule holds.
+  - **The home host** applies a pinned deployment it has never held at once, from the change feed. It used to defer that to its next start. It applies one only when it has neither the deployment in memory nor a local record of it. A deregistration in progress on the home still has its local record, because `forget` removes the fleet record first, so it is never revived. A change to a pinned deployment the host already runs still waits for its next start.
+- **Not done:** rebalancing deployments that already exist (pinned ones move only by the § 8 operation), CPU as a weight, and showing capacity in the admin API or dashboard.
+
 ## Gates
 
 Each row needs a discriminating live test and recorded evidence. Unit tests do not satisfy a row.

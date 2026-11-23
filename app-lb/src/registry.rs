@@ -384,6 +384,33 @@ impl Registry {
         self.foreign.load_full()
     }
 
+    /// Register a new deployment whose `placement` pins it to another fleet
+    /// host (`APP_LB_FLEET_PLACE_BY_CAPACITY`). Only the fleet record is
+    /// written, and only if no deployment by that id exists; this host keeps
+    /// the spec as foreign and never runs or persists anything of its own for
+    /// it. The home host picks it up from the change feed
+    /// ([`Self::apply_fleet_changes`]) and its own autoscaler creates the VMs.
+    pub fn register_elsewhere(&self, spec: DeploymentSpec) -> std::io::Result<()> {
+        let Some(fleet) = &self.fleet else {
+            return Err(std::io::Error::other("not in a fleet"));
+        };
+        if self.placed_here(&spec) {
+            return Err(std::io::Error::other("the deployment is placed on this host"));
+        }
+        let id = spec.id.clone();
+        let record = StoredDeployment {
+            spec,
+            state: DeploymentState::default(),
+        };
+        let json = serde_json::to_vec_pretty(&record)?;
+        let half = fleet_half(&json)?;
+        fleet.put(&state_key(&id), &half, Expect::Absent)?;
+        let mut foreign = (*self.foreign.load_full()).clone();
+        foreign.insert(id, Arc::new(record.spec));
+        self.set_foreign(foreign);
+        Ok(())
+    }
+
     /// Re-read the fleet's deployments after another writer changed them.
     ///
     /// Deployments placed on other hosts are replaced wholesale: this host
@@ -415,6 +442,7 @@ impl Registry {
                 .is_some_and(|p| p.mode == crate::config::PlacementMode::Spread)
         };
         let mut applied = Vec::new();
+        let mut arrived = Vec::new();
         let mut gone = Vec::new();
         for entry in entries {
             let Some(mut record) = entry
@@ -436,6 +464,15 @@ impl Registry {
                 if local.get(id.as_str()).is_none_or(|d| d.spec != record.spec) {
                     if spread(&record.spec) {
                         applied.push(record.spec);
+                    } else if local.get(id.as_str()).is_none()
+                        && matches!(self.records.get(&entry.key), Ok(None))
+                    {
+                        // A pinned deployment this host has never held, placed
+                        // here by another host: there is no pool, rollout or
+                        // drain to reconcile, so it starts now rather than at
+                        // the next restart. A deregistration in progress here
+                        // still has its local record, so it is never revived.
+                        arrived.push(record.spec);
                     } else {
                         deferred.push(id);
                     }
@@ -480,6 +517,14 @@ impl Registry {
                     tracing::info!(deployment = %spec.id, "a spread deployment arrived from another fleet host");
                     self.upsert(spec);
                 }
+            }
+        }
+        for spec in arrived {
+            let id = spec.id.clone();
+            tracing::info!(deployment = %id, "a pinned deployment placed on this host by another fleet host arrived");
+            self.upsert(spec);
+            if let Err(e) = self.persist_one(&id) {
+                tracing::warn!(deployment = %id, error = %e, "could not record an arrived deployment locally");
             }
         }
         for id in gone {
@@ -2232,6 +2277,44 @@ mod tests {
     }
 
     #[test]
+    fn a_deployment_placed_elsewhere_by_capacity_starts_on_its_home_at_once() {
+        let dir = std::env::temp_dir().join(format!("app-lb-fleet-elsewhere-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fleet_dir = dir.join("fleet");
+        let fleet: Arc<dyn Collection> =
+            Arc::new(FileCollection::new(&fleet_dir, ".json", FileOptions::SYNCED));
+        let us5 = Registry::new(dir.join("us5/app-lb-state.json")).with_fleet(fleet.clone(), "us5");
+        let us1 = Registry::new(dir.join("us1/app-lb-state.json")).with_fleet(fleet.clone(), "us1");
+        us5.load().unwrap();
+        us1.load().unwrap();
+
+        let mut s = spec("web", vec![host("web.example")]);
+        s.placement = Some(crate::config::Placement::pinned("us1"));
+        us5.register_elsewhere(s.clone()).unwrap();
+        assert!(us5.get("web").is_none(), "the host that took it never runs it");
+        assert!(us5.foreign().contains_key("web"));
+        assert!(!dir.join("us5/app-lb-state.d/web.json").exists(), "and keeps no local record");
+        assert!(us5.register_elsewhere(s.clone()).is_err(), "only a new deployment");
+        let mut here = s.clone();
+        here.placement = Some(crate::config::Placement::pinned("us5"));
+        assert!(us5.register_elsewhere(here).is_err(), "a deployment placed here is registered normally");
+
+        // The home host takes it from the feed straight away.
+        us1.apply_fleet_changes();
+        assert!(us1.get("web").is_some(), "a new pinned arrival starts now, not at the next restart");
+        assert!(dir.join("us1/app-lb-state.d/web.json").exists());
+
+        // A deregistration in progress on its home is never revived: the
+        // local record is still there while the fleet record is.
+        let d = us1.remove("web").unwrap();
+        assert_eq!(d.spec.id, "web");
+        us1.apply_fleet_changes();
+        assert!(us1.get("web").is_none(), "removed here and still on disk: not an arrival");
+        us1.forget("web").unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_deployment_placed_on_another_host_is_kept_but_never_run_here() {
         let dir = std::env::temp_dir().join(format!("app-lb-fleet-foreign-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2309,7 +2392,18 @@ mod tests {
         write("pin", pinned.clone(), 8080);
         r.apply_fleet_changes();
         assert!(r.get("web").is_some() && r.route(Some("web.example"), "/").is_some());
-        assert!(r.get("pin").is_none(), "a pinned change waits for this host's next start");
+        // A pinned deployment this host never held, placed here by another
+        // host (capacity placement), starts at once: nothing to reconcile.
+        assert!(r.get("pin").is_some(), "a new pinned arrival starts now");
+        // A change to one this host already runs still waits for its next
+        // start: its pool, rollouts and drains need the admin path's care.
+        write("pin", pinned.clone(), 9090);
+        r.apply_fleet_changes();
+        assert_eq!(
+            r.get("pin").unwrap().spec.vm.as_ref().unwrap().port,
+            8080,
+            "a pinned change waits for this host's next start"
+        );
 
         // Changed there: changed here, and a new template rolls the pool in
         // place rather than handing it to teardown.

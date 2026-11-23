@@ -162,7 +162,25 @@ CREATE TABLE {s}.placement_targets (
 );
 "#,
     ),
+    (
+        4,
+        // Each host's capacity, written by that host alone beside its
+        // heartbeat. Nullable: a host on an older binary never writes it, and
+        // the placement controller then splits evenly, as it always has.
+        r#"
+ALTER TABLE {s}.hosts
+    ADD COLUMN cpus         bigint,
+    ADD COLUMN mem_total_mb bigint,
+    ADD COLUMN mem_free_mb  bigint,
+    ADD COLUMN at_capacity  boolean NOT NULL DEFAULT false,
+    ADD COLUMN capacity_at  timestamptz;
+"#,
+    ),
 ];
+
+/// How old a host's capacity report may be before the controller stops
+/// trusting it and treats that host as having reported none.
+pub const CAPACITY_STALE_SECS: f64 = 120.0;
 
 const UPSERT_ANY: &str = "INSERT INTO {s}.records (kind, key, body, revision, updated_by)
      VALUES ($1, $2, $3, nextval('{s}.revision'), $4)
@@ -244,6 +262,20 @@ pub struct DemandReport {
     pub idle_secs: u64,
 }
 
+/// One host's capacity, as it last reported it (`hosts`, migration 4).
+///
+/// Memory is what decides whether the host's VM daemon admits another VM, so
+/// it is what placement weighs. `full` says the host should take no new
+/// replicas: its daemon recently refused a create for capacity, or it has
+/// almost no memory left.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capacity {
+    pub cpus: u32,
+    pub mem_total_mb: u64,
+    pub mem_free_mb: u64,
+    pub full: bool,
+}
+
 /// One fleet member as the hosts table has it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostRow {
@@ -255,6 +287,9 @@ pub struct HostRow {
     pub boot_id: String,
     /// Seconds since its last heartbeat.
     pub age_secs: f64,
+    /// Its capacity, when it has reported one within [`CAPACITY_STALE_SECS`].
+    /// `None` for a host on an older binary, in file mode, or gone quiet.
+    pub capacity: Option<Capacity>,
 }
 
 /// A live record with its last writer: `(key, body, revision, updated_by)`.
@@ -976,7 +1011,9 @@ impl PgStore {
     pub async fn hosts(&self) -> Result<Vec<HostRow>, PgFailure> {
         let sql = self.sql(
             "SELECT host, address, state, boot_id,
-                    extract(epoch FROM now() - heartbeat_at)::float8
+                    extract(epoch FROM now() - heartbeat_at)::float8,
+                    cpus, mem_total_mb, mem_free_mb, at_capacity,
+                    extract(epoch FROM now() - capacity_at)::float8
              FROM {s}.hosts ORDER BY host",
         );
         self.call(move |pool| async move {
@@ -984,14 +1021,63 @@ impl PgStore {
             let rows = c.query(&sql, &[]).await.map_err(classify)?;
             Ok(rows
                 .iter()
-                .map(|r| HostRow {
-                    host: r.get(0),
-                    address: r.get(1),
-                    state: r.get(2),
-                    boot_id: r.get(3),
-                    age_secs: r.get::<_, f64>(4).max(0.0),
+                .map(|r| {
+                    let capacity = match (
+                        r.get::<_, Option<i64>>(5),
+                        r.get::<_, Option<i64>>(6),
+                        r.get::<_, Option<i64>>(7),
+                        r.get::<_, Option<f64>>(9),
+                    ) {
+                        (Some(cpus), Some(total), Some(free), Some(age))
+                            if age <= CAPACITY_STALE_SECS && total > 0 =>
+                        {
+                            Some(Capacity {
+                                cpus: cpus.clamp(0, u32::MAX as i64) as u32,
+                                mem_total_mb: total.max(0) as u64,
+                                mem_free_mb: free.max(0) as u64,
+                                full: r.get(8),
+                            })
+                        }
+                        _ => None,
+                    };
+                    HostRow {
+                        host: r.get(0),
+                        address: r.get(1),
+                        state: r.get(2),
+                        boot_id: r.get(3),
+                        age_secs: r.get::<_, f64>(4).max(0.0),
+                        capacity,
+                    }
                 })
                 .collect())
+        })
+        .await
+    }
+
+    /// Record `host`'s capacity on its own row. Like the heartbeat, it never
+    /// touches the change feed. False when the host has no row yet (it has
+    /// not heartbeated).
+    pub async fn report_capacity(&self, host: &str, capacity: Capacity) -> Result<bool, PgFailure> {
+        let sql = self.sql(
+            "UPDATE {s}.hosts
+             SET cpus = $2, mem_total_mb = $3, mem_free_mb = $4, at_capacity = $5, capacity_at = now()
+             WHERE host = $1",
+        );
+        let host = host.to_string();
+        let n = |v: u64| v.min(i64::MAX as u64) as i64;
+        let (cpus, total, free, full) = (
+            i64::from(capacity.cpus),
+            n(capacity.mem_total_mb),
+            n(capacity.mem_free_mb),
+            capacity.full,
+        );
+        self.call(move |pool| async move {
+            let c = pool.get().await.map_err(pool_failure)?;
+            let n = c
+                .execute(&sql, &[&host, &cpus, &total, &free, &full])
+                .await
+                .map_err(classify)?;
+            Ok(n > 0)
         })
         .await
     }
@@ -1622,6 +1708,56 @@ pub(crate) mod tests {
             a.snapshot().unwrap().cursor,
             cursor,
             "heartbeats never reach the feed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capacity_rides_the_hosts_row_and_is_absent_until_reported() {
+        let Some(a) = test_store("capacity", "us5/1") else {
+            eprintln!("skipped: {TEST_URL_ENV} is not set");
+            return;
+        };
+        let cursor = a.snapshot().unwrap().cursor;
+        let cap = Capacity {
+            cpus: 56,
+            mem_total_mb: 128_000,
+            mem_free_mb: 64_000,
+            full: false,
+        };
+        assert!(
+            !a.report_capacity("us5", cap).await.unwrap(),
+            "no row before the first heartbeat"
+        );
+        a.heartbeat("us5", None, "boot-1").await.unwrap();
+        a.heartbeat("us4", None, "boot-2").await.unwrap();
+        assert!(
+            a.hosts()
+                .await
+                .unwrap()
+                .iter()
+                .all(|h| h.capacity.is_none()),
+            "an older binary reports nothing"
+        );
+        assert!(a.report_capacity("us5", cap).await.unwrap());
+        let hosts = a.hosts().await.unwrap();
+        assert_eq!(hosts[0].capacity, None, "us4 never reported");
+        assert_eq!(hosts[1].capacity, Some(cap));
+        let full = Capacity {
+            full: true,
+            mem_free_mb: 100,
+            ..cap
+        };
+        a.report_capacity("us5", full).await.unwrap();
+        a.heartbeat("us5", None, "boot-3").await.unwrap();
+        assert_eq!(
+            a.hosts().await.unwrap()[1].capacity,
+            Some(full),
+            "a heartbeat keeps the capacity"
+        );
+        assert_eq!(
+            a.snapshot().unwrap().cursor,
+            cursor,
+            "capacity never reaches the feed"
         );
     }
 
