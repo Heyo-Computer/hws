@@ -22,12 +22,13 @@
 #   us4    ci/rollout-host-app-lb replaces app-lb on us4 and waits for
 #          https://admin.us4.heyo.work/healthz to report the new revision.
 #   us5    the same on us5, only after us4 succeeded.
+#   us1    the same on us1, only after us5 succeeded.
 #
 # Each host downloads the blob by digest from art.us2 (the global store
 # hub.heyo.work serves), so the hub and production hold the same bytes.
 #
 # Needs, in this controller's HeyoSecret (sec2.us2):
-#   ci-controller/host-app-lb-targets   entries app-lb-us4 and app-lb-us5
+#   ci-controller/host-app-lb-targets   entries app-lb-us4, app-lb-us5, app-lb-us1
 #   workflow secrets GIT_AUTH_TOKEN, ART_API_KEY, APP_LB_US_FLEET_TOKEN
 #
 # The `changed()` lists match app-lb.yml's submit paths exactly, so a release
@@ -147,6 +148,21 @@ https://github.com/Heyo-Computer/heyo-public.git:
             timeout-minutes: 20
             with:
               target: app-lb-us5
+              token: ${{ secrets.APP_LB_US_FLEET_TOKEN }}
+              workflow: .ci/workflows/app-lb.yml
+              artifact: app-lb
+
+      us1:
+        needs: [us5]
+        vm: *release_vm
+        timeout-minutes: 30
+        steps:
+          - name: Replace app-lb on us1
+            if: ${{ changed('app-lb/**', 'pg-fc/api/**', '.ci/workflows/app-lb.yml', '.ci/rust-cache.sh', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
+            uses: ci/rollout-host-app-lb
+            timeout-minutes: 20
+            with:
+              target: app-lb-us1
               token: ${{ secrets.APP_LB_US_FLEET_TOKEN }}
               workflow: .ci/workflows/app-lb.yml
               artifact: app-lb

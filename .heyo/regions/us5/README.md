@@ -63,7 +63,7 @@ for us3 and eu1. The steps are:
 2. `hub`: publish the validated tarball as `heyo/app-lb:<sha>` and `latest`
    by digest, with no transfer into the job's VM and no checkout (see the
    policy's `hub` job).
-3. `us4`, then `us5`: run `ci/rollout-host-app-lb`, so each host installs
+3. `us4`, then `us5`, then `us1`: run `ci/rollout-host-app-lb`, so each host installs
    those exact bytes, verified by digest, and is done only when its public
    healthz reports the new revision.
 
@@ -72,7 +72,8 @@ Each host is enrolled once, by hand. The enrollment is a root-owned
 `https://art.us2.heyo.work`, health `https://admin.<host>.heyo.work/healthz`,
 deployment `app-lb-admin-<host>`, and every supervisor and env file listed in
 `config_files`), plus `APP_LB_HOST_UPDATE_CONFIG` in `/etc/app-lb/env`. us4
-and us5 were enrolled on 2026-11-21. Editing any listed file, or swapping the
+and us5 were enrolled on 2026-11-21, and us1 on 2026-11-23 (its daemon also holds Heyo
+cloud sandboxes, so it runs with disk expiry and image offload off). Editing any listed file, or swapping the
 binary by hand, changes the hashes a rollout checks first, so do that between
 releases, never during one.
 
