@@ -4938,6 +4938,20 @@ async fn register(
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    // With APP_LB_FLEET_PLACE_BY_CAPACITY, a new plain VM pool that names no
+    // placement goes to the fleet host with the most free memory. Decided
+    // here, applied after every check below has passed against this host.
+    let by_capacity = if spec.placement.is_none()
+        && crate::fleet_placement::place_by_capacity()
+        && crate::fleet_placement::capacity_placeable(&spec)
+        && state.registry.get(&spec.id).is_none()
+        && !state.registry.foreign().contains_key(&spec.id)
+    {
+        crate::fleet_placement::choose_home_now()
+            .filter(|home| state.registry.fleet_host() != Some(home.as_str()))
+    } else {
+        None
+    };
     // In a fleet, a deployment that says nothing about where it runs runs
     // here: unplaced, it would run on every host that loads it.
     if spec.placement.is_none()
@@ -5022,6 +5036,29 @@ async fn register(
     }
     if state.autoscaler.workspaces().recovery_active(&id) {
         return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
+    // Placed on another host by capacity: write only the fleet record. That
+    // host's own autoscaler creates the VMs; this host prepares nothing.
+    if let Some(home) = by_capacity.filter(|_| old.is_none()) {
+        spec.placement = Some(crate::config::Placement::pinned(&home));
+        if let Err(e) = spec.validate() {
+            return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+        if let Err(e) = state.registry.register_elsewhere(spec.clone()) {
+            drop(change);
+            return err(StatusCode::CONFLICT, format!("could not place {id} on {home}: {e}")).into_response();
+        }
+        drop(change);
+        tracing::info!(deployment = %id, home = %home, "registered; placed by capacity on another fleet host");
+        auto_install_plugins(&state, &spec.namespace, caller.as_deref()).await;
+        let placed = Arc::new(crate::deployment::Deployment::new(spec));
+        state.feed.announce(
+            &placed.spec,
+            crate::feed::FeedEventKind::Deployed,
+            lifecycle_detail(&state, &placed.spec),
+            now_secs(),
+        );
+        return (StatusCode::CREATED, Json(status_of(&state, &placed))).into_response();
     }
     let replaced = old.is_some();
     let workspace_replacement = match &old {

@@ -845,6 +845,12 @@ impl Autoscaler {
 
         match usage.snapshot {
             Some(snap) => {
+                // Fleet placement weighs hosts by this (no-op outside a fleet).
+                crate::fleet_placement::note_host_usage(
+                    snap.host.cpu_count,
+                    snap.host.memory_total_bytes,
+                    snap.host.memory_available_bytes,
+                );
                 self.metrics.record_host_usage(
                     usage.available,
                     snap.host.cpu_count,
@@ -2205,6 +2211,12 @@ impl Autoscaler {
                     // for as long as it stays broken, each one logged and fed.
                     // A refused create is also the cheapest failure to repeat,
                     // which is exactly why it needs the embargo the most.
+                    // A daemon out of capacity makes this host full for fleet
+                    // placement, so the controller sends its new replicas to
+                    // peers instead.
+                    if crate::fleet_placement::is_capacity_refusal(&e.to_string()) {
+                        crate::fleet_placement::note_capacity_refusal();
+                    }
                     let (failures, delay) = d.note_boot_failure(now_secs());
                     tracing::warn!(
                         deployment = %d.spec.id,
