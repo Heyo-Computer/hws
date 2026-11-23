@@ -5726,7 +5726,10 @@ impl DeploymentSpec {
     /// if they could not: the state that would be split from its data.
     pub fn host_bound(&self) -> Option<&'static str> {
         let Some(vm) = &self.vm else {
-            return Some("this deployment has no VM pool (its upstreams or site files are on one host)");
+            if self.site.is_some() {
+                return self.site_host_bound();
+            }
+            return Some("this deployment has no VM pool (its upstreams are on one host)");
         };
         if vm.workspace.is_some() {
             return Some("vm.workspace lives on one host");
@@ -5757,6 +5760,31 @@ impl DeploymentSpec {
         }
         if self.discovery.is_some() || self.gateway.is_some() {
             return Some("regional discovery and gateways are placed per region, not per fleet host");
+        }
+        None
+    }
+
+    /// [`Self::host_bound`] for a static site. A site is portable when every
+    /// host can fetch the same tree: an `artifact` in a URL store, named by a
+    /// digest. Each listed host then pulls that digest into its own copy of
+    /// `site.root` (`Jobs::sync_spread_sites`). A site whose files were put on
+    /// a host any other way exists on that host only.
+    fn site_host_bound(&self) -> Option<&'static str> {
+        let Some(artifact) = &self.artifact else {
+            return Some("a site without an `artifact` has its files on one host");
+        };
+        if !artifact.is_remote() {
+            return Some("an artifact store given as a path is on one host");
+        }
+        if !is_sha256_hex(&artifact.artifact_ref) {
+            return Some(
+                "a site's artifact.ref must be a digest, or a tag could resolve differently on each host",
+            );
+        }
+        if self.discovery.is_some() || self.gateway.is_some() {
+            return Some(
+                "regional discovery and gateways are placed per region, not per fleet host",
+            );
         }
         None
     }
@@ -5857,8 +5885,8 @@ impl DeploymentSpec {
                 && let Some(why) = self.host_bound()
             {
                 return Err(SpecError::InvalidPlacement(format!(
-                    "placement.mode `spread` needs a VM pool with no host-bound state, and {why}; \
-                     use `pinned` with a `home`"
+                    "placement.mode `spread` needs a VM pool with no host-bound state, or a \
+                     site pulled from a digest, and {why}; use `pinned` with a `home`"
                 )));
             }
         }
@@ -8907,6 +8935,64 @@ mod tests {
             s.artifact.as_mut().unwrap().strip_components = Some(1);
             assert_eq!(s.validate(), Ok(()));
             assert_eq!(s.artifact.as_ref().unwrap().strip(), 1);
+        }
+
+        /// A site can be `spread` exactly when every host can fetch the same
+        /// tree: a URL store and a digest. Anything else leaves its files on
+        /// one host, and the refusal says which part.
+        #[test]
+        fn a_site_spreads_only_when_pulled_from_a_digest_in_a_url_store() {
+            let digest = "4bb6eee246fcdfeff9d9467caec81df044e95d58777cdfebb830b1c58f03c1e2";
+            let spread = Placement {
+                mode: PlacementMode::Spread,
+                home: None,
+                hosts: vec![],
+            };
+            let refused = |s: &DeploymentSpec, why: &str| match s.validate() {
+                Err(SpecError::InvalidPlacement(msg)) => assert!(msg.contains(why), "{msg}"),
+                other => panic!("expected a placement refusal naming {why:?}, got {other:?}"),
+            };
+
+            let mut s = site_spec();
+            s.placement = Some(spread.clone());
+            refused(&s, "without an `artifact`");
+
+            s.artifact = Some(
+                serde_json::from_str(r#"{"store":"https://art.example","ref":"retail-live"}"#)
+                    .unwrap(),
+            );
+            refused(&s, "must be a digest");
+
+            s.artifact.as_mut().unwrap().store = "/srv/artifacts".into();
+            s.artifact.as_mut().unwrap().artifact_ref = digest.into();
+            refused(&s, "store given as a path");
+
+            s.artifact.as_mut().unwrap().store = "https://art.example".into();
+            assert_eq!(s.validate(), Ok(()));
+            assert_eq!(s.host_bound(), None);
+
+            // Pinned stays allowed for every shape, as before.
+            let mut pinned = site_spec();
+            pinned.placement = Some(Placement {
+                mode: PlacementMode::Pinned,
+                home: Some("us5".into()),
+                hosts: vec![],
+            });
+            assert_eq!(pinned.validate(), Ok(()));
+        }
+
+        /// A static deployment's upstreams are still one host's processes.
+        #[test]
+        fn a_static_deployment_still_cannot_spread() {
+            let mut s = static_spec(&["127.0.0.1:9000"]);
+            s.placement = Some(Placement {
+                mode: PlacementMode::Spread,
+                home: None,
+                hosts: vec![],
+            });
+            assert!(
+                matches!(s.validate(), Err(SpecError::InvalidPlacement(m)) if m.contains("upstreams"))
+            );
         }
 
         /// The half of `artifact` that describes a guest rootfs. Refused rather

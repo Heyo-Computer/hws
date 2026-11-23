@@ -92,6 +92,13 @@ const SKIP_DIRS: [&str; 6] = [".git", "node_modules", "target", "vendor", "dist"
 const VERIFY_SETTLE: Duration = Duration::from_secs(2);
 /// Gap between verification probes.
 const VERIFY_INTERVAL: Duration = Duration::from_secs(2);
+/// How often a fleet host checks that each `spread` site placed on it serves
+/// the digest its spec names (`Jobs::sync_spread_sites`).
+const SITE_SYNC_INTERVAL: Duration = Duration::from_secs(20);
+/// After a failed sync pull, how long before the same reference is retried.
+/// The failure is in the job history either way; this keeps an unreachable
+/// store from getting a pull every interval.
+const SITE_SYNC_RETRY_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -807,6 +814,72 @@ impl Jobs {
         }, move |jobs, job_id, deployment_id| async move {
             jobs.run_build(&job_id, &deployment_id, &spec, force).await
         })
+    }
+
+    /// Start a pull for each `spread` site on this host that is not serving its
+    /// spec's `artifact.ref`, and return the ids it started one for.
+    ///
+    /// A spread site is every listed host's own (see `Registry`), so an edit
+    /// made on any of them — a new `ref`, a first placement here — arrives as a
+    /// spec change and nothing else. This is what turns that into files: each
+    /// host fetches the same digest into its own `site.root`.
+    ///
+    /// "Serving" is judged from this host's job history rather than the digest
+    /// marker beside the root, because the two name different things: the
+    /// marker records the bundle blob a pull unpacked, while the `ref` is
+    /// usually the manifest digest that pointed at it. A pull of exactly this
+    /// `ref` that succeeded, with the tree still on disk, is in sync. A fresh
+    /// process has no history, so its first pass re-resolves each site once;
+    /// the puller finds the tree already serving and writes nothing.
+    pub fn sync_spread_sites(self: &Arc<Self>) -> Vec<String> {
+        let now = now_secs();
+        let mut started = Vec::new();
+        for deployment in self.registry.deployments().values() {
+            let spec = &deployment.spec;
+            let (Some(site), Some(artifact)) = (&spec.site, &spec.artifact) else {
+                continue;
+            };
+            let spread = spec
+                .placement
+                .as_ref()
+                .is_some_and(|p| p.mode == crate::config::PlacementMode::Spread);
+            if !spread || !self.registry.placed_here(spec) || !artifact.is_remote() {
+                continue;
+            }
+            let tree_present =
+                crate::unpack::deployed_digest(Path::new(site.root.trim())).is_some();
+            let last = self
+                .history
+                .lock()
+                .expect("job history mutex poisoned")
+                .iter()
+                .rev()
+                .find(|r| {
+                    r.deployment == spec.id
+                        && r.kind == JobKind::ArtifactPull
+                        && r.artifact_ref.as_deref() == Some(artifact.artifact_ref.as_str())
+                })
+                .map(|r| (r.status, r.finished_at.unwrap_or(r.started_at)));
+            let due = match last {
+                Some((JobStatus::Running, _)) => false,
+                Some((JobStatus::Succeeded, _)) => !tree_present,
+                Some((JobStatus::Failed, at)) => now.saturating_sub(at) >= SITE_SYNC_RETRY_SECS,
+                None => true,
+            };
+            if !due {
+                continue;
+            }
+            match self.start_pull(&spec.id, None, false) {
+                Ok(_) => started.push(spec.id.clone()),
+                // Another pull — an operator's, or a rollout — holds the slot.
+                // The next pass looks again.
+                Err(StartError::AlreadyRunning(_)) => {}
+                Err(e) => {
+                    tracing::warn!(deployment = %spec.id, error = %e, "could not start a spread site's pull")
+                }
+            }
+        }
+        started
     }
 
     /// Pull a managed deployment's guest rootfs from an artifact store, then
@@ -2806,6 +2879,28 @@ fn new_job_id() -> String {
     crate::fleet_admin::scoped(format!("job-{hex}"))
 }
 
+/// Keeps every `spread` site placed on this host serving what its spec names
+/// ([`Jobs::sync_spread_sites`]). Fleet mode only: a `spread` placement means
+/// nothing on a single server.
+pub struct SiteSync(pub Arc<Jobs>);
+
+#[async_trait::async_trait]
+impl pingora_core::services::background::BackgroundService for SiteSync {
+    async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
+        let mut interval = tokio::time::interval(SITE_SYNC_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    for id in self.0.sync_spread_sites() {
+                        tracing::info!(deployment = %id, "pulling a spread site's artifact onto this host");
+                    }
+                }
+                _ = shutdown.changed() => return,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod retention {
     use super::*;
@@ -2928,6 +3023,107 @@ mod tests {
             images_dir: dir.join("images"), git_bin: "git".into(), mounts, shell: "sh".into(),
             timeout, home: None, sites_dir: Some(dir.join("sites")),
         }, registry, autoscaler, secrets, None))
+    }
+
+    /// Wait until no job for `deployment` is running, so the next sync pass is
+    /// judged on finished history rather than a slot that is still taken.
+    async fn idle(jobs: &Arc<Jobs>, deployment: &str) {
+        for _ in 0..200 {
+            if !jobs.running.lock().unwrap().contains(deployment) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{deployment}'s job never finished");
+    }
+
+    fn finished(jobs: &Arc<Jobs>, id: &str, artifact_ref: &str, status: JobStatus, at: u64) {
+        let mut r = JobRecord::new(
+            format!("job-{}", jobs.history.lock().unwrap().len()),
+            id.into(),
+            JobKind::ArtifactPull,
+        );
+        r.artifact_ref = Some(artifact_ref.into());
+        r.status = status;
+        r.started_at = at;
+        r.finished_at = Some(at);
+        jobs.history.lock().unwrap().push_back(r);
+    }
+
+    /// The fleet half of serving a site from every host: each host pulls the
+    /// `ref` a spread site names until a pull of exactly that `ref` has
+    /// succeeded here and the tree is still on disk. Pinned sites are left to
+    /// their operator, a failure waits out the retry window, and a new `ref`
+    /// is pulled even though the old one succeeded.
+    #[tokio::test]
+    async fn a_spread_site_is_pulled_until_this_ref_has_succeeded_here() {
+        let dir = scratch("site-sync");
+        let jobs = jobs_at(&dir);
+        let root = dir.join("sites").join("default").join("retail");
+        let first = "4bb6eee246fcdfeff9d9467caec81df044e95d58777cdfebb830b1c58f03c1e2";
+        let second = "19bdaff1dc422fa861ec9f0a227ca8e327ce66b5783e8cd2b8b88b253f6f57ed";
+        let site =
+            |id: &str, r: &str, placement: serde_json::Value| -> crate::config::DeploymentSpec {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "namespace": "default", "routes": [{"host": format!("{id}.example")}],
+                    "site": {"root": root.display().to_string()},
+                    // Nothing listens here: every pull this test starts fails fast.
+                    "artifact": {"store": "http://127.0.0.1:1", "ref": r},
+                    "placement": placement,
+                }))
+                .unwrap()
+            };
+        let spread = serde_json::json!({"mode": "spread"});
+        let retail = site("retail", first, spread.clone());
+        assert_eq!(retail.validate(), Ok(()));
+        jobs.registry.upsert(retail);
+        jobs.registry.upsert(site(
+            "docs",
+            first,
+            serde_json::json!({"mode": "pinned", "home": "us5"}),
+        ));
+
+        // Nothing pulled yet: the spread site is due, the pinned one is not.
+        assert_eq!(jobs.sync_spread_sites(), vec!["retail".to_string()]);
+        // While that pull runs, and after it fails, nothing new starts.
+        assert!(jobs.sync_spread_sites().is_empty());
+        idle(&jobs, "retail").await;
+        assert!(
+            jobs.sync_spread_sites().is_empty(),
+            "a fresh failure waits out the retry window"
+        );
+
+        // A failure older than the window is retried.
+        finished(
+            &jobs,
+            "retail",
+            first,
+            JobStatus::Failed,
+            now_secs() - SITE_SYNC_RETRY_SECS - 1,
+        );
+        assert_eq!(jobs.sync_spread_sites(), vec!["retail".to_string()]);
+        idle(&jobs, "retail").await;
+
+        // Succeeded with the tree on disk: in sync, even though the marker
+        // names the blob rather than the manifest digest in `ref`.
+        std::fs::create_dir_all(&root).unwrap();
+        crate::unpack::record_digest(&root, second).unwrap();
+        finished(&jobs, "retail", first, JobStatus::Succeeded, now_secs());
+        assert!(jobs.sync_spread_sites().is_empty());
+
+        // Somebody removed the tree: pull it back.
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(jobs.sync_spread_sites(), vec!["retail".to_string()]);
+        idle(&jobs, "retail").await;
+
+        // A new `ref` from any host's edit is pulled here too.
+        std::fs::create_dir_all(&root).unwrap();
+        crate::unpack::record_digest(&root, second).unwrap();
+        finished(&jobs, "retail", first, JobStatus::Succeeded, now_secs());
+        jobs.registry.upsert(site("retail", second, spread));
+        assert_eq!(jobs.sync_spread_sites(), vec!["retail".to_string()]);
+        idle(&jobs, "retail").await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Regression: a deploy that changed only `start_command` rebuilt a 2.2 GB

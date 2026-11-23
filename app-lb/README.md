@@ -4918,6 +4918,20 @@ home on another host is forwarded there rather than refused. Static, site and
 tunnel deployments keep the receiving host: their upstreams and files are
 that host's. A replace of an existing deployment goes to the host that runs it.
 
+**A site can be `spread`** when every host can fetch the same tree: its
+`artifact` names a URL store and its `ref` is a digest. Each listed host then
+pulls that digest into its own copy of `site.root`. A fleet host checks every
+20 s, starts a pull for each spread site it is not yet serving, and retries a
+failed one after 5 minutes. Any host can then answer the site's routes, and DNS
+can name all of them. Rolling out a new build is one edit of `artifact.ref`, on
+any host; each host's next check pulls it. A site whose files got there any
+other way, or one that names a tag, stays `pinned`:
+
+```json
+"artifact": {"store": "https://art.example", "ref": "4bb6eee2…c1e2", "strip_components": 1},
+"placement": {"mode": "spread"}
+```
+
 ### One admin name on every host
 
 1. Each host keeps its own host-scoped static admin deployment

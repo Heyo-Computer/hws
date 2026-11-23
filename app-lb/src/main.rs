@@ -1335,6 +1335,11 @@ fn main() {
     jobs.set_images(image_catalog.clone());
     jobs.set_global_store(store_slot.clone());
     autoscaler.set_images(image_catalog.clone());
+    // Each fleet host pulls its own copy of every `spread` site placed on it.
+    let site_sync = registry
+        .fleet_host()
+        .is_some()
+        .then(|| jobs::SiteSync(jobs.clone()));
 
     // ACME runs only when a contact address is configured. Its `Notify` goes to
     // the admin API so registering a deployment starts issuance immediately
@@ -1645,6 +1650,9 @@ fn main() {
     server.add_service(background_service("operations", operations::Watcher(operations, operations_adopted)));
     if let Some(t) = transfers {
         server.add_service(background_service("transfers", transfers::Sweeper(t)));
+    }
+    if let Some(s) = site_sync {
+        server.add_service(background_service("site-sync", s));
     }
     // Mount-tree reclamation, on the same terms. Cheaper than the disk sweep —
     // it reads one directory and compares names against the registry — but it
