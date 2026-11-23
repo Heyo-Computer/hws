@@ -3029,6 +3029,16 @@ support downloads. S3 reads are restricted to the configured bucket/prefix.
 Downloading an artifact
 does not make it an approved release or service archive.
 
+Every download sets step outputs from ci's record of the artifact: `digest`
+(SHA256), `size`, `public-url`, `sink` and `job`. Give the step an `id:` and
+read them as `${{ steps.<id>.outputs.digest }}`. With `with.transfer: 'false'`
+the step copies nothing into the VM and needs no `path`. It only selects the
+artifact and returns those outputs, which is enough for a job that names the
+artifact by digest, such as tagging it in the store. Without a transfer the
+digest is the only proof of which bytes were selected, so a record with no
+SHA256 is refused in that mode. Any value other than `true` or `false` is
+refused.
+
 This is CI execution history, not deployment authorization. The release actions
 above separately gate publication and the release-artifact handoff. Automatic
 reconciliation of uncertain deployments after finished runs remains outstanding.

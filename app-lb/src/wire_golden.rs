@@ -289,6 +289,8 @@ fn site_spec() -> DeploymentSpec {
             spa: true,
             spa_routes: vec![],
             cache_control: "public, max-age=300".into(),
+            markdown: Some("llms.txt".into()),
+            link: Some("<https://agents.example.com/llms.txt>; rel=\"alternate\"; type=\"text/plain\"".into()),
         }),
         update: Some(crate::config::UpdateSpec {
             working_dir: "/srv/docs".into(),

@@ -352,6 +352,14 @@ fn guest_mounts_survive_the_wire() {
     assert!(m.summary().contains("/data/corpus"));
 }
 
+#[test]
+fn site_discovery_settings_survive_the_wire() {
+    let d: DeploymentStatus = serde_json::from_str(&fixture("deployment-status-site")).unwrap();
+    let site = d.spec.site.unwrap();
+    assert_eq!(site.markdown.as_deref(), Some("llms.txt"));
+    assert_eq!(site.link.as_deref(), Some("<https://agents.example.com/llms.txt>; rel=\"alternate\"; type=\"text/plain\""));
+}
+
 /// Which fleet host runs a deployment, which a client shows beside its name:
 /// read as an absent field, it would describe another host's deployment as
 /// one this host runs.

@@ -164,6 +164,22 @@ CREATE TABLE {s}.placement_targets (
     ),
     (
         4,
+        // Each host's capacity, written by that host alone with its
+        // heartbeat. Nullable: a host on an older binary never writes it, and
+        // the placement controller then splits evenly, as it always has.
+        r#"
+ALTER TABLE {s}.hosts
+    ADD COLUMN cpus         bigint,
+    ADD COLUMN mem_total_mb bigint,
+    ADD COLUMN mem_free_mb  bigint,
+    ADD COLUMN at_capacity  boolean NOT NULL DEFAULT false,
+    ADD COLUMN capacity_at  timestamptz;
+"#,
+    ),
+    (
+        5,
+        // What else a host publishes with its heartbeat (`HostFacts`): the VM
+        // drivers it boots, its idle vCPUs, and its spread deployments' VMs.
         r#"
 ALTER TABLE {s}.hosts ADD COLUMN facts text;
 ALTER TABLE {s}.hosts ADD COLUMN facts_at timestamptz;
@@ -171,9 +187,12 @@ ALTER TABLE {s}.hosts ADD COLUMN facts_at timestamptz;
     ),
 ];
 
-/// A host's facts older than this are not believed: its binary may predate
-/// them, or it stopped publishing them.
-pub const FACTS_STALE_SECS: f64 = 30.0;
+/// How old a host's report (its capacity and its facts, written together by
+/// its heartbeat) may be before nothing believes it: its binary may predate
+/// them, or it stopped heartbeating. Six heartbeats. A stale or missing
+/// report means "unknown": the spread split falls back to even, and
+/// placement never chooses that host automatically.
+pub const REPORT_STALE_SECS: f64 = 30.0;
 
 const UPSERT_ANY: &str = "INSERT INTO {s}.records (kind, key, body, revision, updated_by)
      VALUES ($1, $2, $3, nextval('{s}.revision'), $4)
@@ -255,6 +274,20 @@ pub struct DemandReport {
     pub idle_secs: u64,
 }
 
+/// One host's capacity, as it last reported it (`hosts`, migration 4).
+///
+/// Memory is what decides whether the host's VM daemon admits another VM, so
+/// it is what placement weighs. `full` says the host should take no new
+/// replicas: its daemon recently refused a create for capacity, or it has
+/// almost no memory left.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capacity {
+    pub cpus: u32,
+    pub mem_total_mb: u64,
+    pub mem_free_mb: u64,
+    pub full: bool,
+}
+
 /// One fleet member as the hosts table has it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostRow {
@@ -266,29 +299,31 @@ pub struct HostRow {
     pub boot_id: String,
     /// Seconds since its last heartbeat.
     pub age_secs: f64,
-    /// What it last said it can run and has room for, while that is fresh
-    /// ([`FACTS_STALE_SECS`]). `None` for a host whose binary publishes
-    /// none, which placement treats as unknown rather than incapable.
+    /// Its capacity, while its report is fresh ([`REPORT_STALE_SECS`]).
+    /// `None` for a host on an older binary, in file mode, or gone quiet.
+    /// The one source of memory and `full` for both the spread split and
+    /// the placement of new pools.
+    pub capacity: Option<Capacity>,
+    /// What else it said, under the same staleness rule: the drivers it can
+    /// boot, its idle vCPUs, and its spread VMs. `None` for a host whose
+    /// binary publishes none, which placement treats as unknown rather than
+    /// incapable.
     pub facts: Option<HostFacts>,
 }
 
-/// What a host publishes with its heartbeat (`hosts.facts`, migration 4):
-/// the VM drivers it can boot, how much room it has, and which VMs of its
-/// `spread` deployments it holds. Additive JSON: a field a newer binary adds
-/// is ignored here, and one this binary expects and finds missing is empty.
+/// What a host publishes with its heartbeat beside its [`Capacity`]
+/// (`hosts.facts`, migration 5): the VM drivers it can boot, its idle vCPUs,
+/// and which VMs of its `spread` deployments it holds. Additive JSON: a
+/// field a newer binary adds is ignored here, and one this binary expects
+/// and finds missing is empty. Memory is not here on purpose: it lives in
+/// [`Capacity`], so placement and the spread split read the same numbers.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HostFacts {
     /// Driver names (`firecracker`, `kvm`, `libvirt`, `lxc`). `None` when
     /// the host could not tell, which is not the same as none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drivers: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_free_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_total_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vcpus: Option<u64>,
-    /// Idle vCPUs, estimated from the host's CPU use.
+    /// Idle vCPUs, estimated from the host's CPU use. A tie-break only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpus_free: Option<f64>,
     /// `sandbox id -> deployment id` for the VMs this host runs for its
@@ -299,7 +334,7 @@ pub struct HostFacts {
 
 impl HostFacts {
     fn parse(body: Option<String>, age: Option<f64>) -> Option<Self> {
-        if age.is_none_or(|a| a > FACTS_STALE_SECS) {
+        if age.is_none_or(|a| a > REPORT_STALE_SECS) {
             return None;
         }
         serde_json::from_str(&body?).ok()
@@ -984,32 +1019,52 @@ impl PgStore {
     }
 
     /// Say this host is alive, and where its peers reach it. Its own row, so
-    /// a heartbeat never touches the change feed. `facts` (a [`HostFacts`]
-    /// as JSON) replaces what the row published before; `None` leaves it.
+    /// a heartbeat never touches the change feed.
+    ///
+    /// This is the host's one report: `capacity` and `facts` (a
+    /// [`HostFacts`] as JSON) are written in the same statement, stamped
+    /// with the same time, so every reader sees them together and ages them
+    /// by one rule ([`REPORT_STALE_SECS`]). Either `None` leaves what the
+    /// row published before, which then goes stale on its own.
     pub async fn heartbeat(
         &self,
         host: &str,
         address: Option<&str>,
         boot_id: &str,
+        capacity: Option<Capacity>,
         facts: Option<&str>,
     ) -> Result<(), PgFailure> {
         let sql = self.sql(
-            "INSERT INTO {s}.hosts (host, address, boot_id, heartbeat_at, facts, facts_at)
-             VALUES ($1, $2, $3, now(), $4, CASE WHEN $4::text IS NULL THEN NULL ELSE now() END)
+            "INSERT INTO {s}.hosts (host, address, boot_id, heartbeat_at,
+                                    cpus, mem_total_mb, mem_free_mb, at_capacity, capacity_at,
+                                    facts, facts_at)
+             VALUES ($1, $2, $3, now(),
+                     $4, $5, $6, COALESCE($7, false), CASE WHEN $5::bigint IS NULL THEN NULL ELSE now() END,
+                     $8, CASE WHEN $8::text IS NULL THEN NULL ELSE now() END)
              ON CONFLICT (host) DO UPDATE
              SET address = EXCLUDED.address, boot_id = EXCLUDED.boot_id, heartbeat_at = now(),
+                 cpus = COALESCE(EXCLUDED.cpus, {s}.hosts.cpus),
+                 mem_total_mb = COALESCE(EXCLUDED.mem_total_mb, {s}.hosts.mem_total_mb),
+                 mem_free_mb = COALESCE(EXCLUDED.mem_free_mb, {s}.hosts.mem_free_mb),
+                 at_capacity = CASE WHEN $5::bigint IS NULL THEN {s}.hosts.at_capacity ELSE EXCLUDED.at_capacity END,
+                 capacity_at = COALESCE(EXCLUDED.capacity_at, {s}.hosts.capacity_at),
                  facts = COALESCE(EXCLUDED.facts, {s}.hosts.facts),
                  facts_at = COALESCE(EXCLUDED.facts_at, {s}.hosts.facts_at)",
         );
+        let n = |v: u64| v.min(i64::MAX as u64) as i64;
         let (host, address, boot_id, facts) = (
             host.to_string(),
             address.map(str::to_string),
             boot_id.to_string(),
             facts.map(str::to_string),
         );
+        let cpus = capacity.map(|c| i64::from(c.cpus));
+        let total = capacity.map(|c| n(c.mem_total_mb));
+        let free = capacity.map(|c| n(c.mem_free_mb));
+        let full = capacity.map(|c| c.full);
         self.call(move |pool| async move {
             let c = pool.get().await.map_err(pool_failure)?;
-            c.execute(&sql, &[&host, &address, &boot_id, &facts])
+            c.execute(&sql, &[&host, &address, &boot_id, &cpus, &total, &free, &full, &facts])
                 .await
                 .map_err(classify)?;
             Ok(())
@@ -1037,6 +1092,8 @@ impl PgStore {
         let sql = self.sql(
             "SELECT host, address, state, boot_id,
                     extract(epoch FROM now() - heartbeat_at)::float8,
+                    cpus, mem_total_mb, mem_free_mb, at_capacity,
+                    extract(epoch FROM now() - capacity_at)::float8,
                     facts, extract(epoch FROM now() - facts_at)::float8
              FROM {s}.hosts ORDER BY host",
         );
@@ -1045,13 +1102,34 @@ impl PgStore {
             let rows = c.query(&sql, &[]).await.map_err(classify)?;
             Ok(rows
                 .iter()
-                .map(|r| HostRow {
-                    host: r.get(0),
-                    address: r.get(1),
-                    state: r.get(2),
-                    boot_id: r.get(3),
-                    age_secs: r.get::<_, f64>(4).max(0.0),
-                    facts: HostFacts::parse(r.get(5), r.get(6)),
+                .map(|r| {
+                    let capacity = match (
+                        r.get::<_, Option<i64>>(5),
+                        r.get::<_, Option<i64>>(6),
+                        r.get::<_, Option<i64>>(7),
+                        r.get::<_, Option<f64>>(9),
+                    ) {
+                        (Some(cpus), Some(total), Some(free), Some(age))
+                            if age <= REPORT_STALE_SECS && total > 0 =>
+                        {
+                            Some(Capacity {
+                                cpus: cpus.clamp(0, u32::MAX as i64) as u32,
+                                mem_total_mb: total.max(0) as u64,
+                                mem_free_mb: free.max(0) as u64,
+                                full: r.get(8),
+                            })
+                        }
+                        _ => None,
+                    };
+                    HostRow {
+                        host: r.get(0),
+                        address: r.get(1),
+                        state: r.get(2),
+                        boot_id: r.get(3),
+                        age_secs: r.get::<_, f64>(4).max(0.0),
+                        capacity,
+                        facts: HostFacts::parse(r.get(10), r.get(11)),
+                    }
                 })
                 .collect())
         })
@@ -1665,11 +1743,11 @@ pub(crate) mod tests {
             return;
         };
         let cursor = a.snapshot().unwrap().cursor;
-        a.heartbeat("us5", Some("203.0.113.5"), "boot-1", None)
+        a.heartbeat("us5", Some("203.0.113.5"), "boot-1", None, None)
             .await
             .unwrap();
-        a.heartbeat("us4", None, "boot-2", Some(r#"{"drivers":["libvirt"],"memory_free_bytes":7,"vms":{"sb-1":"web"}}"#)).await.unwrap();
-        a.heartbeat("us5", Some("203.0.113.6"), "boot-3", None)
+        a.heartbeat("us4", None, "boot-2", None, Some(r#"{"drivers":["libvirt"],"vcpus_free":3.5,"vms":{"sb-1":"web"}}"#)).await.unwrap();
+        a.heartbeat("us5", Some("203.0.113.6"), "boot-3", None, None)
             .await
             .unwrap();
         let hosts = a.hosts().await.unwrap();
@@ -1684,15 +1762,65 @@ pub(crate) mod tests {
         let us4 = hosts[0].facts.clone().expect("us4's facts");
         assert_eq!(us4.supports("libvirt"), Some(true));
         assert_eq!(us4.supports("firecracker"), Some(false));
-        assert_eq!(us4.memory_free_bytes, Some(7));
+        assert_eq!(us4.vcpus_free, Some(3.5));
         assert_eq!(us4.vms.get("sb-1").map(String::as_str), Some("web"));
         // A heartbeat without facts keeps the last ones.
-        a.heartbeat("us4", None, "boot-2", None).await.unwrap();
+        a.heartbeat("us4", None, "boot-2", None, None).await.unwrap();
         assert_eq!(a.hosts().await.unwrap()[0].facts.as_ref(), Some(&us4));
         assert_eq!(
             a.snapshot().unwrap().cursor,
             cursor,
             "heartbeats never reach the feed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capacity_and_facts_are_one_report_on_the_heartbeat() {
+        let Some(a) = test_store("capacity", "us5/1") else {
+            eprintln!("skipped: {TEST_URL_ENV} is not set");
+            return;
+        };
+        let cursor = a.snapshot().unwrap().cursor;
+        let cap = Capacity {
+            cpus: 56,
+            mem_total_mb: 128_000,
+            mem_free_mb: 64_000,
+            full: false,
+        };
+        a.heartbeat("us5", None, "boot-1", None, None).await.unwrap();
+        a.heartbeat("us4", None, "boot-2", None, None).await.unwrap();
+        assert!(
+            a.hosts()
+                .await
+                .unwrap()
+                .iter()
+                .all(|h| h.capacity.is_none() && h.facts.is_none()),
+            "an older binary reports nothing"
+        );
+        a.heartbeat("us5", None, "boot-1", Some(cap), Some(r#"{"drivers":["firecracker"]}"#))
+            .await
+            .unwrap();
+        let hosts = a.hosts().await.unwrap();
+        assert_eq!(hosts[0].capacity, None, "us4 never reported");
+        assert_eq!(hosts[1].capacity, Some(cap));
+        assert_eq!(hosts[1].facts.as_ref().and_then(|f| f.supports("firecracker")), Some(true));
+        let full = Capacity {
+            full: true,
+            mem_free_mb: 100,
+            ..cap
+        };
+        a.heartbeat("us5", None, "boot-1", Some(full), None).await.unwrap();
+        assert_eq!(a.hosts().await.unwrap()[1].capacity, Some(full));
+        // A heartbeat that has no fresh numbers keeps the last ones (they
+        // age out on their own after REPORT_STALE_SECS), `full` included.
+        a.heartbeat("us5", None, "boot-3", None, None).await.unwrap();
+        let us5 = &a.hosts().await.unwrap()[1];
+        assert_eq!(us5.capacity, Some(full), "a bare heartbeat keeps the capacity");
+        assert!(us5.facts.is_some(), "and the facts");
+        assert_eq!(
+            a.snapshot().unwrap().cursor,
+            cursor,
+            "the report never reaches the feed"
         );
     }
 

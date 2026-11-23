@@ -6032,7 +6032,7 @@ async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String
         else { discovery_status_locked(&state.registry, &id) };
     match status {
         Ok(mut status) => {
-            if let Some(deployment) = (if target.staged { state.registry.staged(&id) } else { state.registry.get(&id) }) {
+            if let Some(deployment) = if target.staged { state.registry.staged(&id) } else { state.registry.get(&id) } {
                 if let Some(spec) = deployment.spec.discovery.as_ref().and_then(|d| d.regional.as_ref()) {
                     let ready = state.secrets.resolve(&spec.auth).is_ok_and(|token|
                         !token.is_empty() && http::HeaderValue::from_str(&token).is_ok())
@@ -8333,12 +8333,6 @@ async fn get_secret(
         Some(s) => Json(s).into_response(),
         None => err(StatusCode::NOT_FOUND, format!("no secret {id:?}")).into_response(),
     }
-}
-
-#[derive(Deserialize)]
-struct ForceParams {
-    #[serde(default)]
-    force: bool,
 }
 
 /// `DELETE /secrets/:id[?force=true]`.
@@ -13802,14 +13796,14 @@ mod tests {
 
             const PEER_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
-            fn row(host: &str, age: f64, facts: Option<HostFacts>) -> HostRow {
+            fn row(host: &str, age: f64, report: Option<(HostFacts, crate::fleet_pg::Capacity)>) -> HostRow {
                 HostRow { host: host.into(), address: Some(format!("{host}.example")), state: "active".into(),
-                    boot_id: "b".into(), age_secs: age, facts }
+                    boot_id: "b".into(), age_secs: age, capacity: report.as_ref().map(|r| r.1), facts: report.map(|r| r.0) }
             }
 
-            fn facts(drivers: &[&str], free: u64) -> Option<HostFacts> {
-                Some(HostFacts { drivers: Some(drivers.iter().map(|d| d.to_string()).collect()),
-                    memory_free_bytes: Some(free), ..Default::default() })
+            fn facts(drivers: &[&str], free: u64) -> Option<(HostFacts, crate::fleet_pg::Capacity)> {
+                Some((HostFacts { drivers: Some(drivers.iter().map(|d| d.to_string()).collect()), ..Default::default() },
+                    crate::fleet_pg::Capacity { cpus: 8, mem_total_mb: 1_000, mem_free_mb: free, full: false }))
             }
 
             fn spec(id: &str, home: &str) -> DeploymentSpec {
@@ -13840,7 +13834,7 @@ mod tests {
                 let members = vec![
                     row("us4", 0.0, facts(&["firecracker"], 10)),
                     row("us5", if us5_live { 0.0 } else { 100.0 }, facts(&["firecracker", "kvm"], 50).map(|mut f| {
-                        f.vms.insert("sb-b".into(), "s".into());
+                        f.0.vms.insert("sb-b".into(), "s".into());
                         f
                     })),
                     row("us6", 0.0, None),

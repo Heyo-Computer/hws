@@ -28,7 +28,7 @@
 #   index.json        { "store": …, "apps": { "<app>": "<latest>", … } }
 #   install-apps.sh   The installer, copied in so the site serving the
 #                     manifests also serves the script that reads them.
-#   bootstrap-host.sh The fleet host installer, which uses install-apps.sh.
+#   bootstrap-host.sh The fleet host installer (`--binaries releases` uses install-apps.sh).
 #
 # `kind` tells the installer what to do with the unpacked tarball:
 #

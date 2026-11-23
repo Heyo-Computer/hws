@@ -35,6 +35,8 @@ one host, move one of them (`APP_OBS_INGEST_ADDR` or `CI_LISTEN_ADDR`).
 ## Host requirements
 
 - Linux x86_64 with `/dev/kvm` (bare metal, or a VM with nested virtualisation).
+  On AWS, [`app-lb/deploy/ec2`](../app-lb/deploy/ec2/README.md) builds an AMI
+  for a single-server app-lb host on a nested-virtualisation instance.
 - Firecracker on `PATH`. `bootstrap-host.sh` installs `v1.16.1` by default.
 - docker and `e2fsprogs` if the host builds guest images (any deployment with a
   `build` block, or `heyctl build`).
@@ -66,10 +68,10 @@ first install.
 ## Bootstrap a fleet host
 
 [`.ci/bootstrap-host.sh`](../.ci/bootstrap-host.sh) turns a fresh
-Debian/Ubuntu host into an app-lb host: it installs packages and Firecracker,
-installs `heyvm`, `app-lb` and `art` with `install-apps.sh`, writes supervisor
-units for `heyvmd` and `app-lb`, starts them, and routes `admin.<domain>` to
-the admin API. It creates no workload VMs.
+Debian/Ubuntu host into an app-lb host. It installs packages and Firecracker,
+and installs `heyvm`, `heyvmd`, `heyctl` and `app-lb` from their public
+channels. It writes supervisor units for `heyvmd` and `app-lb`, starts them,
+and routes `admin.<domain>` to the admin API. It creates no workload VMs.
 
 Write the secrets first, mode `0600`, over a channel that does not record them:
 
@@ -87,7 +89,7 @@ that value is heyvmd's operator key, and app-lb must present the same value as
 Then run, as root:
 
 ```sh
-curl -fsSL https://get.us2.heyo.work/bootstrap-host.sh | sh -s -- \
+curl -fsSL https://raw.githubusercontent.com/Heyo-Computer/heyo-public/main/.ci/bootstrap-host.sh | sh -s -- \
     --id us4 --domain us4.example.com \
     --public-ip 203.0.113.4 --acme-email ops@example.com
 ```
@@ -99,18 +101,25 @@ curl -fsSL https://get.us2.heyo.work/bootstrap-host.sh | sh -s -- \
 | `--public-ip IP` | yes | The host's public address (`APP_LB_PUBLIC_IPS`) |
 | `--acme-email EMAIL` | yes | Let's Encrypt account contact (`APP_LB_ACME_EMAIL`) |
 | `--acme-staging` | no | Use the Let's Encrypt staging directory |
-| `--releases-url URL` | no | Manifest site. Default `https://get.us2.heyo.work` |
+| `--stage all\|install\|configure` | no | `install` puts packages and binaries on disk with no arguments, KVM or secrets (image builds); `configure` does the per-host rest. Default `all` |
+| `--binaries heyo\|releases\|none` | no | Where binaries come from. `heyo` (default): heyvm from `heyo-cli-releases`, heyctl from `heyo.computer/heyctl/install.sh`, app-lb from `hub.heyo.work/heyo/app-lb`. `releases`: the manifest site via `install-apps.sh` (also installs `art`). `none`: leave them alone |
+| `--vm-api heyvmd\|heyvm` | no | `heyvm` serves the sandbox API with `heyvm --api` (no Heyo login needed) and drops port 34099 on all but loopback. Default `heyvmd`, which needs a login |
+| `--releases-url URL` | no | Manifest site for `--binaries releases`. Default `https://get.us2.heyo.work` |
 
 | Environment | Default | Meaning |
 | --- | --- | --- |
 | `RELEASES_URL` | `https://get.us2.heyo.work` | Same as `--releases-url` |
-| `FIRECRACKER_VERSION` | `v1.16.1` | Firecracker release to install if the one on `PATH` differs |
+| `FIRECRACKER_VERSION` | `v1.16.1` | Firecracker release to install if the one on `PATH` differs, checked against its `.sha256.txt` |
+| `APP_LB_TAG`, `APP_LB_DIGEST` | `latest`, unset | hub tag of app-lb, and the blob sha256 it must resolve to |
+| `HEYVM_VERSION`, `HEYVM_SHA256` | `latest`, unset | heyvm release, and the tarball sha256 it must match (unverified without it) |
+| `HEYCTL_VERSION`, `HEYCTL_DIGEST` | `latest`, unset | heyctl release, and its blob sha256 |
 | `DASHBOARD_USER` | `heyo` | `APP_LB_DASHBOARD_USER` |
 
 What the host looks like afterwards:
 
-- `heyvmd --api-port 34099` under supervisor, `MVM_DATA_DIR=/var/lib/heyvm`,
-  logs in `/var/log/heyvmd/`.
+- `heyvmd --api-port 34099` (or `heyvm --api --port 34099` with `--vm-api
+  heyvm`) under supervisor, `MVM_DATA_DIR=/var/lib/heyvm`, logs in
+  `/var/log/heyvmd/`.
 - `app-lb` as root, proxy on `:80`, TLS on `:443`, admin on `127.0.0.1:9090`,
   state in `/var/lib/app-lb/app-lb-state.json`, ACME in `/var/lib/app-lb/acme`,
   `APP_LB_ART_BIN=/usr/local/bin/art`, images in

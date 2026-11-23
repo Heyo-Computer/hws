@@ -29,6 +29,8 @@ test("goals in an agent's own words reach the right plan", () => {
     ["the site status is empty and every page is 404", "fix-empty-site"],
     ["my vm pool never becomes ready", "fix-vm-not-ready"],
     ["403 forbidden: a namespace credential may not use update", "fix-forbidden"],
+    ["gate my deployment with heyo auth", "gate-with-heyo-signin"],
+    ["put the app behind a login", "gate-with-heyo-signin"],
   ];
   for (const [goal, id] of cases) assert.equal(matchGuide(goal)?.id, id, goal);
 });

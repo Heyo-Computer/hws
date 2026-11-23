@@ -302,6 +302,8 @@ pub struct SiteSpec {
     pub spa: bool,
     pub spa_routes: Vec<String>,
     pub cache_control: String,
+    pub markdown: Option<String>,
+    pub link: Option<String>,
 }
 
 impl DeploymentSpec {

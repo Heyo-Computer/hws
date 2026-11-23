@@ -1736,6 +1736,71 @@ mod repo_workflow {
     }
 
     #[test]
+    fn us2_production_policy_publishes_to_the_hub_then_rolls_us4_before_us5() {
+        const REPO: &str = "https://github.com/Heyo-Computer/heyo-public.git";
+        let raw = include_str!("../../.ci/release-policies/us2-production.yml");
+        // The same admission ci applies to CI_RELEASE_POLICIES.
+        let policy = crate::release_policy::select(Some(raw), REPO).unwrap().expect("the policy names this repository");
+        assert!(crate::release_policy::select(Some(raw), "https://github.com/Heyo-Computer/other.git").unwrap().is_none());
+        // Checkout finds the planned workflow in the submitted source
+        // descriptor, which holds only files the client sends from
+        // .ci/workflows/. A path outside it fails every release job at checkout.
+        assert!(policy.workflow_path.starts_with(".ci/workflows/") && policy.workflow_path.ends_with(".yml"),
+            "workflow_path {} is not a submitted workflow file", policy.workflow_path);
+        assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(&policy.workflow_path).is_file(),
+            "workflow_path {} does not exist in the repository", policy.workflow_path);
+        let wf = Workflow::parse(&policy.workflow_path, &policy.workflow).unwrap();
+        assert_eq!(wf.on, ["release"]);
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        crate::submission::validate_release_plan(&plan).unwrap();
+        assert_eq!(plan.jobs.iter().map(|j| j.base_id.as_str()).collect::<Vec<_>>(), ["merge", "hub", "us4", "us5", "us1"]);
+        let job = |id: &str| plan.jobs.iter().find(|j| j.base_id == id).unwrap();
+        for (id, predecessor) in [("hub", "merge"), ("us4", "hub"), ("us5", "us4"), ("us1", "us5")] {
+            assert_eq!(job(id).needs, [predecessor], "{id}");
+            assert!(job(id).condition.is_none(), "do not skip a dependency stage");
+        }
+        // hub names the validated artifact by digest: no transfer into the VM
+        // and no checkout, so it depends on neither the runner's copy path nor
+        // the VM reaching GitHub.
+        let hub = &job("hub").steps;
+        assert_eq!(hub.len(), 2);
+        assert!(hub.iter().all(|s| s.uses.as_deref() != Some("ci/checkout-release")));
+        assert_eq!(hub[0].uses.as_deref(), Some("ci/download-artifact"));
+        assert_eq!(hub[0].id.as_deref(), Some("artifact"));
+        assert_eq!(hub[0].with["workflow"], ".ci/workflows/app-lb.yml");
+        assert_eq!(hub[0].with["name"], "app-lb");
+        assert_eq!(hub[0].with["transfer"], "false");
+        assert_eq!(hub[1].env["DIGEST"], "${{ steps.artifact.outputs.digest }}");
+        assert_eq!(hub[1].env["REVISION"], "${{ ci.sha }}");
+        let script = hub[1].run.as_deref().unwrap();
+        assert!(script.contains("/manifests") && script.contains("\"latest\""), "tags by manifest, including latest");
+        assert!(!script.contains("${{"), "values reach the script through env, not interpolation");
+        for region in ["us4", "us5", "us1"] {
+            let step = &job(region).steps[0];
+            assert_eq!(step.uses.as_deref(), Some("ci/rollout-host-app-lb"));
+            assert_eq!(step.with["target"], format!("app-lb-{region}"));
+            assert_eq!(step.with["token"], "${{ secrets.APP_LB_US_FLEET_TOKEN }}");
+            assert_eq!(step.with["artifact"], "app-lb");
+        }
+
+        // Every deployment step selects on exactly the changes that make
+        // app-lb.yml build the bundle, so a release never demands an absent one.
+        let yaml = include_str!("../../.ci/workflows/app-lb.yml");
+        let validation = Workflow::parse(".ci/workflows/app-lb.yml", yaml).unwrap();
+        for path in ["app-lb/src/main.rs", "app-lb/heyctl/src/main.rs", "pg-fc/api/src/lib.rs", ".ci/workflows/app-lb.yml",
+            ".ci/rust-cache.sh", ".ci/image/apps/Dockerfile", ".ci/workflows/regional-release.yml",
+            ".ci/publish-hub.py", "ci/src/main.rs", "README.md"] {
+            let changes = crate::paths::Changes::known(vec![path.into()]);
+            let mut ctx = crate::expr::Context::new();
+            ctx.set("ci", serde_json::json!({"changes_known":true,"changed_files":[path]}));
+            let builds = validation.on_submit.admits("feature", &changes).is_ok();
+            for step in plan.jobs.iter().skip(1).flat_map(|j| &j.steps) {
+                assert_eq!(ctx.eval_condition(step.condition.as_deref().unwrap()).unwrap(), builds, "{path}");
+            }
+        }
+    }
+
+    #[test]
     fn regional_release_orders_regions_and_selects_exact_validation_artifacts() {
         let text = include_str!("../../.ci/workflows/regional-release.yml");
         let wf = Workflow::parse("regional-release.yml", text).unwrap();

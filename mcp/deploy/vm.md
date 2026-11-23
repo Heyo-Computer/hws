@@ -202,22 +202,36 @@ app-token gate, which forwards no identity by design ("a token is not a
 person"). Under this shape the old justification — "and the listener is
 loopback" — no longer holds, and the two items above are what stands in for it.
 
-## Building
+## Building and releasing
 
 `heyvm mvm build` runs docker build → docker create → docker export → mke2fs,
 so only the filesystem survives; the kernel boots `init=/init.sh` and app-lb
 starts node afterwards via `start_command`, the only channel carrying the env
-vars above.
+vars above. The Docker build runs the test suite, so a failing test fails the
+image.
 
-    # locally, from mcp/
-    heyvm mvm build --local-only -f deploy/image/Dockerfile -c . -n heyo-mcp
+The image is built once, from a clean checkout of the commit being released,
+and published to the global store as `heyo/heyo-mcp:<short sha>`. Every
+region's `heyo-mcp` deployment pulls that tag through `hub.heyo.work` with
+`artifact` (not `build`), so mcp.heyo.work and mcp.us2 run byte-identical
+images. The repository is private: pulls present the `artifacts` secret's
+`api-key`.
 
-    # on the fleet
-    applb_build_deployment heyo-mcp     # POST /deployments/heyo-mcp/build
+    # from mcp/ in a clean worktree at <sha>
+    heyvm mvm build --local-only -f deploy/image/Dockerfile -c . -n heyo-mcp-<sha> --size-mb 768
+    heyctl artifact push --image heyo-mcp-<sha> --tag heyo/heyo-mcp:<sha>
 
-The `build` block pairs `"dockerfile": "mcp/deploy/image/Dockerfile"` with
-`"context": "mcp"`, keeping the context to this subtree. There is no `update`
-block: a VM deployment ships a new image, it does not `git pull` in place.
+    # per region: point `artifact.ref` at the new tag, then
+    heyctl --context us5 apply -f .heyo/regions/us5/heyo-mcp.json
+    heyctl --context us5 pull heyo-mcp --wait
+
+The first pull of a new tag fills the hub's cache from S3, and the hub can
+take more than a minute to answer it. If a pull fails with `error sending
+request`, wait for `HEAD https://hub.heyo.work/blobs/<digest>` to answer and
+then pull again.
+
+There is no `update` block: a VM deployment ships a new image, it does not
+`git pull` in place.
 
 ## Rollback
 

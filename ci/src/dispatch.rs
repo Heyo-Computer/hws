@@ -3539,7 +3539,9 @@ impl Dispatcher {
             }
             "ci/download-artifact" => {
                 let name = required("name")?;
-                let path = required("path")?;
+                let transfer = download_transfer(with("transfer").as_deref())?;
+                // Metadata only needs no destination; a transfer still requires one.
+                let path = if transfer { required("path")? } else { with("path").unwrap_or_default() };
                 let producer = with("job").filter(|v| !v.trim().is_empty());
                 let artifact_run = match with("workflow") {
                     Some(workflow) => crate::submission::artifact_run(&self.store, &msg.run_id, &workflow)
@@ -3547,7 +3549,7 @@ impl Dispatcher {
                     None => msg.run_id.clone(),
                 };
                 let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
-                let remote = artifact_download_path(workdir, &path)?;
+                let remote = if transfer { Some(artifact_download_path(workdir, &path)?) } else { None };
                 // Scope at the query boundary: workflow input can name an
                 // artifact and its producer, never an arbitrary run, URI or URL.
                 // Cross-run lookup requires frozen successful submission membership.
@@ -3572,11 +3574,16 @@ impl Dispatcher {
                     },
                 })).collect::<Result<Vec<_>, DispatchError>>()?;
                 let selected = select_download(&artifact_run, &name, producer.as_deref(), &candidates)?;
+                let outputs = download_outputs(selected, transfer)?;
+                let Some(remote) = remote else {
+                    return Ok((format!("[ci] artifact {name:?} from job {:?}: sha256 {}, {} bytes (not transferred)\n",
+                        selected.job_key, outputs["digest"].as_str().unwrap_or_default(), selected.stored.size_bytes), outputs));
+                };
                 let bytes = self.artifacts.get(&selected.stored).await
                     .map_err(|e| DispatchError::Artifact(format!("downloading artifact {name:?}: {e}")))?;
                 vm.upload_bytes(sid, &remote, &bytes).await?;
                 Ok((format!("[ci] downloaded artifact {name:?} from job {:?} to {path:?} ({} bytes)\n",
-                    selected.job_key, bytes.len()), serde_json::json!({})))
+                    selected.job_key, bytes.len()), outputs))
             }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
@@ -3700,6 +3707,37 @@ fn select_download<'a>(run_id: &str, name: &str, producer: Option<&str>, candida
         [one] => Ok(one),
         many => Err(DispatchError::Artifact(format!("artifact {name:?} is ambiguous: {} producers match; set with.job", many.len()))),
     }
+}
+
+/// `with.transfer` for `ci/download-artifact`: absent or `true` copies the
+/// bytes into the job's VM; `false` returns only the recorded identity. Any
+/// other value is refused rather than guessed at.
+fn download_transfer(raw: Option<&str>) -> Result<bool, DispatchError> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(DispatchError::Artifact(format!(
+            "ci/download-artifact with.transfer must be true or false, not {other:?}"))),
+    }
+}
+
+/// Step outputs for `ci/download-artifact`: the validated artifact's recorded
+/// identity, so a later step can name it by digest without its bytes. Without
+/// a transfer the digest is the only proof of which bytes were selected, so a
+/// record that lacks one (older disk records) is refused in that mode.
+fn download_outputs(selected: &DownloadCandidate, transfer: bool) -> Result<serde_json::Value, DispatchError> {
+    let digest = selected.stored.digest.clone().unwrap_or_default();
+    if !transfer && (digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(DispatchError::Artifact(format!(
+            "artifact {:?} has no recorded SHA256, so it cannot be named without transferring it", selected.name)));
+    }
+    Ok(serde_json::json!({
+        "digest": digest,
+        "size": selected.stored.size_bytes.to_string(),
+        "public-url": selected.stored.public_url.clone().unwrap_or_default(),
+        "sink": selected.stored.sink,
+        "job": selected.job_key,
+    }))
 }
 
 fn artifact_download_path(workdir: &str, path: &str) -> Result<String, DispatchError> {
@@ -5685,6 +5723,31 @@ mod tests {
                 sink: "disk", digest: None, size_bytes: 1, uri: "/recorded".into(), public_url: None,
             },
         }
+    }
+
+    #[test]
+    fn artifact_download_transfer_is_explicit_and_metadata_names_the_digest() {
+        assert!(download_transfer(None).unwrap());
+        assert!(download_transfer(Some("true")).unwrap());
+        assert!(!download_transfer(Some(" false ")).unwrap());
+        assert!(download_transfer(Some("no")).unwrap_err().to_string().contains("true or false"));
+
+        let mut c = download_candidate("run", "release");
+        c.stored.sink = "artifacts";
+        c.stored.size_bytes = 27872244;
+        c.stored.digest = Some("c072fc11b5e2d6b91eb95670369b3f66d674d82eb18ac64d603ee1eb329a1e59".into());
+        c.stored.public_url = Some("https://art.example/blobs/c072fc11".into());
+        let out = download_outputs(&c, false).unwrap();
+        assert_eq!(out["digest"], "c072fc11b5e2d6b91eb95670369b3f66d674d82eb18ac64d603ee1eb329a1e59");
+        assert_eq!(out["size"], "27872244");
+        assert_eq!(out["public-url"], "https://art.example/blobs/c072fc11");
+        assert_eq!(out["sink"], "artifacts");
+        assert_eq!(out["job"], "release");
+
+        // Without bytes, the digest is the only proof of which artifact this is.
+        let legacy = download_candidate("run", "release");
+        assert!(download_outputs(&legacy, false).unwrap_err().to_string().contains("no recorded SHA256"));
+        assert_eq!(download_outputs(&legacy, true).unwrap()["digest"], "");
     }
 
     #[test]

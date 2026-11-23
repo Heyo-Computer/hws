@@ -46,7 +46,7 @@ const KNOWN = {
     ExpectedHeader: ["name", "value"],
     BuildSpec: ["repo", "store", "ref", "dockerfile", "context", "image_name", "image_size_mb", "auth"],
     ArtifactSpec: ["store", "ref", "auth", "grow_gb", "image_name", "strip_components"],
-    SiteSpec: ["root", "index", "not_found", "spa", "cache_control"],
+    SiteSpec: ["root", "index", "not_found", "spa", "cache_control", "markdown", "link"],
     UpdateSpec: ["working_dir", "commands", "env", "env_from", "auth", "timeout_secs", "verify_timeout_secs"],
     SecretEnv: ["secret", "key", "as", "namespace"],
     SecretRef: ["secret", "key", "username", "namespace"],

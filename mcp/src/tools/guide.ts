@@ -124,6 +124,20 @@ export const GUIDES: readonly Guide[] = [
     ],
   },
   {
+    id: "gate-with-heyo-signin",
+    title: "Put a deployment behind Heyo sign-in",
+    keywords: ["behind a login", "behind sign-in", "heyo sign-in", "sign-in", "sign in", "signin", "login", "log in", "gate", "gated", "protect", "heyo auth", "jwt", "jwks", "restrict", "private site"],
+    steps: [
+      "applb_get_deployment {id}, then applb_deploy with that spec plus `\"auth\": {\"provider_ref\": \"heyo\"}`. That is the whole gate: the `heyo` provider is already installed in your namespace.",
+      "Keep machine paths open if anything polls them: `\"public_paths\": [{\"path\": \"/healthz\", \"scope\": \"public\"}]` next to `provider_ref`.",
+      "A browser without a session is sent to Heyo sign-in and comes back signed in; a program without a token gets 401. `forward_identity` (on by default) passes `x-auth-request-email`/`-user` to the app.",
+    ],
+    pitfalls: [
+      "Do NOT write a `jwt` block, store a JWT signing secret, or look up a JWKS URL for Heyo sign-in. The `heyo` provider already has them, and a gate that sets `provider_ref` and also sets `jwt`, `provider`, `client_id` or the allow-lists is refused.",
+      "The provider admits every signed-in Heyo user. To narrow it, set `require` (e.g. `{\"accountId\": [\"acct_…\"]}`) in the namespace's `auth-heyo` plugin config, which feeds the `heyo` provider; the gate itself takes no allow-list.",
+    ],
+  },
+  {
     id: "check-a-deployment",
     title: "See whether a deployment is working",
     keywords: ["status", "check", "health", "healthy", "working", "logs", "debug", "broken", "down", "verify"],

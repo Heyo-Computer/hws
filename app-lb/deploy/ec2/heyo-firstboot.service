@@ -1,0 +1,18 @@
+# Installed by app-lb-host.pkr.hcl. Configures the app-lb host once, from
+# user-data + SSM; see firstboot.sh. Logs: journalctl -u heyo-firstboot
+[Unit]
+Description=Heyo app-lb host first-boot configuration
+Wants=network-online.target
+After=network-online.target cloud-init.service docker.service supervisor.service
+ConditionPathExists=!/var/lib/heyo/firstboot.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/heyo-firstboot
+TimeoutStartSec=15min
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

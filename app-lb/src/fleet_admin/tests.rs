@@ -1,22 +1,29 @@
 use super::*;
 
-fn row(host: &str, state: &str, facts: Option<HostFacts>) -> HostRow {
+/// One host's heartbeat report: its facts and its capacity, written together.
+type Report = (HostFacts, crate::fleet_pg::Capacity);
+
+fn row(host: &str, state: &str, report: Option<Report>) -> HostRow {
     HostRow {
         host: host.into(),
         address: Some(format!("{host}.example")),
         state: state.into(),
         boot_id: "b".into(),
         age_secs: 0.0,
-        facts,
+        capacity: report.as_ref().map(|r| r.1),
+        facts: report.map(|r| r.0),
     }
 }
 
-fn facts(drivers: &[&str], free: u64) -> Option<HostFacts> {
-    Some(HostFacts {
-        drivers: Some(drivers.iter().map(|d| d.to_string()).collect()),
-        memory_free_bytes: Some(free),
-        ..Default::default()
-    })
+/// A report saying the host boots `drivers` and has `free` MiB free.
+fn facts(drivers: &[&str], free: u64) -> Option<Report> {
+    Some((
+        HostFacts {
+            drivers: Some(drivers.iter().map(|d| d.to_string()).collect()),
+            ..Default::default()
+        },
+        crate::fleet_pg::Capacity { cpus: 8, mem_total_mb: 1_000, mem_free_mb: free, full: false },
+    ))
 }
 
 #[test]
@@ -113,6 +120,50 @@ fn an_explicit_placement_is_checked_against_what_members_boot() {
     assert_eq!(check_explicit("us4", &members, &subset, "firecracker").unwrap(), "us4");
 }
 
+/// A host whose daemon just refused a create for capacity is `full`: it is
+/// passed over for new pools however much memory it reports, as the spread
+/// split passes it over for new replicas.
+#[test]
+fn a_full_host_is_not_chosen_as_a_home() {
+    let mut members = vec![
+        row("us1", "active", facts(&["firecracker"], 900)),
+        row("us4", "active", facts(&["firecracker"], 100)),
+    ];
+    assert_eq!(choose_home("us4", &members, "firecracker").unwrap(), "us1");
+    members[0].capacity.as_mut().unwrap().full = true;
+    assert_eq!(choose_home("us4", &members, "firecracker").unwrap(), "us4");
+    // A capable host whose capacity is unknown ranks after every known one,
+    // but is still chosen over nobody.
+    members[1].capacity = None;
+    assert_eq!(choose_home("us4", &members, "firecracker").unwrap(), "us4");
+}
+
+/// One report steers both decisions: the members' capacity, as read from
+/// the hosts table, is what the spread split weighs and what placement ranks.
+#[test]
+fn one_report_steers_both_the_spread_split_and_the_home() {
+    let members = vec![
+        row("us1", "active", facts(&["firecracker"], 800)),
+        row("us4", "active", facts(&["firecracker"], 200)),
+    ];
+    let mut big = members.clone();
+    big[0].capacity.as_mut().unwrap().mem_total_mb = 3_000;
+    let capacity: std::collections::HashMap<String, crate::fleet_pg::Capacity> =
+        big.iter().filter_map(|m| m.capacity.map(|c| (m.host.clone(), c))).collect();
+    let policy = crate::config::ScalingPolicy { min_replicas: 4, max_replicas: 8, warm_pool: 0, ..Default::default() };
+    let split: std::collections::HashMap<String, u32> =
+        crate::fleet_placement::assign(&policy, &["us1", "us4"], &[], None, Some(&capacity)).into_iter().collect();
+    assert_eq!(split["us1"], 3, "weighted by total memory: 3000 vs 1000");
+    assert_eq!(split["us4"], 1);
+    assert_eq!(choose_home("us4", &big, "firecracker").unwrap(), "us1", "most free memory");
+    // Without a report from every eligible host, the split is the even one.
+    let mut partial = capacity.clone();
+    partial.remove("us4");
+    let even: std::collections::HashMap<String, u32> =
+        crate::fleet_placement::assign(&policy, &["us1", "us4"], &[], None, Some(&partial)).into_iter().collect();
+    assert_eq!((even["us1"], even["us4"]), (2, 2));
+}
+
 #[test]
 fn lists_merge_by_deployment_and_fold_a_spread_ones_vms() {
     let mine = json!([
@@ -187,7 +238,6 @@ fn facts_list_spread_vms_and_room() {
         sampled_at_ms: 1,
     };
     let f = super::facts(&registry, &usage, Some(vec!["firecracker".into()]));
-    assert_eq!(f.memory_free_bytes, Some(60));
     assert_eq!(f.vcpus_free, Some(6.0));
     assert_eq!(f.vms.get("sb-9").map(String::as_str), Some("s"));
     assert!(!f.vms.contains_key("sb-1"), "a pinned deployment's VMs are at its home");

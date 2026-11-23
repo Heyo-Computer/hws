@@ -182,9 +182,10 @@ pub struct FleetAdmin {
     fanout_timeout: Duration,
     peers: Peers,
     clients: Mutex<HashMap<(String, SocketAddr), reqwest::Client>>,
-    /// This host's facts as last computed, for placing on itself without
-    /// waiting for its own heartbeat to come back.
+    /// This host's facts and capacity as last computed, for placing on
+    /// itself without waiting for its own heartbeat to come back.
     local_facts: Mutex<Option<HostFacts>>,
+    local_capacity: Mutex<Option<crate::fleet_pg::Capacity>>,
 }
 
 impl std::fmt::Debug for FleetAdmin {
@@ -238,6 +239,7 @@ impl FleetAdmin {
             peers: Peers::Ingress { admin_host },
             clients: Mutex::new(HashMap::new()),
             local_facts: Mutex::new(None),
+            local_capacity: Mutex::new(None),
         }
     }
 
@@ -250,6 +252,10 @@ impl FleetAdmin {
 
     pub fn set_local_facts(&self, facts: HostFacts) {
         *self.local_facts.lock().unwrap() = Some(facts);
+    }
+
+    pub fn set_local_capacity(&self, capacity: Option<crate::fleet_pg::Capacity>) {
+        *self.local_capacity.lock().unwrap() = capacity;
     }
 
     /// What a request's hop headers say.
@@ -500,10 +506,14 @@ impl FleetAdmin {
     fn members_with_me(&self) -> Vec<HostRow> {
         let mut members = self.fleet.live_members();
         let mine = self.local_facts.lock().unwrap().clone();
+        let my_capacity = *self.local_capacity.lock().unwrap();
         match members.iter_mut().find(|m| m.host == self.host) {
             Some(me) => {
                 if mine.is_some() {
                     me.facts = mine;
+                }
+                if my_capacity.is_some() {
+                    me.capacity = my_capacity;
                 }
             }
             None => members.push(HostRow {
@@ -516,6 +526,7 @@ impl FleetAdmin {
                     .unwrap_or_else(|| crate::fleet_placement::ACTIVE.to_string()),
                 boot_id: String::new(),
                 age_secs: 0.0,
+                capacity: my_capacity,
                 facts: mine,
             }),
         }
@@ -863,20 +874,24 @@ fn spec_driver(spec: &Value) -> Option<String> {
 }
 
 /// Where a new VM pool that names no placement runs: the live, `active`
-/// member that says it boots `driver` and has the most free memory (then
-/// vCPUs, then the first name). Members that publish no facts — an older
-/// binary, a daemon that would not say — are not chosen automatically; with
-/// none known capable, the receiving host keeps it, as before, unless it
-/// knows it cannot boot `driver`.
+/// member that says it boots `driver`, is not full, and has the most free
+/// memory (then idle vCPUs, then the first name). Free memory and `full` are
+/// the host's [`crate::fleet_pg::Capacity`], the same numbers the spread
+/// split weighs; a host is full for a while after its daemon refuses a
+/// create for capacity, or while it has almost no memory left. Members that
+/// publish no facts — an older binary, a daemon that would not say — are not
+/// chosen automatically; with none known capable, the receiving host keeps
+/// it, as before, unless it knows it cannot boot `driver`.
 pub fn choose_home(me: &str, members: &[HostRow], driver: &str) -> Result<String, String> {
     let mut capable: Vec<&HostRow> = members
         .iter()
         .filter(|m| m.state == crate::fleet_placement::ACTIVE)
         .filter(|m| m.host == me || m.address.is_some())
         .filter(|m| m.facts.as_ref().and_then(|f| f.supports(driver)) == Some(true))
+        .filter(|m| !m.capacity.is_some_and(|c| c.full))
         .collect();
     capable.sort_by(|a, b| {
-        let free = |m: &HostRow| m.facts.as_ref().and_then(|f| f.memory_free_bytes).unwrap_or(0);
+        let free = |m: &HostRow| m.capacity.map_or(0, |c| c.mem_free_mb);
         let cpu = |m: &HostRow| m.facts.as_ref().and_then(|f| f.vcpus_free).unwrap_or(0.0);
         free(b)
             .cmp(&free(a))
@@ -1204,12 +1219,8 @@ pub fn facts(registry: &Registry, usage: &crate::metrics::HostUsageSnapshot, dri
             vms.insert(s.clone(), d.spec.id.clone());
         }
     }
-    let known = usage.available && usage.memory_total_bytes > 0;
     HostFacts {
         drivers,
-        memory_free_bytes: known.then(|| usage.memory_total_bytes.saturating_sub(usage.memory_used_bytes)),
-        memory_total_bytes: known.then_some(usage.memory_total_bytes),
-        vcpus: (usage.cpu_count > 0).then_some(usage.cpu_count),
         vcpus_free: (usage.available && usage.cpu_count > 0)
             .then(|| usage.cpu_count as f64 * (1.0 - (usage.cpu_percent / 100.0).clamp(0.0, 1.0))),
         vms,
@@ -1250,9 +1261,15 @@ impl pingora_core::services::background::BackgroundService for FactsService {
                     drivers = Some(with_lxc(Vec::new(), true));
                 }
             }
+            // One report: the capacity the placement controller weighs
+            // (memory, `full` after a capacity refusal) and the facts admin
+            // placement reads, heartbeated together.
             let facts = facts(&self.registry, &self.metrics.host_snapshot(), drivers.clone());
+            let capacity = crate::fleet_placement::local_capacity();
             self.fleet.set_facts(&facts);
+            self.fleet.set_capacity(capacity);
             self.admin.set_local_facts(facts);
+            self.admin.set_local_capacity(capacity);
         }
     }
 }

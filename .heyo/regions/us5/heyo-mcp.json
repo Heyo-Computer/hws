@@ -24,14 +24,10 @@
       { "secret": "artifacts", "key": "api-key", "as": "ART_API_KEY" }
     ]
   },
-  "build": {
-    "repo": "https://github.com/Heyo-Computer/heyo-public.git",
-    "ref": "main",
-    "dockerfile": "mcp/deploy/image/Dockerfile",
-    "context": "mcp",
-    "image_name": "heyo-mcp",
-    "image_size_mb": 768,
-    "auth": { "secret": "github", "key": "token" }
+  "artifact": {
+    "store": "https://hub.heyo.work",
+    "ref": "heyo/heyo-mcp:b4064cb",
+    "auth": { "secret": "artifacts", "key": "api-key" }
   },
   "auth": {
     "provider": "app-token",

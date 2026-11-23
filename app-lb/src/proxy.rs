@@ -237,10 +237,14 @@ pub use crate::request_control::FEED_PAGE;
 /// Everything about *which* file is `site::resolve`'s decision; this is the HTTP
 /// around it — status, headers, conditional requests, ranges, and getting the
 /// bytes onto the wire without reading a large file into memory.
-async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path: &str) -> Result<()> {
+async fn serve_site(
+    session: &mut Session,
+    spec: &crate::config::SiteSpec,
+    path: &str,
+) -> Result<()> {
     use crate::site::{self, Resolved};
 
-    let (file, status) = match site::resolve(spec, path) {
+    let (mut file, status) = match site::resolve(spec, path) {
         Resolved::File(f) => (f, 200),
         Resolved::Redirect(to) => {
             let mut header = ResponseHeader::build(301, Some(3))?;
@@ -272,6 +276,46 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
         }
     };
 
+    let is_page = site::content_type(&file) == "text/html; charset=utf-8";
+    let negotiable = is_page && status == 200 && spec.markdown.is_some();
+    let accept = session
+        .req_header()
+        .headers
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+    let markdown = negotiable
+        && matches!(
+            session.req_header().method,
+            http::Method::GET | http::Method::HEAD
+        )
+        && site::prefers_markdown(&accept);
+    let page_headers = |header: &mut ResponseHeader| -> Result<()> {
+        if negotiable {
+            header.insert_header(http::header::VARY, "Accept")?;
+        }
+        if is_page && let Some(link) = &spec.link {
+            header.insert_header(http::header::LINK, link)?;
+        }
+        Ok(())
+    };
+    if markdown {
+        let Some(alternate) = site::markdown_file(spec) else {
+            // A partial deployment must not silently pass off HTML as markdown.
+            let mut header = ResponseHeader::build(503, Some(4))?;
+            header.insert_header(http::header::CONTENT_LENGTH, "0")?;
+            header.insert_header(http::header::CACHE_CONTROL, "no-store")?;
+            page_headers(&mut header)?;
+            session
+                .write_response_header(Box::new(header), true)
+                .await?;
+            return Ok(());
+        };
+        file = alternate;
+    }
+
     let mut handle = match tokio::fs::File::open(&file).await {
         Ok(f) => f,
         Err(e) => {
@@ -285,7 +329,12 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
         return write_plain(session, 404, "not found\n").await;
     };
     let len = meta.len();
-    let etag = site::etag(&meta);
+    let etag = if markdown {
+        // Distinct representations can have the same length and mtime.
+        format!("\"md-{}", &site::etag(&meta)[1..])
+    } else {
+        site::etag(&meta)
+    };
 
     // A cached client gets a 304 and no body. Only for a 200 — a 404 page is
     // not a representation of the requested URL, so it must not be revalidated
@@ -301,6 +350,7 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
         let mut header = ResponseHeader::build(304, Some(3))?;
         header.insert_header(http::header::ETAG, &etag)?;
         header.insert_header(http::header::CACHE_CONTROL, &spec.cache_control)?;
+        page_headers(&mut header)?;
         session.write_response_header(Box::new(header), true).await?;
         return Ok(());
     }
@@ -328,6 +378,7 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
                     let mut header = ResponseHeader::build(416, Some(3))?;
                     header.insert_header(http::header::CONTENT_RANGE, format!("bytes */{len}"))?;
                     header.insert_header(http::header::CONTENT_LENGTH, "0")?;
+                    page_headers(&mut header)?;
                     session.write_response_header(Box::new(header), true).await?;
                     return Ok(());
                 }
@@ -336,10 +387,18 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
     }
 
     let mut header = ResponseHeader::build(status, Some(6))?;
-    header.insert_header(http::header::CONTENT_TYPE, site::content_type(&file))?;
+    header.insert_header(
+        http::header::CONTENT_TYPE,
+        if markdown {
+            "text/markdown; charset=utf-8"
+        } else {
+            site::content_type(&file)
+        },
+    )?;
     header.insert_header(http::header::CONTENT_LENGTH, count.to_string())?;
     header.insert_header(http::header::ETAG, &etag)?;
     header.insert_header(http::header::CACHE_CONTROL, &spec.cache_control)?;
+    page_headers(&mut header)?;
     // Advertised whether or not this request used one, so a client knows it can
     // resume rather than restarting a large download.
     header.insert_header(http::header::ACCEPT_RANGES, "bytes")?;
@@ -722,6 +781,214 @@ mod tests {
 
     fn backend(addr: &str) -> Arc<VmBackend> {
         Arc::new(VmBackend::new("sb-1".into(), addr.parse().unwrap()))
+    }
+
+    async fn site_request(
+        spec: &crate::config::SiteSpec,
+        method: &str,
+        target: &str,
+        headers: &str,
+    ) -> (u16, http::HeaderMap, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(65536);
+        client
+            .write_all(
+                format!("{method} {target} HTTP/1.1\r\nHost: site.test\r\n{headers}\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server));
+        session.read_request().await.unwrap();
+        let path = session.req_header().uri.path().to_string();
+        serve_site(&mut session, spec, &path).await.unwrap();
+        drop(session);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        let response = String::from_utf8(bytes).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut headers = http::HeaderMap::new();
+        for line in lines {
+            let (name, value) = line.split_once(':').unwrap();
+            headers.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.trim().parse().unwrap(),
+            );
+        }
+        (status, headers, body.to_string())
+    }
+
+    #[tokio::test]
+    async fn site_discovery_negotiates_pages_without_rewriting_assets_or_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, body) in [
+            ("index.html", "home"),
+            ("pricing.html", "prices"),
+            ("llms.txt", "# Shop"),
+            ("style.css", "body{}"),
+            ("404.html", "missing"),
+        ] {
+            std::fs::write(dir.path().join(file), body).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/index.html"), "docs").unwrap();
+        let mut spec: crate::config::SiteSpec = serde_json::from_value(serde_json::json!({
+            "root": dir.path(), "markdown": "llms.txt", "link": "<https://agents.example.com/llms.txt>; rel=\"alternate\"; type=\"text/plain\"",
+            "spa": true, "spa_routes": ["/signup"], "not_found": "404.html"
+        })).unwrap();
+        for (accept, body) in [
+            ("", "prices"),
+            ("*/*", "prices"),
+            ("text/html,text/markdown", "prices"),
+            ("text/markdown,text/html", "# Shop"),
+            ("text/markdown;q=0,text/html;q=0.1", "prices"),
+            ("text/markdown;q=0.3,text/html;q=0.8", "prices"),
+            ("text/html;q=0.2,text/markdown;q=0.9", "# Shop"),
+            ("text/*;q=1,text/markdown;q=0.5", "prices"),
+            ("text/*;q=1,text/html;q=0.1,text/markdown;q=0.5", "# Shop"),
+            ("TEXT/MARKDOWN", "# Shop"),
+            ("text/markdown;q=bogus", "prices"),
+            ("text/markdown;q=0.8\r\nAccept: text/html;q=1", "prices"),
+        ] {
+            let (status, headers, actual) = site_request(
+                &spec,
+                "GET",
+                "/pricing?src=test",
+                &format!("Accept: {accept}\r\n"),
+            )
+            .await;
+            assert_eq!((status, actual.as_str()), (200, body), "{accept}");
+            assert_eq!(headers["vary"], "Accept");
+            assert_eq!(headers["link"], spec.link.as_ref().unwrap().as_str());
+            assert_eq!(
+                headers["content-type"],
+                if body == "# Shop" {
+                    "text/markdown; charset=utf-8"
+                } else {
+                    "text/html; charset=utf-8"
+                }
+            );
+        }
+        for target in ["/", "/docs/", "/signup"] {
+            let (status, _, body) =
+                site_request(&spec, "GET", target, "Accept: text/markdown\r\n").await;
+            assert_eq!((status, body.as_str()), (200, "# Shop"), "{target}");
+        }
+        for (target, status, body) in [
+            ("/style.css", 200, "body{}"),
+            ("/llms.txt", 200, "# Shop"),
+            ("/docs", 301, ""),
+            ("/typo", 404, "missing"),
+        ] {
+            let (actual, headers, actual_body) =
+                site_request(&spec, "GET", target, "Accept: text/markdown\r\n").await;
+            assert_eq!((actual, actual_body.as_str()), (status, body), "{target}");
+            assert!(!headers.contains_key("vary"));
+            if target == "/docs" {
+                assert_eq!(headers["location"], "/docs/");
+            }
+        }
+        spec.markdown = None;
+        spec.link = None;
+        let (_, headers, body) =
+            site_request(&spec, "GET", "/pricing", "Accept: text/markdown\r\n").await;
+        assert_eq!(body, "prices");
+        assert!(!headers.contains_key("vary") && !headers.contains_key("link"));
+    }
+
+    #[tokio::test]
+    async fn site_discovery_preserves_validators_ranges_head_and_root_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let html = dir.path().join("index.html");
+        let markdown = dir.path().join("llms.txt");
+        std::fs::write(&html, "HTML!!").unwrap();
+        std::fs::write(&markdown, "# Shop").unwrap();
+        // Force the metadata collision that a representation-blind ETag misses.
+        let modified = std::fs::metadata(&html).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&markdown)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let spec: crate::config::SiteSpec = serde_json::from_value(serde_json::json!({
+            "root": dir.path(), "markdown": "llms.txt", "link": "<https://agents.example.com/llms.txt>; rel=alternate"
+        })).unwrap();
+        let (_, html_headers, _) = site_request(&spec, "GET", "/", "").await;
+        let (_, md_headers, _) = site_request(&spec, "GET", "/", "Accept: text/markdown\r\n").await;
+        assert_ne!(html_headers["etag"], md_headers["etag"]);
+        for (accept, headers) in [("text/html", &html_headers), ("text/markdown", &md_headers)] {
+            let (status, cached, body) = site_request(
+                &spec,
+                "GET",
+                "/",
+                &format!(
+                    "Accept: {accept}\r\nIf-None-Match: {}\r\n",
+                    headers["etag"].to_str().unwrap()
+                ),
+            )
+            .await;
+            assert_eq!((status, body.as_str()), (304, ""));
+            assert_eq!(cached["vary"], "Accept");
+            assert_eq!(cached["link"], headers["link"]);
+        }
+        let (status, _, body) = site_request(
+            &spec,
+            "GET",
+            "/",
+            &format!(
+                "Accept: text/markdown\r\nIf-None-Match: {}\r\n",
+                html_headers["etag"].to_str().unwrap()
+            ),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "# Shop"));
+        let (status, headers, body) =
+            site_request(&spec, "HEAD", "/", "Accept: text/markdown\r\n").await;
+        assert_eq!((status, body.as_str()), (200, ""));
+        assert_eq!(headers["content-length"], "6");
+        assert_eq!(headers["content-type"], "text/markdown; charset=utf-8");
+        let (status, headers, body) = site_request(
+            &spec,
+            "GET",
+            "/",
+            "Accept: text/markdown\r\nRange: bytes=2-4\r\n",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (206, "Sho"));
+        assert_eq!(headers["content-range"], "bytes 2-4/6");
+        assert_eq!(headers["vary"], "Accept");
+        let (status, headers, _) = site_request(
+            &spec,
+            "GET",
+            "/",
+            "Accept: text/markdown\r\nRange: bytes=99-\r\n",
+        )
+        .await;
+        assert_eq!(status, 416);
+        assert_eq!(headers["vary"], "Accept");
+        std::fs::remove_file(&markdown).unwrap();
+        let (status, headers, _) =
+            site_request(&spec, "GET", "/", "Accept: text/markdown\r\n").await;
+        assert_eq!(status, 503);
+        assert_eq!(headers["cache-control"], "no-store");
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "private").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &markdown).unwrap();
+        let (status, _, body) = site_request(&spec, "GET", "/", "Accept: text/markdown\r\n").await;
+        assert_eq!((status, body.as_str()), (503, ""));
+        let (status, _, body) = site_request(&spec, "GET", "/", "").await;
+        assert_eq!((status, body.as_str()), (200, "HTML!!"));
     }
 
     #[tokio::test]

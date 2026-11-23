@@ -299,6 +299,10 @@ export interface SiteSpec {
    */
   spa_routes?: string[];
   cache_control?: string;
+  /** Alternate file relative to root for HTML requests preferring text/markdown. */
+  markdown?: string;
+  /** Link response header on HTML pages and their markdown alternates. */
+  link?: string;
 }
 
 export interface SecretEnv {

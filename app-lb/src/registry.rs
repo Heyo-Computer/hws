@@ -2315,6 +2315,10 @@ mod tests {
         write("pin", pinned.clone(), 8080);
         r.apply_fleet_changes();
         assert!(r.get("web").is_some() && r.route(Some("web.example"), "/").is_some());
+        // Pinned deployments placed here reach this host through its own
+        // admin API (one admin API: a registration placed on a peer is
+        // forwarded to it), so a pinned change arriving by the feed waits
+        // for this host's next start.
         assert!(r.get("pin").is_none(), "a pinned change waits for this host's next start");
 
         // Changed there: changed here, and a new template rolls the pool in

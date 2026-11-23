@@ -27,7 +27,7 @@
 //! since that host now reports the demand.
 
 use crate::config::{DeploymentSpec, PlacementMode, ScalingPolicy};
-use crate::fleet_pg::{DemandReport, HostRow};
+use crate::fleet_pg::{Capacity, DemandReport, HostRow};
 use crate::fleet_sync::{Fleet, Lease};
 use crate::registry::Registry;
 use arc_swap::ArcSwap;
@@ -56,6 +56,61 @@ const REWRITE_EVERY: Duration = Duration::from_secs(30);
 /// This process's placer, in fleet mode. Global because every `Deployment`
 /// asks it for its target and deployments are rebuilt on every spec write.
 static PLACER: OnceLock<Arc<Placer>> = OnceLock::new();
+
+/// A host is full for this long after its daemon refuses a create for
+/// capacity, so the controller stops sending it new replicas.
+const FULL_AFTER_REFUSAL: Duration = Duration::from_secs(300);
+/// A host with less memory than this available takes no new replicas.
+const FULL_BELOW_FREE_MB: u64 = 1024;
+
+/// The latest host sample from this daemon's `/system/usage`, fed by the
+/// autoscaler's usage poll: `(cpus, memory total, memory available)` in bytes.
+static HOST_USAGE: Mutex<Option<(u32, u64, u64)>> = Mutex::new(None);
+/// When this host's daemon last refused a create for capacity.
+static CAPACITY_REFUSED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Record this host's latest usage sample. Cheap, and harmless outside a
+/// fleet: nothing reads it there.
+pub fn note_host_usage(cpus: u32, memory_total_bytes: u64, memory_available_bytes: u64) {
+    *HOST_USAGE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((cpus, memory_total_bytes, memory_available_bytes));
+}
+
+/// Whether a refused create's error says the daemon is out of capacity, as
+/// heyvmd's memory admission does ("host memory capacity unavailable").
+pub fn is_capacity_refusal(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("capacity unavailable")
+        || m.contains("insufficient memory")
+        || m.contains("out of memory")
+}
+
+/// Record that this host's daemon just refused a create for capacity.
+pub fn note_capacity_refusal() {
+    *CAPACITY_REFUSED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+}
+
+/// This host's capacity from the latest sample, or `None` before the first.
+/// Published with the heartbeat, beside the host's facts
+/// (`fleet_admin::FactsService`), as the one report both the spread split
+/// and the placement of new pools read.
+pub fn local_capacity() -> Option<Capacity> {
+    let (cpus, total, available) = (*HOST_USAGE.lock().unwrap_or_else(|e| e.into_inner()))?;
+    if total == 0 {
+        return None;
+    }
+    let refused = CAPACITY_REFUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|t| t.elapsed() < FULL_AFTER_REFUSAL);
+    let mb = |b: u64| b / (1024 * 1024);
+    Some(Capacity {
+        cpus,
+        mem_total_mb: mb(total),
+        mem_free_mb: mb(available),
+        full: refused || mb(available) < FULL_BELOW_FREE_MB,
+    })
+}
 
 pub fn install(placer: Arc<Placer>) {
     let _ = PLACER.set(placer);
@@ -116,6 +171,7 @@ pub struct Placer {
     view: ArcSwap<View>,
     /// What this host last reported, so unchanged numbers are not rewritten.
     reported: Mutex<Option<HashMap<String, DemandReport>>>,
+    /// The capacity this host last wrote, and when.
     planned: Mutex<Option<Instant>>,
     last_write: Mutex<Option<Instant>>,
     /// The last request for a `spread` deployment that a client sent here
@@ -406,6 +462,10 @@ impl Placer {
             .chain(foreign.values().map(|s| s.as_ref()))
             .filter(|s| spreads(s));
         let view = self.view.load();
+        let capacity: HashMap<String, Capacity> = members
+            .iter()
+            .filter_map(|m| m.capacity.map(|c| (m.host.clone(), c)))
+            .collect();
         let mut plan = Vec::new();
         let mut changed = false;
         for spec in specs {
@@ -424,7 +484,13 @@ impl Placer {
                 eligible = std::mem::take(&mut draining);
             }
             let reports = view.demand.get(&spec.id);
-            let assigned = assign(&spec.scaling, &eligible, &draining, reports);
+            let assigned = assign(
+                &spec.scaling,
+                &eligible,
+                &draining,
+                reports,
+                Some(&capacity),
+            );
             let (generation, current) = view.targets.get(&spec.id).cloned().unwrap_or_default();
             let same = assigned.len() == current.len()
                 && assigned.iter().all(|(h, n)| current.get(h) == Some(n));
@@ -476,11 +542,19 @@ impl Placer {
 /// that should run nothing is told so. A draining host's requests count
 /// toward the fleet's demand, and it keeps its ready replicas only while an
 /// eligible host is short of its share.
+///
+/// **Capacity.** When every eligible host reported its capacity, the split is
+/// weighted by each host's memory instead of even: a host with twice the
+/// memory gets twice the share. A host that is `full` gets no new share: it
+/// keeps at most the replicas it has ready, and the rest go to the others.
+/// When any eligible host reported nothing (an older binary, a stale report),
+/// the split is the even one it has always been.
 pub fn assign(
     policy: &ScalingPolicy,
     eligible: &[&str],
     draining: &[&str],
     reports: Option<&HashMap<String, DemandReport>>,
+    capacity: Option<&HashMap<String, Capacity>>,
 ) -> Vec<(String, u32)> {
     let report = |h: &str| reports.and_then(|r| r.get(h)).copied().unwrap_or_default();
     let counted: Vec<DemandReport> = eligible.iter().chain(draining).map(|h| report(h)).collect();
@@ -503,12 +577,47 @@ pub fn assign(
             .then((rb.ready + rb.booting).cmp(&(ra.ready + ra.booting)))
             .then(a.cmp(b))
     });
-    let n = order.len().max(1) as u32;
-    let shares: Vec<(&str, u32)> = order
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (*h, desired / n + u32::from((i as u32) < desired % n)))
-        .collect();
+    let ready = |h: &str| report(h).ready.min(u64::from(u32::MAX)) as u32;
+    let caps: Option<Vec<Capacity>> =
+        capacity.and_then(|c| order.iter().map(|h| c.get(*h).copied()).collect());
+    let counts: Vec<u32> = match caps {
+        // Every host reported: weight by memory, and keep the full ones to
+        // what they already run.
+        Some(caps) if !order.is_empty() => {
+            let weights: Vec<u64> = caps.iter().map(|c| c.mem_total_mb.max(1)).collect();
+            let open: Vec<bool> = caps.iter().map(|c| !c.full).collect();
+            if open.iter().any(|o| *o) {
+                let all = apportion(desired, &weights);
+                let mut counts: Vec<u32> = order
+                    .iter()
+                    .zip(&all)
+                    .zip(&open)
+                    .map(|((h, share), open)| if *open { 0 } else { (*share).min(ready(h)) })
+                    .collect();
+                let kept: u32 = counts.iter().sum();
+                let open_weights: Vec<u64> = weights
+                    .iter()
+                    .zip(&open)
+                    .map(|(w, o)| if *o { *w } else { 0 })
+                    .collect();
+                for (i, n) in apportion(desired.saturating_sub(kept), &open_weights)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if open[i] {
+                        counts[i] = n;
+                    }
+                }
+                counts
+            } else {
+                // Every host is full: someone still has to try.
+                apportion(desired, &weights)
+            }
+        }
+        // Today's even split: identical to weighting every host the same.
+        _ => apportion(desired, &vec![1; order.len()]),
+    };
+    let shares: Vec<(&str, u32)> = order.iter().copied().zip(counts).collect();
     // Make before break: while any host is short of its share, no host is
     // asked to give up a replica it has ready, so moving one never dips
     // serving capacity. Once the new ones are ready the shares apply, and
@@ -516,7 +625,6 @@ pub fn assign(
     let hold = shares
         .iter()
         .any(|(h, share)| u64::from(*share) > report(h).ready);
-    let ready = |h: &str| report(h).ready.min(u64::from(u32::MAX)) as u32;
     shares
         .into_iter()
         .map(|(h, share)| {
@@ -531,6 +639,38 @@ pub fn assign(
                 .map(|h| (h.to_string(), if hold { ready(h) } else { 0 })),
         )
         .collect()
+}
+
+/// Split `total` over items in proportion to `weights` (largest remainder),
+/// in the items' order: a tie goes to the earlier item. Equal weights give
+/// `total / n` each, plus one for the first `total % n`, exactly as the even
+/// split always did. A zero weight gets nothing unless every weight is zero,
+/// when the split is even.
+fn apportion(total: u32, weights: &[u64]) -> Vec<u32> {
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    let sum: u128 = weights.iter().map(|w| u128::from(*w)).sum();
+    if sum == 0 {
+        return apportion(total, &vec![1; weights.len()]);
+    }
+    let t = u128::from(total);
+    let mut out: Vec<u32> = weights
+        .iter()
+        .map(|w| (t * u128::from(*w) / sum) as u32)
+        .collect();
+    let given: u32 = out.iter().sum();
+    // Rank by remainder, largest first, then by position.
+    let mut rank: Vec<usize> = (0..weights.len()).filter(|i| weights[*i] > 0).collect();
+    rank.sort_by(|a, b| {
+        let ra = t * u128::from(weights[*a]) % sum;
+        let rb = t * u128::from(weights[*b]) % sum;
+        rb.cmp(&ra).then(a.cmp(b))
+    });
+    for i in rank.into_iter().take((total - given) as usize) {
+        out[i] += 1;
+    }
+    out
 }
 
 /// The placer as a pingora service.
@@ -590,16 +730,16 @@ mod tests {
 
     #[test]
     fn min_replicas_count_once_for_the_fleet() {
-        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], &[], None);
+        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], &[], None, None);
         assert_eq!(a, vec![("us4".into(), 1), ("us5".into(), 1)]);
-        let a = assign(&policy(3, 5, 0, 10), &["us4", "us5"], &[], None);
+        let a = assign(&policy(3, 5, 0, 10), &["us4", "us5"], &[], None, None);
         assert_eq!(a.iter().map(|(_, n)| n).sum::<u32>(), 3);
     }
 
     #[test]
     fn a_lone_replica_goes_where_the_demand_is() {
         let r = reports(&[("us5", 0, 1, 0)]);
-        let a = assign(&policy(0, 5, 0, 10), &["us4", "us5"], &[], Some(&r));
+        let a = assign(&policy(0, 5, 0, 10), &["us4", "us5"], &[], Some(&r), None);
         assert_eq!(a, vec![("us5".into(), 1), ("us4".into(), 0)]);
     }
 
@@ -608,14 +748,14 @@ mod tests {
         // 12 + 9 in flight at 10 per replica: 3 replicas for the fleet,
         // where one host alone would have asked for 2 and the other for 1.
         let r = reports(&[("us4", 12, 0, 2), ("us5", 9, 0, 1)]);
-        let a = assign(&policy(0, 10, 0, 10), &["us4", "us5"], &[], Some(&r));
+        let a = assign(&policy(0, 10, 0, 10), &["us4", "us5"], &[], Some(&r), None);
         assert_eq!(a, vec![("us4".into(), 2), ("us5".into(), 1)]);
     }
 
     #[test]
     fn with_no_demand_running_replicas_stay_put() {
         let r = reports(&[("us5", 0, 0, 1)]);
-        let a = assign(&policy(1, 5, 0, 10), &["us4", "us5"], &[], Some(&r));
+        let a = assign(&policy(1, 5, 0, 10), &["us4", "us5"], &[], Some(&r), None);
         assert_eq!(a, vec![("us5".into(), 1), ("us4".into(), 0)]);
     }
 
@@ -624,13 +764,20 @@ mod tests {
         // Both of min 2 on us4; us5 joins. us5 is asked for one while us4
         // keeps both until us5's is ready, then gives one up.
         let joining = reports(&[("us4", 0, 0, 2)]);
-        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], &[], Some(&joining));
+        let a = assign(
+            &policy(2, 5, 0, 10),
+            &["us4", "us5"],
+            &[],
+            Some(&joining),
+            None,
+        );
         assert_eq!(a, vec![("us4".into(), 2), ("us5".into(), 1)]);
         let a = assign(
             &policy(2, 5, 0, 10),
             &["us4", "us5"],
             &[],
             Some(&reports(&[("us4", 0, 0, 2), ("us5", 0, 0, 0)])),
+            None,
         );
         assert_eq!(
             a,
@@ -638,7 +785,13 @@ mod tests {
             "still booting"
         );
         let ready = reports(&[("us4", 0, 0, 2), ("us5", 0, 0, 1)]);
-        let a = assign(&policy(2, 5, 0, 10), &["us4", "us5"], &[], Some(&ready));
+        let a = assign(
+            &policy(2, 5, 0, 10),
+            &["us4", "us5"],
+            &[],
+            Some(&ready),
+            None,
+        );
         assert_eq!(a, vec![("us4".into(), 1), ("us5".into(), 1)]);
     }
 
@@ -647,23 +800,224 @@ mod tests {
         // min 2, one on each; us5 drains. us4 is asked for both, and us5
         // keeps its one until us4 has two ready.
         let before = reports(&[("us4", 0, 0, 1), ("us5", 3, 0, 1)]);
-        let a = assign(&policy(2, 5, 0, 10), &["us4"], &["us5"], Some(&before));
+        let a = assign(
+            &policy(2, 5, 0, 10),
+            &["us4"],
+            &["us5"],
+            Some(&before),
+            None,
+        );
         assert_eq!(a, vec![("us4".into(), 2), ("us5".into(), 1)]);
         let after = reports(&[("us4", 0, 0, 2), ("us5", 3, 0, 1)]);
-        let a = assign(&policy(2, 5, 0, 10), &["us4"], &["us5"], Some(&after));
+        let a = assign(&policy(2, 5, 0, 10), &["us4"], &["us5"], Some(&after), None);
         assert_eq!(a, vec![("us4".into(), 2), ("us5".into(), 0)]);
         // A draining host's requests still count: scale-from-zero demand
         // that arrives there is the fleet's.
         let waiting = reports(&[("us5", 0, 2, 0)]);
-        let a = assign(&policy(0, 5, 0, 10), &["us4"], &["us5"], Some(&waiting));
+        let a = assign(
+            &policy(0, 5, 0, 10),
+            &["us4"],
+            &["us5"],
+            Some(&waiting),
+            None,
+        );
         assert_eq!(a, vec![("us4".into(), 1), ("us5".into(), 0)]);
     }
 
     #[test]
     fn max_replicas_caps_the_fleet() {
         let r = reports(&[("us4", 100, 0, 1), ("us5", 100, 0, 1)]);
-        let a = assign(&policy(0, 3, 0, 10), &["us4", "us5"], &[], Some(&r));
+        let a = assign(&policy(0, 3, 0, 10), &["us4", "us5"], &[], Some(&r), None);
         assert_eq!(a.iter().map(|(_, n)| n).sum::<u32>(), 3);
+    }
+
+    fn caps(rows: &[(&str, u64, bool)]) -> HashMap<String, Capacity> {
+        rows.iter()
+            .map(|(h, total, full)| {
+                (
+                    h.to_string(),
+                    Capacity {
+                        cpus: 8,
+                        mem_total_mb: *total,
+                        mem_free_mb: total / 2,
+                        full: *full,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn by_host(a: &[(String, u32)]) -> HashMap<String, u32> {
+        a.iter().map(|(h, n)| (h.clone(), *n)).collect()
+    }
+
+    #[test]
+    fn apportion_with_equal_weights_is_the_even_split() {
+        for n in 1..6usize {
+            for total in 0..20u32 {
+                let even: Vec<u32> = (0..n as u32)
+                    .map(|i| total / n as u32 + u32::from(i < total % n as u32))
+                    .collect();
+                assert_eq!(apportion(total, &vec![7; n]), even, "{total} over {n}");
+            }
+        }
+        assert_eq!(
+            apportion(5, &[0, 0]),
+            vec![3, 2],
+            "all-zero weights split evenly"
+        );
+        assert_eq!(
+            apportion(4, &[1, 0, 1]),
+            vec![2, 0, 2],
+            "a zero weight gets nothing"
+        );
+    }
+
+    #[test]
+    fn without_capacity_from_every_host_the_split_is_unchanged() {
+        let r = reports(&[("us4", 3, 0, 1), ("us5", 9, 0, 1)]);
+        for p in [
+            policy(2, 5, 0, 10),
+            policy(0, 10, 0, 1),
+            policy(3, 3, 1, 10),
+        ] {
+            let old = assign(&p, &["us4", "us5"], &[], Some(&r), None);
+            // Only one host reported: the even split, exactly as before.
+            let partial = caps(&[("us5", 128_000, false)]);
+            assert_eq!(
+                assign(&p, &["us4", "us5"], &[], Some(&r), Some(&partial)),
+                old
+            );
+            // Equal capacity everywhere weighs every host the same.
+            let equal = caps(&[("us4", 64_000, false), ("us5", 64_000, false)]);
+            assert_eq!(
+                assign(&p, &["us4", "us5"], &[], Some(&r), Some(&equal)),
+                old
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_weights_the_split_by_memory() {
+        // us1 62 GB, us4 91 GB, us5 125 GB; seven replicas.
+        let c = caps(&[
+            ("us1", 62_000, false),
+            ("us4", 91_000, false),
+            ("us5", 125_000, false),
+        ]);
+        let a = assign(
+            &policy(7, 10, 0, 10),
+            &["us1", "us4", "us5"],
+            &[],
+            None,
+            Some(&c),
+        );
+        let a = by_host(&a);
+        assert_eq!(a.values().sum::<u32>(), 7);
+        assert!(a["us5"] >= a["us4"] && a["us4"] >= a["us1"], "{a:?}");
+        assert_eq!((a["us1"], a["us4"], a["us5"]), (2, 2, 3));
+        // Twice the memory, twice the share.
+        let c = caps(&[("big", 200_000, false), ("small", 100_000, false)]);
+        let a = by_host(&assign(
+            &policy(6, 10, 0, 10),
+            &["big", "small"],
+            &[],
+            None,
+            Some(&c),
+        ));
+        assert_eq!((a["big"], a["small"]), (4, 2));
+    }
+
+    #[test]
+    fn a_full_host_gets_no_new_share_but_keeps_what_it_runs() {
+        let c = caps(&[("us1", 62_000, true), ("us5", 125_000, false)]);
+        // Nothing running on the full host: it is given nothing.
+        let a = by_host(&assign(
+            &policy(4, 10, 0, 10),
+            &["us1", "us5"],
+            &[],
+            None,
+            Some(&c),
+        ));
+        assert_eq!((a["us1"], a["us5"]), (0, 4));
+        // One ready there already: it keeps it and gets no more.
+        let r = reports(&[("us1", 0, 0, 1), ("us5", 0, 0, 3)]);
+        let a = by_host(&assign(
+            &policy(4, 10, 0, 10),
+            &["us1", "us5"],
+            &[],
+            Some(&r),
+            Some(&c),
+        ));
+        assert_eq!((a["us1"], a["us5"]), (1, 3));
+        // Every host full: someone still has to try, by weight.
+        let all = caps(&[("us1", 62_000, true), ("us5", 124_000, true)]);
+        let a = by_host(&assign(
+            &policy(3, 10, 0, 10),
+            &["us1", "us5"],
+            &[],
+            None,
+            Some(&all),
+        ));
+        assert_eq!(a.values().sum::<u32>(), 3);
+        assert_eq!((a["us1"], a["us5"]), (1, 2));
+    }
+
+    #[test]
+    fn capacity_keeps_draining_and_make_before_break_as_they_were() {
+        let c = caps(&[("us4", 91_000, false), ("us5", 125_000, false)]);
+        // A draining host is held at what it has ready while the eligible one
+        // is short, then given nothing.
+        let before = reports(&[("us4", 0, 0, 0), ("us5", 0, 0, 2)]);
+        let a = assign(
+            &policy(2, 5, 0, 10),
+            &["us4"],
+            &["us5"],
+            Some(&before),
+            Some(&c),
+        );
+        assert_eq!(
+            by_host(&a),
+            by_host(&assign(
+                &policy(2, 5, 0, 10),
+                &["us4"],
+                &["us5"],
+                Some(&before),
+                None
+            ))
+        );
+        let after = reports(&[("us4", 0, 0, 2), ("us5", 0, 0, 2)]);
+        let a = by_host(&assign(
+            &policy(2, 5, 0, 10),
+            &["us4"],
+            &["us5"],
+            Some(&after),
+            Some(&c),
+        ));
+        assert_eq!((a["us4"], a["us5"]), (2, 0));
+        // Moving a share to a bigger host never drops a ready replica first.
+        let r = reports(&[("us4", 0, 0, 2), ("us5", 0, 0, 0)]);
+        let big = caps(&[("us4", 10_000, false), ("us5", 190_000, false)]);
+        let a = by_host(&assign(
+            &policy(2, 5, 0, 10),
+            &["us4", "us5"],
+            &[],
+            Some(&r),
+            Some(&big),
+        ));
+        assert_eq!(
+            a["us4"], 2,
+            "us4 keeps its ready replicas while us5 is short"
+        );
+        assert_eq!(a["us5"], 2);
+    }
+
+    #[test]
+    fn capacity_refusals_are_recognised() {
+        assert!(is_capacity_refusal(
+            "api error (409): host memory capacity unavailable"
+        ));
+        assert!(!is_capacity_refusal("image not found"));
     }
 
     fn member(host: &str) -> HostRow {
@@ -673,6 +1027,7 @@ mod tests {
             state: "active".into(),
             boot_id: "b".into(),
             age_secs: 0.0,
+            capacity: None,
             facts: None,
         }
     }
@@ -847,6 +1202,6 @@ mod tests {
 
     #[test]
     fn no_eligible_host_gets_nothing() {
-        assert!(assign(&policy(2, 5, 0, 10), &[], &[], None).is_empty());
+        assert!(assign(&policy(2, 5, 0, 10), &[], &[], None, None).is_empty());
     }
 }

@@ -297,6 +297,9 @@ pub struct Fleet {
     /// What this host publishes with its heartbeat (`fleet_admin::facts`),
     /// as JSON; `None` until something has.
     facts: Mutex<Option<String>>,
+    /// This host's capacity, published with the same heartbeat as `facts`
+    /// (`fleet_placement::local_capacity`); `None` before the first sample.
+    capacity: Mutex<Option<crate::fleet_pg::Capacity>>,
     synced_at: AtomicU64,
 }
 
@@ -326,6 +329,7 @@ impl Fleet {
             identity: Mutex::new(None),
             members: Mutex::new((None, Vec::new())),
             facts: Mutex::new(None),
+            capacity: Mutex::new(None),
             synced_at: AtomicU64::new(0),
         })
     }
@@ -345,6 +349,13 @@ impl Fleet {
     /// heartbeats.
     pub fn set_facts(&self, facts: &crate::fleet_pg::HostFacts) {
         *lock(&self.facts) = serde_json::to_string(facts).ok();
+    }
+
+    /// Publish this host's capacity with the next heartbeats, in the same
+    /// write as its facts. `None` publishes nothing new, so the last report
+    /// ages out on its own.
+    pub fn set_capacity(&self, capacity: Option<crate::fleet_pg::Capacity>) {
+        *lock(&self.capacity) = capacity;
     }
 
     /// `host`, while its heartbeat is live.
@@ -410,10 +421,11 @@ impl Fleet {
     async fn membership(&self) {
         let identity = lock(&self.identity).clone();
         let facts = lock(&self.facts).clone();
+        let capacity = *lock(&self.capacity);
         if let Some(id) = identity
             && let Err(e) = self
                 .pg
-                .heartbeat(&id.host, id.address.as_deref(), &id.boot_id, facts.as_deref())
+                .heartbeat(&id.host, id.address.as_deref(), &id.boot_id, capacity, facts.as_deref())
                 .await
         {
             tracing::debug!(error = %e, "fleet heartbeat failed");
@@ -1632,10 +1644,13 @@ mod tests {
         let b = Fleet::new(peer(&pg_a, "us5/1"), snapshot_meta_path(&b_dir.state()), KEY.to_vec());
         a.set_identity("us4", Some("198.51.100.4".into()));
         b.set_identity("us5", Some("198.51.100.5".into()));
-        let mut fa = crate::fleet_pg::HostFacts { drivers: Some(vec!["firecracker".into()]), memory_free_bytes: Some(10), ..Default::default() };
+        let mut fa = crate::fleet_pg::HostFacts { drivers: Some(vec!["firecracker".into()]), ..Default::default() };
         fa.vms.insert("sb-a".into(), "web".into());
+        let cap = |free| crate::fleet_pg::Capacity { cpus: 8, mem_total_mb: 1_000, mem_free_mb: free, full: false };
         a.set_facts(&fa);
-        b.set_facts(&crate::fleet_pg::HostFacts { drivers: Some(vec!["libvirt".into()]), memory_free_bytes: Some(99), ..Default::default() });
+        a.set_capacity(Some(cap(10)));
+        b.set_facts(&crate::fleet_pg::HostFacts { drivers: Some(vec!["libvirt".into()]), ..Default::default() });
+        b.set_capacity(Some(cap(99)));
         a.membership().await;
         b.membership().await;
         a.membership().await;
@@ -1645,6 +1660,7 @@ mod tests {
         let members = b.live_members();
         let us4 = members.iter().find(|m| m.host == "us4").unwrap();
         assert_eq!(us4.facts.as_ref(), Some(&fa));
+        assert_eq!(us4.capacity, Some(cap(10)), "capacity rides the same heartbeat");
         assert_eq!(crate::fleet_admin::choose_home("us5", &members, "firecracker").unwrap(), "us4");
         assert_eq!(crate::fleet_admin::choose_home("us5", &members, "libvirt").unwrap(), "us5");
         assert!(crate::fleet_admin::choose_home("us5", &members, "kvm").is_err());
