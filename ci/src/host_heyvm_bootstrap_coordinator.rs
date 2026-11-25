@@ -143,7 +143,8 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
     let spec=launcher_spec(&launcher,&target.app_lb_namespace,command); let value=serde_json::to_value(&req)?;
     let runner:Option<String>=sqlx::query_scalar("SELECT runner_hd_id FROM ci_job WHERE id=$1").bind(&msg.job_id).fetch_one(d.store.pool()).await?;
     ensure!(runner.as_deref()!=Some(&target.runner_hd_id),"bootstrap coordinator must run on a different runner");
-    let mut tx=d.store.pool().begin().await?; sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,222))").bind(&target.runner_hd_id).execute(&mut *tx).await?;
+    let mut tx=d.store.pool().begin().await?;
+    crate::host_maintenance::lock_host_admission(&mut tx,&target.runner_hd_id).await?;
     if let Some(old)=sqlx::query_scalar::<_,Value>("SELECT request FROM ci_host_heyvm_bootstrap WHERE id=$1").bind(&id).fetch_optional(&mut *tx).await? { ensure!(old==value,"bootstrap request changed on replay"); return Ok(format!("[ci] bootstrap {id} already persisted\n")); }
     let maintenance_fenced:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed')").bind(&target.runner_hd_id).fetch_one(&mut *tx).await?;
     ensure!(!maintenance_fenced,"runner has unresolved host maintenance");

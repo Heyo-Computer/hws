@@ -7813,6 +7813,42 @@ jobs:
             sqlx::query("UPDATE ci_service_archive SET sha=$2,archive_user_id='archive-owner',orchestrator_url='https://orch.test' WHERE step_id=$1")
                 .bind(&publication).bind(&sha).execute(d.store.pool()).await.unwrap();
             assert!(!maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+            if scenario == "success" {
+                // The incident: a coordinator on this runner already owns a
+                // fence on the other host. A second fence would deadlock the
+                // drains, or take both hosts down if parked jobs were ignored.
+                let parked = crate::store::job_id(&run, "parked");
+                sqlx::query("INSERT INTO ci_job(id,run_id,job_key,base_id,display,status,runner_hd_id) VALUES($1,$2,'parked','parked','Parked coordinator','running','hd-local')")
+                    .bind(&parked).bind(&run).execute(d.store.pool()).await.unwrap();
+                let other_step = crate::store::step_id(&parked, 0);
+                let other_id = hex::encode(sha2::Sha256::digest(other_step.as_bytes()));
+                d.store.create_step(&other_step, &parked, 0, "Other host", Some("ci/rollout-host-heyvmd")).await.unwrap();
+                sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$2,$3,$4,'other-host','test','running',$5,'refs/heads/main')")
+                    .bind(&other_id).bind(&other_step).bind(&run).bind(&parked).bind(&sha).execute(d.store.pool()).await.unwrap();
+                sqlx::query("INSERT INTO ci_host_heyvm_bootstrap(id,runner_hd_id,request,launcher_recipe,deadline,launcher_deployment_id,phase) VALUES($1,'hd-other','{}','{}',now()+interval '1 hour','other-launcher','draining')")
+                    .bind(&other_id).execute(d.store.pool()).await.unwrap();
+                for phase in ["draining", "polling", "failed"] {
+                    sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase=$2 WHERE id=$1")
+                        .bind(&other_id).bind(phase).execute(d.store.pool()).await.unwrap();
+                    let error = maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)).await.unwrap_err();
+                    assert!(error.to_string().contains("another runner has unresolved host maintenance"), "{error}");
+                    assert!(!maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+                    assert!(remote.lock().unwrap().posts.is_empty());
+                    assert!(!maintenance::owns_job(&d.store, &job.id).await.unwrap());
+                }
+                sqlx::query("DELETE FROM ci_host_heyvm_bootstrap WHERE id=$1").bind(&other_id).execute(d.store.pool()).await.unwrap();
+                // Independent promotions of the same action must serialize too.
+                sqlx::query("INSERT INTO ci_host_maintenance(id,runner_hd_id,request,deadline,phase) VALUES($1,'hd-other','{}',now()+interval '1 hour','failed')")
+                    .bind(&other_id).execute(d.store.pool()).await.unwrap();
+                assert!(maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)).await.unwrap_err()
+                    .to_string().contains("another runner has unresolved host maintenance"));
+                assert!(!maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+                // A verified completed operation releases admission. Keep its
+                // history in the database through the successful request below.
+                sqlx::query("UPDATE ci_host_maintenance SET phase='passed' WHERE id=$1").bind(&other_id).execute(d.store.pool()).await.unwrap();
+                d.store.set_job_status(&parked, JobStatus::Success, None).await.unwrap();
+                sqlx::query("UPDATE ci_service_deployment SET status='passed',phase='passed' WHERE id=$1").bind(&other_id).execute(d.store.pool()).await.unwrap();
+            }
             // Serialize competing maintenance admission/claims using the real shared lock.
             let mut gate = d.store.pool().begin().await.unwrap();
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('hd-local',222))").execute(&mut *gate).await.unwrap();

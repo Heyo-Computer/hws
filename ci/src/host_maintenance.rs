@@ -149,6 +149,24 @@ pub async fn owns_job(store: &Store, job: &str) -> Result<bool> {
         .bind(job).fetch_one(store.pool()).await?)
 }
 
+/// Admit host changes one runner at a time across both maintenance paths and
+/// regional controllers. Fail before fencing, rather than wait while holding
+/// a coordinator VM on the host that the other operation is draining.
+pub(crate) async fn lock_host_admission(tx: &mut Transaction<'_, Postgres>, runner: &str) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('ci-host-maintenance-admission',223))")
+        .execute(&mut **tx).await?;
+    let blocked: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id<>$1 AND phase<>'passed')
+         OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id<>$1 AND phase NOT IN ('passed','superseded'))",
+    ).bind(runner).fetch_one(&mut **tx).await?;
+    ensure!(!blocked, "another runner has unresolved host maintenance; finish or recover it before draining this runner");
+    // Same-runner conflicts and failed-bootstrap supersession remain the
+    // caller's responsibility; claims use this runner lock as well.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,222))")
+        .bind(runner).execute(&mut **tx).await?;
+    Ok(())
+}
+
 pub(crate) async fn trusted_target(d: &Dispatcher, alias: &str) -> Result<Target> {
     let managed;
     let raw = match d.config.host_maintenance_targets.as_deref() {
@@ -188,7 +206,7 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, plan: &JobPlan, step: &st
     let value = serde_json::to_value(&request)?;
     let hash = hex::encode(Sha256::digest(serde_json::to_vec(&value)?));
     let mut tx = d.store.pool().begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,222))").bind(&request.target.runner_hd_id).execute(&mut *tx).await?;
+    lock_host_admission(&mut tx, &request.target.runner_hd_id).await?;
     let status: String = sqlx::query_scalar("SELECT status FROM ci_run WHERE id=$1 FOR UPDATE").bind(&msg.run_id).fetch_one(&mut *tx).await?;
     ensure!(!matches!(status.as_str(), "cancelled" | "failure"), "run is no longer eligible for maintenance");
     if let Some(existing) = sqlx::query_scalar::<_,Value>("SELECT request FROM ci_host_maintenance WHERE id=$1").bind(&id).fetch_optional(&mut *tx).await? {
