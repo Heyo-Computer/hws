@@ -797,6 +797,7 @@ fn main() {
             plugins::vapi::VapiPlugin::new(secrets.clone()),
             plugins::obs::ObsPlugin::new(secrets.clone()),
             plugins::ci::CiPlugin::new(secrets.clone()),
+            plugins::github_runners::GithubRunnersPlugin::new(registry.clone(), secrets.clone()),
             plugins::remote::RemotePlugin::new(secrets.clone()),
             plugins::secrets::SecretsPlugin::new(secrets.clone()),
             plugins::artifacts::ArtifactsPlugin::new(secrets.clone(), store_slot.clone()),

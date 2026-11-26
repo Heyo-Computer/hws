@@ -463,6 +463,10 @@ pub struct Adoption {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeploymentState {
+    /// External controllers must keep sleep permissions fresh. Expired
+    /// permissions count as demand, so a dead controller cannot strand work.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sleep_permissions: std::collections::BTreeMap<String, u64>,
     /// External work (for example a CI job) that needs a running VM even
     /// without HTTP traffic. Values are expiry times on the LB's clock.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -885,15 +889,18 @@ impl Deployment {
         (live as u32) < self.spec.scaling.max_replicas
     }
 
-    /// Total demand: active requests, waiters and external work leases.
+    /// Total demand: active requests, waiters, external work leases and
+    /// controllers whose permission to sleep has expired.
     ///
     /// Waiters must be included or a scaled-to-zero deployment can never wake
     /// up: the request that would justify a VM is precisely the one with no VM
     /// to be counted against.
     pub fn demand(&self) -> usize {
         let now = now_secs();
+        let state = self.state();
         self.total_in_flight() + self.waiters()
-            + self.state().demand_leases.values().filter(|expires| **expires > now).count()
+            + state.demand_leases.values().filter(|expires| **expires > now).count()
+            + state.sleep_permissions.values().filter(|until| **until <= now).count()
     }
 
     pub fn set_demand_lease(&self, key: &str, ttl_secs: Option<u64>) {

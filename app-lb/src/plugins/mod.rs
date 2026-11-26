@@ -61,6 +61,7 @@ pub mod alerting;
 pub mod artifacts;
 pub mod auth;
 pub mod ci;
+pub mod github_runners;
 pub mod ns_proxy;
 pub mod obs;
 pub mod pgfc;

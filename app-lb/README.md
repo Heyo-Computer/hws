@@ -3390,6 +3390,54 @@ heyctl plugins set pgfc -f pgfc.json --enable
 heyctl plugins disable pgfc
 ```
 
+### Persistent GitHub runners (`github-runners`)
+
+This opt-in controller runs in app-lb, outside the sleeping VM. It keeps an
+existing repository runner registration and uses GitHub's REST API to decide
+whether its deployment needs a running VM. GitHub still assigns and executes
+jobs; no replacement runner or GitHub App is created by the controller.
+
+Enable the fleet plugin with `{}` on the deployment's owning host, then install
+it in the deployment's namespace with this shape:
+
+```json
+{"bindings":[{"id":"ci","repository":"owner/repository","runner_id":42,"deployment":"ci-vm","token":{"secret":"github-read"},"webhook_secret":{"secret":"github-webhook"}}]}
+```
+
+Both credentials must already exist in that namespace's secret store. The token
+needs access to repository runner inventory and Actions runs/jobs. Supplied secret
+namespaces are overwritten with the installing namespace. Bindings are limited
+to host-local, app-lb-owned Libvirt deployments with `idle_action: suspend`,
+`max_replicas: 1`, `warm_pool: 0`, and VM `ttl_seconds: 0`. This initial controller
+does not grant lifecycle ownership over an adopted customer VM.
+
+The optional repository `workflow_job` webhook goes to
+`/api/plugins/github-runners/machine/hooks/<namespace>/<binding-id>` on that
+host's authenticated-TLS ingress. Configure its secret to match the stored
+webhook secret. The handler verifies GitHub's HMAC over raw bytes and checks the
+repository. It only triggers a fresh REST check: duplicated, delayed or reordered
+events cannot release demand. Polling every 15 seconds after each reconciliation
+recovers missing events. Every bound runner whose labels match queued work wakes;
+GitHub chooses which runs the job. Assigned or busy runners remain awake.
+
+Sleep requires a fresh successful idle observation and the deployment's usual
+idle grace. A durable permission expires after 45 seconds into **demand**, not
+idleness. API failures, missing runners, truncated collections, and controller
+failure therefore keep/wake the VM while app-lb is running. A whole app-lb outage
+cannot wake VMs until app-lb recovers. Startup requires fresh observations before
+allowing sleep; restores require observing the runner online again. A runner
+sleeping for seven days wakes for a reconnect. GitHub's online state is eventually
+consistent: it is not a guest heartbeat or an atomic job-assignment/sleep lock.
+An assignment racing with suspension may pause briefly and must recover through
+the next reconciliation and VM restore. Live race/reconnect testing is required
+before enabling a customer's runner.
+
+`GET /namespaces/<namespace>/plugins/github-runners/status` exposes the last
+observation and errors without credentials. To uninstall or change a binding's
+runner/deployment identity, first set its deployment's `min_replicas` to 1, then
+uninstall. Disabling the plugin alone leaves the durable guard in place so its
+deployment cannot silently revert to HTTP-only idle detection.
+
 ### pg-fc databases (`pgfc`)
 
 This plugin monitors and configures [pg-fc](../pg-fc) pools through their
