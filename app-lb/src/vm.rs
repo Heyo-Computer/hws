@@ -1262,10 +1262,13 @@ impl VmManager {
             self.require_stateful(sandbox_id, driver).await?;
             // Only the explicit resume route may restore memory. /start can
             // cold boot; desktop readiness would reject a headless runner.
-            let info: SandboxInfo = self.client.request(
+            let _: serde_json::Value = self.client.request(
                 reqwest::Method::POST, &format!("/sandboxes/{}/resume", form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()),
                 Some(&serde_json::json!({"readiness":"guest"})), heyo_sdk::RequestOptions::default(),
             ).await?;
+            // Resume returns native runtime info. Read the SDK-compatible
+            // representation separately, as the ordinary start path does.
+            let info = self.connect(sandbox_id.into())?.info().await?;
             if info.status != SandboxStatus::Running {
                 return Err(VmError::NotRunning {
                     sandbox_id: info.id, status: info.status, reason: info.error_message,

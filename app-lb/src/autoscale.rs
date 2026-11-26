@@ -5171,7 +5171,13 @@ mod tests {
                         assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"readiness":"guest"}));
                     }
                     g.suspended.store(false, Ordering::SeqCst);
-                    Json(info(&g))
+                    let mut response = info(&g);
+                    if g.driver == crate::config::Driver::Libvirt {
+                        // /resume returns native runtime info, not the SDK's
+                        // /deployed-sandboxes response with this required field.
+                        response.as_object_mut().unwrap().remove("status_changed_at");
+                    }
+                    Json(response)
                 }))
                 .route("/sandboxes/sb-1", get(|State(g): State<Arc<Guest>>| async move { Json(info(&g)) }))
                 .route("/deployed-sandboxes/sb-1", get(|State(g): State<Arc<Guest>>| async move { Json(info(&g)) }))
