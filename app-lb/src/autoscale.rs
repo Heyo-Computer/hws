@@ -1598,10 +1598,13 @@ impl Autoscaler {
 
             if let Some(addr) = addr {
                 if d.spec.scaling.idle_action == IdleAction::Suspend {
-                    if let Err(error) = self.vms().require_stateful(&p.sandbox_id).await {
-                        tracing::error!(sandbox = %p.sandbox_id, %error, "stateful lifecycle not ready");
-                        still_pending.push(p.clone());
-                        continue;
+                    match self.vms().require_stateful(&p.sandbox_id, d.spec.vm_spec().driver).await {
+                        Ok(false) => {}
+                        result => {
+                            tracing::warn!(sandbox = %p.sandbox_id, ?result, "stateful resume not complete");
+                            still_pending.push(p.clone());
+                            continue;
+                        }
                     }
                 }
                 let now_ms = crate::obs::now_millis().max(0) as u64;
@@ -2100,7 +2103,7 @@ impl Autoscaler {
             // and hand the caller an empty sandbox in its place.
             if let Some(sandbox_id) = self.take_suspended(d) {
                 let result = if d.spec.scaling.idle_action == IdleAction::Suspend {
-                    self.vms().resume_stateful(&sandbox_id).await
+                    self.vms().resume_stateful(&sandbox_id, d.spec.vm_spec().driver).await
                 } else { self.vms().resume(&sandbox_id).await };
                 match result {
                     Ok(_) => {
@@ -2402,7 +2405,7 @@ impl Autoscaler {
         // Persist intent before touching the runtime. Replaying capture after
         // a lost response is idempotent; cold-creating a replacement is not.
         let result = match self.registry.persist_one(&d.spec.id) {
-            Ok(()) => self.vms().suspend_stateful(id).await,
+            Ok(()) => self.vms().suspend_stateful(id, d.spec.vm_spec().driver).await,
             Err(error) => Err(vm::VmError::Runtime(error.to_string())),
         };
         if let Err(error) = result {
@@ -2540,7 +2543,7 @@ impl Autoscaler {
             // a fresh guest over the customer's memory state. Retry with the
             // ordinary boot backoff, and require explicit deletion to give up.
             if running {
-                if let Err(error) = self.vms().suspend_stateful(sandbox_id).await {
+                if let Err(error) = self.vms().suspend_stateful(sandbox_id, d.spec.vm_spec().driver).await {
                     tracing::error!(%sandbox_id, %error, "failed resume remains owned for recovery");
                 }
             }
@@ -2928,7 +2931,7 @@ impl Autoscaler {
             match vm::routable_addr(info, d.spec.vm_spec().port) {
                 Ok(addr) if health::probe(addr, &d.spec.health).await
                     && (d.spec.scaling.idle_action != IdleAction::Suspend
-                        || self.vms().require_stateful(&info.id).await.is_ok()) => {
+                        || self.vms().require_stateful(&info.id, d.spec.vm_spec().driver).await.is_ok_and(|saved| !saved)) => {
                     tracing::info!(
                         deployment = %owner,
                         sandbox = %info.id,
@@ -5126,7 +5129,9 @@ mod tests {
 
         #[derive(Default)]
         struct Guest {
+            driver: crate::config::Driver,
             suspended: AtomicBool,
+            pending_clock: AtomicBool,
             fail_capture: AtomicBool,
             healthy: AtomicBool,
             destructive: Mutex<Vec<String>>,
@@ -5134,28 +5139,41 @@ mod tests {
 
         fn info(g: &Guest) -> serde_json::Value {
             serde_json::json!({"id":"sb-1", "name":"applb-demo-01", "image":"fastcar",
+                "backend_type": g.driver,
+                "has_checkpoint": (g.suspended.load(Ordering::SeqCst) || g.pending_clock.load(Ordering::SeqCst)).then_some(true),
                 "status": if g.suspended.load(Ordering::SeqCst) {"stopped"} else {"running"},
                 "uptime_secs":0, "guest_ip":"127.0.0.1", "is_deployed":true, "urls":[], "status_changed_at":""})
         }
 
         #[tokio::test]
         async fn capture_failure_recovery_and_resume_keep_the_same_guest_until_healthy() {
-            let guest = Arc::new(Guest::default());
+            check_capture_recovery(crate::config::Driver::Firecracker).await;
+            check_capture_recovery(crate::config::Driver::Libvirt).await;
+        }
+
+        async fn check_capture_recovery(driver: crate::config::Driver) {
+            let libvirt = driver == crate::config::Driver::Libvirt;
+            let guest = Arc::new(Guest { driver, ..Default::default() });
             guest.fail_capture.store(true, Ordering::SeqCst);
             let app = Router::new()
                 .route("/sandboxes/sb-1/lifecycle", get(|State(g): State<Arc<Guest>>| async move {
+                    assert_eq!(g.driver, crate::config::Driver::Firecracker);
                     Json(serde_json::json!({"policy":{"enabled":true,"auto_resume":false,
                         "idle_timeout_seconds":null,"keep_running":false},"suspended":g.suspended.load(Ordering::SeqCst)}))
                 }))
-                .route("/sandboxes/sb-1/suspend", post(|State(g): State<Arc<Guest>>| async move {
+                .route(if libvirt { "/sandboxes/sb-1/hibernate" } else { "/sandboxes/sb-1/suspend" }, post(|State(g): State<Arc<Guest>>| async move {
                     if g.fail_capture.load(Ordering::SeqCst) { return axum::http::StatusCode::CONFLICT; }
                     g.suspended.store(true, Ordering::SeqCst);
                     axum::http::StatusCode::NO_CONTENT
                 }))
-                .route("/sandbox/sb-1/start", post(|State(g): State<Arc<Guest>>| async move {
+                .route(if libvirt { "/sandboxes/sb-1/resume" } else { "/sandbox/sb-1/start" }, post(|State(g): State<Arc<Guest>>, body: axum::body::Bytes| async move {
+                    if g.driver == crate::config::Driver::Libvirt {
+                        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"readiness":"guest"}));
+                    }
                     g.suspended.store(false, Ordering::SeqCst);
                     Json(info(&g))
                 }))
+                .route("/sandboxes/sb-1", get(|State(g): State<Arc<Guest>>| async move { Json(info(&g)) }))
                 .route("/deployed-sandboxes/sb-1", get(|State(g): State<Arc<Guest>>| async move { Json(info(&g)) }))
                 .route("/health", get(|State(g): State<Arc<Guest>>| async move {
                     if g.healthy.load(Ordering::SeqCst) { axum::http::StatusCode::OK } else { axum::http::StatusCode::SERVICE_UNAVAILABLE }
@@ -5169,14 +5187,19 @@ mod tests {
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let mut s = spec();
             s.scaling.idle_action = IdleAction::Suspend;
+            s.vm.as_mut().unwrap().driver = driver;
             s.vm.as_mut().unwrap().port = addr.port();
             s.health.path = Some("/health".into());
             let (mut scaler, registry) = autoscaler_against(&format!("http://{addr}"), s);
             let d = registry.get("demo").unwrap();
             let request = scaler.vms().prepare_create(d.spec.vm_spec(), "new".into(), None,
                 &vm::VmOwner::default(), HashMap::new(), true).await.unwrap();
-            assert_eq!(request.extra["lifecycle"]["enabled"], true);
-            assert_eq!(request.extra["lifecycle"]["auto_resume"], false);
+            if libvirt {
+                assert!(!request.extra.contains_key("lifecycle"));
+            } else {
+                assert_eq!(request.extra["lifecycle"]["enabled"], true);
+                assert_eq!(request.extra["lifecycle"]["auto_resume"], false);
+            }
             let b = Arc::new(VmBackend::new("sb-1".into(), addr));
             b.set_draining(true);
             d.set_backends(vec![b]);
@@ -5204,6 +5227,12 @@ mod tests {
             scaler.promote_pending(&d, &fleet).await;
             assert!(d.backends().is_empty(), "failed guest health must not route");
             guest.healthy.store(true, Ordering::SeqCst);
+            if libvirt {
+                guest.pending_clock.store(true, Ordering::SeqCst);
+                scaler.promote_pending(&d, &fleet).await;
+                assert!(d.backends().is_empty(), "a live guest with incomplete clock synchronization must not route");
+                guest.pending_clock.store(false, Ordering::SeqCst);
+            }
             scaler.promote_pending(&d, &fleet).await;
             assert_eq!(d.backends()[0].sandbox_id, "sb-1");
             assert!(d.state().suspended.is_empty());

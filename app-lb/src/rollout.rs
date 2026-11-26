@@ -149,8 +149,9 @@ impl Runtime for Live {
     async fn create(&self, spec: &DeploymentSpec, name: &str) -> Result<String, String> { self.scaler.create_candidate(spec, name).await }
     async fn healthy(&self, info: &heyo_sdk::SandboxInfo, spec: &DeploymentSpec) -> Option<std::net::SocketAddr> {
         let addr = crate::vm::routable_addr(info, spec.vm_spec().port).ok()?;
-        if spec.scaling.idle_action == crate::config::IdleAction::Suspend {
-            self.scaler.vms().require_stateful(&info.id).await.ok()?;
+        if spec.scaling.idle_action == crate::config::IdleAction::Suspend
+            && self.scaler.vms().require_stateful(&info.id, spec.vm_spec().driver).await.ok()? {
+            return None;
         }
         crate::health::probe(addr, &spec.health).await.then_some(addr)
     }

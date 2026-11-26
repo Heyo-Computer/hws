@@ -5347,6 +5347,48 @@ async fn update(
     ([(header::ETAG, response_etag)], Json(status_of(&state, &deployment))).into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DemandLeaseRequest {
+    ttl_secs: u64,
+}
+
+async fn put_demand_lease(
+    State(state): State<AdminState>,
+    Path((id, key)): Path<(String, String)>,
+    Json(request): Json<DemandLeaseRequest>,
+) -> Response {
+    if !(1..=3600).contains(&request.ttl_secs) {
+        return err(StatusCode::BAD_REQUEST, "ttl_secs must be between 1 and 3600").into_response();
+    }
+    change_demand_lease(&state, &id, &key, Some(request.ttl_secs)).await
+}
+
+async fn delete_demand_lease(
+    State(state): State<AdminState>,
+    Path((id, key)): Path<(String, String)>,
+) -> Response {
+    change_demand_lease(&state, &id, &key, None).await
+}
+
+async fn change_demand_lease(state: &AdminState, id: &str, key: &str, ttl: Option<u64>) -> Response {
+    if !crate::secrets::is_valid_id(key) {
+        return err(StatusCode::BAD_REQUEST, "invalid demand lease key").into_response();
+    }
+    let _change = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(id) else {
+        return err(StatusCode::NOT_FOUND, "deployment not found").into_response();
+    };
+    if !d.spec.is_managed() || d.spec.placement.as_ref().is_some_and(|p| p.mode == crate::config::PlacementMode::Spread) {
+        return err(StatusCode::CONFLICT, "demand leases require a host-local VM deployment").into_response();
+    }
+    d.set_demand_lease(key, ttl);
+    match state.registry.persist_one(id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 /// Manually scale a deployment: `PATCH /deployments/:id/scaling`.
 ///
 /// The body is a partial `ScalingPolicy` — only the fields present are changed,
@@ -9410,6 +9452,7 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/retired-record", axum::routing::delete(deregister_retired_record))
         .route("/deployments/:id/discovery-status", get(discovery_status))
         .route("/deployments/:id/scaling", patch(scale))
+        .route("/deployments/:id/demand/:key", put(put_demand_lease).delete(delete_demand_lease))
         .route("/deployments/:id/stop", post(stop_deployment))
         .route("/deployments/:id/start", post(start_deployment))
         .route("/deployments/:id/restart", post(restart_deployment))
@@ -11196,6 +11239,33 @@ mod tests {
                     }))
                     .unwrap(),
                 );
+            }
+
+            #[tokio::test]
+            async fn external_demand_lease_wakes_and_survives_restart_until_released() {
+                let f = fixture(true).await;
+                sandbox(&f);
+                let d = f.registry.get("sb").unwrap();
+                assert_eq!(d.desired_replicas(), 0);
+                let path = "/deployments/sb/demand/ci-job";
+                for ttl in [0, 3601] {
+                    assert_eq!(call(&f, "PUT", path, json!({"ttl_secs":ttl})).await.0, StatusCode::BAD_REQUEST);
+                }
+                assert!(d.state().demand_leases.is_empty());
+                for _ in 0..2 {
+                    let (status, body) = call(&f, "PUT", path, json!({"ttl_secs":300})).await;
+                    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+                }
+                assert_eq!(d.demand(), 1);
+                assert_eq!(d.desired_replicas(), 1);
+                let reloaded = Registry::new(f.root.join("deployments.json"));
+                reloaded.load().unwrap();
+                assert_eq!(reloaded.get("sb").unwrap().desired_replicas(), 1);
+                for _ in 0..2 {
+                    assert_eq!(call(&f, "DELETE", path, Value::Null).await.0, StatusCode::NO_CONTENT);
+                }
+                assert_eq!(d.desired_replicas(), 0);
+                assert_eq!(call(&f, "PUT", "/deployments/missing/demand/ci-job", json!({"ttl_secs":30})).await.0, StatusCode::NOT_FOUND);
             }
 
             /// A new template keeps the pool and rolls it; a rollout-policy

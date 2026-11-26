@@ -3309,6 +3309,31 @@ A *partial* failure stays a success: the bytes that went are gone, `removed` and
 come back on the response, and it logs at `warn` with the paths. A clean purge logs at `info`
 with the count it actually removed.
 
+### Memory suspension and external demand
+
+`scaling.idle_action: suspend` preserves memory on Firecracker and Libvirt with
+`vm.rootfs: copy`. It is host-local and cannot be combined with workspace
+capture or archive lifecycle. Firecracker uses its explicit lifecycle policy;
+Libvirt uses `/sandboxes/:id/hibernate` and `/sandboxes/:id/resume` with
+`{"readiness":"guest"}`. The latter requires heyvmd's headless resume support:
+clock synchronization completes before readiness, without a desktop dependency.
+A failed or uncertain operation retains the sandbox and durable pending state;
+it never falls back to destroying it or creating a replacement.
+
+External work can hold a deployment awake without an HTTP request in flight:
+`PUT /deployments/:id/demand/:key` with `{"ttl_secs":300}` creates or renews a
+lease, and `DELETE` on the same route releases it. TTL is 1–3600 seconds. These
+routes use the deployment CRUD authorization and require a host-local VM pool.
+Leases survive app-lb restart; expiry or release starts the normal idle grace.
+They do not override a stopped deployment's zero replica ceiling.
+
+These are controller primitives, not automatic GitHub integration. A GitHub
+controller must independently establish that no job is running or queued and
+that the runner has reconnected after restore before allowing sleep. Expiring
+a demand lease alone is not evidence that a CI runner is idle. Existing
+adopted VMs remain protected from suspension until an explicit lifecycle grant
+is implemented.
+
 ### Reusing VMs instead of recreating them
 
 The other half of the same problem: every new sandbox is a new directory. app-lb already

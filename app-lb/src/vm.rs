@@ -18,7 +18,7 @@
 //!    `mounts` array and the four defaults the SDK would have filled in are
 //!    added here. See [`sdk_create_defaults`].
 
-use crate::config::{DeploymentSpec, VmSpec};
+use crate::config::{DeploymentSpec, Driver, VmSpec};
 use crate::mounts::MountStore;
 use heyo_sdk::{
     BindRequest, CommandResult, CommandRunOptions, Daemon, DaemonCreateRequest, DaemonMount,
@@ -813,7 +813,7 @@ impl VmManager {
         let mounts: Vec<DaemonMount> = resolved.into_iter().map(|m| m.mount).collect();
 
         let mut request = create_request(spec, name, open_ports, env_vars, mounts, owner);
-        if stateful {
+        if stateful && spec.driver == Driver::Firecracker {
             request.extra.insert("lifecycle".into(), serde_json::json!({
                 "enabled": true, "auto_resume": false,
                 "idle_timeout_seconds": null, "keep_running": false
@@ -1213,11 +1213,12 @@ impl VmManager {
 
     /// PR #684's memory-preserving capture. Unlike disk-only `suspend`, a
     /// missing endpoint or sandbox is an error, never permission to stop/kill.
-    pub async fn suspend_stateful(&self, sandbox_id: &str) -> Result<(), VmError> {
+    pub async fn suspend_stateful(&self, sandbox_id: &str, driver: Driver) -> Result<(), VmError> {
         self.refuse_if_protected(sandbox_id, "suspend")?;
-        self.require_stateful(sandbox_id).await?;
+        self.require_stateful(sandbox_id, driver).await?;
+        let action = if driver == Driver::Libvirt { "hibernate" } else { "suspend" };
         self.client.request::<serde_json::Value>(
-            reqwest::Method::POST, &format!("/sandboxes/{}/suspend", form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()),
+            reqwest::Method::POST, &format!("/sandboxes/{}/{action}", form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()),
             None::<&()>, heyo_sdk::RequestOptions::default(),
         ).await?;
         Ok(())
@@ -1225,7 +1226,25 @@ impl VmManager {
 
     /// Verify the daemon accepted the create-time policy. Older daemons ignore
     /// unknown create fields, so successful allocation alone proves nothing.
-    pub async fn require_stateful(&self, sandbox_id: &str) -> Result<bool, VmError> {
+    pub async fn require_stateful(&self, sandbox_id: &str, driver: Driver) -> Result<bool, VmError> {
+        if driver == Driver::Libvirt {
+            let body: serde_json::Value = self.client.request(
+                reqwest::Method::GET, &format!("/sandboxes/{}", form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()),
+                None::<&()>, heyo_sdk::RequestOptions::default(),
+            ).await?;
+            if body["backend_type"] != "libvirt" {
+                return Err(VmError::Runtime("memory hibernation requires the deployment's Libvirt guest".into()));
+            }
+            // SandboxInfo omits this optional field when no save is present.
+            return match &body["has_checkpoint"] {
+                serde_json::Value::Null => Ok(false),
+                serde_json::Value::Bool(saved) => Ok(*saved),
+                _ => Err(VmError::Runtime("invalid Libvirt checkpoint status".into())),
+            };
+        }
+        if driver != Driver::Firecracker {
+            return Err(VmError::Runtime("driver does not support memory suspension".into()));
+        }
         let body: serde_json::Value = self.client.request(
             reqwest::Method::GET, &format!("/sandboxes/{}/lifecycle", form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()),
             None::<&()>, heyo_sdk::RequestOptions::default(),
@@ -1237,8 +1256,24 @@ impl VmManager {
         body["suspended"].as_bool().ok_or_else(|| VmError::Runtime("daemon omitted stateful suspension status".into()))
     }
 
-    pub async fn resume_stateful(&self, sandbox_id: &str) -> Result<SandboxInfo, VmError> {
-        if !self.require_stateful(sandbox_id).await? {
+    pub async fn resume_stateful(&self, sandbox_id: &str, driver: Driver) -> Result<SandboxInfo, VmError> {
+        if driver == Driver::Libvirt {
+            self.refuse_if_protected(sandbox_id, "resume")?;
+            self.require_stateful(sandbox_id, driver).await?;
+            // Only the explicit resume route may restore memory. /start can
+            // cold boot; desktop readiness would reject a headless runner.
+            let info: SandboxInfo = self.client.request(
+                reqwest::Method::POST, &format!("/sandboxes/{}/resume", form_urlencoded::byte_serialize(sandbox_id.as_bytes()).collect::<String>()),
+                Some(&serde_json::json!({"readiness":"guest"})), heyo_sdk::RequestOptions::default(),
+            ).await?;
+            if info.status != SandboxStatus::Running {
+                return Err(VmError::NotRunning {
+                    sandbox_id: info.id, status: info.status, reason: info.error_message,
+                });
+            }
+            return Ok(info);
+        }
+        if !self.require_stateful(sandbox_id, driver).await? {
             // An earlier resume may have completed despite a lost response.
             let info = self.connect(sandbox_id.into())?.info().await?;
             if info.status == SandboxStatus::Running { return Ok(info); }
@@ -1730,7 +1765,9 @@ mod tests {
         assert!(protected(vms.unbind("sb-adopted", "abc123").await));
         assert!(protected(vms.purge_disks("sb-adopted", PurgeParts::All).await.map(|_| ())));
         assert!(protected(vms.terminate("sb-adopted", None, 5).await));
-        assert!(protected(vms.suspend_stateful("sb-adopted").await));
+        assert!(protected(vms.suspend_stateful("sb-adopted", Driver::Firecracker).await));
+        assert!(protected(vms.suspend_stateful("sb-adopted", Driver::Libvirt).await));
+        assert!(protected(vms.resume_stateful("sb-adopted", Driver::Libvirt).await.map(|_| ())));
         let deployment = ProxyDeployment { namespace: "default".into(), id: "web".into() };
         assert!(protected(vms.bind("sb-adopted", 8080, true, &deployment).await.map(|_| ())));
         let err = vms.kill("sb-adopted").await.unwrap_err();

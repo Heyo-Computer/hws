@@ -463,6 +463,12 @@ pub struct Adoption {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeploymentState {
+    /// External work (for example a CI job) that needs a running VM even
+    /// without HTTP traffic. Values are expiry times on the LB's clock.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub demand_leases: std::collections::BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_demand_at: u64,
     /// Sandboxes this deployment adopted in place. Host state: an adoption
     /// names a VM on this host's daemon, so it is never shared with a fleet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -879,13 +885,31 @@ impl Deployment {
         (live as u32) < self.spec.scaling.max_replicas
     }
 
-    /// Total demand: requests being served plus requests waiting for a VM.
+    /// Total demand: active requests, waiters and external work leases.
     ///
     /// Waiters must be included or a scaled-to-zero deployment can never wake
     /// up: the request that would justify a VM is precisely the one with no VM
     /// to be counted against.
     pub fn demand(&self) -> usize {
+        let now = now_secs();
         self.total_in_flight() + self.waiters()
+            + self.state().demand_leases.values().filter(|expires| **expires > now).count()
+    }
+
+    pub fn set_demand_lease(&self, key: &str, ttl_secs: Option<u64>) {
+        let now = now_secs();
+        self.mutate_state(|s| {
+            let last = s.demand_leases.values().copied().max().unwrap_or(0).min(now);
+            s.last_demand_at = s.last_demand_at.max(last);
+            s.demand_leases.retain(|_, expires| *expires > now);
+            if let Some(ttl) = ttl_secs {
+                s.demand_leases.insert(key.into(), now.saturating_add(ttl));
+                s.last_demand_at = now;
+            } else if s.demand_leases.remove(key).is_some() {
+                s.last_demand_at = now;
+            }
+        });
+        self.scale_signal.notify_one();
     }
 
     /// Desired ready-replica count.
@@ -916,7 +940,13 @@ impl Deployment {
             return u64::MAX;
         }
         let last = backends.iter().map(|b| b.last_active()).max().unwrap_or(0);
-        now_secs().saturating_sub(last)
+        let now = now_secs();
+        let state = self.state();
+        // An expired lease was active right up to its deadline. Give the
+        // guest the normal idle grace after that, not since its last request.
+        let external = state.demand_leases.values().copied().max().unwrap_or(0)
+            .min(now).max(state.last_demand_at);
+        now.saturating_sub(last.max(external))
     }
 
     // -- boot-failure backoff ------------------------------------------------
@@ -1431,6 +1461,38 @@ mod tests {
         drop(guard);
         assert_eq!(d.demand(), 0);
         assert_eq!(d.desired_replicas(), 0, "waiter must not leak after drop");
+    }
+
+    #[test]
+    fn external_demand_survives_reload_and_expiry_preserves_idle_grace() {
+        let d = deployment(ScalingPolicy {
+            min_replicas: 0, max_replicas: 1, warm_pool: 0,
+            scale_to_zero_after_secs: 60, ..Default::default()
+        });
+        assert_eq!(d.desired_replicas(), 0);
+        d.set_demand_lease("job-1", Some(300));
+        d.set_demand_lease("job-1", Some(300));
+        assert_eq!(d.demand(), 1, "renewal is idempotent");
+        assert_eq!(d.desired_replicas(), 1);
+        let restored = deployment(d.spec.scaling.clone());
+        restored.apply_state(serde_json::from_value(serde_json::to_value(&*d.state()).unwrap()).unwrap());
+        assert_eq!(restored.desired_replicas(), 1);
+        let b = backend("10.0.0.1:80");
+        b.last_active.store(now_secs() - 120, Ordering::Relaxed);
+        restored.set_backends(vec![b]);
+        restored.mutate_state(|s| {
+            s.last_demand_at = now_secs() - 120;
+            s.demand_leases.insert("job-1".into(), now_secs());
+        });
+        assert_eq!(restored.demand(), 0, "expiry is exclusive");
+        assert_eq!(restored.desired_replicas(), 1, "idle grace starts at expiry");
+        restored.mutate_state(|s| {
+            s.demand_leases.insert("job-1".into(), now_secs() - 61);
+        });
+        assert_eq!(restored.desired_replicas(), 0);
+        restored.set_demand_lease("job-1", None);
+        restored.set_demand_lease("job-1", None);
+        assert_eq!(restored.desired_replicas(), 0, "repeated release must not reset idle time");
     }
 
     #[test]

@@ -5796,10 +5796,10 @@ impl DeploymentSpec {
         self.rollout.validate(self.single_writer(), &self.scaling)?;
         if self.scaling.idle_action == IdleAction::Suspend {
             let Some(vm) = &self.vm else {
-                return Err(SpecError::InvalidSuspend("requires a Firecracker VM pool".into()));
+                return Err(SpecError::InvalidSuspend("requires a Firecracker or Libvirt VM pool".into()));
             };
-            if vm.driver != Driver::Firecracker || vm.rootfs != RootfsMode::Copy {
-                return Err(SpecError::InvalidSuspend("requires Firecracker with private writable rootfs".into()));
+            if !matches!(vm.driver, Driver::Firecracker | Driver::Libvirt) || vm.rootfs != RootfsMode::Copy {
+                return Err(SpecError::InvalidSuspend("requires Firecracker or Libvirt with private writable rootfs".into()));
             }
             if vm.workspace.is_some() || vm.workspace_archive.is_some() {
                 return Err(SpecError::InvalidSuspend("cannot combine memory suspension with workspace capture/archive lifecycle; use disk_size_gb instead".into()));
@@ -8784,11 +8784,17 @@ mod tests {
     }
 
     #[test]
-    fn stateful_suspend_requires_private_firecracker_and_host_placement() {
+    fn stateful_suspend_requires_private_memory_backed_guest_and_host_placement() {
         let mut s = spec();
         s.scaling.idle_action = IdleAction::Suspend;
         assert_eq!(s.validate(), Ok(()));
         assert!(s.host_bound().is_some());
+        s.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        assert_eq!(s.validate(), Ok(()));
+        assert!(s.host_bound().is_some());
+        s.vm.as_mut().unwrap().rootfs = RootfsMode::Shared;
+        assert!(matches!(s.validate(), Err(SpecError::InvalidSuspend(_))));
+        s.vm.as_mut().unwrap().rootfs = RootfsMode::Copy;
         s.vm.as_mut().unwrap().driver = Driver::Kvm;
         assert!(matches!(s.validate(), Err(SpecError::InvalidSuspend(_))));
         s.vm.as_mut().unwrap().driver = Driver::Firecracker;
