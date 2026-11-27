@@ -3438,6 +3438,40 @@ runner/deployment identity, first set its deployment's `min_replicas` to 1, then
 uninstall. Disabling the plugin alone leaves the durable guard in place so its
 deployment cannot silently revert to HTTP-only idle detection.
 
+#### Managed one-job registrations
+
+For hibernating CI VMs, use `managed` instead of `runner_id`. The VM, filesystem
+and work directory persist, but each job gets a fresh GitHub JIT registration.
+The controller wakes the VM before starting its listener and permits sleep only
+after the listener exits and its registration is confirmed absent. It never
+restarts an active listener to recover a queue delay.
+
+```json
+{"bindings":[{"id":"ci","repository":"owner/repository","deployment":"ci-vm","managed":{"labels":["heyo-ci"],"runner_directory":"/opt/github-runner","user":"heyo"},"token":{"secret":"github-runners"},"webhook_secret":{"secret":"github-webhook"}}]}
+```
+
+Use a dedicated, writable installation of the official Linux GitHub Actions
+runner in `runner_directory`, with no separately managed listener running there.
+The non-root `user` must be able to run it through `sudo`; the guest needs `flock`.
+Workflows keep their `runs-on` labels, which must be included in `managed.labels`.
+The repository credential needs runner-registration write permission in addition
+to the inventory/run/job reads used by persistent mode. No GitHub App or new VM
+per job is required. This is a persistent workspace, **not a clean security
+boundary between jobs**; do not mix mutually untrusted repositories in it.
+
+Launch intent lives in the deployment's durable state. The short-lived JIT
+credential uses the existing namespace secret store, never the deployment JSON
+or command text, and is removed after session cleanup. Each launch uses one
+stable operation ID and a guest-side lock, so a lost exec response or controller
+restart recovers the same operation instead of starting a second listener.
+Background operations enforce the existing six-hour execution ceiling. A VM
+replacement or reboot is not permission to replay a previous session.
+
+Missing/incomplete GitHub observations, unavailable credentials and uncertain
+launches keep the VM awake. An empty queue alone cannot release an active
+session. Uninstall requires `min_replicas: 1` and no remaining managed session;
+let running jobs drain first. The existing fixed-registration mode is unchanged.
+
 ### pg-fc databases (`pgfc`)
 
 This plugin monitors and configures [pg-fc](../pg-fc) pools through their

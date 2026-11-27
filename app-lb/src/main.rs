@@ -791,13 +791,16 @@ fn main() {
             plugin_store.dir().join("state"),
         ),
     };
+    let github_runners_plugin = plugins::github_runners::GithubRunnersPlugin::new(
+        registry.clone(), secrets.clone(),
+    );
     let plugin_host = Arc::new(plugins::PluginHost::new(
         vec![
             plugins::pgfc::PgFcPlugin::new(secrets.clone()),
             plugins::vapi::VapiPlugin::new(secrets.clone()),
             plugins::obs::ObsPlugin::new(secrets.clone()),
             plugins::ci::CiPlugin::new(secrets.clone()),
-            plugins::github_runners::GithubRunnersPlugin::new(registry.clone(), secrets.clone()),
+            github_runners_plugin.clone(),
             plugins::remote::RemotePlugin::new(secrets.clone()),
             plugins::secrets::SecretsPlugin::new(secrets.clone()),
             plugins::artifacts::ArtifactsPlugin::new(secrets.clone(), store_slot.clone()),
@@ -1416,6 +1419,7 @@ fn main() {
         registry.clone(),
         vms.clone(),
     );
+    github_runners_plugin.set_operations(operations.clone());
 
     // One-time transfer URLs for large files, when a public base is configured.
     let transfers = transfers::TransferConfig::from_env(

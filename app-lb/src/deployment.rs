@@ -463,6 +463,9 @@ pub struct Adoption {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeploymentState {
+    /// Durable managed GitHub runner launch; contains no credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_runner_session: Option<crate::plugins::github_runners::Session>,
     /// External controllers must keep sleep permissions fresh. Expired
     /// permissions count as demand, so a dead controller cannot strand work.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

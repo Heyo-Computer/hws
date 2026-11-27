@@ -2,6 +2,10 @@
 //! Webhooks only trigger reconciliation. Paginated REST snapshots, never event
 //! ordering or lease expiry, decide whether a runner may sleep.
 
+mod managed;
+use managed::Managed;
+pub use managed::Session;
+
 use super::{Installs, NamespaceScope, Plugin, PluginMeta, SetError};
 use crate::{
     config::{Driver, IdleAction},
@@ -32,7 +36,10 @@ const KEEPALIVE: u64 = 7 * 86400;
 struct Binding {
     id: String,
     repository: String,
+    #[serde(default)]
     runner_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed: Option<Managed>,
     deployment: String,
     token: SecretRef,
     webhook_secret: SecretRef,
@@ -66,14 +73,17 @@ fn parse_install(ns: &str, value: &Value) -> Result<Install, String> {
         if !segment(&b.id)
             || parts.len() != 2
             || !parts.iter().all(|p| segment(p))
-            || b.runner_id == 0
+            || (b.runner_id == 0) != b.managed.is_some()
         {
-            return Err("binding requires an id, owner/repository and numeric runner_id".into());
+            return Err("binding requires an id, owner/repository and either runner_id or managed configuration".into());
+        }
+        if let Some(managed) = &b.managed {
+            managed.validate()?;
         }
         b.repository = b.repository.to_ascii_lowercase();
         if !ids.insert(b.id.clone())
             || !deployments.insert(b.deployment.clone())
-            || !runners.insert((b.repository.clone(), b.runner_id))
+            || (b.runner_id != 0 && !runners.insert((b.repository.clone(), b.runner_id)))
         {
             return Err("binding ids, deployments and repository runners must be unique".into());
         }
@@ -112,8 +122,8 @@ fn needs_runner(r: &Runner, jobs: &[Job]) -> bool {
             if j.status == "completed" {
                 return false;
             }
-            j.runner_id == Some(r.id)
-                || j.runner_name.as_deref() == Some(&r.name)
+            (r.id != 0 && j.runner_id == Some(r.id))
+                || (!r.name.is_empty() && j.runner_name.as_deref() == Some(&r.name))
                 || (j.status == "queued"
                     && !j.labels.is_empty()
                     && j.labels
@@ -143,6 +153,7 @@ pub struct GithubRunnersPlugin {
     wake: tokio::sync::Notify,
     http: reqwest::Client,
     api: String,
+    operations: RwLock<Option<Arc<crate::operations::Operations>>>,
 }
 
 impl GithubRunnersPlugin {
@@ -163,7 +174,13 @@ impl GithubRunnersPlugin {
                 .build()
                 .unwrap(),
             api: "https://api.github.com".into(),
+            operations: RwLock::new(None),
         })
+    }
+
+    pub fn set_operations(&self, operations: Arc<crate::operations::Operations>) {
+        *self.operations.write().unwrap() = Some(operations);
+        self.wake.notify_one();
     }
 
     fn deployment(&self, ns: &str, b: &Binding) -> Result<Arc<Deployment>, String> {
@@ -267,10 +284,29 @@ impl GithubRunnersPlugin {
             .await?;
         let runners: Vec<Runner> =
             serde_json::from_value(json!(runners)).map_err(|_| "invalid runner response")?;
-        let runner = runners
-            .into_iter()
-            .find(|r| r.id == b.runner_id)
-            .ok_or("bound runner is missing")?;
+        let runner = if let Some(managed) = &b.managed {
+            let session = self
+                .registry
+                .get(&b.deployment)
+                .and_then(|d| d.state().github_runner_session.clone());
+            let id = session.as_ref().and_then(|s| s.runner_id).unwrap_or(0);
+            Runner {
+                id,
+                name: session.as_ref().map(Session::name).unwrap_or_default(),
+                status: "offline".into(),
+                busy: runners.iter().any(|r| r.id == id && r.busy),
+                labels: managed
+                    .labels
+                    .iter()
+                    .map(|name| Label { name: name.clone() })
+                    .collect(),
+            }
+        } else {
+            runners
+                .into_iter()
+                .find(|r| r.id == b.runner_id)
+                .ok_or("bound runner is missing")?
+        };
         if runner.status != "online" && runner.status != "offline" {
             return Err("unknown runner status".into());
         }
@@ -336,24 +372,40 @@ impl GithubRunnersPlugin {
                         }
                         observation.awake = awake;
                         observation.last_checked_at = now_secs();
-                        let allow = match &snapshot {
-                            Ok((r, jobs)) if started.elapsed().as_secs() < 30 => {
-                                if awake && r.status == "online" {
-                                    observation.seen_online = true;
-                                    observation.last_online_at = now_secs();
+                        let managed_result = if b.managed.is_some() {
+                            Some(match &snapshot {
+                                Ok((r, jobs)) if started.elapsed().as_secs() < 30 => {
+                                    self.reconcile_managed(&ns, &b, &d, r, jobs).await
                                 }
-                                observation.seen_online
-                                    && !needs_runner(r, jobs)
-                                    && (!awake || r.status == "online")
-                                    && now_secs().saturating_sub(observation.last_online_at)
-                                        < KEEPALIVE
+                                _ => Err("managed runner inventory unavailable or stale".into()),
+                            })
+                        } else {
+                            None
+                        };
+                        let allow = if let Some(result) = &managed_result {
+                            result.as_ref().copied().unwrap_or(false)
+                        } else {
+                            match &snapshot {
+                                Ok((r, jobs)) if started.elapsed().as_secs() < 30 => {
+                                    if awake && r.status == "online" {
+                                        observation.seen_online = true;
+                                        observation.last_online_at = now_secs();
+                                    }
+                                    observation.seen_online
+                                        && !needs_runner(r, jobs)
+                                        && (!awake || r.status == "online")
+                                        && now_secs().saturating_sub(observation.last_online_at)
+                                            < KEEPALIVE
+                                }
+                                _ => false,
                             }
-                            _ => false,
                         };
                         observation.sleep_allowed = allow;
                         let written =
                             self.permission(&d, if allow { now_secs() + FRESH } else { 0 });
-                        written.and(snapshot.map(|_| ()))
+                        written
+                            .and(snapshot.map(|_| ()))
+                            .and(managed_result.unwrap_or(Ok(false)).map(|_| ()))
                     }
                 };
                 observation.error = result.err();
@@ -416,7 +468,9 @@ impl Plugin for GithubRunnersPlugin {
             old.bindings.iter().any(|b| {
                 !install.bindings.iter().any(|n| {
                     n.deployment == b.deployment
+                        && n.id == b.id
                         && n.runner_id == b.runner_id
+                        && n.managed == b.managed
                         && n.repository == b.repository
                 })
             })
@@ -427,10 +481,11 @@ impl Plugin for GithubRunnersPlugin {
         for b in &install.bindings {
             for (other_ns, other) in self.installs.read().unwrap().iter() {
                 if other_ns != ns
-                    && other
-                        .bindings
-                        .iter()
-                        .any(|o| o.repository == b.repository && o.runner_id == b.runner_id)
+                    && other.bindings.iter().any(|o| {
+                        b.runner_id != 0
+                            && o.repository == b.repository
+                            && o.runner_id == b.runner_id
+                    })
                 {
                     return Err(SetError::Conflict("runner is already bound".into()));
                 }
@@ -465,6 +520,14 @@ impl Plugin for GithubRunnersPlugin {
             if targets.iter().any(|d| d.spec.scaling.min_replicas < 1) {
                 return Err(SetError::Conflict(
                     "set min_replicas to 1 before removing runner control".into(),
+                ));
+            }
+            if targets
+                .iter()
+                .any(|d| d.state().github_runner_session.is_some())
+            {
+                return Err(SetError::Conflict(
+                    "wait for the managed runner session to finish before uninstalling".into(),
                 ));
             }
             for d in targets {
@@ -591,6 +654,7 @@ mod tests {
         runner: Value,
         jobs: Vec<Value>,
         fail: bool,
+        lose_mint_once: bool,
         extra_runs: usize,
     }
 
@@ -599,6 +663,17 @@ mod tests {
     }
 
     async fn fixture() -> (
+        tempfile::TempDir,
+        Arc<GithubRunnersPlugin>,
+        Arc<Mutex<Github>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        fixture_with_config(config()).await
+    }
+
+    async fn fixture_with_config(
+        install: Value,
+    ) -> (
         tempfile::TempDir,
         Arc<GithubRunnersPlugin>,
         Arc<Mutex<Github>>,
@@ -622,10 +697,37 @@ mod tests {
             runner: json!({"id":42,"name":"persistent-ci","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"heyo-ci"}]}),
             jobs: vec![],
             fail: false,
+            lose_mint_once: false,
             extra_runs: 0,
         }));
         let state = github.clone();
-        let router = Router::new().fallback(get(
+        let mint = github.clone();
+        let remove = github.clone();
+        let router = Router::new()
+            .route("/repos/owner/repo/actions/runners/generate-jitconfig", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let state = mint.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer namespace-token");
+                    let mut g = state.lock().unwrap();
+                    assert!(g.runner.is_null(), "must not create two registrations");
+                    g.runner = json!({"id":43,"name":body["name"],"status":"online","busy":false,"labels":[{"name":"heyo-ci"}]});
+                    if std::mem::take(&mut g.lose_mint_once) {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    Json(json!({"runner":g.runner,"encoded_jit_config":"one-job-credential"})).into_response()
+                }
+            }))
+            .route("/repos/owner/repo/actions/runners/:id", axum::routing::delete(move |Path(id): Path<u64>| {
+                let state = remove.clone();
+                async move {
+                    let mut g = state.lock().unwrap();
+                    assert_eq!(g.runner["id"], id);
+                    assert_ne!(g.runner["busy"], true);
+                    g.runner = Value::Null;
+                    StatusCode::NO_CONTENT
+                }
+            }))
+            .fallback(get(
             move |uri: axum::http::Uri,
                   Query(query): Query<BTreeMap<String, String>>,
                   headers: HeaderMap| {
@@ -641,7 +743,8 @@ mod tests {
                     }
                     let path = uri.path();
                     if path.ends_with("/runners") {
-                        return Json(json!({"total_count":1,"runners":[g.runner]})).into_response();
+                        let runners = if g.runner.is_null() { vec![] } else { vec![g.runner.clone()] };
+                        return Json(json!({"total_count":runners.len(),"runners":runners})).into_response();
                     }
                     if path.ends_with("/runs") {
                         let runs = if query.get("status").map(String::as_str) == Some("queued") {
@@ -674,6 +777,7 @@ mod tests {
             registry,
             secrets,
             api: url,
+            operations: RwLock::new(None),
             installs: RwLock::new(BTreeMap::new()),
             observations: Mutex::new(BTreeMap::new()),
             task: Mutex::new(None),
@@ -682,10 +786,154 @@ mod tests {
             http: reqwest::Client::new(),
         });
         plugin
-            .on_install("team", &config(), &json!({}))
+            .on_install("team", &install, &json!({}))
             .await
             .unwrap();
         (dir, plugin, github, task)
+    }
+
+    #[tokio::test]
+    async fn managed_session_survives_restart_and_requires_exit_and_deregistration_before_sleep() {
+        let install = json!({"bindings":[{"id":"ci","repository":"owner/repo","deployment":"ci",
+            "managed":{"labels":["heyo-ci"],"runner_directory":"/opt/runner","user":"heyo"},
+            "token":{"secret":"github"},"webhook_secret":{"secret":"hook"}}]});
+        let (dir, p, github, task) = fixture_with_config(install.clone()).await;
+        github.lock().unwrap().runner = Value::Null;
+        let d = p.registry.get("ci").unwrap();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = finished.clone();
+        let boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let runtime = Router::new().route("/sandbox/:id/exec", post(move |Json(body): Json<Value>| {
+            let done = done.clone();
+            async move {
+                let command = body["command"].as_str().unwrap();
+                let stdout = if command == "cat /proc/sys/kernel/random/boot_id" {
+                    format!("{boot}\n")
+                } else if command.contains("flock -n") {
+                    assert_eq!(body["env"]["HEYO_GITHUB_JIT"], "one-job-credential");
+                    assert!(!command.contains("one-job-credential"));
+                    format!("dir=/var/tmp/proof-op\nboot={boot}\n")
+                } else {
+                    let exit = if done.load(std::sync::atomic::Ordering::SeqCst) { "0" } else { "" };
+                    format!("boot={boot}\nop=/var/tmp/proof-op dir=1 alive=1 exit={exit} size=0 cancelled=0\n")
+                };
+                Json(json!({"exit_code":0,"stdout":stdout,"stderr":"","output":stdout}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let daemon = tokio::spawn(async move { axum::serve(listener, runtime).await.unwrap() });
+        let vms = crate::vm::VmManager::new(
+            Some(url),
+            None,
+            crate::mounts::MountStore::new(dir.path().join("mounts"), 0),
+        )
+        .unwrap();
+        let path = dir.path().join("operations.json");
+        let ops =
+            crate::operations::Operations::open(path.clone(), p.registry.clone(), vms.clone());
+        p.set_operations(ops.clone());
+        p.reconcile().await;
+        assert_eq!(
+            d.desired_replicas(),
+            0,
+            "no registration is required while idle"
+        );
+        github.lock().unwrap().jobs = vec![
+            json!({"id":99,"status":"queued","labels":["other"],"runner_id":0,"runner_name":""}),
+        ];
+        p.reconcile().await;
+        assert_eq!(
+            d.desired_replicas(),
+            0,
+            "zero and empty assignment fields do not claim unrelated work"
+        );
+        github.lock().unwrap().jobs[0]["labels"] = json!(["heyo-ci"]);
+        github.lock().unwrap().lose_mint_once = true;
+        p.reconcile().await;
+        assert!(d.state().github_runner_session.is_some());
+        assert!(ops.list("ci").is_empty(), "lost mint receipt cannot launch");
+        assert_eq!(d.desired_replicas(), 1);
+        p.reconcile().await;
+        assert!(
+            github.lock().unwrap().runner.is_null(),
+            "remove the journalled orphan before reminting"
+        );
+        p.reconcile().await;
+        assert!(
+            p.observations.lock().unwrap()[&("team".into(), "ci".into())]
+                .error
+                .is_none()
+        );
+        assert!(d.state().github_runner_session.is_some());
+        assert_eq!(ops.list("ci").len(), 1);
+        assert_eq!(d.desired_replicas(), 1);
+        let session = d.state().github_runner_session.clone();
+        let journal = serde_json::to_string(&d.state().github_runner_session).unwrap();
+        assert!(!journal.contains("one-job-credential"));
+
+        // Reload the controller and operation journal, without minting again.
+        let registry = Arc::new(Registry::new(dir.path().join("state.json")));
+        registry.load().unwrap();
+        let secrets = Arc::new(SecretStore::new(dir.path().join("secrets.json"), None));
+        secrets.load().unwrap();
+        let restarted = Arc::new_cyclic(|me| GithubRunnersPlugin {
+            me: me.clone(),
+            registry: registry.clone(),
+            secrets,
+            installs: RwLock::new(BTreeMap::new()),
+            observations: Mutex::new(BTreeMap::new()),
+            task: Mutex::new(None),
+            serial: tokio::sync::Mutex::new(()),
+            wake: tokio::sync::Notify::new(),
+            http: reqwest::Client::new(),
+            api: p.api.clone(),
+            operations: RwLock::new(None),
+        });
+        let backends = d.backends();
+        drop(ops);
+        drop(p);
+        let d = registry.get("ci").unwrap();
+        d.set_backends(backends.as_ref().clone());
+        let reloaded = crate::operations::Operations::open(path, registry, vms);
+        restarted.set_operations(reloaded.clone());
+        restarted
+            .on_install("team", &install, &json!({}))
+            .await
+            .unwrap();
+        github.lock().unwrap().jobs.clear();
+        restarted.reconcile().await;
+        assert_eq!(d.state().github_runner_session, session);
+        assert_eq!(
+            d.desired_replicas(),
+            1,
+            "empty GitHub queue cannot stop a live guest operation"
+        );
+        github.lock().unwrap().fail = true;
+        restarted.reconcile().await;
+        assert!(
+            !restarted.observations.lock().unwrap()[&("team".into(), "ci".into())].sleep_allowed
+        );
+        github.lock().unwrap().fail = false;
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        restarted.reconcile().await;
+        assert!(
+            d.state().github_runner_session.is_some(),
+            "confirm deletion before releasing the session"
+        );
+        restarted.reconcile().await;
+        assert!(d.state().github_runner_session.is_none());
+        assert_eq!(
+            restarted.secrets.list(Some("team")).len(),
+            2,
+            "JIT credential removed, original secrets retained"
+        );
+        restarted.reconcile().await;
+        assert!(
+            restarted.observations.lock().unwrap()[&("team".into(), "ci".into())].sleep_allowed
+        );
+        daemon.abort();
+        task.abort();
     }
 
     #[tokio::test]
